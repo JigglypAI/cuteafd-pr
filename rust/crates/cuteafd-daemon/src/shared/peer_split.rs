@@ -66,12 +66,106 @@ mod probe_tests {
     }
 }
 
+#[cfg(test)]
+mod terminal_state_tests {
+    use super::*;
+
+    #[test]
+    fn second_abort_publication_succeeds_without_republishing() {
+        let state = Cell::new(TerminalState::Active);
+        assert!(TerminalState::begin_abort(&state).unwrap());
+        assert_eq!(state.get(), TerminalState::Aborting);
+        // #2543: an error path already published; shutdown publishes again.
+        assert!(!TerminalState::begin_abort(&state).unwrap());
+        assert_eq!(state.get(), TerminalState::Aborting);
+        state.set(TerminalState::Drained);
+        assert!(!TerminalState::begin_abort(&state).unwrap());
+        assert_eq!(state.get(), TerminalState::Drained);
+        state.set(TerminalState::Retained);
+        assert!(matches!(TerminalState::begin_abort(&state),
+            Err(TerminalPeerError::Closed(TerminalState::Retained))));
+    }
+
+    #[test]
+    fn publish_all_reaches_every_owner_past_a_failure_then_drains_and_finishes_each() {
+        struct Owner { fail: bool, events: std::cell::RefCell<Vec<&'static str>> }
+        impl TerminalOwner for Owner {
+            fn publish_abort(&self) -> Result<()> {
+                self.events.borrow_mut().push("publish");
+                if self.fail { anyhow::bail!("injected publication failure") } else { Ok(()) }
+            }
+            fn drain_terminal(&self) -> Result<()> { self.events.borrow_mut().push("drain"); Ok(()) }
+            fn finish_terminal(&self, drained: bool) { self.events.borrow_mut().push(if drained { "drained" } else { "retained" }); }
+        }
+        let owners = [false, true, false].map(|fail| Owner { fail, events: Default::default() });
+        let all = owners.iter().map(|owner| owner as &dyn TerminalOwner).collect::<Vec<_>>();
+        let error = publish_all(&all).unwrap_err().to_string();
+        assert!(error.contains("injected publication failure"), "{error}");
+        assert!(owners.iter().all(|owner| *owner.events.borrow() == ["publish"]));
+        drain_all(&all).unwrap();
+        finish_all(&all, true);
+        assert!(owners.iter().all(|owner| *owner.events.borrow() == ["publish", "drain", "drained"]));
+
+        // The full sequence: a publication failure skips every drain and
+        // retains every owner; success drains then finishes each one.
+        let owners = [false, true].map(|fail| Owner { fail, events: Default::default() });
+        let all = owners.iter().map(|owner| owner as &dyn TerminalOwner).collect::<Vec<_>>();
+        let order = std::cell::RefCell::new(Vec::new());
+        assert!(terminal_sequence(&all, || { order.borrow_mut().push("quiesce"); Ok(()) },
+            || { order.borrow_mut().push("rest"); Ok(()) }).is_err());
+        assert!(order.borrow().is_empty());
+        assert!(owners.iter().all(|owner| *owner.events.borrow() == ["publish", "retained"]));
+        let owners = [false, false].map(|fail| Owner { fail, events: Default::default() });
+        let all = owners.iter().map(|owner| owner as &dyn TerminalOwner).collect::<Vec<_>>();
+        terminal_sequence(&all, || { order.borrow_mut().push("quiesce"); Ok(()) },
+            || { order.borrow_mut().push("rest"); Ok(()) }).unwrap();
+        assert_eq!(*order.borrow(), ["quiesce", "rest"]);
+        assert!(owners.iter().all(|owner| *owner.events.borrow() == ["publish", "drain", "drained"]));
+    }
+
+    /// Kimi's shape (#2543): the error path published, then the engine's
+    /// teardown publishes again. Every drain phase must still run.
+    #[test]
+    fn teardown_after_an_earlier_publication_still_drains_every_phase() {
+        use crate::shared::experts::rtx::pair::{teardown, Teardown};
+        let state = Cell::new(TerminalState::Active);
+        assert!(TerminalState::begin_abort(&state).unwrap());
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = teardown(&mut Teardown {
+            abort: || { events.borrow_mut().push("abort"); TerminalState::begin_abort(&state).map(drop).map_err(Into::into) },
+            ranks: || { events.borrow_mut().push("ranks"); Ok(()) },
+            links: || { events.borrow_mut().push("links"); Ok(()) },
+            copies: || { events.borrow_mut().push("copies"); Ok(()) },
+            graphs: || { events.borrow_mut().push("graphs"); Ok(()) },
+            finish: |drained| { state.set(if drained { TerminalState::Drained } else { TerminalState::Retained }); },
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*events.borrow(), ["abort", "ranks", "links", "copies", "graphs"]);
+        assert_eq!(state.get(), TerminalState::Drained);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalState {
     Active,
     Aborting,
     Drained,
     Retained,
+}
+
+impl TerminalState {
+    /// The abort-publication transition: `Ok(true)` when this call must publish
+    /// (and is now `Aborting`), `Ok(false)` when another error path already
+    /// published or the exchange already drained. Publication is idempotent,
+    /// so every terminal path may publish without first inspecting the state;
+    /// only a retained (failed-drain) exchange refuses.
+    fn begin_abort(cell: &Cell<Self>) -> Result<bool, TerminalPeerError> {
+        match cell.get() {
+            Self::Active => { cell.set(Self::Aborting); Ok(true) }
+            Self::Aborting | Self::Drained => Ok(false),
+            state @ Self::Retained => Err(TerminalPeerError::Closed(state)),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +204,62 @@ impl Drop for AbortSide<'_> {
 struct TerminalAbort<'a> {
     sides: [AbortSide<'a>; 2],
     state: Cell<TerminalState>,
+}
+
+/// One engine-owned producer of device-side peer waits. An engine's terminal
+/// path publishes every owner's abort before draining any compute stream, then
+/// drains each owner, then finishes each with the joint verdict.
+pub(crate) trait TerminalOwner {
+    /// Idempotent: an owner an earlier error path aborted publishes nothing.
+    fn publish_abort(&self) -> Result<()>;
+    /// After every owner of the engine published.
+    fn drain_terminal(&self) -> Result<()>;
+    fn finish_terminal(&self, drained: bool);
+}
+
+/// Publish every owner (a failure does not skip the rest), then fail if any failed.
+pub(crate) fn publish_all(owners: &[&dyn TerminalOwner]) -> Result<()> {
+    let failures = owners.iter().filter_map(|owner| owner.publish_abort().err())
+        .map(|error| format!("{error:#}")).collect::<Vec<_>>();
+    ensure!(failures.is_empty(), "terminal abort publication: {}", failures.join("; "));
+    Ok(())
+}
+
+pub(crate) fn drain_all(owners: &[&dyn TerminalOwner]) -> Result<()> {
+    owners.iter().try_for_each(|owner| owner.drain_terminal())
+}
+
+pub(crate) fn finish_all(owners: &[&dyn TerminalOwner], drained: bool) {
+    for owner in owners { owner.finish_terminal(drained); }
+}
+
+/// An engine's terminal order over all its wait owners: publish every abort,
+/// quiesce external links, drain every owner, drain the engine's remaining
+/// streams/copies, then finish every owner with the joint verdict.
+pub(crate) fn terminal_sequence(owners: &[&dyn TerminalOwner], quiesce: impl FnOnce() -> Result<()>,
+    rest: impl FnOnce() -> Result<()>) -> Result<()> {
+    let result = (|| {
+        publish_all(owners)?;
+        quiesce()?;
+        drain_all(owners)?;
+        rest()
+    })();
+    finish_all(owners, result.is_ok());
+    result
+}
+
+impl TerminalOwner for PeerExchange<'_> {
+    fn publish_abort(&self) -> Result<()> { PeerExchange::publish_abort(self) }
+    fn drain_terminal(&self) -> Result<()> {
+        match self.terminal_state() {
+            TerminalState::Aborting => self.drain_compute(),
+            TerminalState::Drained => Ok(()),
+            state => Err(TerminalPeerError::Closed(state).into()),
+        }
+    }
+    fn finish_terminal(&self, drained: bool) {
+        if self.terminal_state() == TerminalState::Aborting { PeerExchange::finish_terminal(self, drained); }
+    }
 }
 
 /// One GPU of a head split: its device and the stream its work runs on.
@@ -415,15 +565,13 @@ impl<'a> PeerExchange<'a> {
     }
 
     /// Terminal only: publish both abort words before draining either compute
-    /// stream. A failure requires the complete engine/native owners to be
+    /// stream. Idempotent: an exchange an earlier error path already aborted
+    /// (or drained) succeeds without republishing, so the caller's teardown
+    /// still drains. A failure requires the complete engine/native owners to be
     /// quarantined; this object must then never be dropped or reused.
     pub fn publish_abort(&self) -> Result<()> {
         let abort = self.abort.as_ref().ok_or(TerminalPeerError::NotAbortable)?;
-        match abort.state.get() {
-            TerminalState::Drained => return Ok(()),
-            TerminalState::Active => abort.state.set(TerminalState::Aborting),
-            state => return Err(TerminalPeerError::Closed(state).into()),
-        }
+        if !TerminalState::begin_abort(&abort.state)? { return Ok(()); }
         let mut failures = Vec::new();
         for (rank, side) in abort.sides.iter().enumerate() {
             // SAFETY: independent owned stream, preloaded publisher, persistent

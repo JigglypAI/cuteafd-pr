@@ -800,12 +800,17 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_state(&self) -> TerminalState { self.terminal.get() }
+
     fn shutdown(&self) -> Result<()> {
         if self.terminal.get() == TerminalState::Drained { return Ok(()); }
         let lanes = self.lanes.try_borrow_mut()?;
         let lanes = RefCell::new(lanes);
         if let Some(draft) = &self.draft { draft.abort()?; }
         let result = teardown(&mut Teardown {
+            // An error path (an RTX expert enqueue) may already have published:
+            // publication is idempotent, so the drains below still run (#2543).
             abort: || {
                 self.terminal.set(TerminalState::Aborting);
                 self.peer.as_deref().map_or(Ok(()), PeerExchange::publish_abort)

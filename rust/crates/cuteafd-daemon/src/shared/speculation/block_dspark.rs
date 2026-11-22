@@ -1508,11 +1508,7 @@ impl<'a> DsparkDrafter<'a> {
         self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.require_live())
     }
     pub(crate) fn abort(&self)->Result<()> {
-        use crate::shared::peer_split::TerminalState;
-        self.head_split.as_ref().map_or(Ok(()),|s|match s.exchange.terminal_state() {
-            TerminalState::Aborting|TerminalState::Drained=>Ok(()),
-            _=>s.exchange.publish_abort(),
-        })
+        self.head_split.as_ref().map_or(Ok(()),|s|s.exchange.publish_abort())
     }
     pub(crate) fn finish_terminal(&self,drained:bool) {
         if let Some(split)=&self.head_split {
