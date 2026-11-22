@@ -1261,6 +1261,9 @@ pub struct TableStats {
     prefetch_resident_copy_rows: AtomicU64,
     prefetch_late_major_faults: AtomicU64,
     pub(crate) cache_hit_rows: AtomicU64,
+    pub(crate) distinct_rows: AtomicU64,
+    pub(crate) demand_rows: AtomicU64,
+    pub(crate) demand_hit_rows: AtomicU64,
     pub(crate) cache_wait_rows: AtomicU64,
     pub(crate) cache_denied_rows: AtomicU64,
     pub(crate) cache_evictions: AtomicU64,
@@ -1354,6 +1357,17 @@ pub struct TableStatsSnapshot {
     /// Row-cache lookups already published when a gather needed them.
     #[serde(default)]
     pub cache_hit_rows: u64,
+    /// Distinct row ids looked up at the row cache, every acquire site. The
+    /// denominator for `cache_hit_rows`.
+    #[serde(default)]
+    pub distinct_rows: u64,
+    /// Distinct row ids looked up by demand gathers only (token-table gather,
+    /// engram gather).
+    #[serde(default)]
+    pub demand_rows: u64,
+    /// Of `demand_rows`, rows already published.
+    #[serde(default)]
+    pub demand_hit_rows: u64,
     /// Row-cache lookups still being filled by another reader when a gather needed them.
     #[serde(default)]
     pub cache_wait_rows: u64,
@@ -1453,6 +1467,11 @@ impl TableStats {
             else { (&self.stall_prefill_fallback_rows, &self.stall_prefill_pending_rows) };
         read.fetch_add(fallback as u64, Ordering::Relaxed);
         waited.fetch_add(pending as u64, Ordering::Relaxed);
+    }
+    /// One demand gather's row-cache lookups: `rows` distinct ids, `hits` already published.
+    pub fn record_demand(&self, rows: usize, hits: usize) {
+        self.demand_rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.demand_hit_rows.fetch_add(hits as u64, Ordering::Relaxed);
     }
     /// Rows a look-ahead read published; `piece` when it completed a piece's
     /// share of this table (or a decode round's).
@@ -1570,6 +1589,9 @@ impl TableStats {
             prefetch_resident_copy_rows: get(&self.prefetch_resident_copy_rows),
             prefetch_late_major_faults: get(&self.prefetch_late_major_faults),
             cache_hit_rows: get(&self.cache_hit_rows),
+            distinct_rows: get(&self.distinct_rows),
+            demand_rows: get(&self.demand_rows),
+            demand_hit_rows: get(&self.demand_hit_rows),
             cache_wait_rows: get(&self.cache_wait_rows),
             cache_denied_rows: get(&self.cache_denied_rows),
             cache_evictions: get(&self.cache_evictions),
@@ -1644,6 +1666,9 @@ impl TableStatsSnapshot {
             prefetch_resident_copy_rows: d(self.prefetch_resident_copy_rows, earlier.prefetch_resident_copy_rows),
             prefetch_late_major_faults: d(self.prefetch_late_major_faults, earlier.prefetch_late_major_faults),
             cache_hit_rows: d(self.cache_hit_rows, earlier.cache_hit_rows),
+            distinct_rows: d(self.distinct_rows, earlier.distinct_rows),
+            demand_rows: d(self.demand_rows, earlier.demand_rows),
+            demand_hit_rows: d(self.demand_hit_rows, earlier.demand_hit_rows),
             cache_wait_rows: d(self.cache_wait_rows, earlier.cache_wait_rows),
             cache_denied_rows: d(self.cache_denied_rows, earlier.cache_denied_rows),
             cache_evictions: d(self.cache_evictions, earlier.cache_evictions),

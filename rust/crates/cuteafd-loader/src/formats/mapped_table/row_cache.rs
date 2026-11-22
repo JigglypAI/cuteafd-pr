@@ -146,10 +146,20 @@ impl RowCache {
             }
         }
         let stats = &self.stats;
+        stats.distinct_rows.fetch_add(rows.len() as u64, Ordering::Relaxed);
         stats.cache_hit_rows.fetch_add(hits, Ordering::Relaxed);
         stats.cache_wait_rows.fetch_add(waits, Ordering::Relaxed);
         stats.cache_denied_rows.fetch_add(denied, Ordering::Relaxed);
         stats.cache_evictions.fetch_add(evicted, Ordering::Relaxed);
+        (pins, lookups)
+    }
+
+    /// `acquire` for a DEMAND gather: the same lookups, plus the demand-only
+    /// counters so `demand_hit_rows / demand_rows` is a rate over demand alone.
+    pub fn acquire_demand(self: &Arc<Self>, rows: &[u64], class: RowClass) -> (Pins, Vec<Lookup>) {
+        let (pins, lookups) = self.acquire(rows, class);
+        let hits = lookups.iter().filter(|lookup| matches!(lookup, Lookup::Ready(_))).count();
+        self.stats.record_demand(rows.len(), hits);
         (pins, lookups)
     }
 
@@ -433,5 +443,49 @@ mod tests {
         assert!(pins.publish(slot + 1, &[&[0; 4]]).is_err());
         assert_eq!(pins.publish_all([(slot, [&[1u8, 2][..], &[3u8, 4][..]])].into_iter()).unwrap(), 1);
         assert_eq!(pins.row(slot), [1, 2, 3, 4]);
+    }
+
+    /// The published hit rate is a rate: its denominator counts the same lookups
+    /// its numerator counts, so it can never exceed 100 %. `rows` (the engram
+    /// gather's tokens x 24 slots) is NOT that denominator — it counts duplicate
+    /// and image slots and only the engram gather, while `cache_hit_rows` counts
+    /// every acquire site. Live 2026-11-15 that read 122 %.
+    #[test]
+    fn the_published_hit_rate_never_exceeds_one() {
+        let stats = Arc::new(TableStats::default());
+        let cache = RowCache::new(4, [8, 4], Arc::clone(&stats)).unwrap();
+        // 6 distinct rows, filled by a demand gather.
+        let (mut pins, lookups) = cache.acquire_demand(&[1, 2, 3, 4, 5, 6], RowClass::Prefill);
+        fill(&mut pins, &lookups, &[1, 2, 3, 4, 5, 6]);
+        drop(pins);
+        // Ten look-ahead acquires of the same 6: 60 more hits, 60 more lookups.
+        // (The look-ahead is the site whose hits the old denominator never counted.)
+        for _ in 0..10 {
+            let (ahead, _) = cache.acquire(&[1, 2, 3, 4, 5, 6], RowClass::Prefill);
+            drop(ahead);
+        }
+        // A demand gather of 4 of them: 4 hits, 4 lookups.
+        let (again, _) = cache.acquire_demand(&[1, 2, 3, 4], RowClass::Prefill);
+        drop(again);
+        // Read the SERIALIZED snapshot: at base `distinct_rows` is absent and this
+        // fails on the expect, not on a missing symbol.
+        let json = serde_json::to_value(stats.snapshot()).unwrap();
+        let hits = json["cache_hit_rows"].as_u64().unwrap();
+        let distinct = json["distinct_rows"].as_u64().expect("distinct_rows is published");
+        let demand = json["demand_rows"].as_u64().expect("demand_rows is published");
+        let demand_hits = json["demand_hit_rows"].as_u64().expect("demand_hit_rows is published");
+        // 64 hits over 70 lookups. Demand alone: the first gather was 6 Fills
+        // (0 hits), the second 4 hits -> 4/10, not 64/70.
+        assert_eq!((hits, distinct, demand, demand_hits), (64, 70, 10, 4));
+        assert!(hits <= distinct, "the published rate is {hits}/{distinct} > 100 %");
+        assert!(demand_hits <= demand, "the demand rate is {demand_hits}/{demand} > 100 %");
+        assert_eq!(hits as f64 / distinct as f64, 64.0 / 70.0);
+        // The old denominator is a slot count, not a lookup count: 2 tokens x 24
+        // slots = 48. Over it the SAME hits read 133 %, which is the live defect
+        // (42,794,906 / 35,077,416 = 122 %); over the lookups they read 91 %.
+        let rows = 2 * 24;
+        assert!(hits > rows, "the old denominator reproduces the >100 % shape");
+        assert!(100 * hits / rows > 100, "the old ratio reads {} %", 100 * hits / rows);
+        assert!(100 * hits / distinct <= 100, "the new ratio cannot exceed 100 %");
     }
 }
