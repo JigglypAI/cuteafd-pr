@@ -39,6 +39,7 @@ FAMILIES = {
     "mistral_large4": "mistral_large4",
     "minimax_m3_vl": "minimax_m3",
     "inkling2": "inkling2",
+    "hy_v4_flash": "hy4_flash",
 }
 
 
@@ -97,7 +98,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
     if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4",
-                  "minimax_m3", "inkling2"):
+                  "minimax_m3", "inkling2", "hy4_flash"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -146,6 +147,15 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     elif family == "inkling2":
         # Every Inkling 2 layer is routed; the bundled dSpark drafter is dense.
         last = layers - 1
+    elif family == "hy4_flash":
+        # Dense prefix (layer 0), then LatentMoE layers 1..=41; DFly2 drafter is dense.
+        dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False}})
+        if dense is None:
+            raise SystemExit("config lacks mlp_layer_types")
+        first = dense.index(False) if False in dense else layers
+        if any(dense[first:]):
+            raise SystemExit("unsupported hy4_flash MoE layer pattern: dense layer after a routed one")
+        last = layers - 1
     elif family == "minimax_m3":
         # text_config.moe_layer_freq: 0 dense, 1 routed, one entry per layer (the
         # loader's MiniMaxM3Config reads the same list). The DSpark drafter is dense.
@@ -192,7 +202,7 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
-    if family in ("kimi_k3", "mistral_large4", "minimax_m3", "inkling2"):
+    if family in ("kimi_k3", "mistral_large4", "minimax_m3", "inkling2", "hy4_flash"):
         _, _, first, last = describe(config)
         return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},

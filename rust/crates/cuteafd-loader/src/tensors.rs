@@ -628,8 +628,8 @@ impl LoadedTensorRows {
 
 fn reject_eager_engram_load(name: &str) -> Result<()> {
     anyhow::ensure!(
-        !name.contains(".engram.embed."),
-        "engram embedding tables must use EngramTable::from_catalog, not whole-tensor loading"
+        !name.contains(".engram.embed.") && !name.contains(".engram_layer.multi_head_embedding.embedding."),
+        "engram embedding tables must use mapped-table readers, not whole-tensor loading"
     );
     Ok(())
 }

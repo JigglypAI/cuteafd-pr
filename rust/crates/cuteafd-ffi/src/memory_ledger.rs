@@ -25,6 +25,9 @@ pub enum Space {
     Managed,
     /// Native malloc backing registered for RDMA, not CUDA-pinned storage.
     Host,
+    /// GB10 display carveout lent by spark-attic: device memory outside
+    /// `MemAvailable`, charged against the lendable size only (#2546).
+    Carveout,
 }
 
 impl Space {
@@ -34,6 +37,7 @@ impl Space {
             Self::Pinned => "pinned",
             Self::Managed => "managed",
             Self::Host => "host",
+            Self::Carveout => "carveout",
         }
     }
 }

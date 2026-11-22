@@ -163,7 +163,18 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             selector_receipts: RefCell::new(None), packing })
     }
 
-    fn live(&self) -> Result<()> { ensure!(!self.terminal.get(), BackendError::Terminal); Ok(()) }
+    fn live(&self) -> Result<()> {
+        ensure!(!self.terminal.get(), BackendError::Terminal);
+        // Split waits are direct abortable waits: a timed-out one skipped itself
+        // and desynchronized every later receive, so the backend is terminal.
+        if self.owners.storage.ranks.len() == 2 {
+            if let Err(error) = self.library().check_peer_wait_timeout() {
+                self.terminal.set(true);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
     fn idle(&self) -> Result<()> { self.live() }
     fn identity(&self, placement: &Placement) -> Result<u64> {
         self.identities.borrow().get(&placement.slot).copied().context("MiniMax request is not bound")
@@ -177,6 +188,8 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         if result.is_err() { self.terminal.set(true); }
         let drain = self.drain();
         if drain.is_err() { self.terminal.set(true); }
+        // A drained step whose peer wait timed out skipped that wait: its results are void.
+        let drain = drain.and_then(|()| self.live());
         match result { Ok(value) => { drain?; Ok(value) }, Err(error) => Err(error) }
     }
     fn validate(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool) -> Result<Vec<Submitted>> {

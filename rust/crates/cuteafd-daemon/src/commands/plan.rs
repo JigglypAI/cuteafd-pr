@@ -154,7 +154,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             let invalid = |error: anyhow::Error| PlanError::InvalidOption {
                 option: "Spark memory inventory", reason: error.to_string() };
             layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
-                cuteafd_loader::serving_capacity::spark_memory::sample_bytes(samples).map_err(invalid)?
+                // Ranks past the requested expert world host media only: no
+                // routed-expert arena, so no display-carveout credit (#2546).
+                cuteafd_loader::serving_capacity::spark_memory::sample_bytes_for(samples,
+                    args.spark_ranks.unwrap_or(usize::MAX)).map_err(invalid)?
             } else {
                 let cfg = launch_config(args.config.as_deref()).map_err(invalid)?;
                 let hosts = configured_spark_hosts(&cfg).into_iter()

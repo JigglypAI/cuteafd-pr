@@ -979,6 +979,29 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         return Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
+    if config["model_type"] == "hy_v4_flash" {
+        let cfg = crate::families::hy4_flash::Hy4FlashConfig::from_hf(config)?;
+        cfg.release_geometry()?;
+        let first_layer = cfg.dense_layer.iter().position(|&dense| !dense)
+            .context("Hy4-flash config has no routed layers")?;
+        let end = cfg.dense_layer.iter().rposition(|&dense| !dense).unwrap() + 1;
+        ensure!(cfg.dense_layer[first_layer..end].iter().all(|&dense| !dense),
+            "Hy4-flash routed layer set is not contiguous");
+        let shape = RoutedExpertShape {
+            layers: end,
+            first_layer,
+            experts: cfg.experts,
+            topk: cfg.topk,
+            hidden: cfg.routed_expert_hidden,
+            intermediate: cfg.moe_intermediate,
+            draft_stages: 0,
+            draft_experts: 0,
+        };
+        let is_exl3 = config["quantization_config"]["quant_method"] == "exl3"
+            || checkpoint.is_some_and(|c| c.contains_tensor(&format!("model.layers.{first_layer}.mlp.experts.0.gate_proj.trellis")));
+        ensure!(is_exl3, "Hy4-flash expert catalog supports EXL3 MUL1 checkpoints; BF16 fused experts have no Spark/RTX package");
+        return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(snapshot);
     }
@@ -1895,7 +1918,9 @@ mod tests {
         let packages = std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE")
             .context("set CUTEAFD_KIMI_SPARK_PACKAGE to the sealed Spark package")?;
         let packages = Path::new(&packages);
-        crate::families::kimi_k3::validate_expert_inventory(spark_manifest, packages)?;
+        crate::families::kimi_k3::validate_expert_inventory_for_codebook(
+            spark_manifest, packages, manifest.codebook(),
+        )?;
         for rank in 0..6 {
             recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;
         }
@@ -2044,9 +2069,11 @@ mod tests {
                     shape: vec![128], byte_offset: 0, byte_length: 256 },
             }).collect(), exl3: Some(crate::V41Exl3Manifest {
                 experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
+                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                 projections: names[..2].iter().map(|name| {
                     let name = name.strip_suffix(".weight").unwrap().to_owned();
                     (name.clone(), crate::V41Exl3Projection { name, kind: crate::V41Exl3ProjectionKind::Gate,
+                        codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                         bits: 4, input_features: 128, output_features: 128 })
                 }).collect(), decoder_tiers: vec![4],
                 storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,

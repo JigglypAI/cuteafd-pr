@@ -847,6 +847,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
+        // A timed-out peer wait skipped itself: every paired engine of this
+        // process is terminal, whether or not its backend checks the record.
+        engine.library().check_peer_wait_timeout()?;
         offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");

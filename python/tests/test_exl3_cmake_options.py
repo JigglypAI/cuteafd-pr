@@ -251,5 +251,70 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, value)
                 self.assertIn('EXL3 tile override must be PROFILE=CAPACITIES', result.stderr)
 
+    def test_opt_in_mul1_suffixes_package_stamp_build_dir_and_passes_codebook_only_there(self):
+        families = (
+            ('dsv4p', '23'), ('glm', '45'), ('glmf', '34'), ('qwen4', '45'),
+            ('kimik3', '23'), ('step5', '46'), ('muse', '45'), ('ml4', '45'),
+            ('inkling2', '45'),
+        )
+        entries = ';'.join(f'{geom}:exl3-k{tag}-mul1' for geom, tag in families)
+        for architecture in ('120', '121'):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                root, build = Path(temporary), Path(temporary) / 'build'
+                (root / 'CMakeLists.txt').write_text(harness(architecture))
+                result = self.cmake(root, build, [f'-DCUTEAFD_EXPERT_FAMILIES={entries}'])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rules = (build / 'build.ninja').read_text()
+                commands = [line for line in rules.splitlines() if 'package_exl3_aot.py build' in line]
+                self.assertEqual(len(commands), len(families))
+                for geom, tag in families:
+                    cmd = next(line for line in commands if f'--geometry {geom} ' in line)
+                    self.assertIn('--codebook mul1', cmd)
+                    self.assertIn(f'exl3_exports/{geom}-k{tag}-mul1', cmd)
+                    self.assertIn(f'exl3-{geom}-k{tag}-mul1', cmd)
+                    stamp = build / f'exl3_{geom}_k{tag}_mul1_config.stamp'
+                    self.assertTrue(stamp.is_file(), f'missing {stamp.name}')
+                    self.assertTrue(stamp.read_text().endswith('|codebook=mul1\n'))
+                    self.assertFalse((build / f'exl3_{geom}_k{tag}_config.stamp').exists())
+
+    def test_coexisting_mcg_and_mul1_keep_mcg_unchanged_and_reject_invalid_suffixes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, build = Path(temporary), Path(temporary) / 'build'
+            (root / 'CMakeLists.txt').write_text(harness('120'))
+            result = self.cmake(root, build, ['-DCUTEAFD_EXPERT_FAMILIES=glmf:exl3-k34;glmf:exl3-k34-mul1'])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rules = (build / 'build.ninja').read_text()
+            commands = [line for line in rules.splitlines() if 'package_exl3_aot.py build' in line]
+            self.assertEqual(len(commands), 2)
+            mcg_cmd = next(line for line in commands if 'exl3_exports/glmf-k34 ' in line)
+            mul1_cmd = next(line for line in commands if 'exl3_exports/glmf-k34-mul1 ' in line)
+            self.assertNotIn('--codebook', mcg_cmd)
+            self.assertIn('--codebook mul1', mul1_cmd)
+            self.assertTrue((build / 'exl3_glmf_k34_config.stamp').read_text().endswith('tiles=\n'))
+            self.assertTrue((build / 'exl3_glmf_k34_mul1_config.stamp').read_text().endswith('|codebook=mul1\n'))
+        for invalid in ('glmf:exl3-k34-mcg', 'glmf:exl3-k34-3inst', 'glmf:exl3-k34-mul2', 'hy4f:exl3-k45'):
+            with self.subTest(invalid=invalid):
+                result, _ = self.configure(f'-DCUTEAFD_EXPERT_FAMILIES={invalid}')
+                self.assertNotEqual(result.returncode, 0, invalid)
+                self.assertIn('EXL3 expert family', result.stderr)
+
+    def test_hy4f_exl3_configures_mul1_only_on_sm120_and_sm121(self):
+        for architecture, layouts in (
+            ('120', ['rtx-tp1', 'rtx-tp2']),
+            ('121', [f'tp{world}-rank{rank}' for world in range(1, 7) for rank in range(world)]),
+        ):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                root, build = Path(temporary), Path(temporary) / 'build'
+                (root / 'CMakeLists.txt').write_text(harness(architecture))
+                result = self.cmake(root, build, ['-DCUTEAFD_EXPERT_FAMILIES=hy4f:exl3-k45-mul1'])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rules = (build / 'build.ninja').read_text()
+                self.assertIn('--geometry hy4f', rules)
+                self.assertIn('--codebook mul1', rules)
+                self.assertIn('--require-layout ' + ','.join(layouts), rules)
+                self.assertIn('exl3-hy4f-k45-mul1/manifest.json', rules)
+                stamp = (build / 'exl3_hy4f_k45_mul1_config.stamp').read_text()
+                self.assertTrue(stamp.endswith('|codebook=mul1\n'))
+
 if __name__ == '__main__':
     unittest.main()

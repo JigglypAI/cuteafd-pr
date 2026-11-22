@@ -65,6 +65,21 @@ static int peer_model_enqueue(struct peer_model_op op) {
     return 0;
 }
 static int peer_model_drain(void *stream);
+/* Opt-in model of the device's abortable-wait timeout record (per DSO, never
+ * the process's real one): an armed blocked abortable wait at a drain records
+ * it, publishes its abort word and exits without advancing its receive state;
+ * every later abortable wait then exits as the device's do. */
+static int peer_model_timeouts;
+static uint32_t peer_model_timeout_count, peer_model_timeout_expected, peer_model_timeout_observed;
+static uint64_t peer_model_timeout_flag;
+void fixture_peer_model_timeouts(void) { peer_model_timeouts = 1; }
+int cuteafd_peer_wait_timeout(uint32_t *expected, uint32_t *observed, uint64_t *flag) {
+    if (!peer_model_timeout_count) return 0;
+    if (expected) *expected = peer_model_timeout_expected;
+    if (observed) *observed = peer_model_timeout_observed;
+    if (flag) *flag = peer_model_timeout_flag;
+    return (int)peer_model_timeout_count;
+}
 static size_t mapped_bytes;
 size_t fixture_mapped_bytes(void) { return mapped_bytes; }
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
@@ -751,8 +766,17 @@ int cuteafd_unregister_host_mapping(void *ptr) {
     if (!ptr) return 1;
     event('g'); return 0;
 }
+#define STREAM_DEVICE_CAPACITY 4096
+static int stream_devices[STREAM_DEVICE_CAPACITY];
+int cuteafd_cuda_stream_device(void *stream, int *device) {
+    uintptr_t id = (uintptr_t)stream;
+    if (!device || !id || id >= STREAM_DEVICE_CAPACITY || id > atomic_load(&next_stream)) return 1;
+    *device = stream_devices[id];
+    return 0;
+}
 int cuteafd_cuda_stream_create(void **out) {
     *out = (void *)(uintptr_t)(atomic_fetch_add(&next_stream, 1) + 1);
+    if ((uintptr_t)*out < STREAM_DEVICE_CAPACITY) stream_devices[(uintptr_t)*out] = current_device;
     pthread_mutex_lock(&upload_mutex);
     if (!blocked_stream) blocked_stream = *out;
     pthread_mutex_unlock(&upload_mutex);
@@ -878,7 +902,7 @@ static int peer_model_drain(void *stream) {
                 op->done = 1; progress = 1; continue;
             }
             if (op->kind == 2) {
-                if (op->aborted && *op->aborted) { op->done = 1; progress = 1; continue; }
+                if (op->aborted && (*op->aborted || peer_model_timeout_count)) { op->done = 1; progress = 1; continue; }
                 if (!op->flag || !op->state || *op->flag <= *op->state) continue;
                 ++*op->state;
             } else {
@@ -890,7 +914,28 @@ static int peer_model_drain(void *stream) {
             }
             op->done = 1; progress = 1;
         }
-        if (!progress) break;
+        if (!progress) {
+            /* The first blocked abortable wait at the head of its stream times out. */
+            if (peer_model_timeouts && !peer_model_timeout_count) {
+                for (size_t i = 0; i < peer_model_count; ++i) {
+                    struct peer_model_op *op = &peer_model_ops[i];
+                    if (op->done || op->kind != 2 || !op->aborted) continue;
+                    int earlier = 0;
+                    for (size_t j = 0; j < i; ++j)
+                        if (!peer_model_ops[j].done && peer_model_ops[j].stream == op->stream) { earlier = 1; break; }
+                    if (earlier) continue;
+                    peer_model_timeout_expected = *op->state + 1;
+                    peer_model_timeout_observed = *op->flag;
+                    peer_model_timeout_flag = (uint64_t)(uintptr_t)op->flag;
+                    peer_model_timeout_count = 1;
+                    *(uint32_t *)op->aborted = 1;
+                    event('t');
+                    op->done = 1; progress = 1;
+                    break;
+                }
+            }
+            if (!progress) break;
+        }
     }
     for (size_t i = 0; i < peer_model_count; ++i)
         if (!peer_model_ops[i].done && peer_model_ops[i].stream == stream) return 1;

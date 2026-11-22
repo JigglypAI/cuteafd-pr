@@ -1144,7 +1144,6 @@ impl<'a> MimoEngine<'a> {
             abort: || {
                 let mut failures = Vec::new();
                 for exchange in self.exchange.iter().map(Rc::as_ref).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-                    if exchange.terminal_state() == TerminalState::Aborting { continue; }
                     if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
                 }
                 ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())

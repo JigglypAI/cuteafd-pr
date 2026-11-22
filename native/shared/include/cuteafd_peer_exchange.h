@@ -116,7 +116,9 @@ int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
 // exits without advancing its receive sequence; every other abortable wait on
 // any device then exits too. Returns 1 once a timeout was recorded (0: none;
 // the record is sticky), with its expected/observed sequence and flag address.
-// The owner must treat it as terminal: reject reuse and drain.
+// The owner must treat it as terminal: reject reuse and drain. Every result of
+// the drained step that recorded it is void (the skipped receive is stale);
+// the Rust binding refuses to queue any later abortable wait.
 int32_t cuteafd_peer_wait_timeout(uint32_t* expected, uint32_t* observed, uint64_t* flag);
 // Test-only: the abortable wait timeout of the current device (default 60 s).
 int32_t cuteafd_peer_wait_timeout_configure(uint64_t timeout_ns);

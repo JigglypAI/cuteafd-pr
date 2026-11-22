@@ -7,6 +7,11 @@ use std::{collections::{BTreeMap, BTreeSet}, fmt, path::Path, str::FromStr};
 
 pub const MC_MANIFEST: &str = "cuteafd-mc.json";
 const SUPPORTED_FEATURES: &[&str] = &[];
+pub const ENGRAM_FP8_LAYOUT: &str = "fp8_e4m3_f32scale_row_interleaved_v1";
+pub const ENGRAM_FP8_ROW_BYTES: usize = 100;
+pub const ENGRAM_FP8_MAX_PART_BYTES: u64 = 45_000_000_000;
+const ENGRAM_FP8_RECIPE_PREFIX: &str =
+    "vendor BF16 per-row E4M3 round trip, BF16 scale held in F32, decode = BF16(F32 code*scale); reference=";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +78,122 @@ pub(super) struct Variant {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Exl3CodebookDeclaration {
+    pub name: String,
+    pub multiplier: u64,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngramFp8Part {
+    pub tensor: String,
+    pub file: String,
+    pub rows: u64,
+    pub sha256: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngramFp8Layer {
+    pub tensor: String,
+    pub sha256: String,
+    pub parts: Vec<EngramFp8Part>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
+}
+
+impl EngramFp8Layer {
+    pub fn layer_index(&self) -> Result<usize> {
+        parse_engram_layer(&self.tensor)
+    }
+    pub fn total_rows(&self) -> Result<u64> {
+        self.parts.iter().try_fold(0u64, |sum, part| sum.checked_add(part.rows))
+            .context("FP8 Engram total rows overflow")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngramFp8 {
+    pub layout: String,
+    pub row_bytes: usize,
+    pub code_dtype: String,
+    pub scale_dtype: String,
+    pub recipe: String,
+    pub layers: Vec<EngramFp8Layer>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, IgnoredAny>,
+}
+
+impl EngramFp8 {
+    pub fn layer(&self, layer: usize) -> Option<&EngramFp8Layer> {
+        self.layers.iter().find(|entry| entry.layer_index().ok() == Some(layer))
+    }
+
+    pub fn total_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for entry in &self.layers {
+            let rows = entry.total_rows()?;
+            let bytes = rows.checked_mul(self.row_bytes as u64)
+                .context("FP8 Engram total bytes overflow")?;
+            total = total.checked_add(bytes).context("FP8 Engram total bytes sum overflow")?;
+        }
+        Ok(total)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(self.layout == ENGRAM_FP8_LAYOUT
+            && self.row_bytes == ENGRAM_FP8_ROW_BYTES
+            && self.code_dtype == "F8_E4M3"
+            && self.scale_dtype == "F32",
+            "invalid FP8 Engram layout");
+        let reference = self.recipe.strip_prefix(ENGRAM_FP8_RECIPE_PREFIX)
+            .context("invalid FP8 Engram recipe or pinned reference")?;
+        ensure!(is_hex(reference, 40), "invalid FP8 Engram recipe or pinned reference");
+        ensure!(!self.layers.is_empty(), "FP8 Engram requires layers");
+        let mut previous: Option<usize> = None;
+        for layer in &self.layers {
+            let number = parse_engram_layer(&layer.tensor)?;
+            ensure!(previous.is_none_or(|prev| number > prev) && is_digest(&layer.sha256),
+                "FP8 Engram layers must be ordered and carry BF16 tensor SHA256");
+            previous = Some(number);
+            ensure!(!layer.parts.is_empty() && layer.parts.len() <= 100_000,
+                "FP8 Engram requires ordered row parts");
+            let stem = layer.tensor.strip_suffix(".weight").context("invalid Engram BF16 tensor name")?;
+            for (i, part) in layer.parts.iter().enumerate() {
+                let expected_tensor = format!("{stem}.strided_{i:05}");
+                let expected_file = format!("engram-fp8-layer-{number:02}-part-{i:05}.safetensors");
+                ensure!(part.tensor == expected_tensor && part.file == expected_file,
+                    "invalid FP8 Engram part tensor or filename order");
+                let bytes = part.rows.checked_mul(ENGRAM_FP8_ROW_BYTES as u64)
+                    .context("invalid FP8 Engram part extent")?;
+                ensure!(bytes > 0 && bytes < ENGRAM_FP8_MAX_PART_BYTES,
+                    "invalid FP8 Engram part extent");
+                ensure!(is_digest(&part.sha256), "invalid FP8 Engram part SHA256");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_index(&self, weights: &BTreeMap<String, String>, core: &BTreeSet<&str>) -> Result<()> {
+        let shards: BTreeSet<&str> = weights.values().map(String::as_str).collect();
+        for layer in &self.layers {
+            let number = parse_engram_layer(&layer.tensor)?;
+            let filename = format!("engram-bf16-layer-{number:02}.safetensors");
+            ensure!(weights.get(&layer.tensor).is_some_and(|shard| shard == &filename)
+                && !core.contains(layer.tensor.as_str()),
+                "BF16 Engram table missing from shared index");
+            for part in &layer.parts {
+                ensure!(!weights.contains_key(&part.tensor) && !shards.contains(part.file.as_str()),
+                    "FP8 Engram part leaked into standard index");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct Manifest {
     schema: String,
     #[serde(default)]
@@ -81,12 +202,27 @@ pub(super) struct Manifest {
     pub(super) original_core_dtype: String,
     shared_inventory_sha256: String,
     variants: Vec<Variant>,
+    #[serde(default)]
+    pub(super) engram_fp8: Option<EngramFp8>,
+    #[serde(default)]
+    pub(super) exl3_codebook: Option<Exl3CodebookDeclaration>,
     #[serde(flatten)]
     extra: BTreeMap<String, IgnoredAny>,
 }
 
-fn is_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+fn is_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn is_digest(value: &str) -> bool { is_hex(value, 64) }
+fn parse_engram_layer(tensor: &str) -> Result<usize> {
+    let rest = tensor.strip_prefix("model.layers.")
+        .and_then(|s| s.strip_suffix(".engram_layer.multi_head_embedding.embedding.weight"))
+        .context("invalid Engram BF16 tensor name")?;
+    let valid = rest == "0" || ((1..=4).contains(&rest.len())
+        && rest.as_bytes()[0].is_ascii_digit() && rest.as_bytes()[0] != b'0'
+        && rest.bytes().all(|b| b.is_ascii_digit()));
+    ensure!(valid, "invalid Engram BF16 tensor name");
+    rest.parse().context("invalid Engram BF16 tensor name")
 }
 fn safe_text(value: &str) -> bool { !value.is_empty() && !value.contains(['\0', '\n', '\r']) }
 fn shard_name(value: &str) -> bool {
@@ -166,8 +302,19 @@ impl Manifest {
             ensure!(names.insert(variant.name.name()), "duplicate MC variant {}", variant.name);
         }
         ensure!(names.contains("original"), "MC requires an original view");
+        if let Some(codebook) = &manifest.exl3_codebook {
+            ensure!(matches!((codebook.name.as_str(), codebook.multiplier),
+                ("mcg", 0xCBAC_1FED) | ("mul1", 0x83DC_D12D)),
+                "invalid MC EXL3 codebook declaration");
+        }
+        if let Some(engram) = &manifest.engram_fp8 {
+            engram.validate()?;
+        }
         if !manifest.extra.is_empty() || !manifest.source.extra.is_empty()
             || manifest.variants.iter().any(|variant| !variant.extra.is_empty())
+            || manifest.exl3_codebook.as_ref().is_some_and(|c| !c.extra.is_empty())
+            || manifest.engram_fp8.as_ref().is_some_and(|e| !e.extra.is_empty()
+                || e.layers.iter().any(|l| !l.extra.is_empty() || l.parts.iter().any(|p| !p.extra.is_empty())))
         {
             tracing::debug!(path = %path.display(), fields = ?manifest.unknown_fields(),
                 "ignoring unknown MC manifest fields");
@@ -180,6 +327,8 @@ impl Manifest {
             .chain(self.variants.iter().flat_map(|variant| {
                 variant.extra.keys().map(move |key| format!("variants[{}].{key}", variant.name))
             }))
+            .chain(self.exl3_codebook.iter().flat_map(|c| c.extra.keys().map(|k| format!("exl3_codebook.{k}"))))
+            .chain(self.engram_fp8.iter().flat_map(|e| e.extra.keys().map(|k| format!("engram_fp8.{k}"))))
             .collect()
     }
     pub(super) fn select(&self, view: CoreView) -> Result<&Variant> {
@@ -188,7 +337,12 @@ impl Manifest {
             .with_context(|| format!("CORE_VIEW={view} is absent from cuteafd-mc.json"))
     }
     pub(super) fn check_index(&self, variant: &Variant, weights: &BTreeMap<String, String>) -> Result<()> {
-        variant.check_index(weights, &self.shared_inventory_sha256)
+        variant.check_index(weights, &self.shared_inventory_sha256)?;
+        if let Some(engram) = &self.engram_fp8 {
+            let core: BTreeSet<&str> = variant.core_tensors.iter().map(String::as_str).collect();
+            engram.check_index(weights, &core)?;
+        }
+        Ok(())
     }
 }
 
@@ -200,7 +354,7 @@ mod tests {
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/tests/fixtures/mc-v1")
     }
-    fn copy_fixture() -> tempfile::TempDir {
+    pub(super) fn copy_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for entry in std::fs::read_dir(fixture()).unwrap() {
             let entry = entry.unwrap();
@@ -728,6 +882,123 @@ mod family_tests {
         assert_eq!(core.native.values().filter(|weight| weight.fp8).count(), 1);
         assert!(core.native["model.language_model.layers.0.self_attn.q_proj"].fp8);
         assert!(!core.native["model.language_model.layers.0.self_attn.k_proj"].fp8);
+        Ok(())
+    }
+
+    #[test]
+    fn engram_fp8_and_exl3_codebook_validate_and_expose_on_all_views() -> Result<()> {
+        let dir = tests::copy_fixture();
+        // Add a shared BF16 engram entry into every variant index and recompute shared digest & fingerprints.
+        let bf16_tensor = "model.layers.1.engram_layer.multi_head_embedding.embedding.weight";
+        let bf16_shard = "engram-bf16-layer-01.safetensors";
+        let fp8_part_tensor = "model.layers.1.engram_layer.multi_head_embedding.embedding.strided_00000";
+        let fp8_part_file = "engram-fp8-layer-01-part-00000.safetensors";
+        let manifest_path = dir.path().join(MC_MANIFEST);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let mut shared_digest = String::new();
+        for variant in manifest["variants"].as_array_mut().unwrap() {
+            let idx_name = variant["index"].as_str().unwrap().to_owned();
+            let idx_path = dir.path().join(&idx_name);
+            let mut idx: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx_path)?)?;
+            idx["weight_map"][bf16_tensor] = bf16_shard.into();
+            let idx_bytes = serde_json::to_vec(&idx)?;
+            std::fs::write(&idx_path, &idx_bytes)?;
+            let digest = format!("{:x}", Sha256::digest(&idx_bytes));
+            variant["metadata_sha256"][&idx_name] = digest.into();
+            let core: BTreeSet<String> = variant["core_tensors"].as_array().unwrap()
+                .iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+            let mut map: BTreeMap<String, String> = BTreeMap::new();
+            for (k, v) in idx["weight_map"].as_object().unwrap() {
+                map.insert(k.clone(), v.as_str().unwrap().to_owned());
+            }
+            let mut h = Sha256::new();
+            for (k, v) in &map {
+                if !core.contains(k) { h.update(format!("{k}\0{v}\n")); }
+            }
+            shared_digest = format!("{:x}", h.finalize());
+            let mut fp = Sha256::new();
+            fp.update(format!("cuteafd-mc-view-v1\0{}\0{shared_digest}\0", variant["name"].as_str().unwrap()));
+            let mut metas: BTreeMap<String, String> = BTreeMap::new();
+            for (k, v) in variant["metadata_sha256"].as_object().unwrap() {
+                metas.insert(k.clone(), v.as_str().unwrap().to_owned());
+            }
+            for (k, v) in metas { fp.update(format!("{k}\0{v}\n")); }
+            variant["fingerprint"] = format!("{:x}", fp.finalize()).into();
+        }
+        manifest["shared_inventory_sha256"] = shared_digest.into();
+        manifest["exl3_codebook"] = serde_json::json!({"name": "mul1", "multiplier": 0x83DC_D12Du64});
+        let valid_engram = serde_json::json!({
+            "layout": ENGRAM_FP8_LAYOUT,
+            "row_bytes": ENGRAM_FP8_ROW_BYTES,
+            "code_dtype": "F8_E4M3",
+            "scale_dtype": "F32",
+            "recipe": format!("{ENGRAM_FP8_RECIPE_PREFIX}{}", "a".repeat(40)),
+            "layers": [{
+                "tensor": bf16_tensor,
+                "sha256": "b".repeat(64),
+                "parts": [{
+                    "tensor": fp8_part_tensor,
+                    "file": fp8_part_file,
+                    "rows": 164_994_380u64,
+                    "sha256": "c".repeat(64)
+                }]
+            }]
+        });
+        manifest["engram_fp8"] = valid_engram.clone();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+
+        for mode in [CoreView::Original, CoreView::K8Compact, CoreView::K6Compact, CoreView::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let engram = view.engram_fp8().expect("engram_fp8 present");
+            assert_eq!(engram.layers.len(), 1);
+            assert_eq!(engram.layer(1).unwrap().total_rows()?, 164_994_380);
+            assert_eq!(view.exl3_codebook().unwrap().name, "mul1");
+            assert_eq!(view.exl3_codebook().unwrap().multiplier, 0x83DC_D12D);
+        }
+
+        // Malformed engram_fp8 variants must fail closed.
+        for (mutator, expected) in [
+            (Box::new(|e: &mut serde_json::Value| { e["row_bytes"] = 96.into(); }) as Box<dyn Fn(&mut serde_json::Value)>, "invalid FP8 Engram layout"),
+            (Box::new(|e: &mut serde_json::Value| { e["recipe"] = "bad".into(); }), "invalid FP8 Engram recipe"),
+            (Box::new(|e: &mut serde_json::Value| { e["layers"][0]["parts"][0]["file"] = "wrong.safetensors".into(); }), "invalid FP8 Engram part tensor or filename"),
+            (Box::new(|e: &mut serde_json::Value| { e["layers"][0]["parts"][0]["rows"] = 0.into(); }), "invalid FP8 Engram part extent"),
+        ] {
+            let mut bad = manifest.clone();
+            mutator(&mut bad["engram_fp8"]);
+            std::fs::write(&manifest_path, serde_json::to_vec(&bad)?)?;
+            let err = CheckpointView::select(dir.path(), CoreView::Original).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err:#}");
+        }
+        // Invalid codebook declaration fails closed.
+        let mut bad_cb = manifest.clone();
+        bad_cb["exl3_codebook"]["multiplier"] = 1.into();
+        std::fs::write(&manifest_path, serde_json::to_vec(&bad_cb)?)?;
+        assert!(CheckpointView::select(dir.path(), CoreView::Original).unwrap_err().to_string().contains("codebook"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "installed Hy4-flash K4 MC checkpoint metadata-only check"]
+    fn installed_hy4_flash_mc_engram_fp8_discovery() -> Result<()> {
+        let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").context("installed HF home required")?;
+        let snapshot = Path::new(&home)
+            .join("hub/models--wrldsuksgo2mars--Hy4-flash-EXL3-K4-MC/snapshots/cc72179113573d751ed3245e3e58d3640694378d");
+        for mode in [CoreView::Original, CoreView::K8Compact, CoreView::K6Compact, CoreView::Fp8Compact] {
+            let view = CheckpointView::select(&snapshot, mode)?;
+            let engram = view.engram_fp8().context("Hy4 MC must expose engram_fp8")?;
+            assert_eq!(engram.layers.len(), 4);
+            let counts: Vec<(usize, u64)> = engram.layers.iter()
+                .map(|l| Ok((l.layer_index()?, l.total_rows()?)))
+                .collect::<Result<_>>()?;
+            assert_eq!(counts, vec![
+                (1, 164_994_380),
+                (11, 164_999_008),
+                (21, 165_004_086),
+                (31, 165_008_942),
+            ]);
+            assert_eq!(view.exl3_codebook().unwrap().name, "mul1");
+            assert_eq!(view.exl3_codebook().unwrap().multiplier, 0x83DC_D12D);
+        }
         Ok(())
     }
 }

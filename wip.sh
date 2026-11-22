@@ -485,7 +485,7 @@ ensure_local_image() {
   else
     local admitted
     admitted="$(python3 "$staging_dir/scripts/build/select-dev-image.py" select \
-      --source "$staging_dir" --arch amd64 --local-tag "$COORDINATOR_DOCKER_DEV" \
+      --source "$staging_dir" --arch amd64 \
       --engine-commit "$source_revision" --mode "${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}" \
       --output "$dev_image_logs/coordinator.json")"
     docker tag "$admitted" "$COORDINATOR_DOCKER_DEV"
@@ -527,7 +527,7 @@ trap 'exit 143' TERM
 [[ ! -e "$cancel_file" ]] || exit 143
 python3 "$source_dir/scripts/build/assert-build-filesystem.py" "$source_dir"
 admitted="$(python3 "$source_dir/scripts/build/select-dev-image.py" select \
-  --source "$source_dir" --arch arm64 --local-tag "$2" --engine-commit "$3" \
+  --source "$source_dir" --arch arm64 --engine-commit "$3" \
   --mode "$4" --output "$source_dir/DEV_IMAGE_REUSE.json")"
 docker tag "$admitted" "$2"
 REMOTE

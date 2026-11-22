@@ -634,6 +634,8 @@ impl DeviceLogits {
         // is read or, after a failed enqueue, dropped.
         let drained = unsafe { library.cuda_stream_synchronize(self.stream) };
         queued.and(drained)?;
+        // A peer wait that timed out skipped itself: these rows may carry stale receives.
+        library.check_peer_wait_timeout()?;
         Ok(out)
     }
 }
@@ -829,7 +831,10 @@ impl<'a> TokenSelector<'a> {
     unsafe fn wait_landed(&mut self, stream: *mut c_void) -> Result<()> {
         // SAFETY: forwarded from this function's contract.
         unsafe { self.landed.wait(stream)? };
-        crate::shared::spark_waves::healthy()
+        crate::shared::spark_waves::healthy()?;
+        // The landed rows complete their whole step. A peer wait inside it (or an
+        // earlier one) that timed out skipped itself, so no token of it is valid.
+        self.library.check_peer_wait_timeout()
     }
 
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
@@ -1342,6 +1347,47 @@ mod tests {
             }
         }
         assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    /// #2542: the step that recorded a peer-wait timeout drains cleanly, but its
+    /// rows may hold stale receives. Neither host selection nor a logits download
+    /// may hand a token of it (or of any later step) to a request. The record is
+    /// the fixture DSO's own; the process latch is untouched.
+    #[test]
+    fn no_token_or_logits_row_is_consumed_after_a_peer_wait_timeout() -> Result<()> {
+        use crate::shared::{memory::device::{Allocation, Device, Stream}, peer_split::{PeerExchange, RankDevice}};
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 1 << 30)?; }
+        fixture.peer_ordering_model(&library)?;
+        fixture.peer_wait_timeouts(&library)?;
+        let devices = [0, 1].map(|id| Device { library: &library, id });
+        let streams = devices.map(|device| Stream::new(device)).into_iter().collect::<Result<Vec<_>>>()?;
+        let vocab = 8;
+        let logits = devices[0].run(|| Allocation::new(devices[0], vocab * 4, Tag::workspace("test/logits")))?;
+        let row: Vec<u8> = (0..vocab).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        devices[0].run(|| library.copy_h2d(logits.buffer, &row))?;
+        let rows = DeviceLogits { ptr: logits.buffer.ptr, rows: 1, vocab, stride: vocab, stream: streams[0].raw, greedy: None };
+        let mut selector = devices[0].run(|| TokenSelector::new(&library, SelectPlacement::Host, vocab, 1))?;
+        let batch = || SelectBatch { rows: vec![RowSelect { sampling: TargetSamplingParams::default(), position: 0,
+            mask: None, logprob: false }] };
+        assert_eq!(selector.select(&rows, &batch())?[0].as_ref().unwrap().token, 7);
+        let ranks = [0, 1].map(|rank| RankDevice { device: rank, stream: streams[rank as usize].raw });
+        let exchange = PeerExchange::new_abortable(&library, ranks, 1, 256, 256)?;
+        // Rank0 waits for a push rank1 never issues: the step drains, the record is set.
+        exchange.wait(0, 0)?;
+        streams[0].drain()?;
+        assert!(library.peer_wait_timeout().is_some());
+        for result in [selector.select(&rows, &batch()).map(drop), rows.to_host(&library).map(drop)] {
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<cuteafd_ffi::peer_exchange::PeerWaitTimeout>().is_some(), "{error:#}");
+        }
+        assert!(exchange.require_live().is_err() && exchange.wait(1, 0).is_err());
+        exchange.publish_abort()?;
+        exchange.drain_compute()?;
+        exchange.finish_terminal(true);
         Ok(())
     }
 

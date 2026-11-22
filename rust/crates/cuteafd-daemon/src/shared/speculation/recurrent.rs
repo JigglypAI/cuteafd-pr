@@ -92,6 +92,20 @@ impl<'a> Drafter<'a> {
         result
     }
 }
+/// The engine's terminal path owns a TP2 drafter's peer waits like its own (#2543).
+impl crate::shared::peer_split::TerminalOwner for Drafter<'_> {
+    fn publish_abort(&self) -> Result<()> {
+        self.live.set(false);
+        self.split.as_ref().map_or(Ok(()), |split| split.exchange.publish_abort())
+    }
+    fn drain_terminal(&self) -> Result<()> {
+        if let Some(split) = &self.split { crate::shared::peer_split::TerminalOwner::drain_terminal(&*split.exchange)?; }
+        self.drain()
+    }
+    fn finish_terminal(&self, drained: bool) {
+        if let Some(split) = &self.split { crate::shared::peer_split::TerminalOwner::finish_terminal(&*split.exchange, drained); }
+    }
+}
 impl Drop for Drafter<'_> {
     fn drop(&mut self){
         self.live.set(false);

@@ -393,7 +393,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
                 let layer_us = pass.captured_layer_us();
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), &active.borrow(), &members, &inputs,
-                    &accepted_inputs, &emissions);
+                    &accepted_inputs, &emissions, || lane_timing(lane, started, draft_us, verify_us, &drafting));
                 if let Some(live) = live {
                     let active = active.borrow();
                     live.push(console_round(tally, lane, shared, started, draft_us,

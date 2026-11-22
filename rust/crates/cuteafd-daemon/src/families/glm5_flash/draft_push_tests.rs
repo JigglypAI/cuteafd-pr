@@ -168,9 +168,11 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
 fn serve_loop_holds_no_draft_policy_of_its_own() {
     // Lengths come from the shared history policy's plan, shape and observe alone.
     let serve = include_str!("serve.rs");
-    for call in ["policy.plan(&requests, verify_rows)", "policy.shape(&mut shaped, verify_rows)", "policy.observe(&outcomes)"] {
+    for call in ["policy.plan(&requests, verify_rows)", "policy.shape(&mut shaped, verify_rows)", "policy.observe_timed(&outcomes,"] {
         assert_eq!(serve.matches(call).count(), 1, "{call}");
     }
+    // The trace's round times reuse the step's lane start, draft seconds and verify ms.
+    assert!(serve.contains("history::RoundTiming::since(tally.lane(),\n            tally.started(), lane.draft_s - draft0, step_ms / 1e3, starts.clone())"));
     for source in [include_str!("mod.rs"), serve, include_str!("dspark.rs")] {
         for removed in ["draft_binding", "resource::", "SelectorFit", "choose_block", "DraftEvidence"] {
             assert!(!source.contains(removed), "{removed}");
