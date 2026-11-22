@@ -16,17 +16,22 @@ pub(crate) enum Site {
     GatherTimeout,
     /// A recoverable submission boundary fails before its body queues anything.
     BeforeSubmission,
+    /// One two-GPU hop (MiniMax Layers, every HopLink) or peer-exchange push
+    /// (Heads) is issued without its peer push, so the matching abortable wait
+    /// times out (#2542 repro: the device skips the wait). One shared countdown.
+    DropPeerPush,
 }
 
 #[cfg(any(test, feature = "dev-fault-hooks"))]
 impl Site {
-    const ALL: [Site; 2] = [Site::GatherTimeout, Site::BeforeSubmission];
+    const ALL: [Site; 3] = [Site::GatherTimeout, Site::BeforeSubmission, Site::DropPeerPush];
     fn index(self) -> usize { self as usize }
     #[cfg(feature = "dev-fault-hooks")]
     fn env(self) -> &'static str {
         match self {
             Site::GatherTimeout => "CUTEAFD_DIAG_FAULT_GATHER_TIMEOUT",
             Site::BeforeSubmission => "CUTEAFD_DIAG_FAULT_BEFORE_SUBMISSION",
+            Site::DropPeerPush => "CUTEAFD_DIAG_FAULT_DROP_PEER_PUSH",
         }
     }
 }
@@ -38,7 +43,7 @@ mod armed {
 
     thread_local! {
         /// Per-thread countdowns (0: disarmed): tests run in parallel threads.
-        static LOCAL: [Cell<u32>; 2] = const { [Cell::new(0), Cell::new(0)] };
+        static LOCAL: [Cell<u32>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
     }
 
     pub(super) fn local(site: Site) -> bool {
@@ -60,7 +65,7 @@ mod armed {
     #[cfg(feature = "dev-fault-hooks")]
     pub(super) fn global(site: Site) -> bool {
         use std::sync::{atomic::{AtomicU32, Ordering}, OnceLock};
-        static COUNTS: OnceLock<[AtomicU32; 2]> = OnceLock::new();
+        static COUNTS: OnceLock<[AtomicU32; 3]> = OnceLock::new();
         let counts = COUNTS.get_or_init(|| Site::ALL.map(|site| {
             let nth = std::env::var(site.env()).ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
             if nth > 0 { tracing::warn!(site = ?site, nth, "dev fault hook armed"); }

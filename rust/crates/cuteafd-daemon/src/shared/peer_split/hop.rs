@@ -315,6 +315,10 @@ impl<'a> HopLink<'a> {
         // the sender's stream and unchanged until later work on it; the
         // destination slot is read only after its matching wait, and the
         // executor reuses a slot only after the destination consumed it.
+        // Test-only (`shared::fault`): leave this eager hop's wait without its push.
+        if crate::shared::fault::fire(crate::shared::fault::Site::DropPeerPush) {
+            return Ok(HopTicket { to, flag, destination: destination.ptr });
+        }
         on_device(self.library, self.ranks[from].device, || unsafe {
             let payload = if crate::shared::memory::device::sm_peer_copy_for(true, bytes, self.decode_lane_bytes) {
                 bytes

@@ -624,6 +624,8 @@ impl<'a> PeerExchange<'a> {
         self.require_live()?;
         crate::shared::stack_dump::progress();
         let flag = self.flag_index(slot)?;
+        // Test-only (`shared::fault`): leave this push's matching wait without it.
+        if crate::shared::fault::fire(crate::shared::fault::Site::DropPeerPush) { return Ok(()); }
         tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
         let diagnostic = self.diagnostic(from, flag, "push");
