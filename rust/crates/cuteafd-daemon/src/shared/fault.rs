@@ -16,17 +16,22 @@ pub(crate) enum Site {
     GatherTimeout,
     /// A recoverable submission boundary fails before its body queues anything.
     BeforeSubmission,
+    /// One two-GPU hop (MiniMax Layers, every HopLink) or peer-exchange push
+    /// (Heads) is issued without its peer push, so the matching abortable wait
+    /// times out (#2542 repro: the device skips the wait). One shared countdown.
+    DropPeerPush,
 }
 
 #[cfg(any(test, feature = "dev-fault-hooks"))]
 impl Site {
-    const ALL: [Site; 2] = [Site::GatherTimeout, Site::BeforeSubmission];
+    const ALL: [Site; 3] = [Site::GatherTimeout, Site::BeforeSubmission, Site::DropPeerPush];
     fn index(self) -> usize { self as usize }
     #[cfg(feature = "dev-fault-hooks")]
     fn env(self) -> &'static str {
         match self {
             Site::GatherTimeout => "CUTEAFD_DIAG_FAULT_GATHER_TIMEOUT",
             Site::BeforeSubmission => "CUTEAFD_DIAG_FAULT_BEFORE_SUBMISSION",
+            Site::DropPeerPush => "CUTEAFD_DIAG_FAULT_DROP_PEER_PUSH",
         }
     }
 }
@@ -38,7 +43,7 @@ mod armed {
 
     thread_local! {
         /// Per-thread countdowns (0: disarmed): tests run in parallel threads.
-        static LOCAL: [Cell<u32>; 2] = const { [Cell::new(0), Cell::new(0)] };
+        static LOCAL: [Cell<u32>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
     }
 
     pub(super) fn local(site: Site) -> bool {
@@ -60,7 +65,7 @@ mod armed {
     #[cfg(feature = "dev-fault-hooks")]
     pub(super) fn global(site: Site) -> bool {
         use std::sync::{atomic::{AtomicU32, Ordering}, OnceLock};
-        static COUNTS: OnceLock<[AtomicU32; 2]> = OnceLock::new();
+        static COUNTS: OnceLock<[AtomicU32; 3]> = OnceLock::new();
         let counts = COUNTS.get_or_init(|| Site::ALL.map(|site| {
             let nth = std::env::var(site.env()).ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
             if nth > 0 { tracing::warn!(site = ?site, nth, "dev fault hook armed"); }
@@ -89,6 +94,27 @@ pub(crate) fn fire(site: Site) -> bool {
         let _ = site;
         false
     }
+}
+
+/// Test-only device peer-wait timeout for a `DropPeerPush` repro (#2542). A
+/// feature build armed with `CUTEAFD_DIAG_FAULT_DROP_PEER_PUSH` shortens the
+/// 60 s device wait to `CUTEAFD_DIAG_FAULT_PEER_WAIT_TIMEOUT_MS` (default 1000),
+/// below the Spark exchange's 5 s no-progress watchdog, so the device records the
+/// skipped wait before a Spark-backed card fails its wire. Always `None` in
+/// release builds and when the site is not armed.
+pub(crate) fn drop_push_wait_timeout() -> Option<std::time::Duration> {
+    #[cfg(feature = "dev-fault-hooks")]
+    {
+        let armed = std::env::var(Site::DropPeerPush.env()).ok()
+            .and_then(|value| value.parse::<u32>().ok()).is_some_and(|nth| nth > 0);
+        if !armed { return None; }
+        let ms = std::env::var("CUTEAFD_DIAG_FAULT_PEER_WAIT_TIMEOUT_MS").ok()
+            .and_then(|value| value.parse::<u64>().ok()).filter(|&ms| ms > 0).unwrap_or(1000);
+        tracing::warn!(ms, "dev fault hook shortens the device peer-wait timeout");
+        Some(std::time::Duration::from_millis(ms))
+    }
+    #[cfg(not(feature = "dev-fault-hooks"))]
+    { None }
 }
 
 /// Arms `site` on this thread to fire on its `nth` visit (1: the next one).

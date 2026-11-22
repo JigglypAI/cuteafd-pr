@@ -215,6 +215,14 @@ impl Fixture {
         Ok(())
     }
 
+    /// Model the device's abortable-wait timeout in this DSO's private record:
+    /// a blocked abortable wait at a drain times out as the device's would.
+    pub fn peer_wait_timeouts(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: private fixture hook arms only its own host-memory record.
+        unsafe { library.lib.get::<unsafe extern "C" fn()>(b"fixture_peer_model_timeouts")?(); }
+        Ok(())
+    }
+
     pub fn peer_stream_fault(&self, library: &NativeLibrary, stream: *mut std::ffi::c_void) -> Result<()> {
         // SAFETY: this private fixture hook records an opaque stream identity;
         // passing null clears the fault after the cancellation assertion.

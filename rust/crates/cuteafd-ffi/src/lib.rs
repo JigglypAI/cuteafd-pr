@@ -1845,6 +1845,7 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_poll_with_timeout: RdmaRcEndpointPollWithTimeoutFn,
     cuteafd_xgrammar_compiler_create: XGrammarCompilerCreateFn,
     cuteafd_xgrammar_compiler_create_json: XGrammarCompilerCreateFn,
+    cuteafd_peer_wait_timeout: unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32,
 }
 
 /// Lifetime-pinned physical memory reader for cache policy owners without a library borrow.

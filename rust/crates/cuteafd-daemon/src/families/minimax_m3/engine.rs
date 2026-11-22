@@ -180,7 +180,11 @@ impl<'a> SplitExecution<'a> {
                 "MiniMax split prefill differs from its HopLink stream");
             rank.decode.borrow().stream.device.run(|| {
                 library.peer_exchange_initialize()?;
-                library.peer_abort_initialize()
+                library.peer_abort_initialize()?;
+                match crate::shared::fault::drop_push_wait_timeout() {
+                    Some(timeout) => library.peer_wait_timeout_configure(timeout),
+                    None => Ok(()),
+                }
             })?;
         }
         let peak = 1 + cuteafd_loader::push_load::COPY_STREAMS as u64 + 1 + 1;
@@ -1802,6 +1806,101 @@ mod tests {
             assert!(trace.matches('s').count() >= 4, "both abort and compute ranks must drain");
             assert!(split.owner(0).is_err(), "terminal split transport must reject reuse");
             fixture.peer_stream_fault(&library, std::ptr::null_mut())?;
+            drop(owners);
+        }
+        Ok(())
+    }
+
+    /// #2542: one dropped push times out a split receive. The device record is
+    /// this fixture DSO's own (the process latch is never touched): the drained
+    /// step is void, no later abortable wait may queue, and every receive plane
+    /// keeps its stale bytes instead of being consumed as the next step's input.
+    #[test]
+    fn dropped_split_push_is_terminal_and_no_later_wait_consumes_a_stale_receive() -> Result<()> {
+        use super::super::{owners::{self, LoadedRank, Owners}, weights::TargetWeights, cache::RequestStreams};
+        use cuteafd_loader::{families::minimax_m3::execution::WirePrecision,
+            placement::{families::minimax_m3 as canonical, planner::Operation},
+            families::minimax_m3::weight_layout::SplitFfnWeights};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.peer_ordering_model(&library)?;
+        fixture.peer_wait_timeouts(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 96 << 30)?; }
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let (checkpoint, cfg) = owners::tests::snapshot(dir.path())?;
+        {
+            let wire = WirePrecision::F32;
+            let mut inputs = owners::tests::inputs(&checkpoint, &cfg, &[0, 1], 1)?;
+            inputs.split_wire = Some(wire);
+            let request = canonical::request(inputs.context, Some(129 * 64),
+                cuteafd_loader::placement::Onboard::Layers(0), inputs.prefill,
+                Operation::Serving, None, Default::default());
+            let admitted = inputs.admit(request)?;
+            fixture.register_programs(&library, inputs.manifest["programs"].as_array().unwrap())?;
+            let manifest = dir.path().join("PROGRAMS.json");
+            std::fs::write(&manifest, serde_json::to_vec(&*inputs.manifest)?)?;
+            let programs = library.programs()?.with_manifest(&manifest)?;
+            let layouts = SplitFfnWeights::plan(&checkpoint, &cfg,
+                &inputs.owners.iter().map(|&gpu| usize::from(gpu)).collect::<Vec<_>>(),
+                cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?;
+            let mut loaded = Vec::new();
+            let mut embedding = None;
+            for gpu in 0..2 {
+                let device = Device { library: &library, id: gpu as i32 };
+                let (weights, records) = crate::shared::experts::rtx::dense::recording(|| {
+                    if gpu == 0 {
+                        let (weights, table) = TargetWeights::load_split_ffn_with_embedding(device, &checkpoint,
+                            &layouts[gpu], crate::shared::token_io::EmbedPlacement::Gpu)?;
+                        embedding = Some(table);
+                        Ok(weights)
+                    } else { TargetWeights::load_split_ffn(device, &checkpoint, &layouts[gpu]) }
+                })?;
+                drop(records);
+                let decode = Rc::new(Stream::new(device)?);
+                loaded.push(LoadedRank { weights, streams: RequestStreams {
+                    decode: Rc::clone(&decode), prefill: vec![decode; inputs.prefill.waves as usize] } });
+            }
+            let owners = Owners::new(&inputs, &admitted, &programs, loaded, embedding.unwrap())?;
+            let storage = &owners.storage;
+            let split = storage.split.as_ref().unwrap();
+            let a = storage.ranks[0].decode.borrow();
+            let b = storage.ranks[1].decode.borrow();
+            let units = [&*a, &*b];
+            // A matched routed broadcast first: its receive lands exactly once.
+            split.routed(units, 1)?;
+            a.stream.drain()?;
+            b.stream.drain()?;
+            assert!(library.peer_wait_timeout().is_none());
+            // Rank1 waits for a routed sum rank0 never pushes (the dropped push).
+            SplitExecution::land(units, 1, 2)?;
+            b.stream.drain().context("an abortable timeout drains without a device fault")?;
+            let timeout = library.peer_wait_timeout().context("the dropped push timed out")?;
+            assert_eq!((timeout.expected, timeout.observed), (2, 1), "{timeout:?}");
+            // Rank1's routed-sum channel (2): flag word 0, receive sequence word 3.
+            let control = units[1].split_plane("control")?;
+            let words = || -> Result<[u32; 2]> {
+                let mut bytes = vec![0; 64];
+                units[1].stream.device.run(|| library.copy_d2h(&mut bytes, control))?;
+                let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+                Ok([word(32), word(44)])
+            };
+            assert_eq!(words()?, [1, 1], "the timed-out wait skipped without advancing its receive");
+            // Fail closed: no later receive (matched or not) can be queued.
+            for (to, channel) in [(1usize, 2usize), (0, 0), (1, 3)] {
+                let error = SplitExecution::land(units, to, channel).unwrap_err();
+                assert!(error.downcast_ref::<cuteafd_ffi::peer_exchange::PeerWaitTimeout>().is_some(), "{error:#}");
+            }
+            // A send may still be queued by a half-issued step, but nothing consumes it.
+            let error = split.routed(units, 1).unwrap_err();
+            assert!(error.downcast_ref::<cuteafd_ffi::peer_exchange::PeerWaitTimeout>().is_some(), "{error:#}");
+            a.stream.drain()?;
+            b.stream.drain()?;
+            assert_eq!(words()?, [2, 1], "the late push landed but no wait consumed it");
+            drop((a, b));
+            split.cancel()?;
+            assert!(split.owner(0).is_err(), "terminal split transport must reject reuse");
             drop(owners);
         }
         Ok(())

@@ -183,7 +183,23 @@ impl<'a> Execution<'a> {
         }
         Ok(())
     }
-    pub fn require_live(&self) -> Result<()> { ensure!(!self.terminal, "Inkling execution is terminal"); Ok(()) }
+    pub fn require_live(&self) -> Result<()> {
+        ensure!(!self.terminal, "Inkling execution is terminal");
+        if let Some(peer) = &self.peer { peer.exchange.require_live()?; }
+        Ok(())
+    }
+    /// Both ranks drained and the peer exchange still live: only then may a
+    /// step's logits or graph observations be used (a timed-out peer wait
+    /// skipped itself, so its drained step is void).
+    fn completed(&mut self) -> Result<()> {
+        self.requests.decode.stream.drain()?;
+        if let Some(peer) = &self.peer {
+            peer.requests.decode.stream.drain()?;
+            peer.exchange.require_live()?;
+        }
+        crate::shared::spark_waves::healthy()?;
+        self.observe_completed()
+    }
     pub fn new(link: SparkLink<'a>, requests: RequestOwners<'a>, head: Head<'a>,
         target: TargetWeights<'a>, kernels: Kernels<'a>, local: Vec<Box<dyn Dispatcher + 'a>>,
         cfg: Inkling2Config, graph_reserve: u64, ingress: Vec<cuteafd_core::SparkIngress>) -> Result<Self> {
@@ -211,9 +227,7 @@ impl<'a> Execution<'a> {
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
-            self.requests.decode.stream.drain()?;
-            crate::shared::spark_waves::healthy()?;
-            self.observe_completed()
+            self.completed()
         })();
         if result.is_err() { self.terminate(); }
         result
@@ -238,9 +252,7 @@ impl<'a> Execution<'a> {
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
-            self.requests.decode.stream.drain()?;
-            crate::shared::spark_waves::healthy()?;
-            self.observe_completed()?;
+            self.completed()?;
             Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
                 vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                 stream: self.requests.decode.stream.raw, greedy: None })

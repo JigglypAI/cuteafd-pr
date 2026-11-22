@@ -193,6 +193,8 @@ impl NativeLibrary {
     pub unsafe fn peer_wait_diagnostic(&self, flag: *const u32, recv_state: *mut u32,
         aborted: *const u32, stream: *mut c_void, diagnostic: &PeerDiagnostic) -> Result<()> {
         type F = unsafe extern "C" fn(*const u32, *mut u32, *const u32, *mut c_void, *const PeerDiagnostic) -> i32;
+        // Fail closed as `peer_wait_abortable` does.
+        if !aborted.is_null() { self.check_peer_wait_timeout()?; }
         // SAFETY: caller retains words and diagnostic owners; descriptor is copied by native.
         let status = unsafe { self.lib.get::<F>(b"cuteafd_peer_wait_diagnostic")?(
             flag, recv_state, aborted, stream, diagnostic) };
@@ -274,12 +276,10 @@ impl NativeLibrary {
     }
 
     /// A recorded abortable-wait timeout (see `cuteafd_peer_wait_timeout`): the
-    /// process's peer exchanges are terminal. Lock-free; a library without the
-    /// record (fixtures) never reports one.
+    /// process's peer exchanges are terminal. Lock-free (one cached symbol and a
+    /// mapped atomic load); a library without the record (fixtures) never reports one.
     pub fn peer_wait_timeout(&self) -> Option<PeerWaitTimeout> {
-        type F = unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32;
-        // SAFETY: lookup only.
-        let f = unsafe { self.lib.get::<F>(b"cuteafd_peer_wait_timeout") }.ok()?;
+        let f = self.cuteafd_peer_wait_timeout().ok()?;
         let (mut expected, mut observed, mut flag) = (0, 0, 0);
         // SAFETY: three live outputs; the entry point reads mapped host memory only.
         (unsafe { f(&mut expected, &mut observed, &mut flag) } != 0)
@@ -300,7 +300,11 @@ impl NativeLibrary {
         })
     }
 
-    /// An error once any abortable peer wait in this process timed out.
+    /// An error once any abortable peer wait in this process timed out. A timed
+    /// out wait skipped itself without advancing its receive sequence, so every
+    /// result of the step that queued it (and of any later step) is void: every
+    /// abortable wait refuses to queue and every host consumer of device output
+    /// (token selection, logits download) refuses it once this reports.
     pub fn check_peer_wait_timeout(&self) -> Result<()> {
         match self.peer_wait_timeout() {
             Some(timeout) => Err(anyhow::Error::new(timeout)),
@@ -343,6 +347,9 @@ impl NativeLibrary {
         stream: *mut c_void,
     ) -> Result<()> {
         type F = unsafe extern "C" fn(*const u32, *mut u32, *const u32, *mut c_void) -> i32;
+        // Fail closed: after a timeout the device would skip this wait too and
+        // its receive buffers are stale. No later step may queue another one.
+        self.check_peer_wait_timeout()?;
         // SAFETY: the caller owns the persistent words and stream described above.
         let status = unsafe {
             self.lib.get::<F>(b"cuteafd_peer_wait_abortable")?(flag, recv_state, aborted, stream)

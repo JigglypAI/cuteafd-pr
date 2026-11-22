@@ -471,6 +471,9 @@ impl<'a> PeerExchange<'a> {
                     library, &[ranks[rank].device], stage, Default::default());
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
+                if let Some(timeout) = crate::shared::fault::drop_push_wait_timeout() {
+                    library.peer_wait_timeout_configure(timeout)?;
+                }
                 probe("peer-abort-after-preload")?;
                 let word = DeviceAllocation::new(library, 256, Tag::transport("shared/peer-abort-word"))?;
                 library.cuda_zero_bytes(word.buffer, word.buffer.bytes)?;
@@ -772,6 +775,8 @@ impl<'a> PeerExchange<'a> {
         self.require_live()?;
         crate::shared::stack_dump::progress();
         let flag = self.flag_index(slot)?;
+        // Test-only (`shared::fault`): leave this push's matching wait without it.
+        if crate::shared::fault::fire(crate::shared::fault::Site::DropPeerPush) { return Ok(()); }
         tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
         let diagnostic = self.diagnostic(from, flag, "push");
