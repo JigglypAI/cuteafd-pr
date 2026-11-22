@@ -52,6 +52,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
     ("tencent/Hy4-flash", &["tencent/Hy4-flash"]),
+    ("tencent/Hy4", &["tencent/Hy4", "tencent/Hy4-FP8"]),
     ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
 
@@ -418,6 +419,13 @@ mod tests {
                 (root, dataset::HY4_REVISION, dataset::HY4_CONFIG));
         }
         assert!(resolve_in("someone/Hy4-flash-unverified", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn hy4_full_official_root_maps_fp8_sibling() {
+        assert_eq!(official_root("tencent/Hy4"), Some("tencent/Hy4"));
+        assert_eq!(official_root("tencent/Hy4-FP8"), Some("tencent/Hy4"));
+        assert!(official_root("tencent/Hy4-unverified").is_none());
     }
 
     #[test]
