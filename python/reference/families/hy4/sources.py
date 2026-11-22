@@ -19,9 +19,14 @@ SEMANTICS = {
     "namespace": "Checkpoint HC, linear_gate and learnable_sink_param keys are renamed by HF conversion_mapping "
                  "(hy_v4_vl_text -> hy_v4); this oracle reads the original keys directly. "
                  "deepseek_sparse_attention is indexed_attention in HF.",
-    "rope": "Pending real-weights RoPE A/B measurement (transformers main 2f1bc5e3 uses split-half; "
-            "transformers#50589 bd5b6b6d, vLLM 1bdc4374, SGLang 6f3f73ae, and AngelSlim GGUF use adjacent-pair "
-            "interleaved rotation in both MLA and the DSA indexer).",
+    "rope": "Settled by full 78-layer F32 real-weights A/B on cassowary (commit 5565df18f9, golden.py:rope_ab): "
+            "the checkpoint uses adjacent-pair (interleaved) RoPE, matching transformers#50589 (bd5b6b6d), vLLM "
+            "(1bdc4374), SGLang (6f3f73ae), AngelSlim GGUF, and Hy4-flash. Transformers main (2f1bc5e3) applies "
+            "split-half RoPE and degrades short-prompt mean NLL from 0.72924 to 1.64792 (+0.91868 nat, top-1 "
+            "80.90% -> 59.80% over 199 scored tokens) and 2,304-token README NLL from 1.10800 to 3.82016 "
+            "(+2.71216 nat, top-1 74.69% -> 37.00%). In the 2x2 MLA x indexer grid at 2,304 tokens (256 tail "
+            "positions pruned to top-2048), interleaved MLA + interleaved indexer gives 70.31% tail top-1 "
+            "(1.09435 NLL) vs 69.14% (1.08950 NLL) with split-half indexer (only ~6% keys pruned at 2,304 tokens).",
     "attention": "Gated DSA MLA in all 78 layers with F32 learnable sinks and elementwise sigmoid output gate. "
                  "No post_proj_norm, no SWA. IndexCache: 21 full indexer layers (0, 1, 5, 9, ..., 77) compute top-2048 "
                  "causal token indices; the 57 shared layers reuse the previous full layer's top-2048 indices. "
@@ -30,7 +35,9 @@ SEMANTICS = {
                 "kv_a_layernorm without passing eps (defaulting to 1e-6), while using config.rms_norm_eps (1e-5) for "
                 "input_layernorm, post_attention_layernorm, model.norm, iHC unweighted RMSNorm, and indexer k_norm. "
                 "vLLM uses 1e-5 for q_a_layernorm/kv_a_layernorm and 1e-6 for indexer k_norm; AngelSlim GGUF uses "
-                "1e-5 everywhere. Measured delta recorded after preflight.",
+                "1e-5 everywhere. On the 3 short real prompts, 1e-6 vs 1e-5 on q_a/kv_a gives 0.72924 vs 0.73023 "
+                "mean NLL (identical 80.90% top-1, rel L2 [2.64e-2, 3.80e-2, 5.23e-5] from isolated MoE routing flips). "
+                "This oracle matches Transformers main (1e-6 on q_a/kv_a, 1e-5 elsewhere).",
     "moe": "Layer 0 is dense SwiGLU (18432); layers 1..77 are standard MoE (256 routed experts top-8, intermediate 2048, "
            "sigmoid + e_score_correction_bias, norm_topk_prob, routed_scaling_factor 2.827, n_group=1, topk_group=1) "
            "plus 1 shared expert (2048). No LatentMoE, no post_fc2_norm, no combine_output_norm, no Engram. "
