@@ -192,19 +192,38 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         None
     };
     let (selected_windows, raw_tokens, raw_window_dir) = if let Some(ref_set) = &published {
-        let wanted: Vec<String> = match &args.window {
-            Some(w) => w.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            None => ref_set.quick_windows.clone(),
+        let wins = match &args.window {
+            Some(w) if w.trim() == "all-quick" => {
+                let mut ws = Vec::with_capacity(ref_set.quick_windows.len());
+                for id in &ref_set.quick_windows {
+                    let win = ref_set
+                        .windows
+                        .iter()
+                        .find(|w| w.id == *id)
+                        .with_context(|| format!("Hy4-flash fidelity window {id:?} not found"))?;
+                    ws.push(win.clone());
+                }
+                ws
+            }
+            Some(w) => {
+                let wanted: Vec<String> = w
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut ws = Vec::with_capacity(wanted.len());
+                for id in &wanted {
+                    let win = ref_set
+                        .windows
+                        .iter()
+                        .find(|w| w.id == *id)
+                        .with_context(|| format!("Hy4-flash fidelity window {id:?} not found"))?;
+                    ws.push(win.clone());
+                }
+                ws
+            }
+            None => cuteafd_bench::fidelity_dataset::quick_windows(ref_set)?,
         };
-        let mut wins = Vec::with_capacity(wanted.len());
-        for id in &wanted {
-            let win = ref_set
-                .windows
-                .iter()
-                .find(|w| w.id == *id)
-                .with_context(|| format!("Hy4-flash fidelity window {id:?} not found"))?;
-            wins.push(win.clone());
-        }
         ensure!(!wins.is_empty(), "Hy4-flash fidelity run selected zero windows");
         (Some(wins), Vec::new(), golden_dir.clone())
     } else {
@@ -321,21 +340,104 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 let slice = &logits[row_idx * vocab..(row_idx + 1) * vocab];
                 rows.push(build_probe_row(pos.pos, slice, &want[&pos.pos]));
             }
-            let score = win.score(&rows);
+            let mut score = win.score(&rows);
+            // Recompute each row's KL and NLL using direct engine tail in f64 (matching
+            // `cuteafd_bench::fidelity_rows::score_compact`, avoiding `1 - q_mass` cancellation).
+            for (rec, pos) in score.records.iter_mut().zip(&win.positions) {
+                let row_idx = pos.pos - 1;
+                let slice = &logits[row_idx * vocab..(row_idx + 1) * vocab];
+                let max_v = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let max_f64 = f64::from(max_v);
+                let lse = max_f64 + slice.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum::<f64>().ln();
+                let mut chosen = vec![false; vocab];
+                let mut kl = 0.0f64;
+                for t in &pos.top {
+                    let id = t.id as usize;
+                    chosen[id] = true;
+                    let q_lp = f64::from(slice[id]) - lse;
+                    kl += t.lp.exp() * (t.lp - q_lp);
+                }
+                if pos.tail_lp.is_finite() {
+                    let mut peak = f64::NEG_INFINITY;
+                    for (id, &v) in slice.iter().enumerate() {
+                        if !chosen[id] {
+                            let lp = f64::from(v) - lse;
+                            if lp > peak {
+                                peak = lp;
+                            }
+                        }
+                    }
+                    let tail_sum: f64 = slice
+                        .iter()
+                        .enumerate()
+                        .filter(|&(id, _)| !chosen[id])
+                        .map(|(_, &v)| ((f64::from(v) - lse) - peak).exp())
+                        .sum();
+                    let tail = peak + tail_sum.ln();
+                    kl += pos.tail_lp.exp() * (pos.tail_lp - tail);
+                }
+                rec.kl = kl.max(0.0);
+                rec.nll = -(f64::from(slice[pos.next as usize]) - lse);
+            }
+            score = cuteafd_bench::reference::Fidelity::from_records(score.records);
+            let gen_win = cuteafd_bench::reference::Fidelity::from_records(
+                score.records.iter().filter(|r| r.role == "gen").cloned().collect(),
+            );
+            let ctx_win = cuteafd_bench::reference::Fidelity::from_records(
+                score.records.iter().filter(|r| r.role == "ctx").cloned().collect(),
+            );
             println!(
-                "hy4f-golden window={} rows={} digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} top-1={:.2}% top-3={:.2}%",
+                "hy4f-golden window={} rows={} digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} (gen={:.6}/{:.2}%/{} ctx={:.6}/{:.2}%/{}) top-1={:.2}% top-3={:.2}%",
                 win.id,
                 score.positions,
                 digest_f32(&logits),
                 score.nll,
                 score.ref_nll,
                 score.kl,
+                if gen_win.positions > 0 { gen_win.kl } else { 0.0 },
+                if gen_win.positions > 0 { gen_win.top1 * 100.0 } else { 0.0 },
+                gen_win.positions,
+                if ctx_win.positions > 0 { ctx_win.kl } else { 0.0 },
+                if ctx_win.positions > 0 { ctx_win.top1 * 100.0 } else { 0.0 },
+                ctx_win.positions,
                 score.top1 * 100.0,
                 score.top3_contained * 100.0,
             );
+            if score.kl > 0.05 {
+                let mut worst = score.records.clone();
+                worst.sort_by(|a, b| b.kl.total_cmp(&a.kl));
+                for r in worst.iter().take(12) {
+                    let prev_tok = win.tokens.get(r.position.saturating_sub(1)).copied().unwrap_or(0);
+                    let next_tok = win.tokens.get(r.position).copied().unwrap_or(0);
+                    println!(
+                        "  worst pos={} role={} prev={} next={} kl={:.4} nll={:.3} ref_nll={:.3} argmax={} ref_argmax={}",
+                        r.position, r.role, prev_tok, next_tok, r.kl, r.nll, r.ref_nll, r.argmax, r.reference_argmax,
+                    );
+                }
+                println!("  first 10 ctx rows:");
+                for r in score.records.iter().filter(|r| r.role == "ctx").take(10) {
+                    let prev_tok = win.tokens.get(r.position.saturating_sub(1)).copied().unwrap_or(0);
+                    let next_tok = win.tokens.get(r.position).copied().unwrap_or(0);
+                    println!(
+                        "    pos={} prev={} next={} kl={:.4} nll={:.3} ref_nll={:.3} argmax={} ref_argmax={}",
+                        r.position, prev_tok, next_tok, r.kl, r.nll, r.ref_nll, r.argmax, r.reference_argmax,
+                    );
+                }
+            }
+            if let Some(out_dir) = &args.save_logits {
+                if windows.len() == 1 {
+                    std::fs::create_dir_all(out_dir)?;
+                    let out_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(out_dir.join("logits.bin"), out_bytes)?;
+                }
+            }
             all_records.extend(score.records);
         }
+        let gen_records: Vec<_> = all_records.iter().filter(|r| r.role == "gen").cloned().collect();
+        let ctx_records: Vec<_> = all_records.iter().filter(|r| r.role == "ctx").cloned().collect();
         let agg = cuteafd_bench::reference::Fidelity::from_records(all_records);
+        let gen_agg = cuteafd_bench::reference::Fidelity::from_records(gen_records);
+        let ctx_agg = cuteafd_bench::reference::Fidelity::from_records(ctx_records);
         println!(
             "hy4f-golden aggregate ({} windows, {} rows): mean NLL={:.6} (ref {:.6}, delta {:+.6}) mean KL={:.6} top-1={:.2}% confident-top-1={:.2}% top-3={:.2}%",
             windows.len(),
@@ -348,6 +450,32 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             agg.confident_top1.unwrap_or(0.0) * 100.0,
             agg.top3_contained * 100.0,
         );
+        if gen_agg.positions > 0 {
+            println!(
+                "hy4f-golden generated-only ({} rows, verdict subset): mean NLL={:.6} (ref {:.6}, delta {:+.6}) mean KL={:.6} top-1={:.2}% confident-top-1={:.2}% top-3={:.2}%",
+                gen_agg.positions,
+                gen_agg.nll,
+                gen_agg.ref_nll,
+                gen_agg.nll - gen_agg.ref_nll,
+                gen_agg.kl,
+                gen_agg.top1 * 100.0,
+                gen_agg.confident_top1.unwrap_or(0.0) * 100.0,
+                gen_agg.top3_contained * 100.0,
+            );
+        }
+        if ctx_agg.positions > 0 {
+            println!(
+                "hy4f-golden context-only ({} rows): mean NLL={:.6} (ref {:.6}, delta {:+.6}) mean KL={:.6} top-1={:.2}% confident-top-1={:.2}% top-3={:.2}%",
+                ctx_agg.positions,
+                ctx_agg.nll,
+                ctx_agg.ref_nll,
+                ctx_agg.nll - ctx_agg.ref_nll,
+                ctx_agg.kl,
+                ctx_agg.top1 * 100.0,
+                ctx_agg.confident_top1.unwrap_or(0.0) * 100.0,
+                ctx_agg.top3_contained * 100.0,
+            );
+        }
         return Ok(());
     }
 
