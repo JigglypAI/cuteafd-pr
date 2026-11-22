@@ -2754,8 +2754,7 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
                 accepted: count, censored: crate::shared::draft::history::finish_censored(r.finished, count as usize,
                     input, emitted.last().copied()) })).collect();
     if requests.len() != members.len() { return; }
-    let timing = crate::shared::draft::history::replay_trace().is_some().then(timing);
-    draft.observe_round(&requests, timing);
+    draft.observe_round(&requests, Some(timing()));
 }
 /// Resolve one finishing row's retained frontier from its downloaded bytes.
 ///

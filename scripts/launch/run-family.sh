@@ -212,15 +212,17 @@ for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
   probe_args+=(-v "$feature_root:$feature_root:ro" -e "CUTEAFD_$feature_key=$feature_root")
 done
 }
-# DRAFT_POLICY: history (the default: per-position acceptance history with
-# exploration) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
+# DRAFT_POLICY: history (the default: keep while the calibrated product stays
+# above 0.3, with exploration), clamped (history with each round's cut set from
+# the online round-cost ratio) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
 # measurement override. Sets draft_policy_args for the serve command.
 shared_draft_policy_args() {
 draft_policy_args=()
 case "$(get DRAFT_POLICY history)" in
   history) ;;
+  clamped) draft_policy_args=(--draft-policy clamped) ;;
   off) draft_policy_args=(--draft-policy off) ;;
-  *) echo "DRAFT_POLICY must be history or off" >&2; exit 2 ;;
+  *) echo "DRAFT_POLICY must be history, clamped or off" >&2; exit 2 ;;
 esac
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace

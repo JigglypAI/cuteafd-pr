@@ -172,7 +172,7 @@ fn serve_loop_holds_no_draft_policy_of_its_own() {
         assert_eq!(serve.matches(call).count(), 1, "{call}");
     }
     // The trace's round times reuse the step's lane start, draft seconds and verify ms.
-    assert!(serve.contains("history::RoundTiming::since(tally.lane(),\n            tally.started(), lane.draft_s - draft0, step_ms / 1e3, starts.clone())"));
+    assert!(serve.contains("policy.observe_timed(&outcomes, Some(history::RoundTiming::since(tally.lane(),\n            tally.started(), lane.draft_s - draft0, step_ms / 1e3, starts.clone())));"));
     for source in [include_str!("mod.rs"), serve, include_str!("dspark.rs")] {
         for removed in ["draft_binding", "resource::", "SelectorFit", "choose_block", "DraftEvidence"] {
             assert!(!source.contains(removed), "{removed}");

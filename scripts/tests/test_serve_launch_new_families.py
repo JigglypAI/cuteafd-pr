@@ -172,7 +172,7 @@ def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, 
         assert _flag(serve, "--split-device") == "1"
 
 
-@pytest.mark.parametrize("mode", [None, "history", "off"])
+@pytest.mark.parametrize("mode", [None, "history", "clamped", "off"])
 def test_minimax_passes_the_shared_draft_policy(tmp_path, mode):
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
@@ -182,6 +182,7 @@ def test_minimax_passes_the_shared_draft_policy(tmp_path, mode):
         encoder_plan=PLANNED)
     serve = _line(result, "serve-minimax --snapshot")
     assert ("--draft-policy off" in serve) == (mode == "off")
+    assert ("--draft-policy clamped" in serve) == (mode == "clamped")
     assert "CUTEAFD_DRAFT_POLICY" not in serve
 
 

@@ -25,7 +25,7 @@ pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, 
     ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice,
     nvfp4_wire_row_bytes};
 mod draft_history;
-pub use draft_history::{DraftControl, DraftHistory, DraftHistoryStats, DraftOutcome, DrafterSpec, HeadScore, PositionTrace,
+pub use draft_history::{clamped, CutRule, RoundCost, DraftControl, DraftHistory, DraftHistoryStats, DraftOutcome, DrafterSpec, HeadScore, PositionTrace,
     RequestTrace, RoundTrace, Track, COPY_COLD_RATE, KEEP_CUT, NEURAL_COLD_RATE, PRIOR_STRENGTH, REQUEST_WINDOW,
     SERVER_WINDOW};
 mod dspark_rng;

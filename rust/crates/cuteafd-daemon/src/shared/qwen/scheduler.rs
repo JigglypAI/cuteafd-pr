@@ -1558,7 +1558,12 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     }
     lanes::commit(&mut Accept { engine, verified, spec }).await?;
     let commit_us = console::us(commit_timer);
-    if let Some(policy) = shared.as_mut() { policy.observe(&outcomes); }
+    if let Some(policy) = shared.as_mut() {
+        // The same round time the trace's `cycle_ms` records.
+        policy.observe_timed(&outcomes, Some(history::RoundTiming { lane: 0,
+            round_us: cycle.elapsed().as_micros() as u64, draft_us: draft_us as u64,
+            verify_us: (1e6 * elapsed) as u64, context: starts.clone() }));
+    }
     for (i, request) in active.iter().enumerate() {
         tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],
             request.constraint.is_some(), finished[i]);

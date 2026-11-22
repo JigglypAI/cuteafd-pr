@@ -32,6 +32,9 @@ pub(crate) struct Policy {
     history: DraftHistory,
     trace: Option<&'static Trace>,
     rounds: u64,
+    /// Each live request's committed context after its last observed round,
+    /// so a round's band is known when it is planned (`clamped`).
+    contexts: std::collections::HashMap<u64, usize>,
 }
 
 impl Policy {
@@ -39,13 +42,13 @@ impl Policy {
     /// `copies` whether the family verifies history copies.
     pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
         let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
-        let history = DraftHistory::new(spec, length.control());
+        let history = DraftHistory::new(spec, length.control()).with_cut_rule(length.cut_rule());
         SPECULATION_ENABLED.store(block > 0 && history.control() != DraftControl::Off,
             std::sync::atomic::Ordering::Relaxed);
         cuteafd_bench::context::set_resolved("draft-mode", &length.label(block));
         tracing::info!(policy = %history.control().label(), block, head = ?head, copy_positions = spec.copy,
             requested_length = ?length.draft_length, "draft policy");
-        let policy = Self { history, trace: replay_trace(), rounds: 0 };
+        let policy = Self { history, trace: replay_trace(), rounds: 0, contexts: Default::default() };
         policy.publish();
         policy
     }
@@ -58,6 +61,9 @@ impl Policy {
     /// Drafts to ask the drafter for, per request. `requests` are (identity,
     /// room) in verifier order; `rows` is the round's verify-row budget.
     pub fn plan(&mut self, requests: &[(u64, usize)], rows: usize) -> Vec<usize> {
+        let known: Vec<usize> = requests.iter().filter_map(|(id, _)| self.contexts.get(id).copied()).collect();
+        let context = if known.is_empty() { 0 } else { known.iter().sum::<usize>() / known.len() };
+        self.history.begin_round(context, requests.len());
         self.history.plan(requests, rows)
     }
 
@@ -91,7 +97,16 @@ impl Policy {
     /// [`Self::observe`] with the round's measured host timing, which the
     /// trace record carries alongside the policy's view (no extra timers).
     pub fn observe_timed(&mut self, outcomes: &[DraftOutcome], timing: Option<RoundTiming>) {
+        if let Some(timing) = &timing {
+            let rows: usize = outcomes.iter().map(|o| o.proposed + 1).sum();
+            let context = if timing.context.is_empty() { 0 } else { timing.context.iter().sum::<usize>() / timing.context.len() };
+            self.history.observe_cost(context, rows, timing.round_us as f64 / 1e6);
+            for (outcome, &start) in outcomes.iter().zip(&timing.context) {
+                self.contexts.insert(outcome.id, start + outcome.accepted + 1);
+            }
+        }
         let record = self.history.observe(outcomes, self.trace.is_some());
+        let timing = timing.filter(|_| self.trace.is_some());
         if let (Some(trace), Some(mut record)) = (self.trace, record) {
             attach_request_ids(&mut record);
             if let Err(error) = trace.write(RoundRecord { r#type: "draft_round", round: self.rounds, timing,
@@ -103,7 +118,7 @@ impl Policy {
         if self.rounds % PUBLISH_ROUNDS == 0 { self.publish(); }
     }
 
-    pub fn release(&mut self, id: u64) { self.history.release(id); }
+    pub fn release(&mut self, id: u64) { self.history.release(id); self.contexts.remove(&id); }
 
     fn publish(&self) {
         if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(Arc::new(self.history.snapshot())); }
@@ -340,6 +355,51 @@ mod tests {
         for field in ["lane", "round_us", "draft_us", "verify_us", "context"] { assert!(untimed.get(field).is_none(), "{field}"); }
         let since = RoundTiming::since(0, std::time::Instant::now(), 0.0015, -1., vec![7]);
         assert_eq!((since.draft_us, since.verify_us, since.context), (1500, 0, vec![7]));
+    }
+
+    #[test]
+    fn clamped_policy_learns_round_cost_and_plans_each_round_at_its_band() {
+        use super::super::length::DraftPolicyChoice;
+        let length = DraftLength { draft_policy: DraftPolicyChoice::Clamped, ..Default::default() };
+        let mut policy = Policy::new(length, 4, HeadScore::Probability, false);
+        assert_eq!(policy.history.cut_rule(), cuteafd_core::CutRule::Clamped);
+        // Rounds at 40K context: 10 ms + 2 ms/row, eight requests at 1 or 4 drafts each.
+        for round in 0..64 {
+            let drafts = if round % 2 == 0 { 0 } else { 3 };
+            let ids: Vec<(u64, usize)> = (0..8).map(|id| (id, 4)).collect();
+            policy.plan(&ids, 64);
+            let outcomes: Vec<_> = (0..8).map(|id| outcome(id, drafts + 1, 1, false)).collect();
+            let rows = 8 * (drafts + 1);
+            let timing = RoundTiming { lane: 0, round_us: (10_000 + 2_000 * rows) as u64, draft_us: 0,
+                verify_us: 0, context: vec![40_000 + round; 8] };
+            policy.observe_timed(&outcomes, Some(timing));
+        }
+        // Each request's next context is its committed length plus what it accepted.
+        assert_eq!(policy.contexts[&0], 40_000 + 63 + 1);
+        // N = 10 ms, e = 2 ms/row: at C8 x = 0.625, 3.8 / 2.625 clamps to HI.
+        policy.plan(&(0..8).map(|id| (id, 4)).collect::<Vec<_>>(), 64);
+        assert_eq!(policy.history.round_cut(), cuteafd_core::clamped::HI);
+        // A short-context round is in another, still-cold band: the history cut.
+        policy.contexts.clear();
+        policy.plan(&[(99, 4)], 64);
+        assert_eq!(policy.history.round_cut(), cuteafd_core::KEEP_CUT);
+        policy.release(0);
+        assert!(!policy.contexts.contains_key(&0));
+    }
+
+    #[test]
+    fn every_family_feeds_its_round_time_to_the_policy() {
+        for (family, source, call) in [
+            ("shared scheduler", include_str!("../qwen/scheduler.rs"), "round_us: cycle.elapsed().as_micros() as u64"),
+            ("GLM 5.3", include_str!("../../families/glm5/serve.rs"), "round_us: (1e3 * verify_ms) as u64"),
+            ("GLM Flash", include_str!("../../families/glm5_flash/serve.rs"), "policy.observe_timed(&outcomes, Some(history::RoundTiming::since("),
+            ("MiMo", include_str!("../../families/mimo_v2/serve.rs"), "policy.observe_timed(&outcomes, Some(history::RoundTiming::since("),
+            ("DeepSeek V4", include_str!("../../families/deepseek_v4/serve.rs"), "round_us: round_started.elapsed().as_micros() as u64"),
+            ("V4.1", include_str!("../../families/deepseek_v41/v41_native_serve/scheduler.rs"), "draft.observe_round(&requests, Some(timing()));"),
+        ] {
+            assert!(source.contains(call), "{family}");
+            assert!(!source.contains("policy.observe(&outcomes)") && !source.contains("shared.observe(&outcomes)"), "{family} untimed observe");
+        }
     }
 
     #[test]

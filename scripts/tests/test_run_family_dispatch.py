@@ -411,8 +411,8 @@ def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> No
         assert private not in run_sh, private
 
 
-@pytest.mark.parametrize("value", [None, "history", "off"])
-def test_draft_policy_reaches_serve_only_when_off(tmp_path: Path, value) -> None:
+@pytest.mark.parametrize("value", [None, "history", "clamped", "off"])
+def test_draft_policy_reaches_serve_only_when_not_history(tmp_path: Path, value) -> None:
     keys = f"DRAFT_POLICY={value}\n" if value else ""
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
@@ -420,6 +420,7 @@ def test_draft_policy_reaches_serve_only_when_off(tmp_path: Path, value) -> None
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert ("--draft-policy off" in launch) == (value == "off"), launch
+    assert ("--draft-policy clamped" in launch) == (value == "clamped"), launch
     assert "CUTEAFD_DRAFT_POLICY" not in result.stderr
     assert "CUTEAFD_SPECULATION_TRACE=" in result.stderr
 
@@ -528,7 +529,7 @@ def test_removed_and_unknown_draft_policies_are_rejected(tmp_path: Path, value) 
                                             "moe_layer_freq": [0, 1]}, "XiaomiMiMo/MiMo-V2-Flash",
                                   f"DRAFT_POLICY={value}\n")
     assert result.returncode != 0
-    assert "DRAFT_POLICY must be history or off" in result.stderr
+    assert "DRAFT_POLICY must be history, clamped or off" in result.stderr
 
 
 def test_family_table_names_every_launchable_family() -> None:

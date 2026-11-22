@@ -4,9 +4,12 @@ use cuteafd_core::DraftControl;
 /// `DRAFT_POLICY`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum DraftPolicyChoice {
-    /// Per-token confidence (position history for token-only drafters) with exploration.
+    /// Keep the leading drafts while their calibrated product stays above 0.3, plus one explore.
     #[default]
     History,
+    /// `history` with each round's cut set from the online ratio of non-row time per
+    /// request to per-row time (`cuteafd_core::clamped`).
+    Clamped,
     /// Verify no drafts.
     Off,
 }
@@ -44,8 +47,16 @@ impl DraftLength {
     pub fn control(self) -> DraftControl {
         match (self.draft_length, self.draft_policy) {
             (Some(length), _) => DraftControl::Fixed(length),
-            (None, DraftPolicyChoice::History) => DraftControl::History,
+            (None, DraftPolicyChoice::History | DraftPolicyChoice::Clamped) => DraftControl::History,
             (None, DraftPolicyChoice::Off) => DraftControl::Off,
+        }
+    }
+
+    /// The keep cut each `history` round uses.
+    pub fn cut_rule(self) -> cuteafd_core::CutRule {
+        match (self.draft_length, self.draft_policy) {
+            (None, DraftPolicyChoice::Clamped) => cuteafd_core::CutRule::Clamped,
+            _ => cuteafd_core::CutRule::Fixed,
         }
     }
 
@@ -61,6 +72,7 @@ impl DraftLength {
     /// The card's draft mode.
     pub fn label(self, native: usize) -> String {
         match self.control() {
+            DraftControl::History if self.cut_rule() == cuteafd_core::CutRule::Clamped => "clamped".into(),
             DraftControl::History => "adaptive".into(),
             DraftControl::Fixed(_) => format!("fixed {}", self.effective(native)),
             DraftControl::Off => "no speculation".into(),
@@ -104,6 +116,14 @@ mod tests {
         let off = config(command, &["--draft-policy", "off"]);
         assert_eq!((off.control(), off.effective(native), off.label(native)),
             (DraftControl::Off, 0, "no speculation".to_string()));
+        // `clamped` is `history` with a per-round cut, on every family.
+        let clamped = config(command, &["--draft-policy", "clamped"]);
+        assert_eq!((clamped.control(), clamped.cut_rule(), clamped.effective(native), clamped.label(native)),
+            (DraftControl::History, cuteafd_core::CutRule::Clamped, native, "clamped".to_string()));
+        assert_eq!(unset.cut_rule(), cuteafd_core::CutRule::Fixed);
+        // A fixed width still overrides it.
+        assert_eq!(config(command, &["--draft-policy", "clamped", "--draft-length", "2"]).cut_rule(),
+            cuteafd_core::CutRule::Fixed);
         for requested in [1, 4, native + 10] {
             let value = requested.to_string();
             // A fixed width overrides the policy either way.
