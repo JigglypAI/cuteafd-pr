@@ -407,8 +407,9 @@ fn add_matrix(
         }
     }
 
-    if checkpoint.converts_to_fp8(&weight_name) {
-        let [stored_n, stored_k] = fp8_role(&weight_name).stored_shape([n, k])?;
+    let role = fp8_role(&weight_name);
+    if checkpoint.converts_to_fp8(&weight_name) && role.supported {
+        let [stored_n, stored_k] = role.stored_shape([n, k])?;
         let payload = stored_n * stored_k;
         let scales = ((stored_n / 128) * (stored_k / 128) * 4).max(256);
         views.push((format!("{stem}.payload"), payload));

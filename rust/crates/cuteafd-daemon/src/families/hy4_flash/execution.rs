@@ -115,6 +115,7 @@ impl<'a> RankScratch<'a> {
         local_vocab: usize,
         attn_scratch_bytes: usize,
         native_layout: Option<&ProjectionScratchLayout>,
+        native_head_layout: Option<&ProjectionScratchLayout>,
     ) -> Result<Self> {
         let alloc = |bytes: usize, label: &'static str| {
             Allocation::new(device, bytes.max(256), Tag::workspace(label))
@@ -123,9 +124,11 @@ impl<'a> RankScratch<'a> {
         let max_inter = 13824 / tp;
         let max_groups = max_pages * (PAGE_ROWS / 4);
         let wire_row = LATENT_H + LATENT_H / 32;
-        let native = native_layout
-            .map(|l| Hy4NativeScratch::allocate(device, l))
-            .transpose()?;
+        let native = if native_layout.is_some() || native_head_layout.is_some() {
+            Some(Hy4NativeScratch::allocate(device, native_layout, native_head_layout)?)
+        } else {
+            None
+        };
         let mut engram_raw = Vec::with_capacity(engram_count);
         let mut engram_masked = Vec::with_capacity(engram_count);
         for _ in 0..engram_count {
@@ -210,8 +213,8 @@ fn launch_proj_out(
     output: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
-        return linear.launch(rows, input, output, &ns.scratch, r.stream.raw);
+        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
+        return linear.launch(rows, input, output, scratch, r.stream.raw);
     }
     // SAFETY: caller ensures device active and all buffers live through stream drain.
     unsafe {
@@ -231,8 +234,8 @@ fn launch_proj_kv_a(
     output_576: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
-        linear.launch(rows, input, r.scratch.kv_a_padded.buffer, &ns.scratch, r.stream.raw)?;
+        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
+        linear.launch(rows, input, r.scratch.kv_a_padded.buffer, scratch, r.stream.raw)?;
         // SAFETY: kv_a_padded [rows, 640] BF16 and output_576 [rows, 576] BF16 are disjoint admitted buffers.
         return unsafe {
             r.device.library.copy_d2d_2d_async(
@@ -267,11 +270,11 @@ fn launch_proj_split(
     out_tp2_f32: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let ns = r.scratch.native.as_ref().context("Hy4 native core missing scratch")?;
+        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
         return if gpus == 1 {
-            linear.launch(rows, input, out_tp1_bf16, &ns.scratch, r.stream.raw)
+            linear.launch(rows, input, out_tp1_bf16, scratch, r.stream.raw)
         } else {
-            linear.partial(rows, input, out_tp2_f32, &ns.scratch, r.stream.raw)
+            linear.partial(rows, input, out_tp2_f32, scratch, r.stream.raw)
         };
     }
     let out = if gpus == 1 { out_tp1_bf16.ptr } else { out_tp2_f32.ptr };
@@ -363,6 +366,7 @@ impl<'a> Hy4Engine<'a> {
                 .max(progs.swa_extend_scratch_bytes);
             let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, max_rows, 0, &stream)?;
             let native_layout = weights.native.scratch_layout(max_rows)?;
+            let native_head_layout = weights.native.head_scratch_layout(max_rows.min(64))?;
             let scratch = RankScratch::new(
                 device,
                 gpus,
@@ -372,6 +376,7 @@ impl<'a> Hy4Engine<'a> {
                 weights.local_vocab,
                 attn_scratch,
                 native_layout.as_ref(),
+                native_head_layout.as_ref(),
             )?;
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
@@ -1350,7 +1355,7 @@ impl<'a> Hy4Engine<'a> {
                 let x_ptr = r.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(start * H * 2).cast();
                 let bytes = count * local_v * 4;
                 if let Some(native_head) = r.weights.native.get("lm_head") {
-                    let ns = r.scratch.native.as_ref().context("Hy4 native lm_head missing scratch")?;
+                    let head_scratch = r.scratch.native.as_ref().and_then(|n| n.head_scratch.as_ref()).context("Hy4 native lm_head missing scratch")?;
                     let x_buf = CuteafdDeviceBuffer {
                         ptr: x_ptr,
                         bytes: count * H * 2,
@@ -1360,7 +1365,7 @@ impl<'a> Hy4Engine<'a> {
                         bytes,
                         ..r.scratch.logits_tile.buffer
                     };
-                    r.device.run(|| native_head.launch(count, x_buf, out_buf, &ns.scratch, r.stream.raw))?;
+                    r.device.run(|| native_head.launch(count, x_buf, out_buf, head_scratch, r.stream.raw))?;
                 } else {
                     let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
                     let lm_head_w = r.weights.weight("lm_head")?;

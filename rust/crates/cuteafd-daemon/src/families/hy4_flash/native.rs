@@ -277,8 +277,10 @@ impl<'a> Hy4NativeCore<'a> {
     pub(crate) fn scratch_layout(&self, rows: usize) -> Result<Option<ProjectionScratchLayout>> {
         let mut merged: Option<ProjectionScratchLayout> = None;
         for (stem, linear) in &self.linears {
-            let r = if stem == HEAD_STEM { rows.min(64) } else { rows };
-            let next = linear.scratch_layout(r)?;
+            if stem == HEAD_STEM {
+                continue;
+            }
+            let next = linear.scratch_layout(rows)?;
             match &mut merged {
                 Some(acc) => acc.merge(&next)?,
                 None => merged = Some(next),
@@ -286,21 +288,37 @@ impl<'a> Hy4NativeCore<'a> {
         }
         Ok(merged)
     }
+
+    pub(crate) fn head_scratch_layout(&self, head_rows: usize) -> Result<Option<ProjectionScratchLayout>> {
+        self.linears
+            .get(HEAD_STEM)
+            .map(|linear| linear.scratch_layout(head_rows))
+            .transpose()
+    }
 }
 
-/// Per-rank serialized scratch shared by all compact-core native projections.
+/// Per-rank serialized scratch shared by all compact-core native projections (and tiled `lm_head`).
 pub(crate) struct Hy4NativeScratch<'a> {
-    pub(crate) scratch: ProjectionScratch<'a>,
+    pub(crate) scratch: Option<ProjectionScratch<'a>>,
+    pub(crate) head_scratch: Option<ProjectionScratch<'a>>,
 }
 
 impl<'a> Hy4NativeScratch<'a> {
-    pub(crate) fn allocate(device: Device<'a>, layout: &ProjectionScratchLayout) -> Result<Self> {
-        let owned = ProjectionLayout {
-            extents: layout.extents.clone(),
-            rows: layout.rows,
+    pub(crate) fn allocate(
+        device: Device<'a>,
+        core_layout: Option<&ProjectionScratchLayout>,
+        head_layout: Option<&ProjectionScratchLayout>,
+    ) -> Result<Self> {
+        let alloc = |layout: &ProjectionScratchLayout, tag: &'static str| -> Result<ProjectionScratch<'a>> {
+            let owned = ProjectionLayout {
+                extents: layout.extents.clone(),
+                rows: layout.rows,
+            };
+            owned.allocate_packed(device, Tag::workspace(tag))
         };
         Ok(Self {
-            scratch: owned.allocate_packed(device, Tag::workspace("hy4_flash/native-core-scratch"))?,
+            scratch: core_layout.map(|l| alloc(l, "hy4_flash/native-core-scratch")).transpose()?,
+            head_scratch: head_layout.map(|l| alloc(l, "hy4_flash/native-head-scratch")).transpose()?,
         })
     }
 }
@@ -348,7 +366,7 @@ pub(crate) fn dequant_kv_b_trellis_absorbed(
         )
     })?;
     let scratch_layout = ProjectionScratchLayout::new(local_k, local_n, local_k)?;
-    let scratch = Hy4NativeScratch::allocate(device, &scratch_layout)?;
+    let scratch = Hy4NativeScratch::allocate(device, Some(&scratch_layout), None)?;
 
     // Upload [kv_lora, kv_lora] BF16 identity matrix I; local(I) produces Y = I @ W^T = W^T [kv_lora, local_n].
     let one_bf16: u16 = 0x3F80;
@@ -362,7 +380,7 @@ pub(crate) fn dequant_kv_b_trellis_absorbed(
     let stream = Stream::new(device)?;
     device.run(|| {
         device.library.copy_h2d(eye.buffer, &eye_bytes)?;
-        projection.local(local_k, eye.buffer, &weights, &scratch.scratch, out.buffer, stream.raw)
+        projection.local(local_k, eye.buffer, &weights, scratch.scratch.as_ref().unwrap(), out.buffer, stream.raw)
     })?;
     stream.drain()?;
     let mut y_bytes = vec![0u8; local_k * local_n * 2];
