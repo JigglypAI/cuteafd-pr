@@ -502,7 +502,7 @@ impl<'a> LoadingArena<'a> {
         let validation = vec![0; layout.validation_bytes];
         let allocation = match &layout.weights {
             Some(weights) => allocate_weight_arena(device, weights, tag.tag())?,
-            None => Allocation::new(device, layout.bytes(), tag.tag())?,
+            None => Allocation::expert_backing(device, layout.bytes(), tag.tag().owner, tag.tag())?,
         };
         let initialized = if layout.generated.is_empty() { Ok(()) } else { device.run(|| {
             let queued = layout.generated.iter().try_for_each(|range| {

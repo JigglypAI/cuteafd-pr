@@ -57,6 +57,8 @@ typedef enum cuteafd_device_buffer_flags_t {
   CUTEAFD_DEVICE_BUFFER_FLAG_HOST_FALLBACK = 1,
   CUTEAFD_DEVICE_BUFFER_FLAG_MANAGED = 2,
   CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST = 4,
+  /* One VMM range: imported display-carveout slices, then a cuMemCreate tail. */
+  CUTEAFD_DEVICE_BUFFER_FLAG_CARVEOUT = 8,
 } cuteafd_device_buffer_flags_t;
 
 typedef enum cuteafd_host_buffer_flags_t {
@@ -315,6 +317,15 @@ cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
 cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
+// One device range of `bytes` (a 2 MiB multiple): the `fd_count` POSIX-fd
+// shareable handles first (spark-attic display-carveout lends of
+// `fd_bytes[i]` each, imported; the caller keeps and closes its fds), then an
+// ordinary cuMemCreate tail for the rest. Freed by cuteafd_free_device_buffer,
+// which unmaps, releases every handle and frees the range. Reports the tail
+// bytes (ordinary device memory admission must charge) in *out_tail_bytes.
+cuteafd_status_t cuteafd_alloc_carveout_device_buffer(size_t bytes, const int* fds,
+    const size_t* fd_bytes, size_t fd_count, cuteafd_device_buffer_t* out,
+    size_t* out_tail_bytes, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_synchronize(void* cuda_stream);

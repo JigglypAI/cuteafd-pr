@@ -25,9 +25,32 @@ pub fn serving_bytes() -> Vec<u64> {
     SERVING_HOSTS.iter().map(|host| measured_bytes(host).expect("measured serving pool")).collect()
 }
 
-static LIVE: OnceLock<Vec<u64>> = OnceLock::new();
+static LIVE: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
 
+/// Capacity of physical rank `rank` among `expert_ranks` expert-holding ranks:
+/// only those hold a routed-expert arena, the one owner the carveout backs, so
+/// a media-only rank past the expert world gets `MemAvailable` alone.
+fn credited((available, carveout): (u64, u64), rank: usize, expert_ranks: usize) -> u64 {
+    if rank < expert_ranks { available.saturating_add(carveout) } else { available }
+}
+
+/// Per-rank capacities with the carveout credited to the first `expert_ranks`.
+pub fn sample_bytes_for(samples: &str, expert_ranks: usize) -> Result<Vec<u64>> {
+    Ok(sample_parts(samples)?.into_iter().enumerate()
+        .map(|(rank, parts)| credited(parts, rank, expert_ranks)).collect())
+}
+
+/// Per-rank Spark capacity: idle `MemAvailable` plus the GB10 display carveout
+/// a validated spark-attic would lend this host's routed-expert arena
+/// (`carveout_bytes`, absent or 0 where none is reachable; #2546). The
+/// carveout lies outside `MemAvailable`, so the two never overlap; the worker
+/// maps it only into its routed-expert arena, so it never backs another owner.
 pub fn sample_bytes(samples: &str) -> Result<Vec<u64>> {
+    Ok(sample_parts(samples)?.into_iter().map(|(available, carveout)| available.saturating_add(carveout)).collect())
+}
+
+/// `(MemAvailable, carveout)` per rank; the carveout counts only while enabled.
+pub fn sample_parts(samples: &str) -> Result<Vec<(u64, u64)>> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(samples)?;
     anyhow::ensure!(!rows.is_empty() && rows.len() <= 8, "Spark samples require 1..8 ranks");
     rows.iter().map(|row| {
@@ -36,12 +59,22 @@ pub fn sample_bytes(samples: &str) -> Result<Vec<u64>> {
         anyhow::ensure!(row["boot_id"].as_str().is_some_and(|id| !id.is_empty())
             && row["age_seconds"].as_f64().is_some_and(|age| age >= 0.0),
             "Spark sample requires boot_id and age_seconds");
-        Ok(bytes)
+        let carveout = match row.get("carveout_bytes") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(value) => value.as_u64().context("carveout_bytes must be a byte count")?,
+        };
+        anyhow::ensure!(carveout % (2 << 20) == 0, "carveout_bytes must be whole 2 MiB slices");
+        Ok((bytes, if cuteafd_ffi_attic_enabled() { carveout } else { 0 }))
     }).collect()
 }
 
+/// `--spark-carveout off` (process-wide) plans without the carveout.
+fn cuteafd_ffi_attic_enabled() -> bool { CARVEOUT_ENABLED.load(std::sync::atomic::Ordering::SeqCst) }
+static CARVEOUT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn set_carveout_enabled(enabled: bool) { CARVEOUT_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst); }
+
 pub fn install_samples(samples: &str) -> Result<()> {
-    let bytes = sample_bytes(samples)?;
+    let bytes = sample_parts(samples)?;
     if let Some(current) = LIVE.get() {
         anyhow::ensure!(*current == bytes, "Spark samples already installed with different capacities");
         return Ok(());
@@ -49,10 +82,14 @@ pub fn install_samples(samples: &str) -> Result<()> {
     LIVE.set(bytes).map_err(|_| anyhow::anyhow!("Spark samples already installed"))
 }
 
-pub fn live_bytes(ranks: usize) -> Result<Option<Vec<u64>>> {
+/// Live capacities of the first `ranks` physical ranks, all of them expert ranks.
+pub fn live_bytes(ranks: usize) -> Result<Option<Vec<u64>>> { live_bytes_for(ranks, ranks) }
+
+/// Live capacities of `ranks` physical ranks, the first `expert_ranks` credited the carveout.
+pub fn live_bytes_for(ranks: usize, expert_ranks: usize) -> Result<Option<Vec<u64>>> {
     LIVE.get().map(|bytes| {
         anyhow::ensure!(bytes.len() >= ranks, "missing live Spark rank measurement: need {ranks}, have {}", bytes.len());
-        Ok(bytes[..ranks].to_vec())
+        Ok(bytes[..ranks].iter().enumerate().map(|(rank, parts)| credited(*parts, rank, expert_ranks)).collect())
     }).transpose()
 }
 
@@ -75,7 +112,7 @@ pub fn runtime_physical_bytes(peers: &[String], ranks: usize) -> Result<Vec<u64>
     if let Some(bytes) = cuteafd_core::memory_policy::MemoryPolicy::current().spark_cap {
         return Ok(vec![bytes; ranks]);
     }
-    if let Some(bytes) = live_bytes(ranks)? { return Ok(bytes); }
+    if let Some(bytes) = live_bytes_for(ranks, peers.len().min(ranks))? { return Ok(bytes); }
     anyhow::ensure!(peers.len() >= ranks, "missing host identity for physical Spark rank {}", peers.len());
     runtime_bytes(&peers[..ranks])
 }
@@ -84,10 +121,7 @@ pub fn runtime_physical_bytes(peers: &[String], ranks: usize) -> Result<Vec<u64>
 pub fn runtime_bytes(peers: &[String]) -> Result<Vec<u64>> {
     let explicit = cuteafd_core::memory_policy::MemoryPolicy::current().spark_cap;
     if let Some(bytes) = explicit { return Ok(vec![bytes; peers.len()]); }
-    if let Some(bytes) = LIVE.get() {
-        anyhow::ensure!(bytes.len() >= peers.len(), "missing live Spark rank measurement");
-        return Ok(bytes[..peers.len()].to_vec());
-    }
+    if let Some(bytes) = live_bytes(peers.len())? { return Ok(bytes); }
     peers.iter().map(|peer| measured_bytes(peer)).collect()
 }
 
@@ -102,6 +136,22 @@ mod tests {
         assert_eq!(sample_bytes(samples).unwrap(), vec![123, 456]);
         for invalid in ["[]", r#"[{"bytes":0,"boot_id":"a","age_seconds":0}]"#,
             r#"[{"bytes":123,"age_seconds":0}]"#, r#"[{"bytes":123,"boot_id":"a"}]"#] {
+            assert!(sample_bytes(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn carveout_is_added_per_rank_and_validated() {
+        let samples = r#"[{"bytes":1000,"boot_id":"a","age_seconds":0,"carveout_bytes":2143289344},
+            {"bytes":2000,"boot_id":"b","age_seconds":1},{"bytes":3000,"boot_id":"c","age_seconds":1,"carveout_bytes":0}]"#;
+        assert_eq!(sample_parts(samples).unwrap(), vec![(1000, 2143289344), (2000, 0), (3000, 0)]);
+        assert_eq!(sample_bytes(samples).unwrap(), vec![2143290344, 2000, 3000]);
+        // A media-only rank past the expert world holds no routed-expert arena.
+        assert_eq!(sample_bytes_for(samples, 0).unwrap(), vec![1000, 2000, 3000]);
+        assert_eq!(credited((5, 2 << 20), 1, 1), 5);
+        assert_eq!(credited((5, 2 << 20), 0, 1), 5 + (2 << 20));
+        for invalid in [r#"[{"bytes":1,"boot_id":"a","age_seconds":0,"carveout_bytes":3}]"#,
+            r#"[{"bytes":1,"boot_id":"a","age_seconds":0,"carveout_bytes":"x"}]"#] {
             assert!(sample_bytes(invalid).is_err(), "{invalid}");
         }
     }

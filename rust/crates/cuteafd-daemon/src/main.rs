@@ -517,6 +517,9 @@ async fn run() -> Result<()> {
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
     policy.install().map_err(anyhow::Error::msg)?;
+    let carveout = memory.spark_carveout != Some(cli::SparkCarveout::Off);
+    cuteafd_ffi::attic::set_enabled(carveout);
+    cuteafd_loader::serving_capacity::spark_memory::set_carveout_enabled(carveout);
     // Resolve the environment only after generic serve/golden's family reparse:
     // an environment fallback must not overwrite an explicit outer CLI value.
     let graph_floor = family_graph_floor.or(initial_graph_floor).or(
