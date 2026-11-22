@@ -220,6 +220,15 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
     let max_pages = max_seq.div_ceil(64).max(16);
 
+    // Set process-wide routed-expert geometry BEFORE NativeLibrary::load so C++
+    // `cuteafd_set_expert_hidden(1536)` configures `exl3_wire` and routed kernels.
+    if let Err(prev) = cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::HY4_FLASH) {
+        ensure!(
+            prev == cuteafd_core::ExpertGeometry::HY4_FLASH,
+            "expert geometry already set to {prev:?}"
+        );
+    }
+
     let lib_path = args
         .native_lib
         .as_deref()
@@ -241,8 +250,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let onboarded: Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'_>>> =
         if let Some(pkg) = &args.expert_package {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-            cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::HY4_FLASH)
-                .map_err(|prev| anyhow::anyhow!("expert geometry already set to {prev:?}"))?;
             let catalog = cuteafd_loader::read_expert_catalog_view(
                 checkpoint.view.as_ref().context("Hy4-flash checkpoint view required for routed experts")?,
             )?;
