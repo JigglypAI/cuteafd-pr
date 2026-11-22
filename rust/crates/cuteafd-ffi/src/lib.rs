@@ -2311,6 +2311,13 @@ fn record_rdma_rings(handle: *mut c_void, views: [CuteafdRdmaRcEndpointBufferVie
 
 /// Per-destination pinned source and copy-completion fence. Raw owners are
 /// released by NativeLibrary only after every pending upload has completed.
+/// A reservation-only ordered upload found no startup staging for its
+/// destination (#2544): creating the event and pinned staging now would run
+/// driver work inside a serving step, possibly while a peer GPU spins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("ordered H2D destination {ptr:#x} on device {device} stream {stream:#x} has no startup reservation")]
+pub struct UnreservedOrderedH2D { pub device: i32, pub stream: usize, pub ptr: usize }
+
 struct OrderedH2DStaging {
     staging: SyncH2DStagingBuffer,
     event: *mut c_void,
@@ -3293,6 +3300,24 @@ impl NativeLibrary {
     /// queued work. Every reader/writer of dst is ordered on this stream (or
     /// joined onto it by an event); this call is outside graph capture.
     pub unsafe fn copy_h2d_ordered(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.copy_h2d_ordered_with(dst, src, stream, false) }
+    }
+
+    /// As [`Self::copy_h2d_ordered`], for a destination [`Self::reserve_h2d_ordered`]
+    /// reserved at startup on this stream: an unreserved destination is refused
+    /// with [`UnreservedOrderedH2D`] instead of creating an event and pinned
+    /// staging inside a serving step (#2544).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::copy_h2d_ordered`].
+    pub unsafe fn copy_h2d_reserved(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.copy_h2d_ordered_with(dst, src, stream, true) }
+    }
+
+    unsafe fn copy_h2d_ordered_with(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void,
+        reserved: bool) -> Result<()> {
         if src.is_empty() { return Ok(()); }
         anyhow::ensure!(!dst.ptr.is_null() && src.len() <= dst.bytes, "ordered H2D destination is too small or null");
         anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
@@ -3300,6 +3325,9 @@ impl NativeLibrary {
         let mut entries = self.ordered_h2d_staging.lock()
             .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
         let key = (device, stream as usize, dst.ptr as usize);
+        if reserved && !entries.contains_key(&key) {
+            return Err(UnreservedOrderedH2D { device, stream: key.1, ptr: key.2 }.into());
+        }
         let capacity = if entries.contains_key(&key) { src.len() } else { dst.bytes };
         let entry = self.ordered_h2d_entry(&mut entries, key, capacity)?;
         if entry.pending {

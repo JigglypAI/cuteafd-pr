@@ -84,10 +84,10 @@ impl Rank<'_> {
         }
         // SAFETY: staging owns copied numeric metadata until each event; the
         // permanent destinations are ordered after previous attention readers.
-        unsafe{lib.copy_h2d_ordered(self.buffer("step.tables")?,bytes(&table),self.stream.raw)?;
-            lib.copy_h2d_ordered(self.buffer("step.positions")?,bytes(&positions),self.stream.raw)?;
+        unsafe{self.upload("step.tables",bytes(&table))?;
+            self.upload("step.positions",bytes(&positions))?;
             if matches!(self.config.context[index],ContextPolicy::Full){
-                lib.copy_h2d_ordered(self.buffer("cache.tables")?,bytes(&page_table),self.stream.raw)?;}}
+                self.upload("cache.tables",bytes(&page_table))?;}}
         Ok(max_context+c.block)
     }
 

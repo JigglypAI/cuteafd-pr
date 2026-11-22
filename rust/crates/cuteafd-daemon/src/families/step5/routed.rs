@@ -26,6 +26,8 @@ pub(crate) type GateRequest = fn(usize, usize, cuteafd_transport::ExpertV2Dtype,
 
 const H: usize = 4096;
 const E: usize = 352;
+/// Routed experts per layer, for route-id fills outside the router.
+pub(super) const EXPERTS: usize = E;
 const K: usize = 8;
 const I: usize = 1536;
 const INPUT: usize = 0;

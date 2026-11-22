@@ -378,7 +378,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                     "Muse received unselected onboarded experts");
                 Vec::new()
             }
-            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, placement,
+            Some(package) => super::onboard::load(&devices, &streams.iter().map(|stream| stream.raw).collect::<Vec<_>>(),
+                &program_refs, &cfg, &catalog, package, placement,
                 onboarded.clone(), usize::try_from(prefill.unit_rows)?, expert_modules, pushed)?,
         };
         Ok((embedding, ranks, local, draft))

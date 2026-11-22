@@ -393,8 +393,30 @@ impl<'a, C> Whole<'a, C> {
     }
 }
 
+/// A TP2 pair rank was stepped before [`Pair::prime`] resolved its lazy
+/// backend capacities (#2544): that work could otherwise run inside a step
+/// while the other GPU already spins on a peer wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("TP2 expert pair rank {rank} stepped before Pair::prime")]
+pub(crate) struct UnprimedPair { pub rank: usize }
+
+/// Which ranks completed [`Pair::prime`]; a step needs both, since either
+/// rank's step can queue a wait on the other.
+#[derive(Debug, Default)]
+struct Primed([Cell<bool>; 2]);
+impl Primed {
+    fn mark(&self, rank: usize) { self.0[rank].set(true); }
+    fn require(&self) -> Result<(), UnprimedPair> {
+        match self.0.iter().position(|primed| !primed.get()) {
+            Some(rank) => Err(UnprimedPair { rank }),
+            None => Ok(()),
+        }
+    }
+}
+
 pub(crate) struct Pair<'a> {
     pub layers: Vec<usize>,
+    primed: Primed,
     /// Input bytes per row a source broadcast carries (the backends' input
     /// dtype: FP8 K32 wire or BF16 rows); 0 when routes only.
     wire_row_bytes: usize,
@@ -518,6 +540,7 @@ impl<'a> Pair<'a> {
             .unwrap_or(0);
         Ok(Self {
             layers,
+            primed: Primed::default(),
             wire_row_bytes,
             ranks: ranks.map(RefCell::new),
             combine: FusedCombine::new(library, exchange)?,
@@ -665,6 +688,7 @@ impl<'a> Pair<'a> {
     }
 
     /// Resolve all lazy backend capacities before either rank queues a peer wait.
+    /// Required for both ranks: [`Self::enqueue`] refuses an unprimed pair.
     /// # Safety
     /// Initialized maximum-capacity input/routes are live on rank's drained startup stream.
     pub(crate) unsafe fn prime(
@@ -697,7 +721,9 @@ impl<'a> Pair<'a> {
                 self.combine_output(&**backend, shared, out, rows, stream)?;
                 self.library.cuda_stream_synchronize(stream)
             }
-        })
+        })?;
+        self.primed.mark(rank);
+        Ok(())
     }
 
     unsafe fn combine_output(
@@ -798,6 +824,8 @@ impl<'a> Pair<'a> {
         broadcast: Option<Broadcast>,
         abort: &mut dyn FnMut(),
     ) -> Result<()> {
+        // Refused before queuing anything: no wait or push exists to abort.
+        self.primed.require()?;
         let mut aborted = false;
         let mut abort_once = || {
             if !aborted {
@@ -1403,6 +1431,28 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unprimed_pair_cannot_be_stepped() {
+        let primed = super::Primed::default();
+        assert_eq!(primed.require(), Err(super::UnprimedPair { rank: 0 }));
+        primed.mark(0);
+        assert_eq!(primed.require(), Err(super::UnprimedPair { rank: 1 }));
+        primed.mark(1);
+        assert_eq!(primed.require(), Ok(()));
+        // Every step entry funnels through the refusal before any peer operation.
+        let source = include_str!("pair.rs");
+        let with = source.split("    unsafe fn enqueue_with(").nth(1).unwrap().split("\n    }\n}").next().unwrap();
+        let refusal = with.find("self.primed.require()?").expect("enqueue refuses an unprimed pair");
+        assert!(["self.routes.on(", "self.routes.push(", "self.routes.wait(", "backend.enqueue("]
+            .iter().all(|call| with.find(call).is_some_and(|at| refusal < at)));
+        for entry in ["    pub(crate) unsafe fn enqueue(\n", "    pub(crate) unsafe fn enqueue_from(\n"] {
+            let body = source.split(entry).nth(1).unwrap().split("\n    }\n").next().unwrap();
+            assert!(body.contains("self.enqueue_with("), "{entry}");
+        }
+        let prime = source.split("    pub(crate) unsafe fn prime(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(prime.contains("self.primed.mark(rank)"));
+    }
+
     #[test]
     fn whole_executor_binds_nonzero_native_f32_and_bf16_prefixes() -> anyhow::Result<()> {
         use super::*;
