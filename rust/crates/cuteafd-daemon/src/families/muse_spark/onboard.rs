@@ -76,13 +76,14 @@ pub(crate) fn push_plan(cfg: &MuseSparkConfig, placement: &Placement, gpus: usiz
 /// `modules` carries the package modules startup bound before the measured
 /// pre-weight sample (one entry per device, `None` when nothing was preloaded).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cfg: &MuseSparkConfig,
+pub(crate) fn load<'a>(devices: &[Device<'a>], streams: &[*mut std::ffi::c_void], programs: &[&'a Programs<'a>], cfg: &MuseSparkConfig,
     catalog: &cuteafd_loader::OfficialV41Catalog, package: &std::path::Path, placement: &Placement,
     layers: Vec<usize>, unit_rows: usize,
     modules: Vec<Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>>,
     pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>) -> Result<Vec<OnboardedExperts<'a>>> {
     ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1]), "Muse onboarded layers ascending");
-    ensure!(devices.len() == programs.len() && matches!(devices.len(), 1 | 2), "Muse onboarding on one GPU or a pair");
+    ensure!(devices.len() == programs.len() && devices.len() == streams.len() && matches!(devices.len(), 1 | 2),
+        "Muse onboarding on one GPU or a pair");
     ensure!(modules.is_empty() || modules.len() == devices.len(), "Muse preloaded module device count");
     let own = own_bytes(cfg, unit_rows);
     let layout = CombineTables { capacity: unit_rows };
@@ -115,11 +116,15 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
         };
         vec![weights.execution_with_modules(modules.next().flatten())?]
     };
-    executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
+    executors.into_iter().zip(devices).zip(programs).zip(streams).map(|(((executor, &device), programs), &stream)| {
+        let tables = Allocation::new(device, layout.bytes(), Tag::workspace("muse/expert-combine"))?;
+        // #2544: the combine tables' ordered-upload staging and fence exist
+        // before readiness; `tables_for` refuses rather than create them mid-step.
+        // SAFETY: a live admitted allocation on this GPU and its rank stream.
+        device.run(|| unsafe { device.library.reserve_h2d_ordered(tables.buffer, stream) })?;
         Ok(OnboardedExperts { epilogue: device.run(|| PartialEpilogue::load(device.library, programs, unit_rows))?,
             own: Allocation::new(device, own, Tag::workspace("muse/expert-partials"))?,
-            tables: Allocation::new(device, layout.bytes(), Tag::workspace("muse/expert-combine"))?, layout,
-            executor, layers: layers.clone(), written: None })
+            tables, layout, executor, layers: layers.clone(), written: None })
     }).collect()
 }
 
@@ -135,8 +140,9 @@ impl OnboardedExperts<'_> {
         if self.written.as_deref() == Some(planes) { return Ok(()); }
         let rows: Vec<u32> = (0..u32::try_from(self.layout.capacity)?).collect();
         let image = self.layout.image(planes, &super::experts::ReplyPlanView { bf16_rows: &rows, wide_rows: &[], wide_at: 0, other_rows: &[], other_at: 0 })?;
-        // SAFETY: this GPU's fixed tables; every combine that reads them follows on `stream`.
-        unsafe { library.copy_h2d_ordered(self.tables.buffer, &image, stream)?; }
+        // SAFETY: this GPU's fixed tables, reserved on `stream` at load; every
+        // combine that reads them follows on `stream`.
+        unsafe { library.copy_h2d_reserved(self.tables.buffer, &image, stream)?; }
         self.written = Some(planes.to_vec());
         Ok(())
     }
@@ -168,6 +174,18 @@ mod tests {
             assert_eq!(cached[bf16_map..bf16_map + rows * 4], wave[bf16_map..bf16_map + rows * 4]);
         }
         Ok(())
+    }
+
+    /// #2544: the combine tables are reserved at load on the rank stream, and
+    /// the step uploads only through the refusing reserved path.
+    #[test]
+    fn combine_tables_are_reserved_at_load_and_uploaded_only_when_reserved() {
+        let source = include_str!("onboard.rs").split("#[cfg(test)]").next().unwrap();
+        let load = source.split("pub(crate) fn load<'a>(").nth(1).unwrap().split("impl OnboardedExperts").next().unwrap();
+        assert!(load.find("reserve_h2d_ordered(tables.buffer, stream)").unwrap() < load.find("Ok(OnboardedExperts").unwrap());
+        let tables = source.split("pub(crate) fn tables_for(").nth(1).unwrap().split("pub(crate) fn own_rows(").next().unwrap();
+        assert!(tables.contains("copy_h2d_reserved(self.tables.buffer"));
+        assert!(!tables.contains("copy_h2d_ordered("));
     }
 
     /// The partial epilogue's BF16 map for an all-BF16 plan is the identity

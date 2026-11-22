@@ -604,6 +604,44 @@ struct Tp2Onboard<'a> {
     broadcast_logged: Vec<Cell<bool>>,
 }
 
+/// One lane's TP2 scratch: packed routes (ids, then weights) and the input rows.
+struct ScratchLayout { ids: usize, weights: usize, input: usize }
+fn scratch_layout(unit: usize) -> ScratchLayout {
+    let packed = crate::shared::experts::rtx::pair::PackedRoutes::new(unit, 8);
+    ScratchLayout { ids: 0, weights: packed.weights, input: packed.bytes }
+}
+
+impl<'a> Tp2Onboard<'a> {
+    /// #2544: resolve both ranks' lazy backend capacities and combine first use
+    /// at startup, before any peer wait exists, on each rank's lane stream.
+    /// Lane 0's admitted scratch holds valid maximum-row routes and zero wire
+    /// rows; its partial plane takes the discarded output.
+    fn prime(&self, devices: &[Device<'a>], unit: usize, layout: &ScratchLayout) -> Result<()> {
+        use crate::shared::experts::rtx::{ExpertInput, Routes};
+        let ids = (0..unit * 8).map(|i| u32::try_from(i % super::routed::EXPERTS).map(u32::to_le_bytes))
+            .collect::<Result<Vec<_>, _>>()?.concat();
+        for rank in 0..2 {
+            let device = devices[rank];
+            let scratch = self.scratch[rank].buffer;
+            let at = |offset: usize| scratch.ptr.cast::<u8>().wrapping_add(offset).cast::<c_void>();
+            device.run(|| {
+                device.library.cuda_zero_bytes(scratch, scratch.bytes)?;
+                device.library.copy_h2d(CuteafdDeviceBuffer { ptr: at(layout.ids), bytes: ids.len(), ..scratch }, &ids)?;
+                // Zero BF16 rows: the shared operand a BF16 combine adds.
+                device.library.cuda_zero_bytes(self.incoming[rank].buffer, self.incoming[rank].buffer.bytes)
+            })?;
+            let input = if self.pair.uses_fp8_input() { ExpertInput::Fp8K32(at(layout.input)) }
+                else { ExpertInput::Bf16(at(layout.input)) };
+            // SAFETY: initialized maximum-row routes/input in this rank's admitted
+            // scratch, a disjoint zero shared operand and partial output, all live
+            // on the drained startup stream with no peer wait queued.
+            unsafe { self.pair.prime(rank, input, Routes { ids: at(layout.ids), weights: at(layout.weights) }, unit,
+                self.incoming[rank].buffer.ptr.cast(), self.partial[rank].buffer.ptr)?; }
+        }
+        Ok(())
+    }
+}
+
 impl<'e, 'a> MainExecution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
     fn bind(checkpoint: &'a Checkpoint, ownership: ExecutionOwnership, native: NativeOwners<'a>,
@@ -720,6 +758,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                         plane(1, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?],
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
+                onboard.prime(&devices, unit, &scratch_layout(unit))?;
                 let mut expected = tp2_exchange_requests(unit, lanes, kind)?;
                 if cuteafd_loader::serving_capacity::peer_wait_diagnostics() {
                     expected.push(cuteafd_loader::serving_capacity::PeerStorageLayout::new(
@@ -2270,6 +2309,18 @@ mod admission_tests {
         admit_native(&admission, &[120], &[0], allocate)?;
         assert_eq!(calls.get(), 1);
         Ok(())
+    }
+
+    /// #2544: the TP2 pair is primed while binding, before the execution (and
+    /// so any step that could queue a peer wait) exists.
+    #[test]
+    fn tp2_pair_is_primed_before_execution_exists() {
+        let source = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let bind = source.split("    fn bind(checkpoint: &'a Checkpoint").nth(1).unwrap();
+        let primed = bind.find("onboard.prime(&devices, unit, &scratch_layout(unit))?").expect("bind primes the pair");
+        assert!(primed < bind.find("Some(onboard)").unwrap() && primed < bind.find("let execution = Self {").unwrap());
+        let prime = source.split("    fn prime(&self, devices: &[Device<'a>]").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(prime.contains("for rank in 0..2") && prime.contains("self.pair.prime(rank,"));
     }
 
     #[test]
