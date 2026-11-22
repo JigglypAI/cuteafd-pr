@@ -1,0 +1,20 @@
+[Unit]
+Description=Publish and verify the sealed full Hy4 K4 MC checkpoint
+ConditionPathExists=%h/Developer/quantization-runs/hy4-k4-mc/production/numerical-complete.json
+OnSuccess=cuteafd-hy4-handoff.service
+OnFailure=cuteafd-hy4-progress.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=HF_XET_HIGH_PERFORMANCE=1
+Environment=HF_XET_FIXED_UPLOAD_CONCURRENCY=32
+UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
+StandardInput=file:%h/.cache/huggingface/token
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4.publish --root %h/Developer/quantization-runs/hy4-k4-mc/production --output %h/Developer/quantization-runs/hy4-k4-mc/package
+TimeoutStartSec=infinity
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/progress-updates/publication.log
+StandardError=inherit

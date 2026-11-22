@@ -1,0 +1,16 @@
+[Unit]
+Description=Adopt full Hy4 and verify its eight-store placement
+ConditionPathExists=%h/Developer/quantization-runs/hy4-k4-mc/production/publication-complete.json
+OnSuccess=cuteafd-hy4-cleanup.service
+OnFailure=cuteafd-hy4-progress.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4.handoff --root %h/Developer/quantization-runs/hy4-k4-mc/production --output %h/Developer/quantization-runs/hy4-k4-mc/package
+TimeoutStartSec=infinity
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/progress-updates/handoff.log
+StandardError=inherit

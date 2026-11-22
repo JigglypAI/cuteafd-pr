@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 from functools import partial
@@ -15,30 +16,47 @@ from inkling2 import handoff as nest
 from inkling2 import publish as hub
 from kimi_k3.uniform_k2.storage import atomic_json, file_identity
 
-from .publish import FAMILY, TARGET, TARGET_REPO, pinned_files
+from .publish import TARGET, TARGET_REPO, pinned_files
 
 MODEL = 'models--' + TARGET_REPO.replace('/', '--')
 PIN_HOST = 'raptor'
 ADOPTION_HOST = 'maxq'
 TARGETS = frozenset(nest.TARGETS)
 KEEP_REF = 'keep/hy4-k4-mc'
-NATIVE = partial(nest.native, repo_id=TARGET_REPO)
 
 
-def _publication(root, output):
+@dataclass(frozen=True)
+class Placement:
+    target: hub.PublicationTarget
+    build_prefix: str
+    engram: bool = False
+
+    @property
+    def model(self):
+        return 'models--' + self.target.repo_id.replace('/', '--')
+
+    @property
+    def schema(self):
+        return f'cuteafd-{self.target.family}-handoff-complete-v2'
+
+
+FLASH = Placement(TARGET, 'hy4-flash-k4-mc', engram=True)
+
+
+def _publication(root, output, layout=FLASH):
     record = hub.load(root / 'publication-complete.json')
     identity = {k: record[k] for k in ('repo_id', 'revision', 'manifest_sha256')}
-    if (record.get('schema') != TARGET.schema('complete') or record.get('status') != 'passed'
-            or identity['repo_id'] != TARGET_REPO or record.get('output') != str(output)
+    if (record.get('schema') != layout.target.schema('complete') or record.get('status') != 'passed'
+            or identity['repo_id'] != layout.target.repo_id or record.get('output') != str(output)
             or not re.fullmatch('[0-9a-f]{40,64}', identity['revision'])
             or hub.manifest_digest(record['files']) != identity['manifest_sha256']):
         raise ValueError('matching verified Hy4 publication required before handoff')
     return record, identity
 
 
-def _inventory(call, managed, files, revision):
+def _inventory(call, managed, files, revision, *, physical_paths=None, model=MODEL):
     """Use native namespace metadata and read only the two small revision refs."""
-    repo = nest.NAMESPACE / MODEL
+    repo = nest.NAMESPACE / model
     snapshot = repo / 'snapshots' / revision
     snapshots = call('ls', snapshot.parent)['entries']
     if [(row['name'], row['kind']) for row in snapshots] != [(revision, 'directory')]:
@@ -46,6 +64,22 @@ def _inventory(call, managed, files, revision):
     blobs = {row['name']: row for row in call('ls', repo / 'blobs')['entries']}
     if set(blobs) != {row['hub_oid'] for row in files.values()}:
         raise ValueError('managed blob inventory differs from publication')
+    physical_by_oid = {}
+    for oid, meta in blobs.items():
+        physical = repo / 'blobs' / oid
+        if meta.get('kind') == 'symlink':
+            # SparkNest's no-copy import mirrors the HF alias and may migrate
+            # its physical file to the deduplicated hub-wide store.
+            target = meta.get('target', '')
+            match = re.fullmatch(r'\.\./\.\./blobs/([a-f0-9]{2})/([a-f0-9]{64})', target)
+            if not match or not match[2].startswith(match[1]):
+                raise ValueError('invalid managed shared blob alias: ' + oid)
+            physical = nest.NAMESPACE / 'blobs' / match[1] / match[2]
+            rows = call('ls', physical)['entries']
+            if len(rows) != 1 or rows[0]['name'] != physical.name:
+                raise ValueError('managed shared blob does not resolve: ' + oid)
+            meta = rows[0]
+        physical_by_oid[oid] = (physical, meta)
     result = {}
     directories = {parent for name in files for parent in Path(name).parents}
     for directory in sorted(directories):
@@ -56,13 +90,16 @@ def _inventory(call, managed, files, revision):
                 continue
             if name not in files or name in result or row.get('kind') != 'symlink':
                 raise ValueError('managed snapshot file inventory differs: ' + name)
-            blob = blobs[files[name]['hub_oid']]
-            expected = os.path.relpath(repo / 'blobs' / blob['name'], snapshot / directory)
+            oid = files[name]['hub_oid']
+            physical, blob = physical_by_oid[oid]
+            expected = os.path.relpath(repo / 'blobs' / oid, snapshot / directory)
             if (row.get('target') != expected or blob.get('kind') != 'regular' or not blob['hosts']
                     or blob.get('sealed') is not True or blob.get('writing_on') is not None
                     or blob['size'] != files[name]['bytes']):
                 raise ValueError('managed snapshot blob identity or size differs: ' + name)
             result[name] = set(blob['hosts'])
+            if physical_paths is not None:
+                physical_paths[name] = physical
     if result.keys() != files.keys():
         raise ValueError('managed file inventory is incomplete')
     refs = repo / 'refs'
@@ -75,7 +112,7 @@ def _inventory(call, managed, files, revision):
                 continue
             name = (directory / row['name']).relative_to(repo).as_posix()
             if (row['kind'] != 'regular' or row['size'] != len(revision) or row.get('writing_on') is not None
-                    or not row['hosts'] or (Path(managed) / MODEL / name).read_bytes() != revision.encode()):
+                    or not row['hosts'] or (Path(managed) / model / name).read_bytes() != revision.encode()):
                 raise ValueError('managed ref differs from pinned publication: ' + name)
             result[name] = set(row['hosts'])
     return result
@@ -144,11 +181,13 @@ def _pin(call, root, state_path, state, files, pins, revision, holders):
                      job_description=f'replicate {snapshot / filename}')
 
 
-def _project(plan, holders, files):
+def _project(plan, holders, files, physical_paths=None, model=MODEL):
     projected = {name: set(hosts) for name, hosts in holders.items()}
     aliases = {}
+    local_blobs = nest.NAMESPACE / model / 'blobs'
     for name, row in files.items():
-        aliases.setdefault(row['hub_oid'], []).append(name)
+        physical = physical_paths[name] if physical_paths is not None else local_blobs / row['hub_oid']
+        aliases.setdefault(physical, []).append(name)
     seen = set()
     for step in plan['steps']:
         host = step['host']
@@ -159,7 +198,9 @@ def _project(plan, holders, files):
             if (path, host) in seen:
                 raise ValueError('native placement has duplicate operations on one file/place')
             seen.add((path, host))
-            names = aliases[path.name] if path.parent.name == 'blobs' else [path.relative_to(nest.NAMESPACE / MODEL).as_posix()]
+            names = aliases.get(path)
+            if names is None:
+                names = [path.relative_to(nest.NAMESPACE / model).as_posix()]
             for name in names:
                 if step['kind'] == 'replicate':
                     projected[name].add(host)
@@ -168,11 +209,11 @@ def _project(plan, holders, files):
     return projected
 
 
-def _place(call, root, state_path, state, revision, files, pins, inventory):
+def _place(call, root, state_path, state, revision, files, pins, inventory, physical_paths, layout):
     key = 'placement'
-    goal = ('--place', 'hf:' + TARGET_REPO, '--factor', '1/8',
+    goal = ('--place', 'hf:' + layout.target.repo_id, '--factor', '1/8',
             *(v for host in nest.TARGET_ARGS for v in ('--host', host)))
-    checks = dict(repo_id=TARGET_REPO, evict_hosts=TARGETS, blob_paths=True, keep_ref=KEEP_REF)
+    checks = dict(repo_id=layout.target.repo_id, evict_hosts=TARGETS, physical_paths=physical_paths, keep_ref=KEEP_REF)
     proposed = root / (key + '-proposed.json')
     raw = hub.load(proposed) if proposed.exists() else call('plan', *goal)
     nest.check_plan(raw, revision, files, **checks)
@@ -196,7 +237,7 @@ def _place(call, root, state_path, state, revision, files, pins, inventory):
             nest.check_plan(shown, revision, files, skipped=skipped, **checks)
             if shown != expected:
                 raise ValueError('native plan changes differ from the reviewed operations')
-            _check_layout(_project(shown, inventory(), files), files, pins)
+            _check_layout(_project(shown, inventory(), files, physical_paths, layout.model), files, pins)
             atomic_json(reviewed, shown)
             if not operations:
                 return None
@@ -207,8 +248,7 @@ def _place(call, root, state_path, state, revision, files, pins, inventory):
     if reviewed.exists() and hub.load(reviewed) != expected:
         raise ValueError('persisted reviewed plan differs from the proposed operations')
     if skipped and not reviewed.exists():
-        blobs = nest.NAMESPACE / MODEL / 'blobs'
-        call('plan', 'skip', raw['id'], *(blobs / files[n]['hub_oid'] for n in sorted(skipped)))
+        call('plan', 'skip', raw['id'], *(physical_paths[n] for n in sorted(skipped)))
     command = ('plan', 'apply', raw['id'], '--wait')
     if operations:
         eviction_count = len(operations) if all(s['kind'] == 'evict' for s, _ in operations) else None
@@ -218,19 +258,21 @@ def _place(call, root, state_path, state, revision, files, pins, inventory):
         reviewed_plan(*command)  # Verify placement already satisfies the goal.
 
 
-def handoff(root, output, stage_root, *, call=NATIVE, managed=nest.MANAGED):
+def handoff(root, output, stage_root, *, call=None, managed=nest.MANAGED, layout=FLASH):
+    if call is None:
+        call = partial(nest.native, repo_id=layout.target.repo_id)
     root, output, stage_root = Path(root).resolve(), Path(output).absolute(), Path(stage_root).absolute()
-    published, identity = _publication(root, output)
+    published, identity = _publication(root, output, layout)
     files, revision = published['files'], identity['revision']
-    pins = pinned_files(files)
-    if not pins:
+    pins = pinned_files(files) if layout.engram else set()
+    if layout.engram and not pins:
         raise ValueError('published FP8 Engram shard inventory is empty')
     with (root / 'handoff.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         marker = root / 'handoff-complete.json'
         if marker.exists():
             complete = hub.load(marker)
-            if (complete.get('schema') != 'cuteafd-hy4_flash-handoff-complete-v2'
+            if (complete.get('schema') != layout.schema
                     or complete.get('one_fabric_copy_per_file') is not True or complete.get('status') != 'passed' or complete.get('identity') != identity
                     or complete.get('stage_root') != str(stage_root)):
                 raise ValueError('Hy4 handoff receipt differs')
@@ -243,38 +285,49 @@ def handoff(root, output, stage_root, *, call=NATIVE, managed=nest.MANAGED):
         if not state_path.exists():
             atomic_json(state_path, state)
         if 'import-job' in state or 'import-job-submission' in state:
-            repo = stage_root / MODEL
+            repo = stage_root / layout.model
         else:
-            repo = nest.stage_snapshot(published, stage_root, repo_id=TARGET_REPO, family=FAMILY,
+            repo = nest.stage_snapshot(published, stage_root, repo_id=layout.target.repo_id, family=layout.target.family,
                                        hub_blobs=True, keep_ref=KEEP_REF)
         nest.run_job(root, state_path, state, call, 'import-job',
                      ('hf', 'import', repo, '--offline', '--no-copy'),
                      job_description=f'hf import {repo} -> {nest.NAMESPACE}',
                      importing_files=len({r['hub_oid'] for r in files.values()}))
 
-        def inventory():
-            return _inventory(call, managed, files, revision)
+        physical_paths = {}
+        imported = _inventory(call, managed, files, revision, physical_paths=physical_paths, model=layout.model)
 
-        imported = inventory()
+        def inventory():
+            current_paths = {}
+            holders = _inventory(call, managed, files, revision, physical_paths=current_paths, model=layout.model)
+            if physical_paths != current_paths:
+                raise ValueError('managed physical blob paths changed during Hy4 handoff')
+            return holders
 
         def save_inventory(filename, holders):
             atomic_json(root / filename, {name: sorted(hosts) for name, hosts in holders.items()})
 
+        physical_receipt = root / 'placement-physical-paths.json'
+        resolved = {name: str(path) for name, path in physical_paths.items()}
+        if physical_receipt.exists() and hub.load(physical_receipt) != resolved:
+            raise ValueError('managed physical blob paths differ from the handoff receipt')
+        atomic_json(physical_receipt, resolved)
         if not (root / 'placement-before.json').exists():
             save_inventory('placement-before.json', imported)
-        _pin(call, root, state_path, state, files, pins, revision, imported)
+        if pins:
+            _pin(call, root, state_path, state, files, pins, revision, imported)
         holders = inventory()
         if any(PIN_HOST not in holders[n] or not holders[n] <= {PIN_HOST, ADOPTION_HOST} for n in pins):
             raise ValueError('FP8 Engram files are not exclusively pinned plus the adoption copy')
-        _place(call, root, state_path, state, revision, files, pins, inventory)
+        _place(call, root, state_path, state, revision, files, pins, inventory, physical_paths, layout)
         placed = inventory()
         distribution = _check_layout(placed, files, pins)
         save_inventory('placement-after.json', placed)
-        record = dict(schema='cuteafd-hy4_flash-handoff-complete-v2', status='passed', identity=identity,
-            repo_id=TARGET_REPO, revision=revision, files=len(files), copied_bytes=0,
+        record = dict(schema=layout.schema, status='passed', identity=identity,
+            repo_id=layout.target.repo_id, revision=revision, files=len(files), copied_bytes=0,
             stage_root=str(stage_root), targets=list(nest.TARGETS), distribution_bytes=distribution,
-            pinned_host=PIN_HOST, pinned_files=sorted(pins), pinned_bytes=sum(files[n]['bytes'] for n in pins),
-            managed_snapshot=str(Path(managed) / MODEL / 'snapshots' / revision),
+            pinned_host=PIN_HOST if pins else None, pinned_files=sorted(pins), pinned_bytes=sum(files[n]['bytes'] for n in pins),
+            managed_snapshot=str(Path(managed) / layout.model / 'snapshots' / revision),
             one_fabric_copy_per_file=True, adoption_host=ADOPTION_HOST,
             retained_adoption_files=sum(ADOPTION_HOST in hosts for hosts in placed.values()),
             time=datetime.now(timezone.utc).isoformat())
@@ -300,14 +353,16 @@ def _engram_staging(root, directory, files):
     return stage
 
 
-def retire(root, output, *, intermediates=(), build_root=None, engram_stage=None):
+def retire(root, output, *, intermediates=(), build_root=None, engram_stage=None, layout=FLASH):
+    if engram_stage and not layout.engram:
+        raise ValueError('full Hy4 has no Engram staging')
     root = Path(root).resolve()
-    published, identity = _publication(root, Path(output).absolute())
+    published, identity = _publication(root, Path(output).absolute(), layout)
     complete = hub.load(root / 'handoff-complete.json')
-    if (complete.get('schema') != 'cuteafd-hy4_flash-handoff-complete-v2'
-            or complete.get('pinned_host') != PIN_HOST
-            or set(complete.get('pinned_files', [])) != pinned_files(published['files'])):
-        raise ValueError('verified Hy4 Engram placement is required for cleanup')
+    if (complete.get('schema') != layout.schema
+            or complete.get('pinned_host') != (PIN_HOST if layout.engram else None)
+            or set(complete.get('pinned_files', [])) != (pinned_files(published['files']) if layout.engram else set())):
+        raise ValueError('verified matching Hy4 placement is required for cleanup')
     with (root / 'handoff.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         marker = root / 'handoff-cleanup-complete.json'
@@ -317,12 +372,12 @@ def retire(root, output, *, intermediates=(), build_root=None, engram_stage=None
                 raise ValueError('Hy4 cleanup receipt differs')
             return record
         stage = _engram_staging(root, engram_stage, published['files']) if engram_stage else None
-        return nest.retire(root, intermediates=intermediates, build_root=build_root, repo_id=TARGET_REPO,
-                           family=FAMILY, build_prefix='hy4-flash-k4-mc', verified_staging=stage,
+        return nest.retire(root, intermediates=intermediates, build_root=build_root, repo_id=layout.target.repo_id,
+                           family=layout.target.family, build_prefix=layout.build_prefix, verified_staging=stage,
                            placement_check='one_fabric_copy_per_file')
 
 
-def main():
+def run_cli(layout):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -336,11 +391,15 @@ def main():
         request = hub.load(args.cleanup_request) if args.cleanup_request else {}
         if set(request) - {'intermediates', 'build_root'}:
             parser.error('unsupported cleanup request field')
-        result = retire(args.root, args.output, engram_stage=args.engram_stage, **request)
+        result = retire(args.root, args.output, engram_stage=args.engram_stage, layout=layout, **request)
     else:
         stage = args.stage_root or args.root / 'handoff-stage'
-        result = handoff(args.root, args.output, stage)
+        result = handoff(args.root, args.output, stage, layout=layout)
     print(json.dumps(result), flush=True)
+
+
+def main():
+    run_cli(FLASH)
 
 
 if __name__ == '__main__':

@@ -65,7 +65,7 @@ def successful(result, *, importing_files=None, eviction_files=None):
 
 
 def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
-               skipped=(), evict_hosts=None, blob_paths=False, keep_ref=None):
+               skipped=(), evict_hosts=None, blob_paths=False, keep_ref=None, physical_paths=None):
     goal = plan.get('goal', {})
     # Native goals retain CLI disk selectors; execution steps use display names.
     disk_names = dict(zip(TARGET_ARGS[:2], TARGETS[:2]))
@@ -101,6 +101,10 @@ def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
             else:
                 relative(name)
                 physical = model / 'blobs' / files[name]['hub_oid'] if blob_paths and name in files else snapshot / name
+                if physical_paths is not None and name in files:
+                    physical = physical_paths[name]
+                    if step['kind'] == 'evict' and physical.parent.parent == NAMESPACE / 'blobs':
+                        raise ValueError('placement must not evict a shared hub blob')
                 valid = (name in files and path == str(physical)
                     and copy.get('group') == repo_id and copy.get('size') == files[name]['bytes'])
             if not valid or bool(copy.get('skip')) != (name in skipped):
@@ -350,6 +354,11 @@ def handoff(root, stage_root, *, call=native, managed=MANAGED):
 
 def _known_unreadable_process(argv, comm):
     """Recognize only the known non-dumpable user infrastructure commands."""
+    if comm == 'ssh-agent' and argv and argv[-1:] == [b'']:
+        command = argv[:-1]
+        return command == [b'/usr/bin/ssh-agent', b'-D'] or (
+            len(command) == 5 and command[:4] == [b'ssh-agent', b'tmux', b'new', b'-s']
+            and re.fullmatch(rb'[A-Za-z0-9_-]+', command[4]) is not None)
     return bool(argv) and (argv[:2] == [b'/usr/lib/systemd/systemd', b'--user']
         or argv[0] == b'(sd-pam)'
         or (comm == 'sshd-session' and not any(argv[1:])
@@ -367,7 +376,9 @@ def assert_unused(paths):
     sys.modules[loader.name] = gc
     loader.exec_module(gc)
     mounts = gc.docker_mounts()
-    busy, partial = gc.process_paths(Path('/'))
+    # The cleanup command names its output and staging leaves as operands.
+    # Still inspect this process's cwd, descriptors and mapped files.
+    busy, partial = gc.process_paths(Path('/'), ignore_own_cmdline=True)
     if mounts is None:
         raise RuntimeError('cannot inspect containers before retirement')
     if partial:
