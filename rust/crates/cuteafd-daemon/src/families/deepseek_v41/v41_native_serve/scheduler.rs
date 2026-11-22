@@ -2217,7 +2217,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions,
+            || lane_timing(lane, started, draft_us, verified_us, &seeds));
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
@@ -2265,7 +2266,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions,
+            || lane_timing(lane, started, draft_us, executed_us - prepared_us, &seeds));
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
@@ -2730,11 +2732,20 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
     console::Event::Gauges(gauges)
 }
 
+/// A lane round's trace times from the values its console round already
+/// carries; `seeds` are (id, anchor, committed end, remaining) in lane order.
+pub(super) fn lane_timing(lane: usize, started: Instant, draft_us: u64, verify_us: u64,
+    seeds: &[(u64, u32, u64, usize)]) -> crate::shared::draft::history::RoundTiming {
+    crate::shared::draft::history::RoundTiming { lane, round_us: started.elapsed().as_micros() as u64, draft_us,
+        verify_us, context: seeds.iter().map(|seed| seed.2 as usize).collect() }
+}
+
 /// Feed a completed lane round's acceptance to the draft policy. A request
 /// that finished on a token its next draft also proposed (or on its last
 /// verified row) was not judged there: its round is censored, not a miss.
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], emissions: &[Vec<u32>],
+    timing: impl FnOnce() -> crate::shared::draft::history::RoundTiming,
 ) {
     let Some(draft) = draft else { return };
     let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(emissions)
@@ -2743,7 +2754,8 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
                 accepted: count, censored: crate::shared::draft::history::finish_censored(r.finished, count as usize,
                     input, emitted.last().copied()) })).collect();
     if requests.len() != members.len() { return; }
-    draft.observe_round(&requests);
+    let timing = crate::shared::draft::history::replay_trace().is_some().then(timing);
+    draft.observe_round(&requests, timing);
 }
 /// Resolve one finishing row's retained frontier from its downloaded bytes.
 ///
@@ -2934,6 +2946,21 @@ mod sampling_tests {
         let idle = &code[start..start + code[start..].find("receive.blocking_recv()").expect("the idle wait")];
         assert!(idle.contains("stats.lock()") && idle.contains("serving_stats("),
             "going idle must publish the serving stats (prefill_queue.prefilling stays stale otherwise): {idle}");
+    }
+
+    /// Every V4.1 lane round hands the draft trace the same times its console
+    /// round carries, and the committed ends of its seeds as context.
+    #[test]
+    fn lane_rounds_trace_their_console_times_and_context() {
+        let source = include_str!("scheduler.rs");
+        let code = source.split("#[cfg(test)]\nmod sampling_tests").next().unwrap();
+        assert_eq!(code.matches("|| lane_timing(lane, started, draft_us, ").count(), 2);
+        assert!(code.contains("|| lane_timing(lane, started, draft_us, verified_us, &seeds)"));
+        assert!(code.contains("|| lane_timing(lane, started, draft_us, executed_us - prepared_us, &seeds)"));
+        let lanes = include_str!("scheduler/independent.rs");
+        assert!(lanes.contains("|| lane_timing(lane, started, draft_us, verify_us, &drafting)"));
+        let timing = lane_timing(1, Instant::now(), 1500, 7000, &[(4, 11, 8192, 64), (5, 12, 131072, 64)]);
+        assert_eq!((timing.lane, timing.draft_us, timing.verify_us, timing.context), (1, 1500, 7000, vec![8192, 131072]));
     }
 
     /// The lanes stop at their first completed boundary past the debt: an independent

@@ -83,7 +83,7 @@ impl TokenTable {
             }
         }
         let class = if priority.is_decode() { RowClass::Decode } else { RowClass::Prefill };
-        let (mut pins, lookups) = self.cache.acquire(&distinct, class);
+        let (mut pins, lookups) = self.cache.acquire_demand(&distinct, class);
         let (mut misses, mut pending) = (Vec::new(), Vec::new());
         for ((lookup, &id), &slot) in lookups.iter().zip(&distinct).zip(&slots) {
             match *lookup {

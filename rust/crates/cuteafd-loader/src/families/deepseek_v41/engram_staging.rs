@@ -209,7 +209,7 @@ impl EngramBatchStaging {
             }
         }
         let class = if priority.is_decode() { RowClass::Decode } else { RowClass::Prefill };
-        let (pins, lookups) = table.cache().acquire(&addresses, class);
+        let (pins, lookups) = table.cache().acquire_demand(&addresses, class);
         let mut pending = Vec::new();
         let mut misses = Vec::new();
         for ((lookup, &address), &slot) in lookups.iter().zip(&addresses).zip(&slots) {

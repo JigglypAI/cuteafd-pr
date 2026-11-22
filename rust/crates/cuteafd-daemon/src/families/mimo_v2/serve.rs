@@ -1307,7 +1307,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted, censored)).collect();
-        policy.observe(&outcomes);
+        policy.observe_timed(&outcomes, trace.is_some().then(|| history::RoundTiming::since(tally.lane(),
+            tally.started(), lane.draft_s - draft0, step_s, starts.clone())));
     }
     if let Some(trace) = trace.as_mut() {
         let line = crate::shared::speculation_trace::record! {rows: sequences.iter().map(Vec::len).sum::<usize>(),
@@ -1412,6 +1413,8 @@ mod lane_tests {
         assert!(round.contains("console::Step::begin(lease.index())"));
         assert!(round.contains("lanes::commit(&mut DraftContext { engine, drafter, context }).await?;"));
         assert!(!round.contains("drafter.update("), "the drafter commit goes through the lane commit");
+        // Draft rounds carry the step's measured times and the committed starts, only while tracing.
+        assert!(round.contains("policy.observe_timed(&outcomes, trace.is_some().then(|| history::RoundTiming::since(tally.lane(),\n            tally.started(), lane.draft_s - draft0, step_s, starts.clone())));"));
     }
 }
 
