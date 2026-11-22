@@ -56,7 +56,7 @@ def write_manifest(path, manifest):
     path.write_text(json.dumps(manifest, indent=2) + '\n')
 
 
-def select(source, arch, local_tag, engine_commit, output, mode='registry'):
+def select(source, arch, engine_commit, output, mode='registry'):
     toolchain_hash = _toolchain.identity(source)
     base = _toolchain.BASE + _toolchain.BASE_DIGESTS[arch]
     reference = f'{REGISTRY}:tc-{toolchain_hash}-{arch}'
@@ -82,9 +82,10 @@ def select(source, arch, local_tag, engine_commit, output, mode='registry'):
             reason = str(error)
             obj = None
     if obj is None:
-        # Configured dev refs may be digest-pinned; Docker build -t requires a tag.
-        if '@' in local_tag:
-            local_tag = f'cuteafd-dev-local:tc-{toolchain_hash}-{arch}'
+        # A private tag: the shared default (cuteafd-*-dev) moves only through
+        # build-dev-images.sh, so a release fallback never retags it under running
+        # WIP builds or export hosts. Callers use the returned immutable ID.
+        local_tag = f'cuteafd-dev-local:tc-{toolchain_hash}-{arch}'
         print(f'dev image fallback on {arch}: {reason}; building locally from Dockerfile.dev', file=sys.stderr)
         subprocess.run(['docker', 'build', '--build-arg', f'BASE_IMAGE={base}',
                         '--build-arg', f'CUTEAFD_TOOLCHAIN_HASH={toolchain_hash}',
@@ -122,7 +123,6 @@ def main():
     selection = sub.add_parser('select')
     selection.add_argument('--source', type=Path, required=True)
     selection.add_argument('--arch', choices=('amd64', 'arm64'), required=True)
-    selection.add_argument('--local-tag', required=True)
     selection.add_argument('--engine-commit', required=True)
     selection.add_argument('--output', type=Path, required=True)
     selection.add_argument('--mode', choices=('registry', 'build'), default='registry')
@@ -137,7 +137,7 @@ def main():
     merge.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.command == 'select':
-        print(select(args.source.resolve(), args.arch, args.local_tag, args.engine_commit, args.output, args.mode))
+        print(select(args.source.resolve(), args.arch, args.engine_commit, args.output, args.mode))
     elif args.command == 'merge':
         write_manifest(args.output, dict(schema='cuteafd.release-dev-image-reuse/2', legs={
             'coordinator': json.loads(args.coordinator.read_text()),
