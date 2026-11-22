@@ -377,6 +377,14 @@ fn validate_rank_streams(streams: &[Vec<(i32, *mut c_void)>], devices: &[i32]) -
     Ok(())
 }
 
+/// Test-build fault point only: armed per thread, never by environment.
+#[cfg(test)]
+pub(crate) mod fault {
+    thread_local! { static HALF_ISSUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub(crate) fn arm_half_issued() { HALF_ISSUED.with(|armed| armed.set(true)); }
+    pub(super) fn take() -> bool { HALF_ISSUED.with(|armed| armed.replace(false)) }
+}
+
 #[cfg(test)]
 fn validate_streams(streams: &[[(i32, *mut c_void); 2]], devices: [i32; 2]) -> Result<()> {
     ensure!(devices[0] != devices[1], "Kimi exchange needs distinct devices");
@@ -776,6 +784,8 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         // Both publications precede either wait. Every event names this lane,
         // never an assumed rank-global compute stream.
         for rank in 0..2 {
+            #[cfg(test)]
+            if rank == 1 && fault::take() { return self.inject_half_issued_failure(); }
             self.protocol.producers(self.lane, rank)?;
             self.protocol.peer()?.push(rank, self.lane, self.local[rank].buffer(source)?.ptr,
                 self.rows * 7168 * 2)?;
@@ -799,12 +809,24 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         ensure!(std::mem::discriminant(&partials[0]) == std::mem::discriminant(&partials[1]),
             "Kimi peer partial precision/basis differs between ranks");
         for rank in 0..2 {
+            #[cfg(test)]
+            if rank == 1 && fault::take() { return self.inject_half_issued_failure(); }
             let buffer=partials[rank].buffer();
             ensure!(self.protocol.peer()?.slot_bytes()>=buffer.bytes,"Kimi peer slot shorter than typed partial");
             self.protocol.producers(self.lane,rank)?;
             self.protocol.peer()?.push(rank,self.lane,buffer.ptr,buffer.bytes)?;
         }
         Ok(())
+    }
+    /// Test-only #2543 fault: a half-issued step (rank 0 waits for a push rank 1
+    /// never queues) fails the way an RTX expert enqueue does: it publishes the
+    /// abort itself, then returns, so the engine's teardown publishes again.
+    #[cfg(test)]
+    fn inject_half_issued_failure(&self) -> Result<()> {
+        let peer = self.protocol.peer()?;
+        peer.wait(0, self.lane)?;
+        crate::shared::decode_graph::fatal_drain(peer.publish_abort(), "Kimi injected half-issued step abort");
+        anyhow::bail!("injected Kimi half-issued step failure (test fault point)")
     }
     /// Trellis and fused FFN partials use BF16; native FP8 down retains F32.
     fn publish_ffn(&self, layer: usize) -> Result<()> {

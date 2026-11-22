@@ -49,6 +49,7 @@ pub mod load_timing;
 mod observer_context;
 pub mod synchronized_load;
 pub mod push_ring;
+pub mod attic;
 pub mod event_waiters;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1221,6 +1222,10 @@ fn native_tag(tag: memory_ledger::Tag) -> Result<(u32, CString)> {
     Ok((tag.kind.as_raw(), CString::new(tag.owner).context("allocation owner contains NUL")?))
 }
 type FreeDeviceBufferFn = unsafe extern "C" fn(buf: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
+type AllocCarveoutDeviceBufferFn = unsafe extern "C" fn(bytes: usize, fds: *const c_int, fd_bytes: *const usize,
+    fd_count: usize, out: *mut CuteafdDeviceBuffer, out_tail_bytes: *mut usize, kind: u32, owner: *const c_char) -> CuteafdStatus;
+/// `cuteafd_device_buffer_flags_t::CUTEAFD_DEVICE_BUFFER_FLAG_CARVEOUT`.
+pub const DEVICE_BUFFER_FLAG_CARVEOUT: u64 = 8;
 type CudaStreamCreateFn = unsafe extern "C" fn(out: *mut *mut c_void) -> CuteafdStatus;
 type CudaStreamDestroyFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaStreamSynchronizeFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
@@ -1717,6 +1722,10 @@ macro_rules! native_symbols {
     };
 }
 
+/// Carveout range base -> its tail's ledger address (rows are keyed by pointer).
+static CARVEOUT_TAILS: Mutex<std::collections::BTreeMap<usize, Option<usize>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
 native_symbols! {
     cuteafd_xgrammar_compile: XGrammarCompileFn,
     cuteafd_xgrammar_matcher_create: XGrammarMatcherCreateFn,
@@ -1739,6 +1748,7 @@ native_symbols! {
     cuteafd_alloc_device_buffer: AllocDeviceBufferFn,
     cuteafd_alloc_managed_device_buffer: AllocManagedDeviceBufferFn,
     cuteafd_free_device_buffer: FreeDeviceBufferFn,
+    cuteafd_alloc_carveout_device_buffer: AllocCarveoutDeviceBufferFn,
     cuteafd_cuda_stream_create: CudaStreamCreateFn,
     cuteafd_cuda_stream_destroy: CudaStreamDestroyFn,
     cuteafd_cuda_stream_synchronize: CudaStreamSynchronizeFn,
@@ -2572,7 +2582,9 @@ impl NativeLibrary {
         let (free, total) = device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-            Ok(available)
+            // A borrowed, not yet mapped display carveout is outside MemAvailable;
+            // only the expert weight arena consumes it (attic::take_for).
+            Ok(available.saturating_add(usize::try_from(attic::pending_bytes())?))
         })?;
         observer_context::exclude(free, total, observer)
     }
@@ -2789,15 +2801,53 @@ impl NativeLibrary {
         Ok(buffer)
     }
 
+    /// One `[carveout | cuMemCreate tail]` range of `bytes` holding `tag`: the
+    /// lease's slices first, ordinary device memory after. Two ledger owners:
+    /// `<owner>` for the tail (charged like any device allocation) and
+    /// `experts/spark-carveout` for the lent bytes (outside `MemAvailable`).
+    /// Freed by [`Self::free_device_buffer`]; the lease's connection is retained.
+    #[track_caller]
+    pub fn alloc_carveout_device_buffer(&self, bytes: usize, lease: &attic::Lease,
+        tag: memory_ledger::Tag) -> Result<(CuteafdDeviceBuffer, usize)> {
+        use std::os::fd::AsRawFd;
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let alloc_fn: AllocCarveoutDeviceBufferFn = self.cuteafd_alloc_carveout_device_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
+        let fds = lease.parts.iter().map(|(fd, _)| fd.as_raw_fd()).collect::<Vec<_>>();
+        let sizes = lease.parts.iter().map(|(_, bytes)| usize::try_from(*bytes)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let carveout: usize = sizes.iter().sum();
+        anyhow::ensure!(carveout <= bytes, "carveout lease exceeds the arena");
+        let mut buffer = CuteafdDeviceBuffer::default();
+        let mut tail = 0usize;
+        // SAFETY: the fds stay open in `lease` and the outputs are live locals
+        // through this synchronous call; native imports, never closes, the fds.
+        let status = unsafe { alloc_fn(bytes, fds.as_ptr(), sizes.as_ptr(), fds.len(), &mut buffer, &mut tail,
+            kind, owner.as_ptr()) };
+        self.status_to_result("cuteafd_alloc_carveout_device_buffer", status)?;
+        anyhow::ensure!(tail + carveout == bytes && buffer.flags & DEVICE_BUFFER_FLAG_CARVEOUT != 0,
+            "carveout range differs from its lease");
+        let base = buffer.ptr as usize;
+        memory_ledger::record_alloc(memory_ledger::Space::Carveout, buffer.device_id, base, carveout,
+            memory_ledger::tag(memory_ledger::MemoryKind::Experts, "experts/spark-carveout"));
+        if tail > 0 {
+            memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, base + carveout, tail, tag);
+        }
+        CARVEOUT_TAILS.lock().unwrap_or_else(|e| e.into_inner()).insert(base, (tail > 0).then_some(base + carveout));
+        Ok((buffer, tail))
+    }
+
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
         let address = buffer.ptr as usize;
+        let carveout_tail = (buffer.flags & DEVICE_BUFFER_FLAG_CARVEOUT != 0).then(||
+            CARVEOUT_TAILS.lock().unwrap_or_else(|e| e.into_inner()).remove(&address).flatten());
         self.retire_ordered_h2d_destinations(*buffer)?;
         // SAFETY: ordered uploads to this allocation (including interior views)
         // completed and released their sources before the native free.
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)?;
         memory_ledger::record_free(address);
+        if let Some(Some(tail)) = carveout_tail { memory_ledger::record_free(tail); }
         Ok(())
     }
 

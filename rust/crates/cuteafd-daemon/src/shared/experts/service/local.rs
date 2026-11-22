@@ -181,6 +181,8 @@ mod selection_tests {
         assert!(retained_workspace(100, 99, 0, 20, 20).is_err());
         assert!(retained_workspace(100, 190, 91, 20, 20).is_err());
         assert!(retained_workspace(100, 190, 70, 20, 19).is_err());
+        // A carveout-backed arena: its lent bytes are retained device memory too.
+        assert_eq!(retained_workspace(100, 100 + 20 + 50, 60, 0, 0).unwrap(), (10, 0));
     }
 }
 
@@ -201,6 +203,12 @@ fn run_empty_selection(listener: TcpListener, rank: usize,
         }
     }
     Ok(())
+}
+
+/// Device-resident ledger bytes: ordinary device allocations plus lent display carveout.
+fn device_bytes(snapshot: &cuteafd_ffi::memory_ledger::Snapshot, device: i32) -> usize {
+    use cuteafd_ffi::memory_ledger::Space;
+    snapshot.total(Space::Device, device) + snapshot.total(Space::Carveout, device)
 }
 
 fn retained_workspace(before_device: usize, after_device: usize, resident: u64,
@@ -241,7 +249,9 @@ fn measured_worker_runtime(library: &NativeLibrary,
         crate::shared::inventory::InventoryPhase::PostLoad, |_| Ok(()))?;
     let retained = memory_ledger::snapshot();
     let (workspace_bytes, pinned_workspace_bytes) = retained_workspace(
-        baseline.total(Space::Device, device), retained.total(Space::Device, device), resident,
+        // A carveout-backed arena's lent bytes are device memory to CUDA, recorded
+        // in their own ledger space (outside MemAvailable): count both spaces.
+        device_bytes(baseline, device), device_bytes(&retained, device), resident,
         baseline.total(Space::Pinned, -1), retained.total(Space::Pinned, -1))?;
     let sample = inventory.gpus.into_iter().next().context("worker runtime sample missing")?;
     let mut detail = census.detail(baseline, &retained, device)?;
@@ -420,6 +430,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
     };
     census.sample("after_expert_modules_before_weights", Some(&library))?;
+    borrow_carveout();
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         super::push::catch_startup("weight loading", || load_weights(&library, &catalog, &config, &mut modules,
@@ -1328,5 +1339,21 @@ mod owner_tests {
     fn the_owner_loop_parks_after_the_shared_idle_time() {
         let source = include_str!("local.rs");
         assert!(source.contains("let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;"));
+    }
+}
+
+/// Borrow the GB10 display carveout for this worker's routed-expert arena, fail
+/// open: every refusal logs one line and the worker loads exactly as before.
+fn borrow_carveout() {
+    if !cuteafd_ffi::attic::enabled() { return; }
+    let settings = cuteafd_ffi::attic::Settings::from_env();
+    match cuteafd_ffi::attic::borrow(&settings, u64::MAX) {
+        Ok(Some(lease)) => {
+            tracing::info!(bytes = lease.bytes(), version = %lease.version,
+                socket = %settings.socket.display(), "spark-attic: borrowed the display carveout for routed experts");
+            cuteafd_ffi::attic::install(lease);
+        }
+        Ok(None) => tracing::info!("spark-attic: nothing free to lend; running without the display carveout"),
+        Err(error) => tracing::info!(%error, "spark-attic: running without the display carveout"),
     }
 }

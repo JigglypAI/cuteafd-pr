@@ -193,11 +193,7 @@ impl<'a> OwnerTp2<'a> {
         let result = unsafe { self.enqueue_live(owner, layer, rows, input, routes, destination) };
         if result.is_err() {
             // Publish independently, but the whole-engine boundary owns drainage.
-            let aborted = match self.exchange.terminal_state() {
-                crate::shared::peer_split::TerminalState::Aborting => Ok(()),
-                _ => self.exchange.publish_abort(),
-            };
-            crate::shared::decode_graph::fatal_drain(aborted, "owner RTX enqueue abort");
+            crate::shared::decode_graph::fatal_drain(self.exchange.publish_abort(), "owner RTX enqueue abort");
         }
         result
     }
@@ -265,17 +261,19 @@ impl Drop for OwnerTp2<'_> {
         use crate::shared::peer_split::TerminalState;
         let complete = match self.exchange.terminal_state() {
             TerminalState::Drained => true,
-            TerminalState::Active => {
-                // Publish abort before draining: a failed enqueue can leave a
-                // peer wait queued whose producer was never reached.
+            // Publish abort before draining: a failed enqueue can leave a peer
+            // wait queued whose producer was never reached. An owner an error
+            // path already aborted (but no engine terminal finished) drains too.
+            TerminalState::Active | TerminalState::Aborting => {
                 let aborted = self.exchange.publish_abort();
-                let drained = self.exchange.drain_compute();
+                let drained = aborted.as_ref().map_err(|_| anyhow::anyhow!("abort unpublished"))
+                    .and_then(|()| self.exchange.drain_compute());
                 let complete = aborted.is_ok() && drained.is_ok();
                 self.exchange.finish_terminal(complete);
                 if !complete { tracing::error!(?aborted, ?drained, "owner TP2 streams failed to drain"); }
                 complete
             }
-            _ => false,
+            TerminalState::Retained => false,
         };
         if !complete {
             self.library.quarantine_module_after_failed_drain();

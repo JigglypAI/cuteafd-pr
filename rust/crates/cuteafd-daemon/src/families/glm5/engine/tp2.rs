@@ -121,13 +121,7 @@ impl<'a> GlmEngine<'a> {
         crate::shared::memory::device::Device { library: self.library, id: self.device }.run(|| {
             let mut failures = Vec::new();
             for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
-                let result = match exchange.terminal_state() {
-                    crate::shared::peer_split::TerminalState::Active => exchange.publish_abort(),
-                    crate::shared::peer_split::TerminalState::Aborting
-                    | crate::shared::peer_split::TerminalState::Drained => Ok(()),
-                    state => Err(crate::shared::peer_split::TerminalPeerError::Closed(state).into()),
-                };
-                if let Err(error) = result { failures.push(format!("{error:#}")); }
+                if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
             }
             if let Some(drafter) = &self.drafter {
                 if let Err(error) = drafter.publish_abort() { failures.push(format!("draft bridge: {error:#}")); }

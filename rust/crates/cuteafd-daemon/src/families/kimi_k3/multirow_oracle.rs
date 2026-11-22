@@ -219,7 +219,56 @@ fn k31_context_multirow_verify_matches_sequential() -> Result<()> { run_checkpoi
 fn k3_context_packed_prefill_matches_sequential() -> Result<()> { run_checkpoint(false) }
 
 fn run_checkpoint(k31: bool) -> Result<()> {
-    use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
+    use cuteafd_loader::plan::checkpoint::CoreView;
+    let views = if k31 { &[CoreView::Original, CoreView::K6Compact][..] } else { &[CoreView::Original][..] };
+    let mut failures = 0;
+    for &view in views {
+        with_engine(k31, view, |engine, tokens, label| {
+            for n in WIDTHS {
+                for history in HISTORIES { case(engine, &[history], tokens, n, label, &mut failures)?; }
+                case(engine, &HISTORIES, tokens, n, label, &mut failures)?;
+            }
+            Ok(())
+        })?;
+    }
+    ensure!(failures == 0, "K3.1 multirow verify: {failures} selection/score/committed-state defects; retain speculation refusal");
+    Ok(())
+}
+
+/// #2543: a step whose error path already published the abort (rank 0 waiting
+/// for a push rank 1 never queued) retires through the engine teardown's second
+/// publication with every drain: the abort, not the watchdog, releases the
+/// wait, the engine ends Drained and the library is not quarantined.
+#[test]
+#[ignore = "requires K3.1 MC checkpoint, two RTX GPUs and sealed WIP programs"]
+fn k31_double_abort_publication_drains_cleanly() -> Result<()> {
+    use cuteafd_loader::plan::checkpoint::CoreView;
+    with_engine(true, CoreView::Original, |engine, tokens, _| {
+        let (pool, mut placements) = prepare(engine, &[63], tokens)?;
+        super::super::layers::fault::arm_half_issued();
+        let mut batch = placements.iter_mut().map(|p| (p, &tokens[0][63..64])).collect::<Vec<_>>();
+        let error = engine.step_device(&mut batch, &pool, 1, false).err().context("injected step succeeded")?;
+        println!("KIMI_DOUBLE_ABORT error={error:#}");
+        ensure!(format!("{error:#}").contains("injected Kimi half-issued step failure"), "unexpected failure: {error:#}");
+        match error.downcast_ref::<crate::shared::experts::rtx::pair::StepFailure>() {
+            Some(crate::shared::experts::rtx::pair::StepFailure::Terminal { drain, .. }) =>
+                ensure!(drain == "queued streams drained; engine cannot be reused", "teardown retained owners: {drain}"),
+            _ => anyhow::bail!("injected failure was not a terminal step failure: {error:#}"),
+        }
+        ensure!(engine.terminal_state() == crate::shared::peer_split::TerminalState::Drained,
+            "engine ended {:?}", engine.terminal_state());
+        ensure!(engine.library().peer_wait_timeout().is_none(), "abort must release the wait before the watchdog");
+        ensure!(!engine.library().is_quarantined_after_failed_drain(), "clean drain quarantined the module");
+        ensure!(engine.step_device(&mut batch, &pool, 1, false).is_err(), "terminal engine accepted a step");
+        println!("KIMI_DOUBLE_ABORT drained=true quarantined=false watchdog=false");
+        Ok(())
+    })
+}
+
+/// Loads layers 0..3 of the checkpoint (routed experts skipped) on both RTX GPUs.
+fn with_engine(k31: bool, view: cuteafd_loader::plan::checkpoint::CoreView,
+    body: impl FnOnce(&Engine<'_>, &[Vec<u32>], &str) -> Result<()>) -> Result<()> {
+    use cuteafd_loader::plan::checkpoint::CheckpointView;
     cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .map_err(|_| anyhow::anyhow!("oracle requires an isolated process"))?;
     let snapshot = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
@@ -236,41 +285,31 @@ fn run_checkpoint(k31: bool) -> Result<()> {
         tokens.push(tokenizer.encode_ids(&prompt)?);
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let mut failures = 0;
-    let views = if k31 { &[CoreView::Original, CoreView::K6Compact][..] } else { &[CoreView::Original][..] };
-    for &view in views {
-        let view = CheckpointView::select(&snapshot, view)?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
-        let full = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
-        ensure!(full.dsa.is_some() == k31, "oracle checkpoint family differs");
-        let cfg = super::super::admission::prefix(&full, 4)?;
-        use cuteafd_loader::families::kimi_k3::config::KimiAttention;
-        // Attention geometry and DSA semantics are global checkpoint fields.
-        // Actual layers 0..3 span every attention class (three KDA, one DSA).
-        for kind in &full.attention { ensure!(cfg.attention.contains(kind), "uncovered attention class: {kind:?}"); }
-        ensure!(cfg.attention.contains(&KimiAttention::Kda)
-            && cfg.attention.contains(&KimiAttention::Mla), "oracle must include recurrent KDA and DSA");
-        let label = format!("{:?}", view.mode());
-        runtime.block_on(async {
-            let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
-                super::super::startup::Options { media: None,
-                    role: super::super::startup::Role::Golden { skip_routed_experts: true },
-                    expert_usage: false, expert_usage_reader: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Fp8,
-                    devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),
-                    native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
-                    rows: 256, waves: 1, prefill_rows: Some(256), slots: 4, marks: 0, max_context: CONTEXT,
-                    context: cuteafd_loader::placement::planner::Context::pinned(CONTEXT as u64), pool_tokens: Some(4 * CONTEXT as u64),
-                    graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, prefix: None,
-                    prove_serve_admission: false,
-                })?;
-            println!("K31_MULTIROW_LAYOUT view={label} layers=4 routed=skipped ranks=2 attention=Context context={CONTEXT} context_graphs=on optional_kda_ffn_graphs=off");
-            for n in WIDTHS {
-                for history in HISTORIES { case(&loaded.engine, &[history], &tokens, n, &label, &mut failures)?; }
-                case(&loaded.engine, &HISTORIES, &tokens, n, &label, &mut failures)?;
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    }
-    ensure!(failures == 0, "K3.1 multirow verify: {failures} selection/score/committed-state defects; retain speculation refusal");
-    Ok(())
+    let view = CheckpointView::select(&snapshot, view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
+    let full = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
+    ensure!(full.dsa.is_some() == k31, "oracle checkpoint family differs");
+    let cfg = super::super::admission::prefix(&full, 4)?;
+    use cuteafd_loader::families::kimi_k3::config::KimiAttention;
+    // Attention geometry and DSA semantics are global checkpoint fields.
+    // Actual layers 0..3 span every attention class (three KDA, one DSA).
+    for kind in &full.attention { ensure!(cfg.attention.contains(kind), "uncovered attention class: {kind:?}"); }
+    ensure!(cfg.attention.contains(&KimiAttention::Kda)
+        && cfg.attention.contains(&KimiAttention::Mla), "oracle must include recurrent KDA and DSA");
+    let label = format!("{:?}", view.mode());
+    runtime.block_on(async {
+        let loaded = super::super::startup::load(&library, &programs, &checkpoint, &full, &cfg,
+            super::super::startup::Options { media: None,
+                role: super::super::startup::Role::Golden { skip_routed_experts: true },
+                expert_usage: false, expert_usage_reader: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Fp8,
+                devices: [0, 1], attention: Some(cuteafd_loader::placement::AttentionPlacement::Context),
+                native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
+                rows: 256, waves: 1, prefill_rows: Some(256), slots: 4, marks: 0, max_context: CONTEXT,
+                context: cuteafd_loader::placement::planner::Context::pinned(CONTEXT as u64), pool_tokens: Some(4 * CONTEXT as u64),
+                graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, prefix: None,
+                prove_serve_admission: false,
+            })?;
+        println!("K31_MULTIROW_LAYOUT view={label} layers=4 routed=skipped ranks=2 attention=Context context={CONTEXT} context_graphs=on optional_kda_ffn_graphs=off");
+        body(&loaded.engine, &tokens, &label)
+    })
 }
