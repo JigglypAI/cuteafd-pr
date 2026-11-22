@@ -671,9 +671,22 @@ impl<E: CopyEngine, P> HostCache<E, P> {
     }
 
     /// Copy only positional state when immutable KV pages are still device resident.
+    ///
+    /// The caller already holds the key (the device entry's host mark), so no lookup runs
+    /// on this path. A completed mark restore is still the host tier serving a request from
+    /// this snapshot: it refreshes the clock `LeastRecent` evicts by and counts a host hit,
+    /// as `lookup_verified` does for a promotion. A restore that does not complete does
+    /// neither. The full `restore` is unchanged: its lookup already did both.
     pub fn restore_mark(&mut self, key: Key, tail: Vec<DeviceRange>) -> RestoreOutcome {
         let target = RestoreTarget { pages: Default::default(), tail, draft: None, scores: Vec::new() };
-        self.restore_parts(key, &target, true)
+        let outcome = self.restore_parts(key, &target, true);
+        if matches!(outcome, RestoreOutcome::Done { .. }) {
+            let now = self.engine.now_ns();
+            if self.snapshots.as_mut().is_some_and(|snapshots| snapshots.touch(key, now)) {
+                self.metrics.get_mut().host_hits += 1;
+            }
+        }
+        outcome
     }
 
     fn restore_parts(&mut self, key: Key, target: &RestoreTarget, mark_only: bool) -> RestoreOutcome {

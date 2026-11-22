@@ -22,6 +22,7 @@ mod functional_hc_7;
 mod functional_hc_9;
 mod functional_pool;
 mod functional_sim;
+mod mark_restore_use;
 mod soak_hc_6;
 mod stability_hc_5;
 mod upstream_eviction_invariants;
