@@ -252,7 +252,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
     }
     /// Feed one completed lane round to the policy; `requests` are in lane order.
-    pub fn observe_round(&mut self, requests: &[LaneRequest]) {
+    pub fn observe_round(&mut self, requests: &[LaneRequest], timing: Option<history::RoundTiming>) {
         use std::sync::atomic::Ordering::Relaxed;
         for request in requests {
             if let Some(&neural) = self.neural_lengths.get(&request.id) {
@@ -266,7 +266,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let Some(policy) = &mut self.policy else { return };
         let outcomes: Vec<_> = requests.iter().map(|request|
             history::outcome(request.id, request.rows, request.accepted as usize, request.censored)).collect();
-        policy.observe(&outcomes);
+        policy.observe_timed(&outcomes, timing);
     }
     pub fn release(&mut self, id: u64) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
@@ -1066,7 +1066,7 @@ mod anchor_fallback_tests {
             runtime.shape(&[(1, &[11], true), (2, &[12], true)], &mut inputs);
             assert_eq!(inputs, vec![vec![11], vec![12]]);
             runtime.observe_round(&[LaneRequest { id: 1, rows: 1, accepted: 1, censored: false },
-                LaneRequest { id: 2, rows: 1, accepted: 1, censored: false }]);
+                LaneRequest { id: 2, rows: 1, accepted: 1, censored: false }], None);
         }
         Ok(())
     }

@@ -1529,7 +1529,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted.max(1), censored)).collect();
-        policy.observe(&outcomes);
+        policy.observe_timed(&outcomes, trace.is_some().then(|| history::RoundTiming::since(tally.lane(),
+            tally.started(), lane.draft_s - draft0, step_ms / 1e3, starts.clone())));
     }
     if let Some(trace) = trace.as_mut() {
         lane.trace_round += 1;
