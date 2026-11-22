@@ -97,6 +97,14 @@ Current entries:
 - **Own a placement policy.** A family builds a `PlacementRequest` from its
   geometry and calls the shared solver. It does not pick pool sizes, onboard
   counts or wave depths itself.
+- **Consume a step after a peer-wait timeout.** A timed-out abortable peer
+  wait skips itself without advancing its receive sequence (#2542), so every
+  later receive on that rank is stale. The shared primitives fail closed:
+  `peer_wait_abortable` refuses to queue once the process record is set, and
+  `TokenSelector` and `DeviceLogits::download` refuse the drained step's rows.
+  A family that calls a peer wait directly still reports terminal from its
+  `require_live` and from its post-drain completion check
+  (`check_peer_wait_timeout`).
 - **Leave compat shims.** A port deletes the family's old loop, workspaces and
   launch keys in the same change. It leaves no dormant path, removed-key
   diagnostic or alias. If a feature truly cannot fit the shared structure, name
