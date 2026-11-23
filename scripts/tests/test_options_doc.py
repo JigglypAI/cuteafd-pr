@@ -405,6 +405,11 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == COLUMNS
                 assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
                 assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "DECODE_LANES":
+                # V4.1's default is two lanes; the lever is the one-lane opt-in.
+                assert lever["families"] == ["V4.1"]
+                assert default == "2"
+                assert "`DECODE_LANES=1`" in lever["enable"]
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
