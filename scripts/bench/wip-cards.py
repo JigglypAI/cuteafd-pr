@@ -3301,14 +3301,15 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                 if cmd is commands[-1]:
                     # CPU-export and native-phase checkouts manage seed leases inside wip.sh;
                     # only legacy full-build checkouts need a pre-build fair wait.
-                    if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build' and seed not in held_by_ancestor():
+                    if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build':
                         # Wait (not fail) while another job's export holds the seed Spark; wip.sh
                         # takes the lock itself for the native phase, so release it at once.
                         seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         seed_command = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true']
-                        status = run_build(seed_command, timeout=seed_wait + 60)
+                        # hwlock refuses to nest inside an enclosing hold (exit 77); one that covers the seed holds it for us.
+                        status = 0 if seed in held_by_ancestor() else run_build(seed_command, timeout=seed_wait + 60)
                         if status:
                             raise subprocess.CalledProcessError(status, seed_command)
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
