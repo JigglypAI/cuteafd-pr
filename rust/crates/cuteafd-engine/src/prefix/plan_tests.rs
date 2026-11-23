@@ -216,8 +216,9 @@ fn a_third_turn_inherits_approximation_on_device_and_host() {
     }
 }
 
+/// #2455 preferred the host ancestor; ranking by rows saved takes the deeper device partial.
 #[test]
-fn a_host_ancestor_beats_a_deeper_device_media_partial() {
+fn a_deeper_device_media_partial_beats_a_shallower_host_ancestor() {
     let mut fake = Fake::new(1024, 4, 8);
     fake.rule = ReuseRule::V41;
     let mut cache = cache(&fake, 1, 1 << 20);
@@ -238,12 +239,13 @@ fn a_host_ancestor_beats_a_deeper_device_media_partial() {
     let mut branch = original;
     branch[1001] = 4999;
     let keyed = keys(&branch);
-    assert_eq!(cache.peek_media(keyed.tokens(), keyed.spans(), false), 512);
+    // The partial diverges at 1001: sources through 1000, replay from 872 (> the 512 ancestor).
+    assert_eq!(cache.peek_media(keyed.tokens(), keyed.spans(), false), 872);
     let admitted = cache.admit_native(&fake, keyed.tokens(), &branch, keyed.spans(), branch.len(), false,
         |pages| media_place(pages, 2)).unwrap();
     let source = admitted.source.unwrap();
-    assert_eq!(admitted.resume, 512);
-    assert!(source.host && !source.partial && source.plan.exact());
+    assert_eq!(admitted.resume, 872);
+    assert!(!source.host && source.partial && !source.plan.exact());
     cache.release(&fake, &admitted.placement.pages).unwrap();
 }
 
@@ -560,12 +562,11 @@ fn lag_round(cache: &mut PrefixCache<Shared, LagMeta>, family: &Lagged, ring: us
 }
 
 #[test]
-fn a_deep_partial_beats_a_shallow_ancestor_on_the_device_but_not_within_the_slack() {
-    let slack = cuteafd_core::prefix::ANCESTOR_SLACK;
-    let (shallow, deep) = (40, 40 + slack + 400);
-    // A partial resumes at its aligned divergence minus the fixture's WINDOW-row replay.
-    for (divergence, partial) in [(40 + slack + WINDOW, false), (40 + slack + WINDOW + 2, true)] {
-        let family = Lagged::new((deep + 64) / ROWS * 3, 6, 8);
+fn the_partial_that_leaves_fewer_rows_wins_and_an_exact_ancestor_wins_ties() {
+    let (shallow, deep) = (40, 400);
+    // The fixture replays WINDOW rows: a divergence at shallow + WINDOW ties the ancestor.
+    for (divergence, partial) in [(shallow + WINDOW, false), (shallow + WINDOW + 2, true), (deep - 20, true)] {
+        let family = Lagged::new(deep, 6, 8);
         let mut cache = lag_cache(&family, 4, 0);
         let long = seq(100, deep);
         lag_round(&mut cache, &family, 0, &long[..shallow]);
@@ -576,45 +577,54 @@ fn a_deep_partial_beats_a_shallow_ancestor_on_the_device_but_not_within_the_slac
         assert_eq!(cache.peek(&query, false), expected);
         let (admitted, _) = lag_round(&mut cache, &family, 2, &query);
         let source = admitted.source.unwrap();
-        assert_eq!((admitted.resume, source.partial), (expected, partial));
+        assert_eq!((admitted.resume, source.partial), (expected, partial), "divergence {divergence}");
         assert_eq!(source.plan.exact(), !partial, "only the replay is approximate");
         assert_eq!(source.approximate_from, partial.then_some(divergence / 2 * 2));
-        let stats = cache.stats();
-        assert_eq!((stats.partial_hits, stats.approximate_replay_hits, stats.approximate_lineage_hits),
-            (u64::from(partial), u64::from(partial), 0));
     }
 }
 
 #[test]
-fn the_host_tier_promotes_a_deep_partial_over_a_shallow_device_ancestor() {
-    let slack = cuteafd_core::prefix::ANCESTOR_SLACK;
-    let (shallow, deep) = (40, 40 + slack + 400);
-    let family = Lagged::new((deep + 64) / ROWS * 3, 6, 8);
+fn the_host_tier_promotes_a_deeper_partial_over_a_shallow_device_ancestor() {
+    let (shallow, deep) = (40, 400);
+    let family = Lagged::new(deep * 3, 6, 8);
     let mut cache = lag_cache(&family, 1, 1 << 22);
     let long = seq(100, deep);
     // The deep prompt goes to the host tier; the shallow ancestor stays on the device.
     lag_round(&mut cache, &family, 0, &long);
     lag_round(&mut cache, &family, 1, &long[..shallow]);
-    let mut query = long[..shallow + slack + WINDOW + 2].to_vec();
+    let mut query = long[..deep - 20].to_vec();
     query.extend(seq(90_000, 7));
     let promotions = cache.stats().host_promotions;
-    let expected = shallow + slack + 2;
+    let expected = (deep - 20) / 2 * 2 - WINDOW;
     assert_eq!(cache.peek(&query, false), expected);
     let (admitted, _) = lag_round(&mut cache, &family, 2, &query);
     let source = admitted.source.unwrap();
     assert_eq!((admitted.resume, source.host, source.partial), (expected, true, true));
     assert_eq!(cache.stats().host_promotions, promotions + 1);
-    // Within the slack the device ancestor stays (no promotion, exact).
-    let mut near = long[..shallow + slack + WINDOW].to_vec();
-    near.extend(seq(91_000, 7));
-    let promotions = cache.stats().host_promotions;
-    let (admitted, _) = lag_round(&mut cache, &family, 3, &near);
+}
+
+/// A retained entry whose mark is gone (staging reaped an uncached mark) keeps its exact pages
+/// under a replay rule and restores by bounded replay from just short of its frontier, instead
+/// of a cold miss or a shallower ancestor.
+#[test]
+fn a_markless_entry_restores_by_bounded_replay_from_its_own_pages() {
+    let family = Lagged::new(256, 6, 8);
+    let mut cache = lag_cache(&family, 4, 0);
+    let prompt = seq(100, 41);
+    lag_round(&mut cache, &family, 0, &prompt);
+    // Drop the entry's mark as the staging ring does for an uncached write.
+    assert_eq!(cache.drop_marks_for_test(&family), 1);
+    assert_eq!(cache.stats().marks_dropped, 1);
+    let mut next = prompt.clone();
+    next.extend(seq(2000, 9));
+    assert_eq!(cache.peek(&next, false), prompt.len(), "peek is a hint; admission rechecks");
+    let (admitted, _) = lag_round(&mut cache, &family, 1, &next);
     let source = admitted.source.unwrap();
-    // The ancestor is the shallow prompt, which was itself admitted as a 32-row partial of the
-    // deep snapshot: its restore inherits that lineage (tainted from its own frontier).
-    assert_eq!((admitted.resume, source.partial), (shallow, false));
-    assert_eq!(source.approximate_from, Some(shallow));
-    assert_eq!(cache.stats().host_promotions, promotions + 1, "one bank entry: the ancestor is on the host");
+    // common 40 (one short of the frontier): sources through 40, replay from 40 - WINDOW.
+    assert_eq!((admitted.resume, source.partial, source.plan.exact()), (40 - WINDOW, true, false));
+    assert_eq!(source.approximate_from, Some(40));
+    let stats = cache.stats();
+    assert_eq!((stats.markless_replays, stats.approximate_replay_hits, stats.dead_marks), (1, 1, 0));
 }
 
 /// Problem 2: a replay taints only rows from its shared frontier on. Descendants keep content

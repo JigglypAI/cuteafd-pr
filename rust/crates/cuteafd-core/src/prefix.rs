@@ -1,10 +1,10 @@
 //! Token-prefix radix retention shared by the in-memory snapshot cache
 //! (`cuteafd-daemon::v41_native_serve::prefix`) and the disk persistence index (`cuteafd-persist`).
 //!
-//! Both tiers apply the same reuse rule: the most computation saved wins. Under a rule whose partial
-//! reuse is approximate (V4.1's bounded replay), an exact retained ancestor wins unless a partial
-//! match saves more than [`ANCESTOR_SLACK`] further rows. Prompt repeats and completed turns keep
-//! separate bounded banks (`Retention`); a tie prefers the completed turn.
+//! Both tiers apply the same reuse rule: the candidate that leaves the fewest rows to prefill or
+//! replay wins, whether it restores exactly or by V4.1's bounded replay; an exact ancestor wins a
+//! tie. Approximation is a label (metrics, traces), never a lookup preference. Prompt repeats and
+//! completed turns keep separate bounded banks (`Retention`); a tie prefers the completed turn.
 //!
 //! The reuse rule is a parameter ([`ReuseRule`]) so the generic engine's families share this
 //! radix: V4.1 keeps `ReuseRule::V41` (`Radix::new`, `Retention::new`), paged families resume at
@@ -256,13 +256,6 @@ pub fn mark_slots_with_host(lanes: u64, entries: u64, slot_bytes: u64, budget_by
     else { mark_slots_for(lanes, entries, slot_bytes, budget_bytes) }
 }
 
-/// Extra rows of prefill an exact ancestor is worth over an approximate partial match. A partial
-/// match that saves no more than this beyond the ancestor's resume point keeps the exact state
-/// (no replay, no approximate lineage); a deeper one is restored by bounded replay. 2,048 rows
-/// is about 0.27 s of V4.1 min-card prefill (7.5-7.8K tok/s at 8K, #2455's cards) and less than
-/// one 2,752-row prefill unit, while an ancestor kept after evictions can be arbitrarily shallow.
-pub const ANCESTOR_SLACK: usize = 2048;
-
 /// How much computation a retained frontier saves for a query that shares `common` tokens with
 /// it. An exact ancestor (`common == frontier`) always saves `common`. A partial match resumes at
 /// `common` rounded down to `align`, minus `replay` tokens replayed before it; `align == 0`
@@ -286,22 +279,17 @@ impl ReuseRule {
     pub const fn partial(self) -> bool {
         self.align > 0
     }
-    /// Whether partial reuse rebuilds positional state approximately (a replay window), so an
-    /// exact ancestor is worth some extra prefill.
+    /// Whether partial reuse rebuilds positional state approximately (a replay window); such a
+    /// rule can also replay from a retained ancestor whose positional mark is gone.
     pub const fn approximate_partial(self) -> bool {
         self.align > 0 && self.replay.is_some()
     }
-    /// Rows an exact ancestor may resume short of the best approximate partial match and still
-    /// win: [`ANCESTOR_SLACK`] under an approximate partial rule, otherwise none.
-    pub const fn ancestor_slack(self) -> usize {
-        if self.approximate_partial() { ANCESTOR_SLACK } else { 0 }
-    }
 
-    /// Rank a usable match by the rows it saves (`resume`, after any media rounding and
-    /// replay). An exact ancestor gets [`ReuseRule::ancestor_slack`] on top, and wins ties.
+    /// Rank a usable match by the rows it saves (`resume`, after any media rounding and replay):
+    /// the fewest rows left to compute wins, and an exact ancestor (zero replay) wins a tie.
     pub fn rank(self, common: usize, frontier: usize, resume: usize) -> (usize, bool) {
-        let ancestor = common == frontier && resume > 0;
-        (if ancestor { resume.saturating_add(self.ancestor_slack()) } else { resume }, ancestor)
+        let _ = self;
+        (resume, common == frontier && resume > 0)
     }
 
     /// Tokens a match of `common` against a frontier at `frontier` saves.
@@ -554,7 +542,7 @@ impl<T> Radix<T> {
             .expect("prefix access clock exhausted");
         self.root.lookup(tokens, 0, self.clock)
     }
-    /// Select under the reuse rule: the most rows saved, with the rule's ancestor slack.
+    /// Select under the reuse rule: the most rows saved, an exact ancestor on a tie.
     pub fn lookup_reusable(&mut self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
         let found = self.root.find_reusable(tokens, 0, self.rule)?;
         self.clock = self
@@ -832,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn v41_prefers_an_ancestor_across_banks_within_its_slack() {
+    fn v41_takes_the_deeper_partial_across_banks() {
         let prompt: Vec<u32> = (1..=512).collect();
         let mut branch = prompt.clone();
         branch.extend(513..=1500);
@@ -842,27 +830,26 @@ mod tests {
             let mut retained = Retention::new(8);
             retained.bank_mut(kind).insert(&prompt, "ancestor");
             retained.bank_mut(SnapshotKind::Prompt).insert(&branch, "branch");
-            // The partial saves 360 more rows, within the ancestor slack.
+            // The partial saves 872 rows against the ancestor's 512.
             assert!(ReuseRule::V41.skipped(1001, 1500) > prompt.len());
-            assert!(ReuseRule::V41.skipped(1001, 1500) <= prompt.len() + ANCESTOR_SLACK);
-            assert_eq!(retained.peek_reusable(&divergent), Some((512, 512, &"ancestor")));
-            assert_eq!(retained.lookup_reusable(&divergent), Some((512, 512, &"ancestor")));
+            assert_eq!(retained.peek_reusable(&divergent), Some((1001, 1500, &"branch")));
+            assert_eq!(retained.lookup_reusable(&divergent), Some((1001, 1500, &"branch")));
         }
     }
 
     /// Problem 1 of #2455's follow-up: an evicted conversation leaves a shallow exact ancestor
-    /// and a deep partial. Ranking is by rows saved; the exact ancestor keeps a bounded slack.
+    /// and a deep partial. Ranking is by rows left to compute; an exact ancestor wins only ties.
     #[test]
-    fn v41_ranks_by_rows_saved_with_a_bounded_ancestor_slack() {
+    fn v41_ranks_by_rows_saved_and_breaks_ties_to_the_exact_ancestor() {
         let long: Vec<u32> = (1..=100_000).collect();
         for kind in [SnapshotKind::Prompt, SnapshotKind::Turn] {
             for (ancestor, divergence, wins) in [
                 // 2K ancestor vs a 100K partial replaying 128 rows: the partial saves ~98K more.
                 (2_000, 99_999, "partial"),
-                // Within the slack the exact state wins (no replay, no approximate lineage).
-                (90_000, 90_000 + ANCESTOR_SLACK + 128, "ancestor"),
-                // One aligned pair past the slack the partial wins.
-                (90_000, 90_000 + ANCESTOR_SLACK + 128 + 2, "partial"),
+                // The partial saves exactly the ancestor's rows: the exact ancestor wins the tie.
+                (90_000, 90_000 + 128, "ancestor"),
+                // Two rows more: the partial wins.
+                (90_000, 90_000 + 130, "partial"),
             ] {
                 let mut retained = Retention::new(8);
                 retained.bank_mut(kind).insert(&long[..ancestor], "ancestor");
@@ -873,20 +860,18 @@ mod tests {
                 assert_eq!(found, wins, "{kind:?} ancestor {ancestor} divergence {divergence}");
                 assert_eq!(retained.lookup_reusable(&query).map(|f| *f.2), Some(wins));
                 let saved = ReuseRule::V41.skipped(common, frontier);
-                if wins == "partial" { assert!(saved > ancestor + ANCESTOR_SLACK); } else { assert_eq!(saved, ancestor); }
+                if wins == "partial" { assert!(saved > ancestor); } else { assert_eq!(saved, ancestor); }
             }
         }
-        // Exact-only and paged rules have no approximate partial and so no slack.
-        assert_eq!(ReuseRule::EXACT.ancestor_slack(), 0);
-        assert_eq!(ReuseRule::paged(64).ancestor_slack(), 0);
-        assert_eq!(ReuseRule::V41.ancestor_slack(), ANCESTOR_SLACK);
-        // A paged partial (exact rows) that saves one row more beats the ancestor.
+        // Paged and exact rules rank the same way.
         let mut paged = Radix::with_rule(4, ReuseRule::paged(64));
         paged.insert(&long[..128], 128);
         paged.insert(&long[..1000], 1000);
         let mut query = long[..200].to_vec();
         query.push(7);
         assert_eq!(paged.lookup_reusable(&query).map(|f| *f.2), Some(1000));
+        assert!(!ReuseRule::EXACT.approximate_partial() && !ReuseRule::paged(64).approximate_partial());
+        assert!(ReuseRule::V41.approximate_partial());
     }
 
     #[test]

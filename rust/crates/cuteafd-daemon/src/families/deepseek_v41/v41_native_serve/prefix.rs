@@ -23,8 +23,9 @@
 //! taint row (the replay's `source_end`), which follows it into later captures: pages before it
 //! keep token-content host identities, and a later partial restore that shares only those pages is
 //! exact. Restoring a tainted mark is byte-exact to the capture, not to cold prefill.
-//! Ranking is by rows saved: an exact ancestor wins unless bounded replay saves more than
-//! `ANCESTOR_SLACK` rows beyond it.
+//! Ranking minimizes rows left to prefill or replay; an exact ancestor wins a tie. With the host
+//! tier on, a retained entry's host-only mark is pinned while the entry lives; an entry without a
+//! mark replays from its own pages.
 //! An ancestor followed by a suffix of at least 128 tokens resumes as an
 //! encoder continuation (encoder rings and carry restored, decoder rings rebuilt by the suffix's
 //! final replay, which covers the whole decoder window).
@@ -647,9 +648,14 @@ mod tests {
         let partial = selected(&[&tokens[..1500]], &branch).unwrap();
         assert_eq!(partial.fidelity, RestoreFidelity::ApproximateReplay);
         assert_eq!((partial.lag.source_end, partial.resume()), (1000, 872));
-        let ancestor = selected(&[&tokens[..512], &tokens[..1500]], &branch).unwrap();
+        // The 512 ancestor saves fewer rows than the replay (872): the replay wins.
+        let deeper = selected(&[&tokens[..512], &tokens[..1500]], &branch).unwrap();
+        assert!(!deeper.exact());
+        assert_eq!(deeper.resume(), 872);
+        // A 900 ancestor saves more than the replay: it wins and stays exact.
+        let ancestor = selected(&[&tokens[..900], &tokens[..1500]], &branch).unwrap();
         assert!(ancestor.exact());
-        assert_eq!(ancestor.resume(), 512);
+        assert_eq!(ancestor.resume(), 900);
         for (prompt, end) in [(&tokens[..777], 777), (&tokens[..1001], 1001), (&tokens[..2000], 1001)] {
             let exact = selected(&[&tokens[..end]], prompt).unwrap();
             assert!(exact.exact());

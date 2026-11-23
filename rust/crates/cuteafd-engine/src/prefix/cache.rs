@@ -15,17 +15,19 @@
 //! [`PrefixCache::release`] drops the placement's references.
 //!
 //! Selection is the most computation saved under the family's [`ReuseRule`](cuteafd_core::prefix::ReuseRule)
-//! (`cuteafd_core::prefix::Retention`, prompts and turns in bounded banks), on both tiers: an exact
-//! ancestor wins over an approximate partial match unless the partial saves more than the rule's
-//! ancestor slack beyond it.
+//! (`cuteafd_core::prefix::Retention`, prompts and turns in bounded banks), on both tiers: the
+//! candidate that leaves the fewest rows to prefill or replay wins, an exact restore on a tie.
 //!
 //! A host-enabled mark family keeps a retained entry's positional mark only on the host
 //! (`Entry::host_mark`) once its copy landed. That host snapshot is pinned while the device entry
 //! lives, so host pressure evicts host-only snapshots and never orphans live device pages; the
 //! pinned bytes stay inside the host quota. If pinned snapshots fill the quota, new host stores
-//! are skipped and those entries keep their device staging mark until the staging ring evicts
-//! them: an ordinary eviction, never a dead mark. A dead mark is still checked
-//! (`PrefixStats::dead_marks`, `marks_lost`): the entry is evicted and selection retried.
+//! are skipped and those entries keep their device staging mark until the staging ring needs it.
+//! A mark-less entry (staging reaped an uncached mark, or, as an invariant violation counted in
+//! `PrefixStats::dead_marks`, its host mark is gone) is handled by the rule: under an approximate
+//! partial rule (V4.1, MiMo `--prefix-partial on`) its exact pages stay and it restores by bounded
+//! replay from just short of its frontier (`markless_replays`); otherwise it is evicted and
+//! selection retries the next exact candidate.
 //!
 //! Approximate lineage is scoped to a row ([`Entry::approximate_from`]): a placement restored by
 //! approximate replay, or from a snapshot that carries such lineage, may differ from an exact
@@ -191,6 +193,11 @@ pub struct PrefixStats {
     /// invariant violation: host marks of live entries are pinned. The entry is evicted and
     /// selection retried, never served approximately.
     pub dead_marks: u64,
+    /// Restores of a retained entry without a positional mark by bounded replay from its own
+    /// pages (approximate partial rules); counted in `approximate_replay_hits` too.
+    pub markless_replays: u64,
+    /// Uncached staging marks dropped while their entry's pages stayed (approximate partial rules).
+    pub marks_dropped: u64,
     pub captures_prompt: u64,
     pub captures_turn: u64,
     /// Prompt snapshots parked by a prefill cancelled at a chunk boundary.
@@ -397,6 +404,17 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn host_mark_keys(&self) -> Vec<cuteafd_hostcache::snapshot::Key> {
         self.entries.values().filter(|e| e.mark.is_none()).filter_map(|e| e.host_mark).collect()
     }
+    /// Drop every device-resident mark as staging pressure does for uncached writes (test support).
+    #[doc(hidden)]
+    pub fn drop_marks_for_test<F: PrefixFamily<M>>(&mut self, family: &F) -> usize {
+        let ids: Vec<_> = self.entries.iter().filter(|(_, e)| e.mark.is_some()).map(|(&id, _)| id).collect();
+        for &id in &ids {
+            let mark = self.entries.get_mut(&id).and_then(|e| e.mark.take());
+            self.give_back(family, mark).expect("drained");
+            self.stats.marks_dropped += 1;
+        }
+        ids.len()
+    }
     #[doc(hidden)]
     pub fn host_mut(&mut self) -> Option<&mut HostCache<E, HostPayload<M>>> { self.host.as_mut() }
 
@@ -455,6 +473,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             let mut hit = if let Some(compatible) = compatible {
                 self.device_compatible_hit(tokens, media, sampled, compatible)
             } else { self.lookup_media(tokens, media, sampled) };
+            // A selected device entry without a mark restores by replay (or not at all).
+            if let Some(h) = hit.as_ref() {
+                match self.check_mark(family, h.id) {
+                    Err(PrefixError::DeadMark) => continue,
+                    result => result?,
+                }
+            }
+            hit = hit.and_then(|h| self.markless_hit(h, tokens, media));
             let rule = self.layout.rule;
             let device_rank = hit.as_ref().map_or((0, false), |h| rule.rank(h.common, h.frontier, h.resume));
             // A host snapshot that ranks above the device hit under the same rule (rows saved,
@@ -755,12 +781,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             if mark.is_none() {
                 self.release(family, &pages)?;
                 if !self.host.as_ref().is_some_and(|h| h.payload(key).is_some()) {
-                    // The pinned host mark is gone: an invariant violation, never an
-                    // approximate restore. Drop the entry so selection finds the next exact one.
+                    // The pinned host mark is gone: an invariant violation (pins prevent it).
+                    // Under a replay rule the entry restores from its pages; otherwise drop it so
+                    // selection finds the next exact one.
                     debug_assert!(false, "a live device entry lost its pinned host mark");
                     tracing::error!(target: "cuteafd::prefix", tokens = hit.frontier, "device entry lost its host mark");
                     self.stats.dead_marks += 1;
-                    self.evict(family, hit.id)?;
+                    if let Some(entry) = self.entries.get_mut(&hit.id) { entry.host_mark = None; }
+                    if !self.layout.rule.approximate_partial() { self.evict(family, hit.id)?; }
                     return Err(PrefixError::DeadMark);
                 }
                 return Ok(None);
@@ -810,6 +838,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.stats.exact_hits += u64::from(after.is_some() && plan.exact());
         self.stats.partial_hits += u64::from(!ancestor);
         self.stats.approximate_replay_hits += u64::from(replays);
+        self.stats.markless_replays += u64::from(replays && hit.common + 1 == hit.frontier
+            && self.entries.get(&hit.id).is_some_and(|e| e.mark.is_none() && e.host_mark.is_none()));
         self.stats.approximate_lineage_hits += u64::from(!replays && approximate_from.is_some());
         self.restored_session = session.clone();
         Ok(Some(Admitted {
@@ -1286,6 +1316,45 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         }
     }
 
+    /// Whether `entry` can restore its positional mark (on the device, or a resident host copy).
+    fn has_mark(&self, entry: &Entry<M>) -> bool {
+        self.layout.mark_bytes == 0 || entry.mark.is_some()
+            || entry.host_mark.is_some_and(|key| self.host.as_ref().is_some_and(|h| h.payload(key).is_some()))
+    }
+
+    /// A device entry whose host-only mark is no longer resident: an invariant violation (pins
+    /// prevent it), counted and asserted. A replay rule keeps the pages (the entry replays);
+    /// otherwise the entry is evicted so it cannot shadow an exact candidate.
+    fn check_mark<F: PrefixFamily<M>>(&mut self, family: &F, id: EntryId) -> Result<(), PrefixError> {
+        let Some(entry) = self.entries.get(&id) else { return Ok(()) };
+        let Some(key) = entry.host_mark.filter(|_| entry.mark.is_none()) else { return Ok(()) };
+        if self.host.as_ref().is_some_and(|h| h.payload(key).is_some()) { return Ok(()); }
+        debug_assert!(false, "a live device entry lost its pinned host mark");
+        tracing::error!(target: "cuteafd::prefix", tokens = entry.len(), "device entry lost its host mark");
+        self.stats.dead_marks += 1;
+        if self.layout.rule.approximate_partial() {
+            self.entries.get_mut(&id).expect("checked").host_mark = None;
+            Ok(())
+        } else {
+            self.evict(family, id)?;
+            Err(PrefixError::DeadMark)
+        }
+    }
+
+    /// An entry selected as an exact ancestor but holding no mark restores by bounded replay from
+    /// its own pages: rank and plan it as a partial match one row short of its frontier.
+    fn markless_hit(&self, mut hit: Hit, tokens: &[u32], media: &[MediaSpan]) -> Option<Hit> {
+        let entry = self.entries.get(&hit.id)?;
+        if hit.common < hit.frontier || self.has_mark(entry) { return Some(hit); }
+        if !self.layout.rule.approximate_partial() { return None; }
+        let common = hit.frontier - 1;
+        let plan = RestorePlan::under(self.layout.rule, RestoreCandidate { common, snapshot_end: hit.frontier,
+            target_end: tokens.len(), resume: self.layout.rule.skipped(common, hit.frontier), media, saved_media: &entry.media });
+        let resume = plan.resume();
+        (resume > 0 && verify_media(plan.lag.source_end, &entry.media, media))
+            .then(|| { hit.common = common; hit.resume = resume; hit })
+    }
+
     fn mark_victim(&self) -> Option<EntryId> {
         victim(self.entries.iter().filter(|(_, e)| e.mark.is_some()).map(|(&id, e)| (id, e.kind, e.last_use)))
     }
@@ -1334,7 +1403,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             } else {
                 // Uncacheable/failed host writes retain their mark only until staging pressure.
                 let Some(id) = self.mark_victim() else { break };
-                self.evict(family, id)?;
+                if self.layout.rule.approximate_partial() {
+                    // Keep the exact pages: the entry restores by bounded replay from them.
+                    let mark = self.entries.get_mut(&id).and_then(|e| e.mark.take());
+                    self.give_back(family, mark)?;
+                    self.stats.marks_dropped += 1;
+                } else {
+                    self.evict(family, id)?;
+                }
             }
         }
         if waited {

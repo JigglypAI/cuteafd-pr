@@ -2124,31 +2124,40 @@ fn host_pressure_never_orphans_a_live_device_entry() {
     }
 }
 
-/// A dead mark (an invariant violation the pin prevents) is counted, its entry evicted, and
-/// selection falls through to the next exact candidate instead of prefilling cold.
+/// A dead mark (an invariant violation the pin prevents) is counted. An exact-only family evicts
+/// the entry and selection falls through to the next exact candidate; a replay rule keeps the
+/// entry's exact pages and replays from just short of its frontier. Neither goes cold.
 #[test]
 #[cfg_attr(debug_assertions, should_panic(expected = "lost its pinned host mark"))]
-fn a_dead_mark_falls_through_to_the_next_exact_candidate() {
-    let fake = Fake::new(160, 4, 2);
-    let mut cache = cache(&fake, 8, 1 << 20);
-    let prompt = seq(100, 13);
-    let (_, turn, p) = serve(&mut cache, &fake, 0, &prompt, &seq(5000, 3), 20);
-    cache.release(&fake, &p.pages).unwrap();
-    fake.mem.borrow_mut().advance(10_000_000);
-    cache.tick();
-    // Both marks are host-only now; remove the turn's (the newest entry) behind the pin.
-    let keys = cache.host_mark_keys();
-    assert_eq!(keys.len(), 2);
-    let turn_key = *keys.iter().max().unwrap();
-    assert!(cache.host_mut().unwrap().pinned(turn_key));
-    assert!(cache.host_mut().unwrap().remove_for_test(turn_key));
-    assert_eq!(cache.stats().marks_lost, 1);
-    let mut next = turn.clone();
-    next.push(9999);
-    let admitted = cache.admit(&fake, &next, 24, false,
-        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
-    // Release builds: the prompt snapshot (exact) serves it, the dead entry is gone.
-    assert_eq!(admitted.resume, prompt.len());
-    assert!(admitted.source.unwrap().plan.exact());
-    assert_eq!((cache.stats().dead_marks, cache.stats().marks_lost), (1, 0));
+fn a_dead_mark_falls_through_or_replays_by_rule() {
+    for replay in [false, true] {
+        let mut fake = Fake::new(600, 4, 2);
+        if replay { fake.rule = ReuseRule::V41; }
+        let mut cache = cache(&fake, 8, 1 << 20);
+        let prompt = seq(100, 260);
+        let (_, turn, p) = serve(&mut cache, &fake, 0, &prompt, &seq(5000, 300), 600);
+        cache.release(&fake, &p.pages).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        // Both marks are host-only now; remove the turn's (the newest entry) behind the pin.
+        let keys = cache.host_mark_keys();
+        assert_eq!(keys.len(), 2);
+        let turn_key = *keys.iter().max().unwrap();
+        assert!(cache.host_mut().unwrap().pinned(turn_key));
+        assert!(cache.host_mut().unwrap().remove_for_test(turn_key));
+        assert_eq!(cache.stats().marks_lost, 1);
+        let mut next = turn.clone();
+        next.push(9999);
+        let admitted = cache.admit(&fake, &next, 600, false,
+            |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        let source = admitted.source.unwrap();
+        if replay {
+            // Common 559 (one short of 560): sources through 558, replay from 430 > the 260 prompt.
+            assert_eq!((admitted.resume, source.partial, source.plan.exact()), (430, true, false));
+        } else {
+            assert_eq!((admitted.resume, source.plan.exact()), (prompt.len(), true));
+        }
+        assert_eq!((cache.stats().dead_marks, cache.stats().marks_lost), (1, 0));
+        cache.release(&fake, &admitted.placement.pages).unwrap();
+    }
 }
