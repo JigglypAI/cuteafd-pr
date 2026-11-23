@@ -28,6 +28,12 @@ pub(crate) unsafe fn enqueue(library: &NativeLibrary, source: CuteafdHostBuffer,
     Ok(())
 }
 
+/// All available source ranges still belong to queued copies. The owner and
+/// stream remain usable: the current upload did not issue a copy.
+#[derive(Debug, thiserror::Error)]
+#[error("retained metadata arena exceeded admitted source depth: exhaustion {count}, upload {bytes} bytes")]
+pub(crate) struct UploadPressure { count: u64, bytes: usize }
+
 /// One immutable source range per queued read, over one admitted pinned owner.
 /// Each arena serves exactly one consumer stream; only completed sources wrap.
 pub(crate) struct RetainedUploads<'a> {
@@ -95,8 +101,7 @@ impl<'a> RetainedUploads<'a> {
             let ready = event.device.run(|| unsafe { library.cuda_event_query(event.raw) })?;
             if !ready {
                 self.exhaustion_waits += 1;
-                anyhow::bail!("retained metadata arena exceeded admitted source depth: exhaustion {}, upload {} bytes",
-                    self.exhaustion_waits, bytes.len());
+                return Err(UploadPressure { count: self.exhaustion_waits, bytes: bytes.len() }.into());
             }
             self.cursor.retire(oldest)?;
         };

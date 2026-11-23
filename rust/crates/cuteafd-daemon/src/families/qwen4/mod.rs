@@ -924,6 +924,7 @@ fn packed_decode_interleave(engine: &engine::Qwen4Engine<'_>, tokens: &[u32]) ->
     let equal = |a: &[f32], b: &[f32]| a.iter().map(|x| x.to_bits()).eq(b.iter().map(|x| x.to_bits()));
     engine.prepare_serving_workspaces()?;
     let reserve = engine.configure_graph_cache()?;
+    ensure!(reserve.iter().any(|&bytes| bytes > 0), "packed/decode golden needs a nonzero graph reserve");
     engine.warm_decode_graphs(2, false)?;
     let graph_hits = || snapshots().iter().filter_map(|s| s.cycles.get(&Cycle::Decode)).map(|c| c.hits).sum::<u64>();
     for start in [0, ROWS + 1] {
@@ -945,12 +946,12 @@ fn packed_decode_interleave(engine: &engine::Qwen4Engine<'_>, tokens: &[u32]) ->
             Ok(logits)
         };
         let before = graph_hits();
-        let decoded = [decode(&mut packed[0], &mut packed_draft[0], &input[0])?,
-            decode(&mut packed[1], &mut packed_draft[1], &input[1])?];
-        if start != 0 && reserve.iter().any(|&bytes| bytes > 0) {
-            ensure!(graph_hits() > before, "packed/decode golden did not exercise decode graph replay");
-        }
-        for i in 0..input.len() {
+        // Table row zero still names member 0. Decode member 1 first so a
+        // missing rewrite cannot accidentally read the right table on replay.
+        let second = decode(&mut packed[1], &mut packed_draft[1], &input[1])?;
+        ensure!(graph_hits() > before, "packed/decode golden did not replay member 1 at row {end}");
+        let decoded = [decode(&mut packed[0], &mut packed_draft[0], &input[0])?, second];
+        for i in [1, 0] {
             let ids = &input[i];
             let head = engine.prefill_device(&mut single[i], &ids[start..end], None, None, 1)?
                 .context("packed/decode singleton head")?.row_host(engine.library, 0)?;

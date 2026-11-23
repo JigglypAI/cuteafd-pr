@@ -208,7 +208,7 @@ use crate::shared::probe;
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixFamily, SnapshotKind};
 use crate::shared::draft::history::{self, Policy, Proposal};
-use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
+use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs, PrefillQueue};
 use anyhow::Context;
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, NativeFailure,
@@ -733,6 +733,46 @@ fn packed_chunk<P: Placement, D>(p: &Prefill<'_, P, D>) -> Option<(usize, usize)
     Some((p.placement.len(), p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()) - p.done))
 }
 
+/// The production scheduler splits adjacent chunks against both the row plan
+/// and the family's admitted metadata planes before calling the backend.
+#[allow(clippy::too_many_arguments)]
+fn round_packed<P>(queue: &mut PrefillQueue<P>, limits: Option<crate::shared::prefill_packing::Limits>,
+    budget: Option<crate::shared::prefill_packing::TableBudget>, most: usize,
+    excluded: &std::cell::Cell<Duration>, shape: impl Fn(&P) -> Option<(usize, usize)>,
+    entries: impl Fn(&P) -> [usize; 2], chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>)
+    -> Vec<(P, Result<()>)> {
+    queue.round_packed_excluding(limits.map_or(0, |l| l.rows), most, excluded,
+        |p| shape(p).map(|(_, rows)| rows),
+        |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(
+            &group.iter().chain([next]).filter_map(&shape).collect::<Vec<_>>(), &limits).is_ok())
+            && budget.is_none_or(|budget| budget.fits(group.iter().chain([next]).map(&entries))),
+        chunk)
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_splits_for_metadata_capacity_before_submission() {
+    use crate::shared::prefill_packing::{Limits, TableBudget};
+    // Qwen4 supports at most 64 members and admits 64 full-pool table rows,
+    // so use a smaller backend budget to exercise the generic split path.
+    let mut queue = PrefillQueue::new(0.2).one_wave_rounds();
+    let entries = [[4, 1], [4, 1], [5, 2], [4, 1], [1, 1]];
+    for id in 0..entries.len() { queue.push(id); }
+    let limits = Limits { rows: 32, chunk_rows: 32, max_context: 4096, taps: None };
+    let budget = TableBudget([10, 2]);
+    for expected in [&[0, 1][..], &[2], &[3, 4]] {
+        let finished = round_packed(&mut queue, Some(limits), Some(budget), 8, &Default::default(),
+            |_| Some((128, 1)), |&id| entries[id], |group| {
+                assert_eq!(group, expected);
+                assert!(budget.offsets(group.iter().map(|&id| entries[id])).is_ok());
+                group.iter().map(|_| Ok(Chunk::Done)).collect()
+            });
+        assert_eq!(finished.len(), expected.len());
+        assert!(finished.iter().all(|(_, result)| result.is_ok()));
+    }
+    assert!(queue.is_empty());
+}
+
 fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
     cache: &mut PrefixCache<CudaCopyEngine<'a>, B::Meta>, selector: &mut TokenSelector<'a>,
     group: &mut [Prefill<'_, B::Placement, B::Draft>], neural: bool) -> Vec<Result<Chunk>> {
@@ -1089,13 +1129,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let caching = cache.enabled();
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
             let limits = engine.checked_packed_limits()?;
-            let table_budget = engine.packed_table_budget();
-            let finished = prefills.round_packed_excluding(limits.map_or(0, |l| l.rows), max_sequences, turn.prefill_excluded(),
-                |p| packed_chunk(p).map(|(_, rows)| rows),
-                |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(
-                    &group.iter().chain([next]).filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok())
-                    && table_budget.is_none_or(|budget| budget.fits(group.iter().chain([next])
-                        .map(|p| engine.packed_table_entries(&p.placement)))),
+            let finished = round_packed(&mut prefills, limits, engine.packed_table_budget(), max_sequences,
+                turn.prefill_excluded(), packed_chunk, |p| engine.packed_table_entries(&p.placement),
                 |group| {
                     if group.len() > 1 {
                         if let Err(error) = offer() {

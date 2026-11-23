@@ -268,8 +268,8 @@ def test_packed_qwen_metadata_is_uploaded_once_and_only_viewed_inside_layers():
     moe = (root / "qwen4/engine.rs").read_text()
     packed = moe[moe.index("    pub(crate) fn prefill_packed("):moe.index("    pub(crate) fn mtp_prefill_rows(")]
     assert packed.count("self.stage_step_tables(w, &all)?;") == 1
-    assert packed.count("self.stage_table(decode, &decode.page_table, &pages)?;") == 1
-    assert packed.count("self.stage_table(decode, &decode.pool_table, &pools)?;") == 1
+    assert packed.count("self.stage_table(decode, &decode.page_table, &pages).map_err(packed_upload_error)?;") == 1
+    assert packed.count("self.stage_table(decode, &decode.pool_table, &pools).map_err(packed_upload_error)?;") == 1
     assert "run_prefill_units(&mut hooks, &[unit], 1)?" in packed
     hooks = moe[moe.index("struct PackedHooks"):moe.index("struct UnitHooks")]
     assert "stage_step_tables" not in hooks and "stage_table(" not in hooks

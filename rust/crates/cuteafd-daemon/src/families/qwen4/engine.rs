@@ -1399,7 +1399,7 @@ impl<'a> Qwen4Engine<'a> {
                 let logits = if decode { DECODE_ROWS } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
                     if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
-                    self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits)?;
+                    self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits, self.gdn_banks.len() == 1)?;
                 let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
                 for (kind, bytes) in [("staging", host.staging), ("pinned-logits", host.logits)] {
                     if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
@@ -1817,6 +1817,8 @@ impl<'a> Qwen4Engine<'a> {
     /// observe the graph boundary a capture in the step may have opened.
     /// TP2 and Spark layouts hold peer or Spark waits that only the terminal
     /// abort words can release, so they refuse and retire as before (#1842).
+    /// Packed metadata pressure is earlier: at most one ordered table copy
+    /// has issued, and its upload fence precedes this stream's drain.
     fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
         use crate::shared::experts::rtx::pair::Recovery;
         if kind == Recovery::HostGather {
@@ -2016,7 +2018,7 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
                 units, self.has_sparks(), self.weights.mtp.is_some(),
-                self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows)?
+                self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows, self.gdn_banks.len() == 1)?
         };
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
         Ok(Workspace {
@@ -2431,6 +2433,16 @@ impl<'a> Qwen4Engine<'a> {
             let mut decode = self.decode_workspace.try_borrow_mut()?;
             if decode.is_none() { *decode = Some(self.workspace(DECODE_ROWS, true, DECODE_ROWS)?); }
             let decode = decode.as_ref().context("Qwen packed decode metadata owner")?;
+            let (mut pages, mut pools) = (Vec::new(), Vec::new());
+            for s in sequences.iter() {
+                pages.extend_from_slice(&s.placement.pages);
+                pools.extend_from_slice(&s.placement.pool_pages);
+            }
+            // Only the borrowed owner stages the page IDs. If the previous
+            // sources have not retired, fail this pack before touching state,
+            // PLE or Spark. A first successful upload can still be in flight.
+            self.stage_table(decode, &decode.page_table, &pages).map_err(packed_upload_error)?;
+            self.stage_table(decode, &decode.pool_table, &pools).map_err(packed_upload_error)?;
             let mut tables: Vec<StepTables> = Vec::with_capacity(sequences.len());
             for (i, s) in sequences.iter_mut().enumerate() {
                 if s.start == 0 { self.start(s.placement)?; }
@@ -2448,10 +2460,9 @@ impl<'a> Qwen4Engine<'a> {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false); w.terminal_valid.set(false);
             self.last_stream_offset.set(0);
             let mut all = StepTables::default();
-            let (mut pages, mut pools) = (Vec::new(), Vec::new());
             let views = offsets.into_iter().zip(&tables).map(|(offsets, table)|
                 decode.attention_tables(offsets, table.page_width)).collect::<Vec<_>>();
-            for ((s, t), member) in segments.iter().zip(&tables).zip(sequences.iter()) {
+            for (s, t) in segments.iter().zip(&tables) {
                 all.positions.extend_from_slice(&t.positions);
                 all.rope_positions.extend_from_slice(&t.rope_positions);
                 all.block_rope_positions.extend_from_slice(&t.block_rope_positions);
@@ -2460,14 +2471,8 @@ impl<'a> Qwen4Engine<'a> {
                 all.seq_first.extend(std::iter::repeat_n(s.first as i32, s.rows));
                 all.pool_slots.extend_from_slice(&t.pool_slots);
                 all.cache_lengths.extend_from_slice(&t.cache_lengths);
-                pages.extend_from_slice(&member.placement.pages);
-                pools.extend_from_slice(&member.placement.pool_pages);
                 all.ple_ids.extend_from_slice(&t.ple_ids);
             }
-            // Only the decode owner stages the page IDs. MTP reads the same
-            // immutable views; the prefill workspace stages just row metadata.
-            self.stage_table(decode, &decode.page_table, &pages)?;
-            self.stage_table(decode, &decode.pool_table, &pools)?;
             w.table_view.set(None);
             let all = Arc::new(all);
             self.stage_step_tables(w, &all)?;
@@ -4265,6 +4270,15 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         })
     }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+}
+
+fn packed_upload_error(error: anyhow::Error) -> anyhow::Error {
+    use crate::shared::experts::rtx::pair::{RecoverableStepError, Recovery};
+    if error.is::<crate::shared::token_table::UploadPressure>() {
+        RecoverableStepError::new(Recovery::PackedMetadata, error.to_string()).into()
+    } else {
+        error
+    }
 }
 
 fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_context: usize) -> Result<()> {
