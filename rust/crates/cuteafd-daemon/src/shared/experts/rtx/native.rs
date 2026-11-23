@@ -95,9 +95,12 @@ pub(super) trait CompletionEvent {
 
 impl CompletionEvent for Event<'_> {
     fn record(&self, stream: *mut c_void) -> Result<()> {
-        // SAFETY: enqueue's caller retains its rank-local stream through recording.
+        // SAFETY: enqueue's caller retains its rank-local stream through recording,
+        // and any captured graph referencing this event drains and destroys before
+        // this owner drops (using external record during stream capture keeps the
+        // event synchronizable on Drop without a later eager enqueue).
         self.device
-            .run(|| unsafe { self.device.library.cuda_event_record(self.raw, stream) })
+            .run(|| unsafe { self.device.library.cuda_event_record_external(self.raw, stream) })
     }
     fn drain(&self, stream: *mut c_void) -> Result<()> {
         // SAFETY: the caller already published every peer abort word and retains the stream.
