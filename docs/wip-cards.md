@@ -137,7 +137,9 @@ and arms for cleanup. Source worktrees are retained for inspection.
   `experts`, `exchange wait`; GLM 5.3 `L<i> experts exchange R/B`) and `select`.
   They are host ranges around graph launches: with node tracing, a captured
   segment's kernels fall in its range, so attention/dense versus MoE/exchange
-  split per layer, and kernel names split inside a segment. Families: GLM
+  split per layer, and kernel names split inside a segment. Under a head
+  split, the second GPU's segments fall only in the sample range: split them
+  by device. Families: GLM
   Flash and GLM 5.3; another family adopts it by implementing
   `shared::probe::verify_timing::VerifyTarget` over its serving verify step.
 - `--panels baseline,spec_lossless_set` adds the lossless merge gate: every
