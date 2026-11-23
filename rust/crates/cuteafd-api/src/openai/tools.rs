@@ -51,6 +51,8 @@ pub(super) enum ToolSyntax {
     MiniMaxXml,
     /// Inkling native channel containing {name, args}.
     InklingJson,
+    /// Hy4-flash `<tool_calls:opensource><tool_call:opensource>NAME<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></tool_calls:opensource>`.
+    Hy4Xml,
 }
 
 pub(super) struct ToolConstraints {
@@ -184,6 +186,11 @@ impl ToolConstraints {
                         "content":{"type":"json_schema", "json_schema":schema, "style":"glm_xml", "any_order":false},
                         "end":"</tool_call>"})
                 }
+                ToolSyntax::Hy4Xml => {
+                    json!({"type":"tag", "begin":format!("<tool_call:opensource>{}", tool.name),
+                        "content":{"type":"regex", "pattern":"(<arg_key:opensource>[^<]+</arg_key:opensource><arg_value:opensource>[^<]*</arg_value:opensource>)*"},
+                        "end":"</tool_call:opensource>"})
+                }
                 // The JSON object closes the call: the next call, or the end of the turn, follows it.
                 ToolSyntax::MistralCalls => json!({"type":"tag", "begin":format!("[TOOL_CALLS]{}[ARGS]", tool.name),
                     "content":{"type":"ds41_json_schema", "strict":strict, "json_schema":schema}, "end":""}),
@@ -249,6 +256,15 @@ impl ToolConstraints {
                 json!({"type":"triggered_tags", "triggers":["<tool_call>"], "tags":tags, "at_least_one":false,
                     "stop_after_first":!parallel}),
             ),
+            ToolSyntax::Hy4Xml => {
+                let calls = json!({"type":"tag", "begin":"<tool_calls:opensource>",
+                    "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
+                        "at_least_one":true, "stop_after_first":!parallel},
+                    "end":"</tool_calls:opensource>"});
+                let triggered = json!({"type":"triggered_tags", "triggers":["<tool_calls:opensource>"],
+                    "tags":[calls.clone()], "at_least_one":false, "stop_after_first":true});
+                (calls, triggered)
+            }
             ToolSyntax::MistralCalls => (
                 json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
                     "stop_after_first":!parallel}),

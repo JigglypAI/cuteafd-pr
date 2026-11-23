@@ -60,6 +60,8 @@ pub enum ModelEncoding {
     Mistral(Arc<mistral::MistralEncoding>),
     MiniMax(Arc<minimax::MiniMaxEncoding>),
     Inkling(Arc<inkling2::InklingEncoding>),
+    /// Hy4-flash: checkpoint chat template, `<think:opensource>` reasoning and `:opensource` XML tool calls.
+    Hy4Flash(Arc<hy4_flash::Hy4Encoding>),
 }
 
 impl ModelEncoding {
@@ -85,6 +87,7 @@ impl ModelEncoding {
             Self::Mistral(encoding) => encoding.tokens().eos.clone(),
             Self::MiniMax(encoding) => encoding.tokens().eos.clone(),
             Self::Inkling(encoding) => encoding.tokens().eos.clone(),
+            Self::Hy4Flash(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -95,6 +98,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
             Self::Kimi(_) | Self::Mistral(_) | Self::MiniMax(_) | Self::Inkling(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
+            Self::Hy4Flash(encoding) => Some(encoding.tokens().think_close),
             Self::Muse(_) => None,
         }
     }
@@ -223,7 +227,7 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::Mistral(_) | ModelEncoding::MiniMax(_) | ModelEncoding::Inkling(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::Mistral(_) | ModelEncoding::MiniMax(_) | ModelEncoding::Inkling(_) | ModelEncoding::Hy4Flash(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
@@ -231,6 +235,7 @@ impl ModelProfile {
                     ModelEncoding::Mistral(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::MiniMax(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Inkling(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Hy4Flash(encoding) => encoding.stop_token_ids(tools_declared),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -262,7 +267,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, inkling2, kimi, muse, mistral, minimax, qwen4, step5};
+use chat::{deepseek, glm5, hy4_flash, inkling2, kimi, muse, mistral, minimax, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -683,6 +688,8 @@ enum Templated {
     Mistral(Arc<mistral::MistralEncoding>),
     MiniMax(Arc<minimax::MiniMaxEncoding>),
     Inkling(Arc<inkling2::InklingEncoding>),
+    /// Hy4-flash: checkpoint chat template, `<think:opensource>` reasoning and `:opensource` XML tool calls.
+    Hy4Flash(Arc<hy4_flash::Hy4Encoding>),
 }
 
 impl Templated {
@@ -710,6 +717,10 @@ impl Templated {
                 let effort = inkling2::prompt::effort(body)?;
                 Ok(glm5::GlmThinking { enabled: effort != "none" && effort.as_f64() != Some(0.0), effort: None })
             }
+            Self::Hy4Flash(_) => {
+                let effort = hy4_flash::prompt::effort(body)?;
+                Ok(glm5::GlmThinking { enabled: effort != "no_think", effort: None })
+            }
         }
     }
 }
@@ -717,6 +728,7 @@ impl Templated {
 /// The family's generated-text parser in front of the OpenAI chunk generator.
 enum OutputProcessor {
     Inkling(glm5::GlmStreamProcessor<ChatGenerator, inkling2::InklingOutputParser>),
+    Hy4Flash(glm5::GlmStreamProcessor<ChatGenerator, hy4_flash::Hy4OutputParser>),
     Deepseek(glm5::GlmStreamProcessor<ChatGenerator, deepseek::parser::DeepseekOutputParser>),
     Glm(glm5::GlmStreamProcessor<ChatGenerator>),
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
@@ -739,6 +751,7 @@ impl OutputProcessor {
             Self::Mistral(processor) => Box::pin(processor.process(input)),
             Self::MiniMax(processor) => Box::pin(processor.process(input)),
             Self::Inkling(processor) => Box::pin(processor.process(input)),
+            Self::Hy4Flash(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -895,6 +908,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Mistral(encoding) => Some(Templated::Mistral(encoding.clone())),
         ModelEncoding::MiniMax(encoding) => Some(Templated::MiniMax(encoding.clone())),
         ModelEncoding::Inkling(encoding) => Some(Templated::Inkling(encoding.clone())),
+        ModelEncoding::Hy4Flash(encoding) => Some(Templated::Hy4Flash(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -1019,6 +1033,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Mistral(_), _, _)) => tools::ToolSyntax::MistralCalls,
         Some((Templated::MiniMax(_), _, _)) => tools::ToolSyntax::MiniMaxXml,
         Some((Templated::Inkling(_), _, _)) => tools::ToolSyntax::InklingJson,
+        Some((Templated::Hy4Flash(_), _, _)) => tools::ToolSyntax::Hy4Xml,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
@@ -1147,6 +1162,20 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Inkling(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Hy4Flash(encoding), raw, thinking)) => {
+            let options = hy4_flash::Hy4PromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect() };
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
+            };
+            let parser = hy4_flash::Hy4OutputParser::with_stream_args(hy4_flash::Hy4ParserOptions {
+                thinking: thinking.enabled,
+                tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
+                    .then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone(),
+                id: id.clone() }, stream_args);
+            (prompt, Vec::new(), OutputProcessor::Hy4Flash(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::MiniMax(encoding), raw, _thinking)) => {
             let options = minimax::MiniMaxPromptOptions {
