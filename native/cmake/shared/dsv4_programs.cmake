@@ -13,7 +13,7 @@
 # epilogue `expert_partial` for families listed in CUTEAFD_PARTIAL_REPLY_FAMILIES).
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
-   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_HY4F_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
    CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT OR
    CUTEAFD_ENABLE_INKLING2_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
@@ -75,6 +75,13 @@ if(CUTEAFD_ENABLE_STEP5_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "step5,step52")
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},step5,step52")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_HY4F_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "hy4f,hy4f2")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},hy4f,hy4f2")
   endif()
 endif()
 if(CUTEAFD_ENABLE_KIMIK3_AOT)
@@ -182,6 +189,12 @@ if(CUTEAFD_ENABLE_INKLING2_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},inkling2")
   endif()
 endif()
+if(CUTEAFD_ENABLE_HY4F_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES hy4f)
+  if(NOT CUTEAFD_PROGRAM_GEOMETRY MATCHES "(^|,)dense_trellis_k6(,|$)")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+endif()
 if(CUTEAFD_ENABLE_V41_EXPERT_AOT)
   # Coordinator planning reads Spark segment geometry from its own manifest;
   # both images must carry the same native width inventory.
@@ -251,6 +264,7 @@ add_custom_command(
   COMMAND sh -c "${CMAKE_AR} qcs '${CUTEAFD_DSV4_ARCHIVE}' '${CUTEAFD_DSV4_DIR}'/*.o"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_hy4_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_dense_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dense_trellis_k6_aot.py"

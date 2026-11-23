@@ -122,6 +122,14 @@ pub fn fp8_role(name: &str) -> Fp8Role {
     if stem.starts_with("model.dfly_layers.") {
         return Fp8Role::exact("dfly2 drafter", false);
     }
+    if stem.ends_with(".self_attn.kv_b_proj") {
+        // Absorbed MLA keeps W_UK and W_UV in BF16 inside the packed target arena.
+        return Fp8Role::exact("hy4 absorbed kv_b_proj", false);
+    }
+    if stem.ends_with(".mlp.down_proj") || stem.ends_with(".mlp.shared_experts.down_proj") {
+        // TP2 K-split halves (6912, 768) are not multiples of 512 for block-FP8 GEMV warps; keep BF16.
+        return Fp8Role::exact("hy4 k-split down_proj", false);
+    }
     if stem.ends_with(".self_attn.kv_a_proj_with_mqa") {
         return Fp8Role::padded("hy4 kv_a_proj_with_mqa", true, 128);
     }
@@ -251,12 +259,16 @@ pub fn target_arenas(
             let local_heads = attn.heads / layer_ranks;
             views.push((format!("{p}.self_attn.learnable_sink_param"), local_heads * 4));
 
-            // Attention linear projections
-            let attn_projs: [(&str, [usize; 2], CoreSplit); 6] = [
+            // Attention linear projections (`kv_b_proj` lives absorbed as BF16 W_UK+W_UV in the arena
+            // across all MC views; compact EXL3 checkpoints dequantize it via transient storage at load).
+            views.push((
+                format!("{p}.self_attn.kv_b_proj.weight"),
+                local_heads * (attn.qk_nope_dim + attn.v_head_dim) * cfg.kv_lora_rank * 2,
+            ));
+            let attn_projs: [(&str, [usize; 2], CoreSplit); 5] = [
                 ("self_attn.q_a_proj", [cfg.q_lora_rank, h], CoreSplit::Whole),
                 ("self_attn.q_b_proj", [attn.heads * attn.qk_head_dim(), cfg.q_lora_rank], CoreSplit::Output),
                 ("self_attn.kv_a_proj_with_mqa", [cfg.kv_lora_rank + attn.qk_rope_dim, h], CoreSplit::Whole),
-                ("self_attn.kv_b_proj", [attn.heads * (attn.qk_nope_dim + attn.v_head_dim), cfg.kv_lora_rank], CoreSplit::Output),
                 ("self_attn.linear_gate", [attn.heads * attn.v_head_dim, h], CoreSplit::Output),
                 ("self_attn.o_proj", [h, attn.heads * attn.v_head_dim], CoreSplit::Input),
             ];
@@ -315,7 +327,7 @@ pub fn target_arenas(
                 views.push((format!("{p}.mlp.combine_output_norm.weight"), h * 2));
             }
 
-            // Engram small GPU projections/norms (table itself stays host-mapped)
+            // Engram small GPU projections/norms (packed contiguously inside target arena; table itself stays host-mapped)
             if cfg.engram_layers.contains(&layer) {
                 let ep = format!("{p}.engram_layer");
                 let w = cfg.engram_head_width();
@@ -323,16 +335,12 @@ pub fn target_arenas(
                 views.push((format!("{ep}.unified_pre_gamma"), h * 2));
                 views.push((format!("{ep}.value_proj.weight"), h * concat * 2));
                 views.push((format!("{ep}.value_proj.bias"), h * 2));
-                for j in 0..cfg.engram_total_heads() {
-                    views.push((format!("{ep}.lookup_per_head_norms.{j}.weight"), w * 2));
-                }
-                for j in 0..hc {
-                    views.push((format!("{ep}.key_projs.{j}.weight"), h * concat * 2));
-                    views.push((format!("{ep}.key_projs.{j}.bias"), h * 2));
-                    views.push((format!("{ep}.norm_key.{j}.weight"), h * 2));
-                    views.push((format!("{ep}.norm_query.{j}.weight"), h * 2));
-                    views.push((format!("{ep}.unified_per_hc_scales.{j}"), h * 2));
-                }
+                views.push((format!("{ep}.lookup_per_head_norms.packed"), cfg.engram_total_heads() * w * 2));
+                views.push((format!("{ep}.key_projs.packed.weight"), hc * h * concat * 2));
+                views.push((format!("{ep}.key_projs.packed.bias"), hc * h * 2));
+                views.push((format!("{ep}.norm_key.packed"), hc * h * 2));
+                views.push((format!("{ep}.norm_query.packed"), hc * h * 2));
+                views.push((format!("{ep}.unified_per_hc_scales.packed"), hc * h * 2));
             }
         }
 
@@ -399,8 +407,9 @@ fn add_matrix(
         }
     }
 
-    if checkpoint.converts_to_fp8(&weight_name) {
-        let [stored_n, stored_k] = fp8_role(&weight_name).stored_shape([n, k])?;
+    let role = fp8_role(&weight_name);
+    if checkpoint.converts_to_fp8(&weight_name) && role.supported {
+        let [stored_n, stored_k] = role.stored_shape([n, k])?;
         let payload = stored_n * stored_k;
         let scales = ((stored_n / 128) * (stored_k / 128) * 4).max(256);
         views.push((format!("{stem}.payload"), payload));

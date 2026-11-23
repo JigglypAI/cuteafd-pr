@@ -54,18 +54,18 @@ pub enum ExpertStorage {
     Bf16,
 }
 
-pub(super) struct Model {
-    pub(crate) cfg: Hy4FlashConfig,
+pub struct Model {
+    pub cfg: Hy4FlashConfig,
     spec: ModelSpec,
     contracts: BTreeMap<String, Contract>,
-    pub(crate) core: BTreeMap<String, CoreProjection>,
+    pub core: BTreeMap<String, CoreProjection>,
     pub(crate) routed_bytes: u64,
     pub(crate) expert_storage: BTreeMap<usize, ExpertStorage>,
-    pub(crate) has_engram_fp8: bool,
+    pub has_engram_fp8: bool,
 }
 
 impl Model {
-    fn open(checkpoint: &Checkpoint) -> Result<Self> {
+    pub fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = Hy4FlashConfig::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
         let dfly = Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?;

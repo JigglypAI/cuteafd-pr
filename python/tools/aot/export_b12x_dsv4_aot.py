@@ -1780,9 +1780,9 @@ def context_split_programs(g, decode_rows: int, max_context: int):
 
 def dense_family_scopes(families, exlr8_family):
     requested = set((families if families is not None else "kimik3").split(","))
-    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2"}:
-        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse, ml4 and/or inkling2")
-    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2") if name in requested)
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2", "hy4f"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse, ml4, inkling2 and/or hy4f")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4", "inkling2", "hy4f") if name in requested)
     native = tuple(name for name in k6 if name in ("glm", "glmf")) \
         if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
     return k6, native
@@ -1852,9 +1852,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "hy4f", "hy4f2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, hy4f, hy4f2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -1988,6 +1988,8 @@ def main() -> None:
             continue
         if name in ("minimax", "inkling2"):
             continue  # appended after existing programs to preserve their indices
+        if name in ("hy4f", "hy4f2"):
+            continue  # appended after inkling2 to preserve existing indices
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             if not native_families:
@@ -2184,6 +2186,32 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    for hy4_name in ("hy4f", "hy4f2"):
+        if hy4_name in geometries:
+            from export_b12x_hy4_aot import programs as hy4_programs
+            tp = 1 if hy4_name == "hy4f" else 2
+            extent = min(int(args.max_context), 262144)
+            manifest["families"][hy4_name] = {
+                "tp": tp, "hidden": 3072, "dsa_heads": 32 // tp, "swa_heads": 64 // tp,
+                "indexer_heads": 16, "q_lora_rank": 1024, "kv_lora_rank": 512,
+                "qk_nope_dim": 192, "qk_rope_dim": 64, "v_head_dim": 256,
+            }
+            manifest["family_capacities"][hy4_name] = {"max_context": extent}
+            work += [(hy4_name, *item) for item in hy4_programs(tp, args.decode_rows, args.prefill_rows, extent)]
+    if "hy4f" in geometries or "hy4f2" in geometries:
+        from export_b12x_dense_trellis_k6_aot import HY4F_SHAPES
+        existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
+        for name, k, n, side in HY4F_SHAPES:
+            if name.startswith("hy4f_kv_b") or name in ("hy4f_dense_down", "hy4f_dense_down_tp2", "hy4f_shared_down_tp2"):
+                continue  # absorbed kv_b_proj and TP2 K-split down_proj (K=6912/768 not 512-aligned) stay BF16 in fp8-compact
+            is_head = n in (120832, 60416)
+            precision = "f32" if (is_head or side == 2) else "bf16"
+            for rows in ((64,) if is_head else (64, 4096)):
+                suffix = f"n{n}_k{k}_m{rows}" + ("_f32" if precision == "f32" else "")
+                if suffix not in existing_fp8:
+                    existing_fp8.add(suffix)
+                    work.append(("native_attention", suffix, "attention_projection", dict(max_rows=rows),
+                                 functools.partial(compile_native_attention_projection, n, k, rows, precision)))
     # Append precision alternates without changing the shipped FP8 recipes or indices.
     for family, suffix, op, params, original in tuple(work):
         if selected is not None and f"{suffix}_bf16" not in selected:

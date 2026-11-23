@@ -160,8 +160,38 @@ INKLING_SHAPES = (
     ("inkling_head_rank1", 4608, 100480, 1),
 )
 INKLING_TARGET_SHAPES = INKLING_SHAPES[:8] + INKLING_SHAPES[-3:]
-FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES}
-F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088, 100608, 100480)
+# Hy4-flash (H=3072, q_lora=1024, kv_a=576 padded to 640, DSA 32h / SWA 64h,
+# dense layer 0 I=13824, shared I=1536, LatentMoE H_latent=1536, vocab=120832):
+# every TP1 and TP2 dimension is an exact multiple of 128; MUL1 codebook only.
+HY4F_SHAPES = (
+    ("hy4f_q_a", 3072, 1024, 1),
+    ("hy4f_kv_a_padded", 3072, 640, 1),
+    ("hy4f_q_b_dsa", 1024, 8192, 1),
+    ("hy4f_q_b_dsa_tp2", 1024, 4096, 1),
+    ("hy4f_q_b_swa", 1024, 16384, 1),
+    ("hy4f_kv_b_dsa", 512, 14336, 1),
+    ("hy4f_kv_b_dsa_tp2", 512, 7168, 1),
+    ("hy4f_kv_b_swa", 512, 28672, 1),
+    ("hy4f_gate_dsa", 3072, 8192, 1),
+    ("hy4f_gate_dsa_tp2", 3072, 4096, 1),
+    ("hy4f_gate_swa", 3072, 16384, 1),
+    ("hy4f_o_dsa", 8192, 3072, 1),
+    ("hy4f_o_dsa_tp2", 4096, 3072, 2),
+    ("hy4f_o_swa", 16384, 3072, 1),
+    ("hy4f_o_swa_tp2", 8192, 3072, 2),
+    ("hy4f_dense_gate_up", 3072, 13824, 1),
+    ("hy4f_dense_gate_up_tp2", 3072, 6912, 1),
+    ("hy4f_dense_down", 13824, 3072, 1),
+    ("hy4f_dense_down_tp2", 6912, 3072, 2),
+    ("hy4f_shared_gate_up", 3072, 1536, 1),
+    ("hy4f_shared_gate_up_tp2", 3072, 768, 1),
+    ("hy4f_shared_down", 1536, 3072, 1),
+    ("hy4f_shared_down_tp2", 768, 3072, 2),
+    ("hy4f_lm_head", 3072, 120832, 1),
+    ("hy4f_lm_head_tp2", 3072, 60416, 1),
+)
+FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES, "hy4f": HY4F_SHAPES}
+F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088, 100608, 100480, 120832, 60416)
 F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
 
@@ -187,7 +217,7 @@ def shapes_for(families):
     result, seen = [], set()
     for family in families:
         for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family] if _bits(shape) == 6)
-                                                if family in ("kimik3", "glm", "glmf", "muse", "step5", "inkling2") else ())):
+                                                if family in ("kimik3", "glm", "glmf", "muse", "step5", "inkling2", "hy4f") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))
@@ -200,7 +230,11 @@ GROUPED_MAX_ROWS = 4096
 
 
 def _codebooks(name):
-    return ("mcg",) if name.startswith("inkling_head_rank") else ("mcg", "mul1")
+    if name.startswith("inkling_head_rank"):
+        return ("mcg",)
+    if name.startswith("hy4f_"):
+        return ("mul1",)
+    return ("mcg", "mul1")
 
 
 def row_policies(families=("kimik3",)):
