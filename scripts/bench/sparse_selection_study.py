@@ -117,11 +117,13 @@ def pages_of(ids: np.ndarray, dump, page: int, position: int) -> np.ndarray:
     heads, ut = dump["heads"], dump["unit_tokens"]
     unit, head = ids // heads, ids % heads
     lo, hi = unit * ut // page, np.minimum(unit * ut + ut - 1, position) // page
-    if np.all(lo == hi):
-        keys = lo * heads + head
-    else:
-        keys = np.concatenate([np.arange(a, b + 1) * heads + h for a, b, h in zip(lo, hi, head)])
-    return np.unique(keys)
+    count = (hi - lo + 1).astype(np.int64)
+    if np.all(count == 1):
+        return np.unique(lo * heads + head)
+    # Vectorized expansion of each unit's page range [lo, hi].
+    starts = np.repeat(lo.astype(np.int64), count)
+    offsets = np.arange(int(count.sum()), dtype=np.int64) - np.repeat(np.cumsum(count) - count, count)
+    return np.unique((starts + offsets) * heads + np.repeat(head.astype(np.int64), count))
 
 
 def frontier_units(position: int, dump) -> int:
@@ -396,13 +398,18 @@ def tidy(args) -> int:
     dumps = {d["layer"]: session_only(d, args.min_position) for d in (read_layer(f) for f in files)}
     by_pos = {layer: {int(p): s for p, s in zip(d["position"], sets_of(d))} for layer, d in dumps.items()}
     per_layer = {}
+    # Prefetch source: the nearest earlier selecting layer of the same unit
+    # geometry (a model's later layers often share an index source).
+    jobs = {}
     for layer, d in sorted(dumps.items()):
-        # Prefetch source: the nearest earlier selecting layer of the same unit
-        # geometry (a model's later layers often share an index source).
         earlier = [l for l in dumps if l < layer and dumps[l]["unit_tokens"] == d["unit_tokens"] and dumps[l]["heads"] == d["heads"]]
-        source = by_pos[max(earlier)] if earlier else None
-        per_layer[layer] = analyze_layer(d, source)
-        print(f"{args.family} layer {layer}: {len(d['position'])} records", file=sys.stderr, flush=True)
+        jobs[layer] = (d, by_pos[max(earlier)] if earlier else None)
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max(1, min(args.jobs, len(jobs)))) as pool:
+        futures = {layer: pool.submit(analyze_layer, d, source) for layer, (d, source) in jobs.items()}
+        for layer, future in futures.items():
+            per_layer[layer] = future.result()
+            print(f"{args.family} layer {layer}: {len(dumps[layer]['position'])} records", file=sys.stderr, flush=True)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     for kind in ("working", "churn", "cluster", "cache"):
@@ -508,6 +515,7 @@ def main(argv=None) -> int:
     t.add_argument("--dump", type=Path, required=True)
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--session", type=Path)
+    t.add_argument("--jobs", type=int, default=8, help="layers analyzed in parallel")
     t.add_argument("--min-position", type=int, default=1024,
                    help="drop records below this engine position (server warm-up and probe requests)")
     t.add_argument("--index-bytes-per-token", type=float, required=True,
