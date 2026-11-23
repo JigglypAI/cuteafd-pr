@@ -875,6 +875,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
     /// Both peer exchanges this execution queues waits on.
     fn require_live(&self) -> Result<()> {
         self.exchange.require_live()?;
+        if let Exchange::Pair { peer, .. } = &self.exchange { peer.require_live()?; }
         if let Some(tp2) = &self.tp2 { tp2.pair.routes.require_live()?; }
         Ok(())
     }
@@ -999,7 +1000,10 @@ impl<'e, 'a> Execution<'e, 'a> {
             for bank in &self.main.graphs { bank.tick(); }
             return Ok(());
         }
-        // enqueue drains every rank before reaching this outer step boundary.
+        // First touch and cache maintenance need a quiescent sample; ordinary
+        // replays only tick above and leave the head ordered on its lane stream.
+        collect_lane_results(self.main.stages.iter().map(|stage| stage.stream.drain()))?;
+        self.main.require_live()?;
         // SAFETY: graph owners hold no allocations; native, cache and staging storage
         // stays live in this execution and its borrowed owners until terminal drainage.
         unsafe { crate::shared::decode_graph::device::observe_completed(self.main.device(0)?.library,
@@ -1020,8 +1024,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         Ok((self.main.device(rank)?, self.main.terminal_output.take().context("Step-5 terminal wave absent")?))
     }
     pub(super) fn require_live(&self) -> Result<()> {
-        self.main.exchange.require_live()?;
-        if let Some(tp2) = &self.main.tp2 { tp2.pair.routes.require_live()?; }
+        self.main.require_live()?;
         ensure!(self.main.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
         Ok(())
     }
@@ -1079,10 +1082,10 @@ impl<'e, 'a> Execution<'e, 'a> {
             let head = main.ownership.execution().spec().head_gpu as usize;
             let output = binding.current[head].context("Step-5 pipeline omitted terminal head output")?;
             ensure!(output.device_id == main.device(head)?.id, "Step-5 terminal output rank mismatch");
+            self.graph_completed()?;
             main.terminal_output.set(Some(output));
-            collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
-        }))?;
-        self.graph_completed()
+            Ok(())
+        }))
     }
 }
 
@@ -1133,7 +1136,9 @@ impl<'e, 'a> Execution<'e, 'a> {
             hooks.binding.step.finish_units();
             main.reset_units()?;
             main.terminal_output.set(Some(input.buffer));
-            collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
+            // The head runs on the same stream. Step publication or abandonment
+            // waits on every rank before releasing the staging and cache owners.
+            Ok(())
         }))
     }
 }

@@ -619,7 +619,8 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
             let stages = self.execution.stages();
             let stream = &stages[rank].stream;
             let head = self.execution.head()?;
-            crate::shared::prefill_packing::finish_members(segments.len(), |i| {
+            let mut guard = stream.cancellation_guard("Step-5 packed member head");
+            let outcomes = crate::shared::prefill_packing::finish_members(segments.len(), |i| {
                 let sequence = &mut sequences[i];
                 if sequence.neural {
                     self.prefill_draft(sequence.placement, sequence.start, sequence.tokens,
@@ -627,10 +628,13 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
                 }
                 let source = super::mtp::slice(self.inputs.residual.buffer,
                     (segments[i].end_row() - 1) * H * 4, H * 4)?;
-                let logits = head.device_logits_on(source, 1, stream)?;
-                stream.drain()?;
-                Ok(logits)
-            }, on_logits)
+                // Downloads and selection wait on the producing stream. If the
+                // member needs neither, the next head or target reuses scratch
+                // on this same stream without a host fence.
+                head.device_logits_on(source, 1, stream)
+            }, on_logits)?;
+            guard.complete = true;
+            Ok(outcomes)
         })
     }
 
