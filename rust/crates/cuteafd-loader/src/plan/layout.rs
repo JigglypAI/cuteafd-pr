@@ -207,6 +207,14 @@ pub struct LayoutOptions {
 }
 
 impl LayoutOptions {
+    /// Offline coordinator class for this rank, unless the caller supplied a
+    /// physical SM count (e.g. when capping the memory of a larger card).
+    pub fn coordinator_sms(&self, rank: usize) -> u32 {
+        self.physical_sms.unwrap_or_else(|| {
+            crate::placement::ArchContext::coordinator(self.rtx_bytes[rank], None).sms
+        })
+    }
+
     pub fn spark_capacity(&self, rank: usize) -> u64 {
         if let Some(bytes) = self.spark_allocation_budget_bytes { bytes }
         else if self.spark_bytes > 0 { self.spark_bytes }
@@ -1012,8 +1020,7 @@ impl Shape {
         if let Some(manifest) = self.manifest.as_mut() {
             cuteafd_core::attention::select_sparse_mla_manifest(std::sync::Arc::make_mut(manifest),
                 report.attention_precision.as_ref().map(|precision| precision.mode).unwrap_or_default());
-            let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
-                "sm_120", options.rtx_bytes[0]).sms);
+            let sms = options.coordinator_sms(0);
             if let Err(error) = cuteafd_core::coordinator_programs::select_card_plans(std::sync::Arc::make_mut(manifest), sms) {
                 report.placement_supported = false;
                 notes.push(error.to_string());

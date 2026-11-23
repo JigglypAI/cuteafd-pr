@@ -57,7 +57,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;
     let fp8: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_FP8_AOT.json"))
         .context("missing V4.1 native FP8 allocation manifest")?)?;
-    let sms = options.physical_sms.unwrap_or_else(|| ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms);
+    let sms = options.coordinator_sms(0);
     let programs = v41::owners::NativePrograms::new(&fp8, sms)?;
     let mode = Fp8Head::configured();
     let window_batch = ranks == 1 && std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0");
