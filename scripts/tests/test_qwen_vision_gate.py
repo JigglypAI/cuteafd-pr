@@ -27,7 +27,7 @@ def test_history_policy_removes_unused_route_geometry_probes():
         assert "RouteProbe" not in source
     policy = (daemon / "shared/draft/history.rs").read_text()
     assert "DraftHistory::new(spec, length.control())" in policy
-    assert "self.history.settle(&ids, rows)" in policy
+    assert "self.history.settle_with_padding(&ids, rows, bucket)" in policy
     # Removing route probes does not move admitted EXL3 onboarding.
     glm = (daemon / "families/glm5_flash/mod.rs").read_text()
     assert glm.index("local.ensure(local_layers[0], stream)?;") < glm.index("engine.install_local(local_layers, experts)?;")
@@ -357,7 +357,7 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     copy = serve.index("policy.shape_with_padding(&mut shaped, geometry.decode_rows")
     assert copy < serve.index("let sequences: Vec<Vec<u32>>")
     policy = (ROOT / "rust/crates/cuteafd-daemon/src/shared/draft/history.rs").read_text()
-    assert policy.index("copy::continuation(") < policy.index("self.history.settle(&ids, rows)")
+    assert policy.index("copy::continuation(") < policy.index("self.history.settle_with_padding(&ids, rows, bucket)")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route

@@ -412,11 +412,11 @@ def test_optional_levers_are_default_off_and_documented():
                 assert default == "2"
                 assert "`DECODE_LANES=1`" in lever["enable"]
             elif key == "DRAFT_POLICY":
-                # The lever is the opt-in `clamped` policy; `history` stays the default.
                 assert default == "history"
                 assert lever["families"] == COLUMNS
-                assert "`DRAFT_POLICY=clamped`" in lever["enable"]
-                assert "clamped) draft_policy_args=(--draft-policy clamped) ;;" in (ROOT / "scripts/launch/run-family.sh").read_text()
+                for policy in ("clamped", "history-shared-explore"):
+                    assert f"`DRAFT_POLICY={policy}`" in lever["enable"]
+                assert 'history-shared-explore|clamped|off) draft_policy_args=(--draft-policy "$(get DRAFT_POLICY)") ;;' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
