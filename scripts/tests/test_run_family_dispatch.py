@@ -2511,6 +2511,27 @@ def test_mistral_large4_launch_places_its_pixtral_encoder_where_the_plan_does(tm
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
 
 
+@pytest.mark.parametrize("vision", ["rtx", "off"])
+def test_mistral_large4_media_cache_reaches_plan_and_serve_only_with_vision(tmp_path, vision):
+    config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
+              "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1},
+              "vision_config": {"model_type": "pixtral", "num_hidden_layers": 30}}
+    placement = {"kind": "rtx", "gpu": 0} if vision == "rtx" else {"kind": "off"}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "max_image_tokens": 55 * 56,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = f"RTX_GPUS=1\nSPECULATOR=off\nAUDIO=off\nVISION={'auto' if vision == 'rtx' else 'off'}\nMEDIA_CACHE_BYTES=2GiB\n"
+    result = _family_launch_result(tmp_path, config, "test/ml4", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    planned = next(shlex.split(line) for line in result.stderr.splitlines()
+                   if "cuteafd plan" in line and "--deployment" in line)
+    for argv in (serve, planned):
+        assert ("--media-cache-bytes" in argv) == (vision == "rtx")
+        if vision == "rtx":
+            assert argv[argv.index("--media-cache-bytes") + 1] == "2GiB"
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(tmp_path, gpus):
     config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
