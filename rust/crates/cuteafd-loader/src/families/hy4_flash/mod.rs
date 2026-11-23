@@ -1,6 +1,7 @@
 //! Hy4-flash (`hy_v4_flash`, `HYV4FlashForConditionalGeneration`) checkpoint facts,
 //! FP8-only Engram mapped-table reader and multi-layer look-ahead, packed
 //! coordinator weight arenas, and shared-contract execution layouts.
+pub mod admission;
 pub mod config;
 pub mod engram;
 pub mod execution;

@@ -19,6 +19,8 @@ use super::Hy4FlashConfig;
 
 pub const HEAD_STEM: &str = "lm_head";
 pub const HEAD_WEIGHT: &str = "lm_head.weight";
+pub const ROPE_INV_FREQ_DSA: &str = "hy4_flash.rope.inv_freq_dsa";
+pub const ROPE_INV_FREQ_SWA: &str = "hy4_flash.rope.inv_freq_swa";
 
 /// Classify whether a Hy4-flash core matrix is head/intermediate-splittable
 /// across two coordinator GPUs under `HeadSplit` / `ContextSplit`.
@@ -155,6 +157,55 @@ impl CoordinatorWeights {
             maximum,
             cuteafd_core::memory_layout::MemoryKind::Weights,
         )
+    }
+
+    pub fn has_bf16_head(&self) -> bool {
+        self.arena.views().contains_key(HEAD_WEIGHT)
+    }
+
+    pub fn native_core_scratch(&self, rows: usize)
+        -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+        let mut combined: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
+        for (stem, layout) in &self.core {
+            if stem == HEAD_STEM {
+                continue;
+            }
+            let [n, k] = layout.shape;
+            let one = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+            match &mut combined {
+                Some(acc) => acc.merge(&one)?,
+                None => combined = Some(one),
+            }
+        }
+        for stem in self.fp8.keys() {
+            if stem == HEAD_STEM {
+                continue;
+            }
+            let one = crate::formats::trellis_core::ProjectionScratchLayout {
+                rows,
+                extents: BTreeMap::from([("fp8", 256)]),
+            };
+            match &mut combined {
+                Some(acc) => acc.merge(&one)?,
+                None => combined = Some(one),
+            }
+        }
+        Ok(combined)
+    }
+
+    pub fn native_head_scratch(&self, head_rows: usize)
+        -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+        if let Some(layout) = self.core.get(HEAD_STEM) {
+            let [n, k] = layout.shape;
+            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, head_rows)?));
+        }
+        if self.fp8.contains_key(HEAD_STEM) {
+            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout {
+                rows: head_rows,
+                extents: BTreeMap::from([("fp8", 256)]),
+            }));
+        }
+        Ok(None)
     }
 
     pub fn trellis_scratch(&self, prefill_rows: usize, decode_rows: usize)
@@ -340,6 +391,10 @@ pub fn target_arenas(
             }
         }
 
+        // RoPE inverse frequency constants live inside the target arena (never standalone allocations).
+        views.push((ROPE_INV_FREQ_DSA.into(), (cfg.qk_rope_dim / 2) * 4));
+        views.push((ROPE_INV_FREQ_SWA.into(), (cfg.swa_qk_rope_dim / 2) * 4));
+
         let arena = WeightArenaLayout::new(format!("hy4_flash/target/gpu{rank}"), views)?;
         out.push(CoordinatorWeights {
             rank,
@@ -369,9 +424,13 @@ fn add_matrix(
     let effective_rank = if split == CoreSplit::Whole { 0 } else { rank };
 
     if let Some(proj) = core_projections.get(stem) {
-        let side = match split {
-            CoreSplit::Input => TrellisSide::Input,
-            CoreSplit::Output | CoreSplit::Whole => TrellisSide::Output,
+        let side = if effective_ranks == 1 {
+            TrellisSide::Output
+        } else {
+            match split {
+                CoreSplit::Input => TrellisSide::Input,
+                CoreSplit::Output | CoreSplit::Whole => TrellisSide::Output,
+            }
         };
         let layout = if stem == HEAD_STEM && effective_ranks == 2 {
             CoreWeightLayout::output_shard(proj, effective_rank)?

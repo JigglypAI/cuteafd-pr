@@ -1,4 +1,4 @@
-//! Named physical cache, prefix-mark, and per-unit workspace layouts for Hy4-flash.
+//! Named physical cache, prefix-mark, and packed scratch arena layouts for Hy4-flash.
 //!
 //! Shared by `cuteafd plan --layout` and runtime admission so planned and
 //! allocated bytes match owner for owner.
@@ -6,11 +6,13 @@ use std::collections::BTreeMap;
 
 use anyhow::{ensure, Context, Result};
 
+use crate::serving_capacity::WeightArenaLayout;
+
 use super::{Hy4FlashConfig, Hy4KvCache};
 
 /// KV page quantum for the 12 DSA layers (64-token pages).
 pub const PAGE_ROWS: usize = 64;
-/// Per-sequence SWA-512 circular ring rows: 10 pages = 640 rows
+/// Minimum per-sequence SWA-512 circular ring rows: 10 pages = 640 rows
 /// (`512` window + up to `64` decode/verify rows + page wrap alignment).
 pub const SWA_RING_PAGES: usize = 10;
 pub const SWA_RING_ROWS: usize = SWA_RING_PAGES * PAGE_ROWS;
@@ -22,17 +24,36 @@ pub fn mla_split_scratch_bytes(decode_rows: usize, head_parts: usize) -> usize {
 
 /// Compressed indexer group-cache record bytes: 128 E4M3 dims + 4B F32 scale.
 pub const INDEX_GROUP_RECORD_BYTES: usize = 132;
+/// Maximum rows projected through `lm_head` in one tile.
+pub const HEAD_TILE_ROWS: usize = 64;
+/// Cap `idx_scores` at 64 MiB (16M floats); long-context prefill tiles rows automatically.
+pub const MAX_IDX_SCORE_FLOATS: usize = 16 * 1024 * 1024;
+/// Padded `kv_a` width required by compact core projections (128-aligned >= 576).
+pub const KV_A_PADDED: usize = 640;
+/// Active-split-1 MLA scratch size matching `PROGRAMS.json` (`hy4f_mla_*`).
+pub const ATTN_SCRATCH_BYTES: usize = 1024;
+
+/// Per-sequence SWA circular ring pages required to hold the live `sliding_window`
+/// plus one full prefill unit without overwriting any token still needed by queries
+/// earlier in the same unit.
+pub fn swa_ring_pages(sliding_window: usize, unit_rows: usize) -> usize {
+    ((sliding_window + unit_rows).div_ceil(PAGE_ROWS) + 1).max(SWA_RING_PAGES)
+}
 
 /// Persistent per-sequence SWA-512 ring & prefix-mark bytes for one GPU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheLayout {
+    /// Per-sequence SWA ring pages (`>= SWA_RING_PAGES`).
+    pub swa_ring_pages: usize,
+    /// Per-sequence SWA ring rows (`swa_ring_pages * PAGE_ROWS`).
+    pub swa_ring_rows: usize,
     /// Active SWA-512 rings across all admitted sequences and owned SWA layers.
     pub active_swa_ring_bytes: usize,
     /// Pending incomplete compressed-indexer token keys (`compress_ratio - 1 = 3`
     /// tokens × `128` F32) across admitted sequences and owned DSA layers.
     pub active_indexer_pending_bytes: usize,
     /// Exact per-snapshot prefix-mark bytes (30 SWA-512 windows + 12 DSA pending
-    /// indexer tokens ≈ 16.9 MiB BF16 on one GPU).
+    /// indexer tokens).
     pub mark_bytes_per_slot: usize,
     /// Per-page bytes of one DSA layer's KV records (`64 * record_bytes`).
     pub dsa_kv_page_bytes: usize,
@@ -49,6 +70,17 @@ impl CacheLayout {
         owned_dsa_layers: usize,
         owned_swa_layers: usize,
     ) -> Result<Self> {
+        Self::for_unit(cfg, kv_format, sequences, owned_dsa_layers, owned_swa_layers, 0)
+    }
+
+    pub fn for_unit(
+        cfg: &Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        sequences: usize,
+        owned_dsa_layers: usize,
+        owned_swa_layers: usize,
+        unit_rows: usize,
+    ) -> Result<Self> {
         ensure!(sequences > 0, "Hy4-flash requires at least one admitted sequence");
         let rec = kv_format.record_bytes();
         let dsa_kv_page_bytes = PAGE_ROWS.checked_mul(rec).context("DSA KV page overflow")?;
@@ -57,9 +89,12 @@ impl CacheLayout {
             .checked_mul(INDEX_GROUP_RECORD_BYTES)
             .context("DSA index page overflow")?;
 
-        // Active SWA-512 circular rings: 10 pages (640 rows) per sequence per owned SWA layer.
+        let swa_ring_pages = swa_ring_pages(cfg.sliding_window, unit_rows);
+        let swa_ring_rows = swa_ring_pages
+            .checked_mul(PAGE_ROWS)
+            .context("SWA ring rows overflow")?;
         let swa_ring_per_seq = owned_swa_layers
-            .checked_mul(SWA_RING_ROWS)
+            .checked_mul(swa_ring_rows)
             .and_then(|v| v.checked_mul(rec))
             .context("SWA ring overflow")?;
         let active_swa_ring_bytes = swa_ring_per_seq
@@ -85,6 +120,8 @@ impl CacheLayout {
             .context("mark bytes overflow")?;
 
         Ok(Self {
+            swa_ring_pages,
+            swa_ring_rows,
             active_swa_ring_bytes,
             active_indexer_pending_bytes,
             mark_bytes_per_slot,
@@ -94,8 +131,172 @@ impl CacheLayout {
     }
 }
 
-/// Named scratch buffers owned by one in-flight execution unit (one decode lane
-/// or one prefill wave slot) on a coordinator GPU.
+/// One packed scratch arena per coordinator GPU per in-flight prefill wave slot.
+/// Holds every buffer that must survive across `PrefillHooks` boundaries for that slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaveScratchLayout {
+    pub arena: WeightArenaLayout,
+}
+
+impl WaveScratchLayout {
+    pub fn arena_id(gpu: usize, slot: usize) -> String {
+        format!("hy4_flash.wave.{gpu}.{slot}")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cfg: &Hy4FlashConfig,
+        gpu: usize,
+        slot: usize,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(tp, 1 | 2) && max_rows > 0 && max_sequences > 0,
+            "invalid Hy4-flash WaveScratchLayout shape"
+        );
+        let h = cfg.hidden;
+        let hc = cfg.hc_mult;
+        let pages = max_seq_pages.max(16);
+        let max_batch_groups = max_rows / cfg.indexer_compress_ratio + max_sequences + 2;
+        let tp2_f32_bytes = if tp == 2 { max_rows * h * 4 } else { 256 };
+        let engram_concat = cfg.engram_concat_width();
+
+        let mut views: Vec<(String, usize)> = vec![
+            ("positions_i64".into(), (max_rows * 8).max(256)),
+            ("positions_i32".into(), (max_rows * 4).max(256)),
+            ("dsa_slots_i64".into(), (max_rows * 8).max(256)),
+            ("swa_slots_i64".into(), (max_rows * 8).max(256)),
+            ("r_a".into(), (max_rows * hc * h * 2).max(256)),
+            ("r_b".into(), (max_rows * hc * h * 2).max(256)),
+            ("post_ffn".into(), (max_rows * hc * 4).max(256)),
+            ("y".into(), (max_rows * h * 2).max(256)),
+            ("shared_out".into(), (max_rows * h * 2).max(256)),
+            ("shared_f32".into(), tp2_f32_bytes.max(256)),
+            ("dsa_page_table".into(), (max_rows * pages * 4).max(256)),
+            ("swa_page_table".into(), (max_sequences * pages * 4).max(256)),
+            ("swa_seqlens".into(), (max_sequences * 4).max(256)),
+            ("dsa_cu_seqlens".into(), ((max_rows + 1) * 4).max(256)),
+            ("swa_cu_seqlens".into(), ((max_sequences + 1) * 4).max(256)),
+            ("idx_limits".into(), (max_rows * 4).max(256)),
+            ("idx_group_pos".into(), (max_batch_groups * 8).max(256)),
+            ("idx_group_slots".into(), (max_batch_groups * 8).max(256)),
+        ];
+        for i in 0..cfg.engram_layers.len() {
+            views.push((format!("engram_raw.{i}"), (max_rows * engram_concat * 2).max(256)));
+            views.push((format!("engram_masked.{i}"), max_rows.max(256)));
+        }
+        let arena = WeightArenaLayout::new(Self::arena_id(gpu, slot), views)?;
+        Ok(Self { arena })
+    }
+}
+
+/// One packed hook-local scratch arena per coordinator GPU, shared across all wave slots
+/// on that rank's ordered stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedScratchLayout {
+    pub arena: WeightArenaLayout,
+    pub idx_score_floats: usize,
+}
+
+impl SharedScratchLayout {
+    pub fn arena_id(gpu: usize) -> String {
+        format!("hy4_flash.scratch.{gpu}")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cfg: &Hy4FlashConfig,
+        rank: usize,
+        tp: usize,
+        max_rows: usize,
+        decode_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+        local_vocab: usize,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(tp, 1 | 2) && rank < tp && max_rows > 0 && decode_rows > 0 && max_sequences > 0,
+            "invalid Hy4-flash SharedScratchLayout shape"
+        );
+        let h = cfg.hidden;
+        let hc = cfg.hc_mult;
+        let max_heads = cfg.swa_heads.max(cfg.sparse_heads) / tp;
+        let max_inter = cfg.intermediate / tp;
+        let pages = max_seq_pages.max(16);
+        let max_seq_groups = pages * (PAGE_ROWS / cfg.indexer_compress_ratio);
+        let idx_score_floats = max_rows
+            .saturating_mul(max_seq_groups.max(1))
+            .min(MAX_IDX_SCORE_FLOATS)
+            .max(max_seq_groups.max(1));
+        let wire_row = cfg.routed_expert_hidden + cfg.routed_expert_hidden / 32;
+        let tp2_f32_bytes = if tp == 2 { max_rows * h * 4 } else { 256 };
+        let kv_a_dim = cfg.kv_lora_rank + cfg.qk_rope_dim;
+        let qk_dim = cfg.qk_nope_dim + cfg.qk_rope_dim;
+        let idx_h = cfg.indexer_heads;
+        let idx_d = cfg.indexer_head_dim;
+        let engram_concat = cfg.engram_concat_width();
+
+        let mut views: Vec<(String, usize)> = vec![
+            ("ids".into(), (max_rows * 4).max(256)),
+            ("r_head_in".into(), (HEAD_TILE_ROWS * hc * h * 2).max(256)),
+            ("post".into(), (max_rows * hc * 4).max(256)),
+            ("delta".into(), (max_rows * h * 2).max(256)),
+            ("delta_f32".into(), tp2_f32_bytes.max(256)),
+            ("delta_peer_f32".into(), tp2_f32_bytes.max(256)),
+            ("delta_sum_f32".into(), tp2_f32_bytes.max(256)),
+            ("delta_norm".into(), (max_rows * h * 2).max(256)),
+            ("engram_normed".into(), (max_rows * engram_concat * 2).max(256)),
+            ("engram_val".into(), (max_rows * h * 2).max(256)),
+            ("engram_keys".into(), (max_rows * hc * h * 2).max(256)),
+            ("q_a".into(), (max_rows * cfg.q_lora_rank * 2).max(256)),
+            ("kv_a".into(), (max_rows * kv_a_dim * 2).max(256)),
+            ("kv_a_padded".into(), (max_rows * KV_A_PADDED * 2).max(256)),
+            ("q_resid".into(), (max_rows * cfg.q_lora_rank * 2).max(256)),
+            ("q_raw".into(), (max_rows * max_heads * qk_dim * 2).max(256)),
+            ("gate".into(), (max_rows * max_heads * cfg.v_head_dim * 2).max(256)),
+            ("query".into(), (max_rows * max_heads * kv_a_dim * 2).max(256)),
+            ("attn_out".into(), (max_rows * max_heads * cfg.kv_lora_rank * 2).max(256)),
+            ("lse_out".into(), (max_rows * max_heads * 4).max(256)),
+            ("uv_out".into(), (max_rows * max_heads * cfg.v_head_dim * 2).max(256)),
+            ("attn_scratch".into(), mla_split_scratch_bytes(decode_rows, tp).max(ATTN_SCRATCH_BYTES).max(256)),
+            ("idx_q_raw".into(), (max_rows * idx_h * idx_d * 2).max(256)),
+            ("idx_q_rot".into(), (max_rows * idx_h * idx_d * 2).max(256)),
+            ("idx_w_raw".into(), (max_rows * idx_h * 2).max(256)),
+            ("idx_w_out".into(), (max_rows * idx_h * 4).max(256)),
+            ("idx_tk_raw".into(), (max_rows * idx_d * 2).max(256)),
+            ("idx_tk".into(), (max_rows * idx_d * 2).max(256)),
+            ("idx_group_tok".into(), ((max_rows + cfg.indexer_compress_ratio * max_sequences) * idx_d * 2).max(256)),
+            ("idx_scores".into(), (idx_score_floats * 4).max(256)),
+            ("idx_cand_slots".into(), (max_rows * cfg.indexer_candidate_topk * 4).max(256)),
+            ("idx_cand_lens".into(), (max_rows * 4).max(256)),
+            ("ffn_gate".into(), (max_rows * max_inter * 2).max(256)),
+            ("ffn_up".into(), (max_rows * max_inter * 2).max(256)),
+            ("ffn_act".into(), (max_rows * max_inter * 2).max(256)),
+            ("router_logits".into(), (max_rows * cfg.experts * 4).max(256)),
+            ("router_select".into(), (max_rows * cfg.experts * 4).max(256)),
+            ("route_ids".into(), (max_rows * cfg.topk * 4).max(256)),
+            ("route_weights".into(), (max_rows * cfg.topk * 4).max(256)),
+            ("latent_in".into(), (max_rows * cfg.routed_expert_hidden * 2).max(256)),
+            ("wire_in".into(), (max_rows * wire_row).max(256)),
+            ("routed_latent".into(), (max_rows * cfg.routed_expert_hidden * 2).max(256)),
+            ("routed_out".into(), (max_rows * h * 2).max(256)),
+            (
+                "logits_tile".into(),
+                if tp == 2 { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
+            ),
+        ];
+        if rank == 0 {
+            views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
+        }
+        let arena = WeightArenaLayout::new(Self::arena_id(rank), views)?;
+        Ok(Self { arena, idx_score_floats })
+    }
+}
+
+/// Named scratch buffers owned by one in-flight execution unit (kept for unit-level inspection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitLayout {
     pub buffers: BTreeMap<String, usize>,
@@ -108,51 +309,17 @@ impl UnitLayout {
         rows: usize,
         head_parts: usize,
     ) -> Result<Self> {
-        ensure!(rows > 0 && matches!(head_parts, 1 | 2), "invalid Hy4-flash UnitLayout shape");
-        let h = cfg.hidden;
-        let hc = cfg.hc_mult;
-        let max_heads = cfg.swa_heads.max(cfg.sparse_heads) / head_parts;
+        let _ = kv_format;
+        let max_seq_pages = cfg.max_position.div_ceil(PAGE_ROWS);
+        let shared = SharedScratchLayout::new(cfg, 0, head_parts, rows, rows.min(64), max_seq_pages, 16, cfg.vocab_size / head_parts)?;
+        let wave = WaveScratchLayout::new(cfg, 0, 0, head_parts, rows, max_seq_pages, 16)?;
         let mut buffers = BTreeMap::new();
-
-        // 4-stream iHC residual [rows, 4, H] BF16 + pre/post FP32 mixing coefficients.
-        buffers.insert("ihc_residual".into(), rows * hc * h * 2);
-        buffers.insert("ihc_post".into(), rows * hc * 4);
-        buffers.insert("layer_in".into(), rows * h * 2);
-        buffers.insert("layer_out".into(), rows * h * 2);
-
-        // MLA producer & absorbed attention scratch:
-        // q_a [rows, 1024], kv_a [rows, 576], absorbed query [rows, max_heads, 576],
-        // attn_latent [rows, max_heads, 512], lse [rows, max_heads] F32,
-        // gate/uv [rows, max_heads, 256] BF16, SWA step KV scratch [(rows + 576), record_bytes].
-        buffers.insert("q_a".into(), rows * cfg.q_lora_rank * 2);
-        buffers.insert("kv_a".into(), rows * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2);
-        buffers.insert("absorbed_q".into(), rows * max_heads * (cfg.kv_lora_rank + cfg.qk_rope_dim) * 2);
-        buffers.insert("attn_latent".into(), rows * max_heads * cfg.kv_lora_rank * 2);
-        buffers.insert("attn_lse".into(), rows * max_heads * 4);
-        buffers.insert("attn_gate".into(), rows * max_heads * cfg.v_head_dim * 2);
-        buffers.insert("attn_uv".into(), rows * max_heads * cfg.v_head_dim * 2);
-        let swa_step_pages = (rows + cfg.sliding_window + PAGE_ROWS).div_ceil(PAGE_ROWS);
-        buffers.insert("swa_step_kv".into(), swa_step_pages * PAGE_ROWS * kv_format.record_bytes());
-
-        // Compressed indexer scratch (DSA layers): queries, token keys, candidate slots [rows, 2048] I32.
-        buffers.insert("indexer_q".into(), rows * cfg.indexer_heads * cfg.indexer_head_dim * 2);
-        buffers.insert("indexer_k".into(), rows * cfg.indexer_head_dim * 4);
-        buffers.insert("indexer_weights".into(), rows * cfg.indexer_heads * 4);
-        buffers.insert("indexer_candidates".into(), rows * cfg.indexer_candidate_topk * 4);
-
-        // Dense layer-0 / shared expert / LatentMoE scratch.
-        let dense_cols = cfg.intermediate / head_parts;
-        buffers.insert("ffn_gate_up".into(), rows * dense_cols * 2 * 2);
-        buffers.insert("latent_in".into(), rows * cfg.routed_expert_hidden * 2);
-        buffers.insert("latent_out".into(), rows * cfg.routed_expert_hidden * 2);
-        buffers.insert("router_scores".into(), rows * cfg.experts * 4);
-        buffers.insert("router_ids".into(), rows * cfg.topk * 4);
-        buffers.insert("router_weights".into(), rows * cfg.topk * 4);
-
-        // Engram GPU staging & gate scratch: 16 heads × 96 BF16 + 4-stream key/value projections.
-        buffers.insert("engram_embed".into(), rows * cfg.engram_concat_width() * 2);
-        buffers.insert("engram_kv".into(), rows * (hc + 1) * h * 2);
-
+        for (k, v) in shared.arena.views() {
+            buffers.insert(format!("shared.{k}"), v.bytes());
+        }
+        for (k, v) in wave.arena.views() {
+            buffers.insert(format!("wave.{k}"), v.bytes());
+        }
         Ok(Self { buffers })
     }
 
@@ -163,11 +330,149 @@ impl UnitLayout {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn mla_split_partials_scale_with_resolved_rows_and_head_parts() {
         let full = super::mla_split_scratch_bytes(64, 1);
         assert_eq!(full, 64 * 16 * 64 * 1028);
         assert_eq!(super::mla_split_scratch_bytes(32, 1), full / 2);
         assert_eq!(super::mla_split_scratch_bytes(32, 2), full / 4);
+    }
+
+    fn test_cfg() -> Hy4FlashConfig {
+        Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 42,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: (0..42).map(|i| i % 4 == 0).collect(),
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: (0..42).map(|i| i == 0).collect(),
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 3.998,
+            swiglu_limit: 10.0,
+            engram_layers: vec![1, 11, 21, 31],
+            engram_vocab_sizes: BTreeMap::new(),
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: 120_002,
+            engram_seed: 10_007,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 120_818,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        }
+    }
+
+    #[test]
+    fn packed_scratch_arenas_are_aligned_and_disjoint() -> Result<()> {
+        let cfg = test_cfg();
+        for tp in [1usize, 2] {
+            for rank in 0..tp {
+                let shared = SharedScratchLayout::new(&cfg, rank, tp, 2752, 64, 4096, 16, cfg.vocab_size / tp)?;
+                assert_eq!(shared.arena.views().contains_key("head_logits_f32"), rank == 0);
+                for (name, view) in shared.arena.views() {
+                    assert_eq!(view.offset() % 256, 0, "shared {name} unaligned");
+                    assert!(view.bytes() >= 256);
+                }
+                let mut wave_ids = std::collections::BTreeSet::new();
+                for slot in 0..3 {
+                    let wave = WaveScratchLayout::new(&cfg, rank, slot, tp, 2752, 4096, 16)?;
+                    let id = wave.arena.id().to_string();
+                    assert_eq!(id, format!("hy4_flash.wave.{rank}.{slot}"));
+                    assert!(wave_ids.insert(id), "duplicate wave arena id across slots");
+                    let mut spans = Vec::new();
+                    for (name, view) in wave.arena.views() {
+                        assert_eq!(view.offset() % 256, 0, "wave {name} unaligned");
+                        assert!(view.bytes() >= 256);
+                        spans.push((view.offset(), view.offset() + view.bytes(), name.as_str()));
+                    }
+                    spans.sort_by_key(|&(s, _, _)| s);
+                    for pair in spans.windows(2) {
+                        assert!(
+                            pair[0].1 <= pair[1].0,
+                            "wave views overlap: {} [{}..{}) vs {} [{}..{})",
+                            pair[0].2, pair[0].0, pair[0].1, pair[1].2, pair[1].0, pair[1].1
+                        );
+                    }
+                    for i in 0..cfg.engram_layers.len() {
+                        assert!(wave.arena.view(&format!("engram_raw.{i}")).is_some());
+                        assert!(wave.arena.view(&format!("engram_masked.{i}")).is_some());
+                    }
+                }
+            }
+        }
+        let cache = CacheLayout::for_unit(&cfg, Hy4KvCache::Fp8, 16, 12, 30, 2752)?;
+        assert_eq!(cache.swa_ring_pages, swa_ring_pages(512, 2752));
+        assert_eq!(cache.swa_ring_rows, cache.swa_ring_pages * PAGE_ROWS);
+        Ok(())
+    }
+
+    #[test]
+    fn attn_scratch_view_covers_runtime_split_k_cap_across_tp_and_rows() -> Result<()> {
+        let cfg = test_cfg();
+        for tp in [1usize, 2] {
+            for decode_rows in [1usize, 32, 64] {
+                let runtime_split_k_cap =
+                    mla_split_scratch_bytes(decode_rows, tp).max(ATTN_SCRATCH_BYTES);
+                for unit_rows in [1usize, 64, 128, 512, 2752, 4096] {
+                    let capacity_rows = unit_rows.max(decode_rows);
+                    for rank in 0..tp {
+                        let shared = SharedScratchLayout::new(
+                            &cfg,
+                            rank,
+                            tp,
+                            capacity_rows,
+                            decode_rows,
+                            64,
+                            16,
+                            cfg.vocab_size / tp,
+                        )?;
+                        let view = shared
+                            .arena
+                            .view("attn_scratch")
+                            .expect("SharedScratchLayout missing attn_scratch");
+                        assert!(
+                            view.bytes() >= runtime_split_k_cap,
+                            "tp={tp} rank={rank} unit_rows={unit_rows} decode_rows={decode_rows}: admitted attn_scratch {} < runtime split_k_cap {runtime_split_k_cap}",
+                            view.bytes()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

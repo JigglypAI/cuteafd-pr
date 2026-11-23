@@ -15,7 +15,7 @@ use crate::shared::experts::staging::RouteStaging;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use crate::shared::memory::receipts::Inventory;
-use crate::shared::memory::Tag;
+use crate::shared::memory::weight_arena::DeviceArena;
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
 use crate::shared::spark_intake::SparkLink;
 use crate::shared::spark_waves::{self, WaveTicket, Waves};
@@ -23,10 +23,13 @@ use crate::shared::target_head::{self, TargetHead};
 use crate::shared::token_io::DeviceLogits;
 use crate::shared::token_table::{enqueue as enqueue_table_h2d, CopyPlane};
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::memory_layout::{arena_class, ArenaTag};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
-use cuteafd_loader::families::hy4_flash::execution::{mla_split_scratch_bytes, PAGE_ROWS};
+use cuteafd_loader::families::hy4_flash::execution::{
+    mla_split_scratch_bytes, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+};
 use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
@@ -51,8 +54,6 @@ const TOPK: usize = 16;
 const IDX_HEADS: usize = 16;
 const IDX_DIM: usize = 128;
 const CANDIDATE_TOPK: usize = 2048;
-/// Cap `idx_scores` at 64 MiB (16M floats); long-context prefill tiles rows automatically.
-const MAX_IDX_SCORE_FLOATS: usize = 16 * 1024 * 1024;
 
 /// Which rows of a batch compute terminal `hc_head` + `lm_head` FP32 logits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,13 +74,19 @@ enum ReducePlanes {
 }
 
 impl ReducePlanes {
-    fn buffers(self, rank: &RankRuntime<'_>, rows: usize, skip_routed: bool) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
-        let scratch = &rank.scratch;
+    fn buffers(
+        self,
+        rank: &RankRuntime<'_>,
+        wave_slot: usize,
+        rows: usize,
+        skip_routed: bool,
+    ) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
+        let shared = &rank.shared;
         Ok(match self {
-            Self::Delta => (scratch.delta_f32.buffer, scratch.delta.buffer),
+            Self::Delta => (shared.delta_f32.buffer, shared.delta.buffer),
             Self::Routed => {
                 let input = if skip_routed {
-                    scratch.delta_f32.buffer
+                    shared.delta_f32.buffer
                 } else {
                     let experts = rank.onboarded_experts.borrow();
                     CuteafdDeviceBuffer {
@@ -89,38 +96,147 @@ impl ReducePlanes {
                         flags: 0,
                     }
                 };
-                (input, scratch.routed_latent.buffer)
+                (input, shared.routed_latent.buffer)
             }
-            Self::Shared => (scratch.shared_f32.buffer, scratch.shared_out.buffer),
+            Self::Shared => {
+                let w = &rank.waves[wave_slot];
+                (w.shared_f32.buffer, w.shared_out.buffer)
+            }
         })
     }
 }
 
-/// Per-rank scratch workspace for one Hy4-flash prefill or decode unit.
-struct RankScratch<'a> {
-    ids: Allocation<'a>,
+/// One packed per-wave scratch arena per coordinator GPU rank holding every buffer
+/// that remains live across `PrefillHooks` boundaries for that wave slot.
+struct WaveScratch<'a> {
+    _arena: DeviceArena<'a, arena_class::ReadWrite>,
     positions_i64: Allocation<'a>,
     positions_i32: Allocation<'a>,
     dsa_slots_i64: Allocation<'a>,
     swa_slots_i64: Allocation<'a>,
     r_a: Allocation<'a>,
     r_b: Allocation<'a>,
-    r_head_in: Allocation<'a>,
-    post: Allocation<'a>,
     post_ffn: Allocation<'a>,
     y: Allocation<'a>,
+    shared_out: Allocation<'a>,
+    shared_f32: Allocation<'a>,
+    dsa_page_table: Allocation<'a>,
+    swa_page_table: Allocation<'a>,
+    swa_seqlens: Allocation<'a>,
+    dsa_cu_seqlens: Allocation<'a>,
+    swa_cu_seqlens: Allocation<'a>,
+    idx_limits: Allocation<'a>,
+    idx_group_pos: Allocation<'a>,
+    idx_group_slots: Allocation<'a>,
+    engram_raw: Vec<Allocation<'a>>,
+    engram_masked: Vec<Allocation<'a>>,
+}
+
+impl<'a> WaveScratch<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: Device<'a>,
+        cfg: &Hy4FlashConfig,
+        rank: usize,
+        slot: usize,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+    ) -> Result<Self> {
+        let layout = WaveScratchLayout::new(cfg, rank, slot, tp, max_rows, max_seq_pages, max_sequences)?;
+        let arena = DeviceArena::new(
+            device,
+            layout.arena.clone(),
+            ArenaTag::workspace("hy4_flash/wave-scratch"),
+        )?;
+        let view = |name: &str| -> Result<Allocation<'a>> {
+            let bytes = arena
+                .layout()
+                .view(name)
+                .with_context(|| format!("Hy4 wave scratch missing view {name}"))?
+                .bytes();
+            arena.view(name, bytes)
+        };
+        let mut engram_raw = Vec::with_capacity(cfg.engram_layers.len());
+        let mut engram_masked = Vec::with_capacity(cfg.engram_layers.len());
+        for i in 0..cfg.engram_layers.len() {
+            engram_raw.push(view(&format!("engram_raw.{i}"))?);
+            engram_masked.push(view(&format!("engram_masked.{i}"))?);
+        }
+        Ok(Self {
+            positions_i64: view("positions_i64")?,
+            positions_i32: view("positions_i32")?,
+            dsa_slots_i64: view("dsa_slots_i64")?,
+            swa_slots_i64: view("swa_slots_i64")?,
+            r_a: view("r_a")?,
+            r_b: view("r_b")?,
+            post_ffn: view("post_ffn")?,
+            y: view("y")?,
+            shared_out: view("shared_out")?,
+            shared_f32: view("shared_f32")?,
+            dsa_page_table: view("dsa_page_table")?,
+            swa_page_table: view("swa_page_table")?,
+            swa_seqlens: view("swa_seqlens")?,
+            dsa_cu_seqlens: view("dsa_cu_seqlens")?,
+            swa_cu_seqlens: view("swa_cu_seqlens")?,
+            idx_limits: view("idx_limits")?,
+            idx_group_pos: view("idx_group_pos")?,
+            idx_group_slots: view("idx_group_slots")?,
+            engram_raw,
+            engram_masked,
+            _arena: arena,
+        })
+    }
+
+    fn inventory(&self, inventory: &mut Inventory<'_>, rank: usize, slot: usize) -> Result<()> {
+        let prefix = format!("hy4_flash.wave.{rank}.{slot}");
+        for (name, alloc) in [
+            ("positions_i64", &self.positions_i64),
+            ("positions_i32", &self.positions_i32),
+            ("dsa_slots_i64", &self.dsa_slots_i64),
+            ("swa_slots_i64", &self.swa_slots_i64),
+            ("r_a", &self.r_a),
+            ("r_b", &self.r_b),
+            ("post_ffn", &self.post_ffn),
+            ("y", &self.y),
+            ("shared_out", &self.shared_out),
+            ("shared_f32", &self.shared_f32),
+            ("dsa_page_table", &self.dsa_page_table),
+            ("swa_page_table", &self.swa_page_table),
+            ("swa_seqlens", &self.swa_seqlens),
+            ("dsa_cu_seqlens", &self.dsa_cu_seqlens),
+            ("swa_cu_seqlens", &self.swa_cu_seqlens),
+            ("idx_limits", &self.idx_limits),
+            ("idx_group_pos", &self.idx_group_pos),
+            ("idx_group_slots", &self.idx_group_slots),
+        ] {
+            alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        for (i, alloc) in self.engram_raw.iter().enumerate() {
+            alloc.inventory(inventory, &format!("{prefix}.engram_raw.{i}"))?;
+        }
+        for (i, alloc) in self.engram_masked.iter().enumerate() {
+            alloc.inventory(inventory, &format!("{prefix}.engram_masked.{i}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// One packed hook-local scratch arena per coordinator GPU rank, shared across all wave slots.
+struct SharedScratch<'a> {
+    _arena: DeviceArena<'a, arena_class::ReadWrite>,
+    ids: Allocation<'a>,
+    r_head_in: Allocation<'a>,
+    post: Allocation<'a>,
     delta: Allocation<'a>,
     delta_f32: Allocation<'a>,
     delta_peer_f32: Allocation<'a>,
     delta_sum_f32: Allocation<'a>,
     delta_norm: Allocation<'a>,
-    // Engram (one staging slot per Engram layer so all 4 upload once before the layer loop)
-    engram_raw: Vec<Allocation<'a>>,
-    engram_masked: Vec<Allocation<'a>>,
     engram_normed: Allocation<'a>,
     engram_val: Allocation<'a>,
     engram_keys: Allocation<'a>,
-    // MLA
     q_a: Allocation<'a>,
     kv_a: Allocation<'a>,
     kv_a_padded: Allocation<'a>,
@@ -132,12 +248,6 @@ struct RankScratch<'a> {
     lse_out: Allocation<'a>,
     uv_out: Allocation<'a>,
     attn_scratch: Allocation<'a>,
-    dsa_page_table: Allocation<'a>,
-    swa_page_table: Allocation<'a>,
-    swa_seqlens: Allocation<'a>,
-    dsa_cu_seqlens: Allocation<'a>,
-    swa_cu_seqlens: Allocation<'a>,
-    // Indexer
     idx_q_raw: Allocation<'a>,
     idx_q_rot: Allocation<'a>,
     idx_w_raw: Allocation<'a>,
@@ -145,14 +255,10 @@ struct RankScratch<'a> {
     idx_tk_raw: Allocation<'a>,
     idx_tk: Allocation<'a>,
     idx_group_tok: Allocation<'a>,
-    idx_group_pos: Allocation<'a>,
-    idx_group_slots: Allocation<'a>,
     idx_scores: Allocation<'a>,
     idx_score_floats: usize,
-    idx_limits: Allocation<'a>,
     idx_cand_slots: Allocation<'a>,
     idx_cand_lens: Allocation<'a>,
-    // FFN / LatentMoE
     ffn_gate: Allocation<'a>,
     ffn_up: Allocation<'a>,
     ffn_act: Allocation<'a>,
@@ -164,130 +270,175 @@ struct RankScratch<'a> {
     wire_in: Allocation<'a>,
     routed_latent: Allocation<'a>,
     routed_out: Allocation<'a>,
-    shared_out: Allocation<'a>,
-    shared_f32: Allocation<'a>,
-    // Sharded head logits tile (<=64 rows * local_vocab F32)
     logits_tile: Allocation<'a>,
-    // Full gathered FP32 logits tile on rank 0 (<=64 rows * vocab F32)
     head_logits_f32: Option<Allocation<'a>>,
-    // Compact-core serialized scratch (`k8-compact`, `k6-compact`, `fp8-compact`)
     native: Option<Hy4NativeScratch<'a>>,
 }
 
-impl<'a> RankScratch<'a> {
+impl<'a> SharedScratch<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         device: Device<'a>,
+        cfg: &Hy4FlashConfig,
         rank: usize,
         tp: usize,
         max_rows: usize,
+        decode_rows: usize,
         max_seq_pages: usize,
         max_sequences: usize,
-        engram_count: usize,
-        vocab: usize,
         local_vocab: usize,
         attn_scratch_bytes: usize,
         native_layout: Option<&ProjectionScratchLayout>,
         native_head_layout: Option<&ProjectionScratchLayout>,
     ) -> Result<Self> {
-        let alloc = |bytes: usize, label: &'static str| {
-            Allocation::new(device, bytes.max(256), Tag::workspace(label))
+        let layout = SharedScratchLayout::new(
+            cfg,
+            rank,
+            tp,
+            max_rows,
+            decode_rows,
+            max_seq_pages,
+            max_sequences,
+            local_vocab,
+        )?;
+        let arena = DeviceArena::new(
+            device,
+            layout.arena.clone(),
+            ArenaTag::workspace("hy4_flash/rank-scratch"),
+        )?;
+        let view = |name: &str| -> Result<Allocation<'a>> {
+            let bytes = arena
+                .layout()
+                .view(name)
+                .with_context(|| format!("Hy4 shared scratch missing view {name}"))?
+                .bytes();
+            arena.view(name, bytes)
         };
-        let max_heads = 64 / tp;
-        let max_inter = 13824 / tp;
-        let max_seq_groups = max_seq_pages * (PAGE_ROWS / 4);
-        let idx_score_floats = max_rows
-            .saturating_mul(max_seq_groups.max(1))
-            .min(MAX_IDX_SCORE_FLOATS)
-            .max(max_seq_groups.max(1));
-        let wire_row = LATENT_H + LATENT_H / 32;
+        let attn_scratch = view("attn_scratch")?;
+        ensure!(
+            attn_scratch_bytes <= attn_scratch.buffer.bytes,
+            "Hy4 MLA scratch {attn_scratch_bytes} exceeds admitted {}",
+            attn_scratch.buffer.bytes
+        );
         let native = if native_layout.is_some() || native_head_layout.is_some() {
             Some(Hy4NativeScratch::allocate(device, native_layout, native_head_layout)?)
         } else {
             None
         };
-        let mut engram_raw = Vec::with_capacity(engram_count);
-        let mut engram_masked = Vec::with_capacity(engram_count);
-        for _ in 0..engram_count {
-            engram_raw.push(alloc(max_rows * 16 * 96 * 2, "engram-raw")?);
-            engram_masked.push(alloc(max_rows, "engram-masked")?);
-        }
         let head_logits_f32 = if rank == 0 {
-            Some(alloc(64 * vocab * 4, "head-logits-f32")?)
+            Some(view("head_logits_f32")?)
         } else {
             None
         };
-        let max_batch_groups = max_rows / 4 + max_sequences + 2;
-        let tp2_f32_bytes = if tp == 2 { max_rows * H * 4 } else { 256 };
         Ok(Self {
-            ids: alloc(max_rows * 4, "ids")?,
-            positions_i64: alloc(max_rows * 8, "pos-i64")?,
-            positions_i32: alloc(max_rows * 4, "pos-i32")?,
-            dsa_slots_i64: alloc(max_rows * 8, "dsa-slots-i64")?,
-            swa_slots_i64: alloc(max_rows * 8, "swa-slots-i64")?,
-            r_a: alloc(max_rows * HC * H * 2, "r-a")?,
-            r_b: alloc(max_rows * HC * H * 2, "r-b")?,
-            r_head_in: alloc(64 * HC * H * 2, "r-head-in")?,
-            post: alloc(max_rows * HC * 4, "post")?,
-            post_ffn: alloc(max_rows * HC * 4, "post-ffn")?,
-            y: alloc(max_rows * H * 2, "y")?,
-            delta: alloc(max_rows * H * 2, "delta")?,
-            delta_f32: alloc(tp2_f32_bytes, "delta-f32")?,
-            delta_peer_f32: alloc(tp2_f32_bytes, "delta-peer-f32")?,
-            delta_sum_f32: alloc(tp2_f32_bytes, "delta-sum-f32")?,
-            delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
-            engram_raw,
-            engram_masked,
-            engram_normed: alloc(max_rows * 1536 * 2, "engram-normed")?,
-            engram_val: alloc(max_rows * H * 2, "engram-val")?,
-            engram_keys: alloc(max_rows * HC * H * 2, "engram-keys")?,
-            q_a: alloc(max_rows * Q_LORA * 2, "q-a")?,
-            kv_a: alloc(max_rows * KV_A_DIM * 2, "kv-a")?,
-            kv_a_padded: alloc(max_rows * KV_A_PADDED * 2, "kv-a-padded")?,
-            q_resid: alloc(max_rows * Q_LORA * 2, "q-resid")?,
-            q_raw: alloc(max_rows * max_heads * 256 * 2, "q-raw")?,
-            gate: alloc(max_rows * max_heads * 256 * 2, "gate")?,
-            query: alloc(max_rows * max_heads * 576 * 2, "query")?,
-            attn_out: alloc(max_rows * max_heads * 512 * 2, "attn-out")?,
-            lse_out: alloc(max_rows * max_heads * 4, "lse-out")?,
-            uv_out: alloc(max_rows * max_heads * 256 * 2, "uv-out")?,
-            attn_scratch: alloc(attn_scratch_bytes, "attn-scratch")?,
-            dsa_page_table: alloc(max_rows * max_seq_pages.max(16) * 4, "dsa-page-table")?,
-            swa_page_table: alloc(max_sequences * max_seq_pages.max(16) * 4, "swa-page-table")?,
-            swa_seqlens: alloc(max_sequences * 4, "swa-seqlens")?,
-            dsa_cu_seqlens: alloc((max_rows + 1) * 4, "dsa-cu-seqlens")?,
-            swa_cu_seqlens: alloc((max_sequences + 1) * 4, "swa-cu-seqlens")?,
-            idx_q_raw: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-raw")?,
-            idx_q_rot: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-rot")?,
-            idx_w_raw: alloc(max_rows * IDX_HEADS * 2, "idx-w-raw")?,
-            idx_w_out: alloc(max_rows * IDX_HEADS * 4, "idx-w-out")?,
-            idx_tk_raw: alloc(max_rows * IDX_DIM * 2, "idx-tk-raw")?,
-            idx_tk: alloc(max_rows * IDX_DIM * 2, "idx-tk")?,
-            idx_group_tok: alloc((max_rows + 4 * max_sequences) * IDX_DIM * 2, "idx-group-tok")?,
-            idx_group_pos: alloc(max_batch_groups * 8, "idx-group-pos")?,
-            idx_group_slots: alloc(max_batch_groups * 8, "idx-group-slots")?,
-            idx_scores: alloc(idx_score_floats * 4, "idx-scores")?,
-            idx_score_floats,
-            idx_limits: alloc(max_rows * 4, "idx-limits")?,
-            idx_cand_slots: alloc(max_rows * CANDIDATE_TOPK * 4, "idx-cand-slots")?,
-            idx_cand_lens: alloc(max_rows * 4, "idx-cand-lens")?,
-            ffn_gate: alloc(max_rows * max_inter * 2, "ffn-gate")?,
-            ffn_up: alloc(max_rows * max_inter * 2, "ffn-up")?,
-            ffn_act: alloc(max_rows * max_inter * 2, "ffn-act")?,
-            router_logits: alloc(max_rows * EXPERTS * 4, "router-logits")?,
-            router_select: alloc(max_rows * EXPERTS * 4, "router-select")?,
-            route_ids: alloc(max_rows * TOPK * 4, "route-ids")?,
-            route_weights: alloc(max_rows * TOPK * 4, "route-weights")?,
-            latent_in: alloc(max_rows * LATENT_H * 2, "latent-in")?,
-            wire_in: alloc(max_rows * wire_row, "wire-in")?,
-            routed_latent: alloc(max_rows * LATENT_H * 2, "routed-latent")?,
-            routed_out: alloc(max_rows * H * 2, "routed-out")?,
-            shared_out: alloc(max_rows * H * 2, "shared-out")?,
-            shared_f32: alloc(max_rows * H * 4, "shared-f32")?,
-            logits_tile: alloc(64 * local_vocab * 4, "logits-tile")?,
+            ids: view("ids")?,
+            r_head_in: view("r_head_in")?,
+            post: view("post")?,
+            delta: view("delta")?,
+            delta_f32: view("delta_f32")?,
+            delta_peer_f32: view("delta_peer_f32")?,
+            delta_sum_f32: view("delta_sum_f32")?,
+            delta_norm: view("delta_norm")?,
+            engram_normed: view("engram_normed")?,
+            engram_val: view("engram_val")?,
+            engram_keys: view("engram_keys")?,
+            q_a: view("q_a")?,
+            kv_a: view("kv_a")?,
+            kv_a_padded: view("kv_a_padded")?,
+            q_resid: view("q_resid")?,
+            q_raw: view("q_raw")?,
+            gate: view("gate")?,
+            query: view("query")?,
+            attn_out: view("attn_out")?,
+            lse_out: view("lse_out")?,
+            uv_out: view("uv_out")?,
+            attn_scratch,
+            idx_q_raw: view("idx_q_raw")?,
+            idx_q_rot: view("idx_q_rot")?,
+            idx_w_raw: view("idx_w_raw")?,
+            idx_w_out: view("idx_w_out")?,
+            idx_tk_raw: view("idx_tk_raw")?,
+            idx_tk: view("idx_tk")?,
+            idx_group_tok: view("idx_group_tok")?,
+            idx_scores: view("idx_scores")?,
+            idx_score_floats: layout.idx_score_floats,
+            idx_cand_slots: view("idx_cand_slots")?,
+            idx_cand_lens: view("idx_cand_lens")?,
+            ffn_gate: view("ffn_gate")?,
+            ffn_up: view("ffn_up")?,
+            ffn_act: view("ffn_act")?,
+            router_logits: view("router_logits")?,
+            router_select: view("router_select")?,
+            route_ids: view("route_ids")?,
+            route_weights: view("route_weights")?,
+            latent_in: view("latent_in")?,
+            wire_in: view("wire_in")?,
+            routed_latent: view("routed_latent")?,
+            routed_out: view("routed_out")?,
+            logits_tile: view("logits_tile")?,
             head_logits_f32,
             native,
+            _arena: arena,
         })
+    }
+
+    fn inventory(&self, inventory: &mut Inventory<'_>, rank: usize) -> Result<()> {
+        let prefix = format!("hy4_flash.scratch.{rank}");
+        for (name, alloc) in [
+            ("ids", &self.ids),
+            ("r_head_in", &self.r_head_in),
+            ("post", &self.post),
+            ("delta", &self.delta),
+            ("delta_f32", &self.delta_f32),
+            ("delta_peer_f32", &self.delta_peer_f32),
+            ("delta_sum_f32", &self.delta_sum_f32),
+            ("delta_norm", &self.delta_norm),
+            ("engram_normed", &self.engram_normed),
+            ("engram_val", &self.engram_val),
+            ("engram_keys", &self.engram_keys),
+            ("q_a", &self.q_a),
+            ("kv_a", &self.kv_a),
+            ("kv_a_padded", &self.kv_a_padded),
+            ("q_resid", &self.q_resid),
+            ("q_raw", &self.q_raw),
+            ("gate", &self.gate),
+            ("query", &self.query),
+            ("attn_out", &self.attn_out),
+            ("lse_out", &self.lse_out),
+            ("uv_out", &self.uv_out),
+            ("attn_scratch", &self.attn_scratch),
+            ("idx_q_raw", &self.idx_q_raw),
+            ("idx_q_rot", &self.idx_q_rot),
+            ("idx_w_raw", &self.idx_w_raw),
+            ("idx_w_out", &self.idx_w_out),
+            ("idx_tk_raw", &self.idx_tk_raw),
+            ("idx_tk", &self.idx_tk),
+            ("idx_group_tok", &self.idx_group_tok),
+            ("idx_scores", &self.idx_scores),
+            ("idx_cand_slots", &self.idx_cand_slots),
+            ("idx_cand_lens", &self.idx_cand_lens),
+            ("ffn_gate", &self.ffn_gate),
+            ("ffn_up", &self.ffn_up),
+            ("ffn_act", &self.ffn_act),
+            ("router_logits", &self.router_logits),
+            ("router_select", &self.router_select),
+            ("route_ids", &self.route_ids),
+            ("route_weights", &self.route_weights),
+            ("latent_in", &self.latent_in),
+            ("wire_in", &self.wire_in),
+            ("routed_latent", &self.routed_latent),
+            ("routed_out", &self.routed_out),
+            ("logits_tile", &self.logits_tile),
+        ] {
+            alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        if let Some(head) = &self.head_logits_f32 {
+            head.inventory(inventory, &format!("{prefix}.head_logits_f32"))?;
+        }
+        if let Some(native) = &self.native {
+            native.inventory(inventory, rank)?;
+        }
+        Ok(())
     }
 }
 
@@ -300,7 +451,7 @@ fn launch_proj_out(
     output: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
+        let scratch = r.shared.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
         return linear.launch(rows, input, output, scratch, r.stream.raw);
     }
     // SAFETY: caller ensures device active and all buffers live through stream drain.
@@ -321,14 +472,14 @@ fn launch_proj_kv_a(
     output_576: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
-        linear.launch(rows, input, r.scratch.kv_a_padded.buffer, scratch, r.stream.raw)?;
+        let scratch = r.shared.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
+        linear.launch(rows, input, r.shared.kv_a_padded.buffer, scratch, r.stream.raw)?;
         // SAFETY: kv_a_padded [rows, 640] BF16 and output_576 [rows, 576] BF16 are disjoint admitted buffers.
         return unsafe {
             r.device.library.copy_d2d_2d_async(
                 output_576,
                 KV_A_DIM * 2,
-                r.scratch.kv_a_padded.buffer,
+                r.shared.kv_a_padded.buffer,
                 KV_A_PADDED * 2,
                 KV_A_DIM * 2,
                 rows,
@@ -357,7 +508,7 @@ fn launch_proj_split(
     out_tp2_f32: CuteafdDeviceBuffer,
 ) -> Result<()> {
     if let Some(linear) = r.weights.native.get(stem) {
-        let scratch = r.scratch.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
+        let scratch = r.shared.native.as_ref().and_then(|n| n.scratch.as_ref()).context("Hy4 native core missing scratch")?;
         return if gpus == 1 {
             linear.launch(rows, input, out_tp1_bf16, scratch, r.stream.raw)
         } else {
@@ -383,7 +534,7 @@ fn launch_rank_lm_head(
 ) -> Result<()> {
     if let Some(native_head) = r.weights.native.get("lm_head") {
         let head_scratch = r
-            .scratch
+            .shared
             .native
             .as_ref()
             .and_then(|n| n.head_scratch.as_ref())
@@ -417,7 +568,8 @@ struct RankRuntime<'a> {
     mla_splits: MlaSplitPlan,
     weights: Hy4RankWeights<'a>,
     cache: Rc<Hy4CacheRank<'a>>,
-    scratch: RankScratch<'a>,
+    shared: SharedScratch<'a>,
+    waves: Vec<WaveScratch<'a>>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
     quantize_grid: Fp8QuantizeGrid,
@@ -425,40 +577,41 @@ struct RankRuntime<'a> {
 }
 
 impl<'a> RankRuntime<'a> {
-    fn engram_compute(&self, p: &str, slot: usize, rows: usize, use_a: bool) -> Result<()> {
-        let r_cur = if use_a { self.scratch.r_a.buffer } else { self.scratch.r_b.buffer };
+    fn engram_compute(&self, p: &str, slot: usize, wave_slot: usize, rows: usize, use_a: bool) -> Result<()> {
+        let w = &self.waves[wave_slot];
+        let r_cur = if use_a { w.r_a.buffer } else { w.r_b.buffer };
         let ep = format!("{p}.engram_layer");
         let s = [Scalar::I32(rows as i32)];
         // SAFETY: admitted arena weight views & rank scratch live through stream drain.
         unsafe {
             self.programs.engram_head_norm.launch(
                 &[
-                    self.scratch.engram_raw[slot].buffer.ptr,
+                    w.engram_raw[slot].buffer.ptr,
                     self.weights.buf(&format!("{ep}.lookup_per_head_norms.packed"))?.ptr,
-                    self.scratch.engram_normed.buffer.ptr,
+                    self.shared.engram_normed.buffer.ptr,
                 ],
                 &s, self.stream.raw,
             )?;
             self.programs.proj_engram_value.launch(
-                &[self.scratch.engram_normed.buffer.ptr, self.weights.weight(&format!("{ep}.value_proj"))?.ptr, self.scratch.engram_val.buffer.ptr],
+                &[self.shared.engram_normed.buffer.ptr, self.weights.weight(&format!("{ep}.value_proj"))?.ptr, self.shared.engram_val.buffer.ptr],
                 &s, self.stream.raw,
             )?;
             self.programs.proj_engram_key.launch(
-                &[self.scratch.engram_normed.buffer.ptr, self.weights.buf(&format!("{ep}.key_projs.packed.weight"))?.ptr, self.scratch.engram_keys.buffer.ptr],
+                &[self.shared.engram_normed.buffer.ptr, self.weights.buf(&format!("{ep}.key_projs.packed.weight"))?.ptr, self.shared.engram_keys.buffer.ptr],
                 &s, self.stream.raw,
             )?;
             self.programs.engram_gate_add.launch(
                 &[
                     r_cur.ptr,
-                    self.scratch.engram_keys.buffer.ptr,
+                    self.shared.engram_keys.buffer.ptr,
                     self.weights.buf(&format!("{ep}.key_projs.packed.bias"))?.ptr,
-                    self.scratch.engram_val.buffer.ptr,
+                    self.shared.engram_val.buffer.ptr,
                     self.weights.buf(&format!("{ep}.value_proj.bias"))?.ptr,
                     self.weights.buf(&format!("{ep}.norm_key.packed"))?.ptr,
                     self.weights.buf(&format!("{ep}.norm_query.packed"))?.ptr,
                     self.weights.buf(&format!("{ep}.unified_pre_gamma"))?.ptr,
                     self.weights.buf(&format!("{ep}.unified_per_hc_scales.packed"))?.ptr,
-                    self.scratch.engram_masked[slot].buffer.ptr,
+                    w.engram_masked[slot].buffer.ptr,
                 ],
                 &s, self.stream.raw,
             )
@@ -472,17 +625,19 @@ impl<'a> RankRuntime<'a> {
         layer: usize,
         is_sparse: bool,
         local_heads: usize,
+        wave_slot: usize,
         rows: usize,
         use_a: bool,
         kv_cache_buf: CuteafdDeviceBuffer,
     ) -> Result<()> {
-        let r_cur = if use_a { self.scratch.r_a.buffer } else { self.scratch.r_b.buffer };
+        let w = &self.waves[wave_slot];
+        let r_cur = if use_a { w.r_a.buffer } else { w.r_b.buffer };
         let s_rows = [Scalar::I32(rows as i32)];
         let inv_freq = if is_sparse { self.weights.inv_freq_dsa.buffer.ptr } else { self.weights.inv_freq_swa.buffer.ptr };
         let kv_slots_ptr = if is_sparse {
-            self.scratch.dsa_slots_i64.buffer.ptr
+            w.dsa_slots_i64.buffer.ptr
         } else {
-            self.scratch.swa_slots_i64.buffer.ptr
+            w.swa_slots_i64.buffer.ptr
         };
         let (w_uk, _) = self.weights.kv_b_absorbed(layer, local_heads)?;
         let (proj_qb, proj_gate, q_abs) = if is_sparse {
@@ -499,8 +654,8 @@ impl<'a> RankRuntime<'a> {
                     self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
                     self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
                     self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
-                    self.scratch.post.buffer.ptr,
-                    self.scratch.y.buffer.ptr,
+                    self.shared.post.buffer.ptr,
+                    w.y.buffer.ptr,
                 ],
                 &s_rows, self.stream.raw,
             )?;
@@ -509,26 +664,26 @@ impl<'a> RankRuntime<'a> {
                 &format!("{p}.self_attn.q_a_proj"),
                 &self.programs.proj_q_a,
                 rows,
-                self.scratch.y.buffer,
-                self.scratch.q_a.buffer,
+                w.y.buffer,
+                self.shared.q_a.buffer,
             )?;
             launch_proj_kv_a(
                 self,
                 &format!("{p}.self_attn.kv_a_proj_with_mqa"),
                 rows,
-                self.scratch.y.buffer,
-                self.scratch.kv_a.buffer,
+                w.y.buffer,
+                self.shared.kv_a.buffer,
             )?;
             self.programs.mla_rank_norm_pack.launch(
                 &[
-                    self.scratch.q_a.buffer.ptr,
-                    self.scratch.kv_a.buffer.ptr,
+                    self.shared.q_a.buffer.ptr,
+                    self.shared.kv_a.buffer.ptr,
                     self.weights.buf(&format!("{p}.self_attn.q_a_layernorm.weight"))?.ptr,
                     self.weights.buf(&format!("{p}.self_attn.kv_a_layernorm.weight"))?.ptr,
                     kv_slots_ptr,
-                    self.scratch.positions_i64.buffer.ptr,
+                    w.positions_i64.buffer.ptr,
                     inv_freq,
-                    self.scratch.q_resid.buffer.ptr,
+                    self.shared.q_resid.buffer.ptr,
                     kv_cache_buf.ptr,
                 ],
                 &s_rows, self.stream.raw,
@@ -538,82 +693,85 @@ impl<'a> RankRuntime<'a> {
                 &format!("{p}.self_attn.q_b_proj"),
                 proj_qb,
                 rows,
-                self.scratch.q_resid.buffer,
-                self.scratch.q_raw.buffer,
+                self.shared.q_resid.buffer,
+                self.shared.q_raw.buffer,
             )?;
             launch_proj_out(
                 self,
                 &format!("{p}.self_attn.linear_gate"),
                 proj_gate,
                 rows,
-                self.scratch.y.buffer,
-                self.scratch.gate.buffer,
+                w.y.buffer,
+                self.shared.gate.buffer,
             )?;
             q_abs.launch(
-                &[self.scratch.q_raw.buffer.ptr, w_uk, self.scratch.positions_i64.buffer.ptr, inv_freq, self.scratch.query.buffer.ptr],
+                &[self.shared.q_raw.buffer.ptr, w_uk, w.positions_i64.buffer.ptr, inv_freq, self.shared.query.buffer.ptr],
                 &s_rows, self.stream.raw,
             )
         }
     }
 
-    fn dsa_index_wk(&self, p: &str, rows: usize) -> Result<()> {
+    fn dsa_index_wk(&self, p: &str, wave_slot: usize, rows: usize) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let ip = format!("{p}.self_attn.compressed_indexer");
         let s_rows = [Scalar::I32(rows as i32)];
         // SAFETY: arena weight views and scratch live through stream drain.
         unsafe {
             self.programs.proj_indexer_wk.launch(
-                &[self.scratch.y.buffer.ptr, self.weights.weight(&format!("{ip}.token_key_projection"))?.ptr, self.scratch.idx_tk_raw.buffer.ptr],
+                &[w.y.buffer.ptr, self.weights.weight(&format!("{ip}.token_key_projection"))?.ptr, self.shared.idx_tk_raw.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             let tk_w = self.weights.buf(&format!("{ip}.token_key_norm.weight"))?.ptr;
             self.programs.rms_norm_128.launch(
-                &[self.scratch.idx_tk_raw.buffer.ptr, tk_w, tk_w, tk_w, tk_w, tk_w, self.scratch.idx_tk.buffer.ptr],
+                &[self.shared.idx_tk_raw.buffer.ptr, tk_w, tk_w, tk_w, tk_w, tk_w, self.shared.idx_tk.buffer.ptr],
                 &s_rows, self.stream.raw,
             )
         }
     }
 
-    fn dsa_index_q(&self, p: &str, rows: usize) -> Result<()> {
+    fn dsa_index_q(&self, p: &str, wave_slot: usize, rows: usize) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let ip = format!("{p}.self_attn.compressed_indexer");
         let s_rows = [Scalar::I32(rows as i32)];
         let inv_freq = self.weights.inv_freq_dsa.buffer.ptr;
         // SAFETY: arena weight views and scratch live through stream drain.
         unsafe {
             self.programs.proj_indexer_wq_b.launch(
-                &[self.scratch.q_resid.buffer.ptr, self.weights.weight(&format!("{ip}.query_projection"))?.ptr, self.scratch.idx_q_raw.buffer.ptr],
+                &[self.shared.q_resid.buffer.ptr, self.weights.weight(&format!("{ip}.query_projection"))?.ptr, self.shared.idx_q_raw.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             self.programs.proj_indexer_weights.launch(
-                &[self.scratch.y.buffer.ptr, self.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr, self.scratch.idx_w_raw.buffer.ptr],
+                &[w.y.buffer.ptr, self.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr, self.shared.idx_w_raw.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             self.programs.indexer_query_rope.launch(
                 &[
-                    self.scratch.idx_q_raw.buffer.ptr,
-                    self.scratch.idx_w_raw.buffer.ptr,
-                    self.scratch.positions_i64.buffer.ptr,
+                    self.shared.idx_q_raw.buffer.ptr,
+                    self.shared.idx_w_raw.buffer.ptr,
+                    w.positions_i64.buffer.ptr,
                     inv_freq,
-                    self.scratch.idx_q_rot.buffer.ptr,
-                    self.scratch.idx_w_out.buffer.ptr,
+                    self.shared.idx_q_rot.buffer.ptr,
+                    self.shared.idx_w_out.buffer.ptr,
                 ],
                 &s_rows, self.stream.raw,
             )
         }
     }
 
-    fn dsa_attn(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize, decode: bool) -> Result<()> {
+    fn dsa_attn(&self, kv_cache_buf: CuteafdDeviceBuffer, wave_slot: usize, rows: usize, decode: bool) -> Result<()> {
+        let w = &self.waves[wave_slot];
         // SAFETY: cache and scratch live through stream drain.
         unsafe {
             self.programs.mla_dsa_decode.launch(
                 &[
-                    self.scratch.query.buffer.ptr,
+                    self.shared.query.buffer.ptr,
                     kv_cache_buf.ptr,
-                    self.scratch.idx_cand_slots.buffer.ptr,
-                    self.scratch.idx_cand_lens.buffer.ptr,
-                    self.scratch.dsa_cu_seqlens.buffer.ptr,
-                    self.scratch.attn_out.buffer.ptr,
-                    self.scratch.lse_out.buffer.ptr,
-                    self.scratch.attn_scratch.buffer.ptr,
+                    self.shared.idx_cand_slots.buffer.ptr,
+                    self.shared.idx_cand_lens.buffer.ptr,
+                    w.dsa_cu_seqlens.buffer.ptr,
+                    self.shared.attn_out.buffer.ptr,
+                    self.shared.lse_out.buffer.ptr,
+                    self.shared.attn_scratch.buffer.ptr,
                 ],
                 &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64),
                     Scalar::I32(if decode { self.mla_splits.dsa } else { 1 })],
@@ -625,11 +783,13 @@ impl<'a> RankRuntime<'a> {
     fn swa_attn(
         &self,
         kv_cache_buf: CuteafdDeviceBuffer,
+        wave_slot: usize,
         rows: usize,
         members_len: usize,
         swa_pt_stride: usize,
         decode: bool,
     ) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let (swa_prog, splits) = if decode {
             (&self.programs.mla_swa_decode, self.mla_splits.swa)
         } else {
@@ -639,14 +799,14 @@ impl<'a> RankRuntime<'a> {
         unsafe {
             swa_prog.launch(
                 &[
-                    self.scratch.query.buffer.ptr,
+                    self.shared.query.buffer.ptr,
                     kv_cache_buf.ptr,
-                    self.scratch.swa_page_table.buffer.ptr,
-                    self.scratch.swa_seqlens.buffer.ptr,
-                    self.scratch.swa_cu_seqlens.buffer.ptr,
-                    self.scratch.attn_out.buffer.ptr,
-                    self.scratch.lse_out.buffer.ptr,
-                    self.scratch.attn_scratch.buffer.ptr,
+                    w.swa_page_table.buffer.ptr,
+                    w.swa_seqlens.buffer.ptr,
+                    w.swa_cu_seqlens.buffer.ptr,
+                    self.shared.attn_out.buffer.ptr,
+                    self.shared.lse_out.buffer.ptr,
+                    self.shared.attn_scratch.buffer.ptr,
                 ],
                 &[
                     Scalar::I32(rows as i32),
@@ -679,12 +839,12 @@ impl<'a> RankRuntime<'a> {
         unsafe {
             sink_uv.launch(
                 &[
-                    self.scratch.attn_out.buffer.ptr,
+                    self.shared.attn_out.buffer.ptr,
                     w_uv,
-                    self.scratch.gate.buffer.ptr,
-                    self.scratch.lse_out.buffer.ptr,
+                    self.shared.gate.buffer.ptr,
+                    self.shared.lse_out.buffer.ptr,
                     self.weights.buf(&format!("{p}.self_attn.learnable_sink_param"))?.ptr,
-                    self.scratch.uv_out.buffer.ptr,
+                    self.shared.uv_out.buffer.ptr,
                 ],
                 &s_rows, self.stream.raw,
             )?;
@@ -695,66 +855,68 @@ impl<'a> RankRuntime<'a> {
             &format!("{p}.self_attn.o_proj"),
             proj_o,
             rows,
-            self.scratch.uv_out.buffer,
-            self.scratch.delta.buffer,
-            self.scratch.delta_f32.buffer,
+            self.shared.uv_out.buffer,
+            self.shared.delta.buffer,
+            self.shared.delta_f32.buffer,
         )
     }
 
-    fn post_attn_ihc(&self, p: &str, rows: usize, use_a: bool) -> Result<()> {
+    fn post_attn_ihc(&self, p: &str, wave_slot: usize, rows: usize, use_a: bool) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let (r_in, r_out) = if use_a {
-            (self.scratch.r_a.buffer, self.scratch.r_b.buffer)
+            (w.r_a.buffer, w.r_b.buffer)
         } else {
-            (self.scratch.r_b.buffer, self.scratch.r_a.buffer)
+            (w.r_b.buffer, w.r_a.buffer)
         };
         let s_rows = [Scalar::I32(rows as i32)];
         // SAFETY: arena weights and scratch live through stream drain.
         unsafe {
             let ppn = self.weights.buf(&format!("{p}.self_attn.post_proj_norm.weight"))?.ptr;
             self.programs.rms_norm_3072.launch(
-                &[self.scratch.delta.buffer.ptr, ppn, ppn, ppn, ppn, ppn, self.scratch.delta_norm.buffer.ptr],
+                &[self.shared.delta.buffer.ptr, ppn, ppn, ppn, ppn, ppn, self.shared.delta_norm.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             self.programs.ihc_post_pre.launch(
                 &[
-                    self.scratch.delta_norm.buffer.ptr,
+                    self.shared.delta_norm.buffer.ptr,
                     r_in.ptr,
-                    self.scratch.post.buffer.ptr,
+                    self.shared.post.buffer.ptr,
                     self.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_fn"))?.ptr,
                     self.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_scale"))?.ptr,
                     self.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_base"))?.ptr,
                     self.weights.buf(&format!("{p}.post_attention_layernorm.weight"))?.ptr,
                     r_out.ptr,
-                    self.scratch.post_ffn.buffer.ptr,
-                    self.scratch.y.buffer.ptr,
+                    w.post_ffn.buffer.ptr,
+                    w.y.buffer.ptr,
                 ],
                 &s_rows, self.stream.raw,
             )
         }
     }
 
-    fn dense_ffn(&self, p: &str, gpus: usize, rows: usize) -> Result<()> {
+    fn dense_ffn(&self, p: &str, gpus: usize, wave_slot: usize, rows: usize) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let s_rows = [Scalar::I32(rows as i32)];
         launch_proj_out(
             self,
             &format!("{p}.mlp.gate_proj"),
             &self.programs.proj_dense_gate_up,
             rows,
-            self.scratch.y.buffer,
-            self.scratch.ffn_gate.buffer,
+            w.y.buffer,
+            self.shared.ffn_gate.buffer,
         )?;
         launch_proj_out(
             self,
             &format!("{p}.mlp.up_proj"),
             &self.programs.proj_dense_gate_up,
             rows,
-            self.scratch.y.buffer,
-            self.scratch.ffn_up.buffer,
+            w.y.buffer,
+            self.shared.ffn_up.buffer,
         )?;
         // SAFETY: arena weights and scratch live through stream drain.
         unsafe {
             self.programs.post_silu_split_dense.launch(
-                &[self.scratch.ffn_gate.buffer.ptr, self.scratch.ffn_up.buffer.ptr, self.scratch.ffn_act.buffer.ptr],
+                &[self.shared.ffn_gate.buffer.ptr, self.shared.ffn_up.buffer.ptr, self.shared.ffn_act.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
         }
@@ -764,35 +926,44 @@ impl<'a> RankRuntime<'a> {
             &format!("{p}.mlp.down_proj"),
             &self.programs.proj_dense_down,
             rows,
-            self.scratch.ffn_act.buffer,
-            self.scratch.delta.buffer,
-            self.scratch.delta_f32.buffer,
+            self.shared.ffn_act.buffer,
+            self.shared.delta.buffer,
+            self.shared.delta_f32.buffer,
         )
     }
 
-    fn moe_router_shared(&self, p: &str, gpus: usize, rows: usize, routed_scaling_factor: f32, needs_router: bool) -> Result<()> {
+    fn moe_router_shared(
+        &self,
+        p: &str,
+        gpus: usize,
+        wave_slot: usize,
+        rows: usize,
+        routed_scaling_factor: f32,
+        needs_router: bool,
+    ) -> Result<()> {
+        let w = &self.waves[wave_slot];
         let s_rows = [Scalar::I32(rows as i32)];
         // SAFETY: all buffers live through stream drain.
         unsafe {
             if needs_router {
                 self.programs.proj_router.launch(
-                    &[self.scratch.y.buffer.ptr, self.weights.weight(&format!("{p}.mlp.gate"))?.ptr, self.scratch.router_logits.buffer.ptr],
+                    &[w.y.buffer.ptr, self.weights.weight(&format!("{p}.mlp.gate"))?.ptr, self.shared.router_logits.buffer.ptr],
                     &s_rows, self.stream.raw,
                 )?;
                 let bias = self.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
                 self.device.library.copy_d2d_async(
-                    self.scratch.router_select.buffer,
-                    self.scratch.router_logits.buffer,
+                    self.shared.router_select.buffer,
+                    self.shared.router_logits.buffer,
                     rows * EXPERTS * 4,
                     self.stream.raw,
                 )?;
                 self.device.library.router_select(
-                    self.scratch.router_select.buffer.ptr,
+                    self.shared.router_select.buffer.ptr,
                     bias,
                     std::ptr::null(),
                     std::ptr::null(),
-                    self.scratch.route_ids.buffer.ptr,
-                    self.scratch.route_weights.buffer.ptr,
+                    self.shared.route_ids.buffer.ptr,
+                    self.shared.route_weights.buffer.ptr,
                     rows,
                     EXPERTS,
                     TOPK,
@@ -801,7 +972,7 @@ impl<'a> RankRuntime<'a> {
                     self.stream.raw,
                 )?;
                 self.programs.route_weights.launch(
-                    &[self.scratch.router_logits.buffer.ptr, bias, self.scratch.route_ids.buffer.ptr, self.scratch.route_weights.buffer.ptr],
+                    &[self.shared.router_logits.buffer.ptr, bias, self.shared.route_ids.buffer.ptr, self.shared.route_weights.buffer.ptr],
                     &s_rows, self.stream.raw,
                 )?;
                 launch_proj_out(
@@ -809,16 +980,16 @@ impl<'a> RankRuntime<'a> {
                     &format!("{p}.mlp.routed_expert_down_proj"),
                     &self.programs.proj_latent_down,
                     rows,
-                    self.scratch.y.buffer,
-                    self.scratch.latent_in.buffer,
+                    w.y.buffer,
+                    self.shared.latent_in.buffer,
                 )?;
                 let grid = self.quantize_grid.blocks(rows, LATENT_H);
                 self.programs.expert_input_quant.launch(
                     &[
-                        self.scratch.latent_in.buffer.ptr,
-                        self.scratch.wire_in.buffer.ptr,
-                        self.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
-                        self.scratch.wire_in.buffer.ptr,
+                        self.shared.latent_in.buffer.ptr,
+                        self.shared.wire_in.buffer.ptr,
+                        self.shared.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
+                        self.shared.wire_in.buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
                     self.stream.raw,
@@ -829,19 +1000,19 @@ impl<'a> RankRuntime<'a> {
                 &format!("{p}.mlp.shared_experts.gate_proj"),
                 &self.programs.proj_shared_gate_up,
                 rows,
-                self.scratch.y.buffer,
-                self.scratch.ffn_gate.buffer,
+                w.y.buffer,
+                self.shared.ffn_gate.buffer,
             )?;
             launch_proj_out(
                 self,
                 &format!("{p}.mlp.shared_experts.up_proj"),
                 &self.programs.proj_shared_gate_up,
                 rows,
-                self.scratch.y.buffer,
-                self.scratch.ffn_up.buffer,
+                w.y.buffer,
+                self.shared.ffn_up.buffer,
             )?;
             self.programs.post_silu_split_shared.launch(
-                &[self.scratch.ffn_gate.buffer.ptr, self.scratch.ffn_up.buffer.ptr, self.scratch.ffn_act.buffer.ptr],
+                &[self.shared.ffn_gate.buffer.ptr, self.shared.ffn_up.buffer.ptr, self.shared.ffn_act.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             launch_proj_split(
@@ -850,9 +1021,9 @@ impl<'a> RankRuntime<'a> {
                 &format!("{p}.mlp.shared_experts.down_proj"),
                 &self.programs.proj_shared_down,
                 rows,
-                self.scratch.ffn_act.buffer,
-                self.scratch.shared_out.buffer,
-                self.scratch.shared_f32.buffer,
+                self.shared.ffn_act.buffer,
+                w.shared_out.buffer,
+                w.shared_f32.buffer,
             )
         }
     }
@@ -866,10 +1037,10 @@ impl<'a> RankRuntime<'a> {
                     experts.enqueue(
                         layer,
                         rows,
-                        ExpertInput::Fp8K32(self.scratch.wire_in.buffer.ptr),
+                        ExpertInput::Fp8K32(self.shared.wire_in.buffer.ptr),
                         Routes {
-                            ids: self.scratch.route_ids.buffer.ptr,
-                            weights: self.scratch.route_weights.buffer.ptr,
+                            ids: self.shared.route_ids.buffer.ptr,
+                            weights: self.shared.route_weights.buffer.ptr,
                         },
                         self.stream.raw,
                         &mut || (),
@@ -883,7 +1054,7 @@ impl<'a> RankRuntime<'a> {
                         };
                         self.device.library.cuda_f32_to_bf16_async(
                             exp_out,
-                            self.scratch.routed_latent.buffer,
+                            self.shared.routed_latent.buffer,
                             rows * LATENT_H,
                             self.stream.raw,
                         )?;
@@ -894,31 +1065,39 @@ impl<'a> RankRuntime<'a> {
                     );
                 }
             } else {
-                self.device.library.cuda_zero_bytes_async(self.scratch.routed_latent.buffer, rows * LATENT_H * 2, self.stream.raw)?;
+                self.device.library.cuda_zero_bytes_async(self.shared.routed_latent.buffer, rows * LATENT_H * 2, self.stream.raw)?;
                 if gpus == 2 {
-                    self.device.library.cuda_zero_bytes_async(self.scratch.delta_f32.buffer, rows * LATENT_H * 4, self.stream.raw)?;
+                    self.device.library.cuda_zero_bytes_async(self.shared.delta_f32.buffer, rows * LATENT_H * 4, self.stream.raw)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn ffn_combine_post(&self, p: &str, is_dense: bool, rows: usize, use_a: bool) -> Result<()> {
+    fn ffn_combine_post(
+        &self,
+        p: &str,
+        is_dense: bool,
+        wave_slot: usize,
+        rows: usize,
+        use_a: bool,
+    ) -> Result<()> {
+        let w = &self.waves[wave_slot];
         if !is_dense {
             launch_proj_out(
                 self,
                 &format!("{p}.mlp.routed_expert_up_proj"),
                 &self.programs.proj_latent_up,
                 rows,
-                self.scratch.routed_latent.buffer,
-                self.scratch.routed_out.buffer,
+                self.shared.routed_latent.buffer,
+                self.shared.routed_out.buffer,
             )?;
             // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
             unsafe {
                 self.bf16_add.launch(
-                    self.scratch.routed_out.buffer,
-                    self.scratch.shared_out.buffer,
-                    self.scratch.delta.buffer,
+                    self.shared.routed_out.buffer,
+                    w.shared_out.buffer,
+                    self.shared.delta.buffer,
                     rows * H,
                     self.stream.raw,
                 )?;
@@ -930,20 +1109,20 @@ impl<'a> RankRuntime<'a> {
             format!("{p}.mlp.combine_output_norm.weight")
         };
         let (r_in, r_out) = if use_a {
-            (self.scratch.r_a.buffer, self.scratch.r_b.buffer)
+            (w.r_a.buffer, w.r_b.buffer)
         } else {
-            (self.scratch.r_b.buffer, self.scratch.r_a.buffer)
+            (w.r_b.buffer, w.r_a.buffer)
         };
         let s_rows = [Scalar::I32(rows as i32)];
         // SAFETY: arena weights and scratch live through stream drain.
         unsafe {
             let nw = self.weights.buf(&ffn_norm_name)?.ptr;
             self.programs.rms_norm_3072.launch(
-                &[self.scratch.delta.buffer.ptr, nw, nw, nw, nw, nw, self.scratch.delta_norm.buffer.ptr],
+                &[self.shared.delta.buffer.ptr, nw, nw, nw, nw, nw, self.shared.delta_norm.buffer.ptr],
                 &s_rows, self.stream.raw,
             )?;
             self.programs.ihc_post.launch(
-                &[self.scratch.delta_norm.buffer.ptr, r_in.ptr, self.scratch.post_ffn.buffer.ptr, r_out.ptr],
+                &[self.shared.delta_norm.buffer.ptr, r_in.ptr, w.post_ffn.buffer.ptr, r_out.ptr],
                 &s_rows, self.stream.raw,
             )
         }
@@ -962,6 +1141,7 @@ struct ActiveMember {
 }
 
 struct ActiveBatch {
+    wave_slot: usize,
     rows: usize,
     max_seq_end: usize,
     pt_stride: usize,
@@ -1006,51 +1186,6 @@ pub(crate) struct Hy4Engine<'a> {
 }
 
 impl<'a> Hy4Engine<'a> {
-    /// Conservative upper bound on per-rank `RankScratch` + head/selector workspace bytes
-    /// (excluding target weights, routed experts, and KV/SWA/mark caches) for KV pool sizing.
-    pub(crate) fn estimated_rank_workspace_bytes(
-        cfg: &Hy4FlashConfig,
-        tp: usize,
-        max_rows: usize,
-        decode_rows: usize,
-        max_seq_pages: usize,
-        max_sequences: usize,
-    ) -> u64 {
-        let max_heads = 64 / tp;
-        let max_inter = 13824 / tp;
-        let max_seq_groups = max_seq_pages * (PAGE_ROWS / 4);
-        let idx_score_floats = max_rows
-            .saturating_mul(max_seq_groups.max(1))
-            .min(MAX_IDX_SCORE_FLOATS)
-            .max(max_seq_groups.max(1));
-        let wire_row = LATENT_H + LATENT_H / 32;
-        let tp2_f32 = if tp == 2 { 3 * max_rows * H * 4 } else { 0 };
-        let split_k_cap = mla_split_scratch_bytes(decode_rows, tp);
-        let engram_count = cfg.engram_layers.len();
-        let sum = max_rows * (4 + 8 + 4 + 8 + 8)
-            + 2 * max_rows * HC * H * 2
-            + 64 * HC * H * 2
-            + 2 * max_rows * HC * 4
-            + 3 * max_rows * H * 2
-            + tp2_f32
-            + engram_count * (max_rows * 16 * 96 * 2 + max_rows)
-            + max_rows * (1536 * 2 + H * 2 + HC * H * 2)
-            + max_rows * (Q_LORA * 4 + KV_A_DIM * 2 + KV_A_PADDED * 2)
-            + max_rows * max_heads * ((256 * 3 + 576 + 512) * 2 + 4)
-            + split_k_cap
-            + max_rows * max_seq_pages.max(16) * 4
-            + max_sequences * max_seq_pages.max(16) * 4
-            + max_rows * (IDX_HEADS * IDX_DIM * 4 + IDX_HEADS * 6 + IDX_DIM * 4)
-            + (max_rows + 4 * max_sequences) * IDX_DIM * 2
-            + idx_score_floats * 4
-            + max_rows * (CANDIDATE_TOPK * 4 + 8)
-            + 3 * max_rows * max_inter * 2
-            + max_rows * (EXPERTS * 8 + TOPK * 8 + LATENT_H * 4 + wire_row + H * 8)
-            + 64 * cfg.vocab_size * 8;
-        // Include 256 MiB for optional native-core projection scratch + CUDA allocation tails.
-        (sum as u64) + (256u64 << 20)
-    }
-
     /// Single-sequence constructor used by `hy4f-golden`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1060,6 +1195,7 @@ impl<'a> Hy4Engine<'a> {
         cfg: Hy4FlashConfig,
         kv_format: Hy4KvCache,
         max_rows: usize,
+        prefill_waves: usize,
         max_pages: usize,
         skip_routed_experts: bool,
         onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
@@ -1068,14 +1204,16 @@ impl<'a> Hy4Engine<'a> {
         Self::new_serving(
             devices,
             programs,
+            None,
             checkpoint,
             cfg,
             kv_format,
             max_rows,
             max_rows.min(DECODE_ROWS as usize),
-            1,
+            prefill_waves,
             max_pages,
             1,
+            max_context,
             max_context,
             0,
             skip_routed_experts,
@@ -1083,11 +1221,13 @@ impl<'a> Hy4Engine<'a> {
         )
     }
 
-    /// Serving & multi-sequence constructor with exact prefix mark slots and COW page pool.
+    /// Serving & multi-sequence constructor with exact prefix mark slots, COW page pool,
+    /// and packed per-wave scratch arenas matching `Hy4Inputs` admission.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_serving(
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
+        mut preloaded_programs: Option<Vec<Hy4Programs<'a>>>,
         checkpoint: &Checkpoint,
         cfg: Hy4FlashConfig,
         kv_format: Hy4KvCache,
@@ -1097,6 +1237,7 @@ impl<'a> Hy4Engine<'a> {
         max_pages: usize,
         max_sequences: usize,
         max_context: usize,
+        admitted_context: usize,
         mark_slots: usize,
         skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
@@ -1107,7 +1248,13 @@ impl<'a> Hy4Engine<'a> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4Engine supports 1 or 2 GPUs, got {gpus}");
         ensure!(onboarded_experts.len() == gpus, "onboarded_experts rank count mismatch");
-        ensure!(max_sequences > 0 && max_pages > 0 && unit_rows > 0, "invalid Hy4Engine extents");
+        ensure!(
+            max_sequences > 0 && max_pages > 0 && unit_rows > 0 && (1..=4).contains(&prefill_waves),
+            "invalid Hy4Engine extents"
+        );
+        if let Some(pre) = &preloaded_programs {
+            ensure!(pre.len() == gpus, "preloaded Hy4Programs rank count mismatch");
+        }
         if gpus == 2 {
             let probed = crate::shared::peer_split::probed_device(
                 devices[0].library,
@@ -1129,14 +1276,17 @@ impl<'a> Hy4Engine<'a> {
         let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows)?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
-        let max_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16).min(max_pages);
+        let max_seq_pages = admitted_context.div_ceil(PAGE_ROWS).max(16);
 
         let mut ranks = Vec::with_capacity(gpus);
         for (rank, weights) in weights_all.into_iter().enumerate() {
             let device = devices[rank];
             let stream = Rc::new(Stream::new(device)?);
             let peer_ready = Event::new(device)?;
-            let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format))?;
+            let progs = match preloaded_programs.as_mut() {
+                Some(pre) => pre.remove(0),
+                None => device.run(|| Hy4Programs::load(programs, gpus, kv_format))?,
+            };
             let sms = device.run(|| device.library.sm_count())?;
             let mla_splits = MlaSplitPlan::new(&progs, max_context, decode_rows, sms)?;
             // Split-capable launches never exceed the admitted decode/verify rows.
@@ -1152,20 +1302,33 @@ impl<'a> Hy4Engine<'a> {
             )?);
             let native_layout = weights.native.scratch_layout(max_rows)?;
             let native_head_layout = weights.native.head_scratch_layout(head_rows)?;
-            let scratch = RankScratch::new(
+            let shared = SharedScratch::new(
                 device,
+                &cfg,
                 rank,
                 gpus,
                 max_rows,
+                decode_rows,
                 max_seq_pages,
                 max_sequences,
-                cfg.engram_layers.len(),
-                cfg.vocab_size,
                 weights.local_vocab,
                 attn_scratch,
                 native_layout.as_ref(),
                 native_head_layout.as_ref(),
             )?;
+            let mut waves = Vec::with_capacity(prefill_waves);
+            for slot in 0..prefill_waves {
+                waves.push(WaveScratch::new(
+                    device,
+                    &cfg,
+                    rank,
+                    slot,
+                    gpus,
+                    max_rows,
+                    max_seq_pages,
+                    max_sequences,
+                )?);
+            }
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
             let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
@@ -1178,7 +1341,8 @@ impl<'a> Hy4Engine<'a> {
                 mla_splits,
                 weights,
                 cache,
-                scratch,
+                shared,
+                waves,
                 bf16_add,
                 f32_add,
                 quantize_grid,
@@ -1215,7 +1379,7 @@ impl<'a> Hy4Engine<'a> {
 
         let onboarded_layers: BTreeSet<usize> = cfg.routed_layers().into_iter().collect();
         let swa_pt_host = vec![0i32; max_sequences * max_seq_pages.max(16)];
-        Ok(Self {
+        let engine = Self {
             cfg,
             max_rows,
             decode_rows,
@@ -1240,7 +1404,85 @@ impl<'a> Hy4Engine<'a> {
             engram_index_of,
             golden_placement,
             terminal: false,
-        })
+        };
+        engine.assert_disjoint_wave_engram_buffers()?;
+        Ok(engine)
+    }
+
+    pub(crate) fn prefill_waves(&self) -> usize {
+        self.prefill_waves
+    }
+
+    pub(crate) fn golden_engram_tail(&self) -> [u32; 2] {
+        self.golden_placement.engram_tail
+    }
+
+    /// Assert that across every rank and every live wave slot, `engram_raw` and `engram_masked`
+    /// device byte ranges (and backing `WaveScratch` arenas) are strictly disjoint.
+    pub(crate) fn assert_disjoint_wave_engram_buffers(&self) -> Result<()> {
+        for (rank, r) in self.ranks.iter().enumerate() {
+            let mut spans: Vec<(usize, usize, String)> = Vec::new();
+            let mut arena_spans: Vec<(usize, usize, usize)> = Vec::new();
+            for (slot, w) in r.waves.iter().enumerate() {
+                let abase = w.positions_i64.buffer.ptr as usize;
+                let aend = abase.checked_add(w._arena.layout().bytes()).context("wave arena ptr overflow")?;
+                arena_spans.push((abase, aend, slot));
+                for (i, buf) in w.engram_raw.iter().enumerate() {
+                    let start = buf.buffer.ptr as usize;
+                    let end = start.checked_add(buf.buffer.bytes).context("engram_raw ptr overflow")?;
+                    ensure!(start != 0 && buf.buffer.bytes > 0, "rank {rank} wave {slot} engram_raw.{i} null/empty");
+                    spans.push((start, end, format!("rank{rank}.wave{slot}.engram_raw.{i}")));
+                }
+                for (i, buf) in w.engram_masked.iter().enumerate() {
+                    let start = buf.buffer.ptr as usize;
+                    let end = start.checked_add(buf.buffer.bytes).context("engram_masked ptr overflow")?;
+                    ensure!(start != 0 && buf.buffer.bytes > 0, "rank {rank} wave {slot} engram_masked.{i} null/empty");
+                    spans.push((start, end, format!("rank{rank}.wave{slot}.engram_masked.{i}")));
+                }
+            }
+            arena_spans.sort_by_key(|&(s, _, _)| s);
+            for pair in arena_spans.windows(2) {
+                ensure!(
+                    pair[0].1 <= pair[1].0,
+                    "rank {rank} wave arenas overlap: wave {} [{:#x}..{:#x}) vs wave {} [{:#x}..{:#x})",
+                    pair[0].2, pair[0].0, pair[0].1, pair[1].2, pair[1].0, pair[1].1
+                );
+            }
+            spans.sort_by_key(|&(s, _, _)| s);
+            for pair in spans.windows(2) {
+                ensure!(
+                    pair[0].1 <= pair[1].0,
+                    "per-wave Engram buffers overlap: {} [{:#x}..{:#x}) vs {} [{:#x}..{:#x})",
+                    pair[0].2, pair[0].0, pair[0].1, pair[1].2, pair[1].0, pair[1].1
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Human-readable device pointer ranges for per-wave `engram_raw` and `engram_masked` buffers.
+    pub(crate) fn wave_engram_buffer_summary(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rank, r) in self.ranks.iter().enumerate() {
+            for (slot, w) in r.waves.iter().enumerate() {
+                let raws: Vec<String> = w
+                    .engram_raw
+                    .iter()
+                    .map(|b| format!("{:#x}+{}", b.buffer.ptr as usize, b.buffer.bytes))
+                    .collect();
+                let masks: Vec<String> = w
+                    .engram_masked
+                    .iter()
+                    .map(|b| format!("{:#x}+{}", b.buffer.ptr as usize, b.buffer.bytes))
+                    .collect();
+                out.push(format!(
+                    "rank={rank} wave={slot} engram_raw=[{}] engram_masked=[{}]",
+                    raws.join(","),
+                    masks.join(",")
+                ));
+            }
+        }
+        out
     }
 
     /// Attach a bootstrapped Spark expert link for routed layers not onboarded onto the RTX GPUs.
@@ -1457,9 +1699,17 @@ impl<'a> Hy4Engine<'a> {
         self.engram.drain()
     }
 
-    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
-        for r in &self.ranks {
-            r.cache.inventory(inventory)?;
+    pub(crate) fn inventory(&self, weights_inv: &mut Inventory<'_>, retained_inv: &mut Inventory<'_>) -> Result<()> {
+        for (rank, r) in self.ranks.iter().enumerate() {
+            r.weights.inventory(weights_inv, retained_inv)?;
+            r.cache.inventory(retained_inv)?;
+            r.shared.inventory(retained_inv, rank)?;
+            for (slot, wave) in r.waves.iter().enumerate() {
+                wave.inventory(retained_inv, rank, slot)?;
+            }
+            if let Some(experts) = r.onboarded_experts.borrow().as_ref() {
+                experts.allocation_receipts(weights_inv, &format!("hy4_flash.experts.{rank}"))?;
+            }
         }
         Ok(())
     }
@@ -1505,7 +1755,12 @@ impl<'a> Hy4Engine<'a> {
     /// Reduce two FP32 partials into their final BF16 consumers without staging
     /// through `delta`. The peer-read completion fence protects both sources.
     fn reduce_tp2_f32_to_bf16(
-        &mut self, rows: usize, width: usize, egress_stem: Option<&str>, planes: ReducePlanes,
+        &mut self,
+        wave_slot: usize,
+        rows: usize,
+        width: usize,
+        egress_stem: Option<&str>,
+        planes: ReducePlanes,
     ) -> Result<()> {
         if self.ranks.len() == 1 {
             return Ok(());
@@ -1518,15 +1773,15 @@ impl<'a> Hy4Engine<'a> {
         let ev0 = self.ranks[0].peer_ready.raw;
         let ev1 = self.ranks[1].peer_ready.raw;
         let skip = self.skip_routed_experts;
-        let rank0 = planes.buffers(&self.ranks[0], rows, skip)?;
-        let rank1 = planes.buffers(&self.ranks[1], rows, skip)?;
+        let rank0 = planes.buffers(&self.ranks[0], wave_slot, rows, skip)?;
+        let rank1 = planes.buffers(&self.ranks[1], wave_slot, rows, skip)?;
         ensure!(rank0.0.bytes >= bytes && rank1.0.bytes >= bytes, "Hy4 TP2 partial buffer too small");
         let src0 = CuteafdDeviceBuffer { bytes, ..rank0.0 };
         let src1 = CuteafdDeviceBuffer { bytes, ..rank1.0 };
         self.ranks[0].device.run(|| unsafe {
             self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, ev1)?;
             self.ranks[0].device.library.copy_peer_async(
-                CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.delta_peer_f32.buffer },
+                CuteafdDeviceBuffer { bytes, ..self.ranks[0].shared.delta_peer_f32.buffer },
                 src1,
                 bytes,
                 self.ranks[0].stream.raw,
@@ -1535,7 +1790,7 @@ impl<'a> Hy4Engine<'a> {
         self.ranks[1].device.run(|| unsafe {
             self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
             self.ranks[1].device.library.copy_peer_async(
-                CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.delta_peer_f32.buffer },
+                CuteafdDeviceBuffer { bytes, ..self.ranks[1].shared.delta_peer_f32.buffer },
                 src0,
                 bytes,
                 self.ranks[1].stream.raw,
@@ -1556,19 +1811,19 @@ impl<'a> Hy4Engine<'a> {
                     r.device.library.cuda_stream_wait_event(r.stream.raw, wait_ev)?;
                     r.f32_add.launch(
                         input,
-                        r.scratch.delta_peer_f32.buffer,
-                        r.scratch.delta_sum_f32.buffer,
+                        r.shared.delta_peer_f32.buffer,
+                        r.shared.delta_sum_f32.buffer,
                         elems,
                         r.stream.raw,
                     )?;
                 }
                 if let Some(linear) = egress_stem.and_then(|s| r.weights.native.get(s)) {
-                    linear.egress(rows, r.scratch.delta_sum_f32.buffer, output, r.stream.raw)
+                    linear.egress(rows, r.shared.delta_sum_f32.buffer, output, r.stream.raw)
                 } else {
                     // SAFETY: the sum precedes narrowing into the disjoint consumer buffer.
                     unsafe {
                         r.device.library.cuda_f32_to_bf16_async(
-                            r.scratch.delta_sum_f32.buffer,
+                            r.shared.delta_sum_f32.buffer,
                             output,
                             elems,
                             r.stream.raw,
@@ -1581,14 +1836,19 @@ impl<'a> Hy4Engine<'a> {
     }
 
     /// Stage metadata, Engram lookups, and token embeddings for a multi-sequence unit.
+    #[allow(clippy::too_many_arguments)]
     fn begin_batch(
         &mut self,
         placements: &[Hy4Placement],
         initial_starts: &[usize],
+        staged_frontiers: &mut [usize],
+        staged_engram_tails: &mut [[u32; 2]],
         sources: &[&[u32]],
         unit: &Unit,
         priority: ReadPriority,
     ) -> Result<ActiveBatch> {
+        let wave_slot = unit.slot;
+        ensure!(wave_slot < self.prefill_waves, "Hy4 unit wave slot {wave_slot} >= {}", self.prefill_waves);
         let rows = unit.rows.len();
         ensure!(rows > 0 && rows <= self.max_rows, "Hy4 unit rows {rows} outside 1..={}", self.max_rows);
         ensure!(priority != ReadPriority::Decode || rows <= self.decode_rows,
@@ -1626,13 +1886,6 @@ impl<'a> Hy4Engine<'a> {
                 seg.rows.start == row_cursor && seg.rows.len() == seg.tokens.len() && !seg.rows.is_empty(),
                 "Hy4 segment rows/tokens mismatch"
             );
-            let pos_start = p.len;
-            ensure!(
-                seg.tokens.start == pos_start,
-                "Hy4 segment start {} differs from placement frontier {}",
-                seg.tokens.start,
-                pos_start
-            );
             let base_start = *initial_starts
                 .get(seg.sequence)
                 .with_context(|| format!("Hy4 initial start {} out of range", seg.sequence))?;
@@ -1644,8 +1897,14 @@ impl<'a> Hy4Engine<'a> {
             let tok_slice = src
                 .get(slice_start..slice_start + seg.tokens.len())
                 .context("Hy4 segment token slice out of bounds")?;
+            let (pos_start, pos_end, cur_tail, next_tail) = stage_segment_frontier_and_tail(
+                seg.sequence,
+                seg.tokens.start,
+                tok_slice,
+                staged_frontiers,
+                staged_engram_tails,
+            )?;
             let n = tok_slice.len();
-            let pos_end = pos_start + n;
             ensure!(
                 pos_end <= self.max_context && pos_end.div_ceil(PAGE_ROWS) <= p.units.len(),
                 "Hy4 sequence extent {pos_end} exceeds context {} or reserved pages {}",
@@ -1687,8 +1946,7 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
 
-            let next_tail = advance_tail(p.engram_tail, tok_slice, tok_slice.len());
-            engram_members.push((p.engram_tail, tok_slice));
+            engram_members.push((cur_tail, tok_slice));
             members.push(ActiveMember {
                 sequence: seg.sequence,
                 slot: p.slot,
@@ -1702,10 +1960,12 @@ impl<'a> Hy4Engine<'a> {
         swa_cu_bytes.extend_from_slice(&(rows as i32).to_le_bytes());
 
         let graphed = priority == ReadPriority::Decode
+            && wave_slot == 0
+            && rows <= self.decode_rows
             && self.graphs_active()
             && !self.skip_routed_experts
             && self.dump_dir.is_none();
-        let all_single_row = members.len() == rows && rows <= 64;
+        let all_single_row = members.len() == rows && rows <= self.decode_rows;
         let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
         let swa_pt_stride = if graphed && all_single_row {
             self.max_seq_pages
@@ -1761,23 +2021,23 @@ impl<'a> Hy4Engine<'a> {
         // BEFORE launching embed/layer 0 so host I/O overlaps with GPU execution.
         let engram_wave = self.engram.begin_wave(&unit.layers, &engram_members, priority)?;
 
-        // Embed tokens on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
+        // Embed tokens on rank 0 into waves[wave_slot].r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
             let r0 = &mut self.ranks[0];
             let emb = r0.weights.embedding.as_ref().context("rank 0 missing TokenEmbedding")?;
             r0.device.run(|| {
-                emb.embed(&flat_tokens, r0.scratch.ids.buffer, HC, r0.scratch.r_a.buffer, r0.stream.raw)
+                emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, r0.waves[wave_slot].r_a.buffer, r0.stream.raw)
             })?;
             r0.peer_ready.record(&r0.stream)?;
         }
         if self.ranks.len() == 2 {
             let bytes = rows * HC * H * 2;
             let ev0 = self.ranks[0].peer_ready.raw;
-            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.r_a.buffer };
+            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].waves[wave_slot].r_a.buffer };
             self.ranks[1].device.run(|| unsafe {
                 self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
                 self.ranks[1].device.library.copy_peer_async(
-                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.r_a.buffer },
+                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].waves[wave_slot].r_a.buffer },
                     src0,
                     bytes,
                     self.ranks[1].stream.raw,
@@ -1785,24 +2045,25 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
 
-        // Upload unit metadata ONCE on each rank's non-blocking stream; Engram layers land
-        // from pinned staging right before each Engram layer runs.
+        // Upload unit metadata ONCE into this wave slot on each rank's non-blocking stream;
+        // Engram layers land from pinned staging right before each Engram layer runs.
         for r in &self.ranks {
+            let w = &r.waves[wave_slot];
             r.device.run(|| unsafe {
                 let s = r.stream.raw;
-                r.device.library.copy_h2d_ordered(r.scratch.positions_i64.buffer, &pos_i64, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.positions_i32.buffer, &pos_i32, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.dsa_slots_i64.buffer, &dsa_slots_i64, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.swa_slots_i64.buffer, &swa_slots_i64, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.dsa_page_table.buffer, &dsa_pt_bytes, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.swa_page_table.buffer, &swa_pt_slice_bytes, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.dsa_cu_seqlens.buffer, &cu_singleton, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.swa_cu_seqlens.buffer, &swa_cu_bytes, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.swa_seqlens.buffer, &swa_seqlens_bytes, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.idx_limits.buffer, &limits_bytes, s)?;
+                r.device.library.copy_h2d_ordered(w.positions_i64.buffer, &pos_i64, s)?;
+                r.device.library.copy_h2d_ordered(w.positions_i32.buffer, &pos_i32, s)?;
+                r.device.library.copy_h2d_ordered(w.dsa_slots_i64.buffer, &dsa_slots_i64, s)?;
+                r.device.library.copy_h2d_ordered(w.swa_slots_i64.buffer, &swa_slots_i64, s)?;
+                r.device.library.copy_h2d_ordered(w.dsa_page_table.buffer, &dsa_pt_bytes, s)?;
+                r.device.library.copy_h2d_ordered(w.swa_page_table.buffer, &swa_pt_slice_bytes, s)?;
+                r.device.library.copy_h2d_ordered(w.dsa_cu_seqlens.buffer, &cu_singleton, s)?;
+                r.device.library.copy_h2d_ordered(w.swa_cu_seqlens.buffer, &swa_cu_bytes, s)?;
+                r.device.library.copy_h2d_ordered(w.swa_seqlens.buffer, &swa_seqlens_bytes, s)?;
+                r.device.library.copy_h2d_ordered(w.idx_limits.buffer, &limits_bytes, s)?;
                 if !g_pos_bytes.is_empty() {
-                    r.device.library.copy_h2d_ordered(r.scratch.idx_group_pos.buffer, &g_pos_bytes, s)?;
-                    r.device.library.copy_h2d_ordered(r.scratch.idx_group_slots.buffer, &g_slots_bytes, s)?;
+                    r.device.library.copy_h2d_ordered(w.idx_group_pos.buffer, &g_pos_bytes, s)?;
+                    r.device.library.copy_h2d_ordered(w.idx_group_slots.buffer, &g_slots_bytes, s)?;
                 }
                 Ok(())
             })?;
@@ -1818,10 +2079,11 @@ impl<'a> Hy4Engine<'a> {
             std::fs::create_dir_all(dir)?;
             let tok_bytes: Vec<u8> = flat_tokens[..dump_rows].iter().flat_map(|t| t.to_le_bytes()).collect();
             std::fs::write(dir.join("tokens.u32"), tok_bytes)?;
-            self.dump_bf16("embed", self.ranks[0].scratch.r_a.buffer, dump_rows * HC * H)?;
+            self.dump_bf16("embed", self.ranks[0].waves[wave_slot].r_a.buffer, dump_rows * HC * H)?;
         }
 
         Ok(ActiveBatch {
+            wave_slot,
             rows,
             max_seq_end,
             pt_stride,
@@ -1852,6 +2114,7 @@ impl<'a> Hy4Engine<'a> {
         let rows = batch.rows;
         let use_a = batch.use_a;
         let engram_slot = self.engram_index_of.get(&layer).copied();
+        let wave_slot = batch.wave_slot;
 
         // (A) Engram host-to-device staging (always eager outside graph capture: variable lease ptr + TP2 P2P).
         if let Some(slot) = engram_slot {
@@ -1868,12 +2131,12 @@ impl<'a> Hy4Engine<'a> {
                             pinned.bytes.buffer(),
                             &[
                                 CopyPlane {
-                                    destination: r0.scratch.engram_raw[slot].buffer,
+                                    destination: r0.waves[wave_slot].engram_raw[slot].buffer,
                                     offset: 0,
                                     bytes: raw_bytes,
                                 },
                                 CopyPlane {
-                                    destination: r0.scratch.engram_masked[slot].buffer,
+                                    destination: r0.waves[wave_slot].engram_masked[slot].buffer,
                                     offset: raw_bytes,
                                     bytes: masked_bytes,
                                 },
@@ -1900,18 +2163,18 @@ impl<'a> Hy4Engine<'a> {
             }
             if gpus == 2 {
                 let ev0 = self.ranks[0].peer_ready.raw;
-                let src_raw = CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[0].scratch.engram_raw[slot].buffer };
-                let src_mask = CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[0].scratch.engram_masked[slot].buffer };
+                let src_raw = CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[0].waves[wave_slot].engram_raw[slot].buffer };
+                let src_mask = CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[0].waves[wave_slot].engram_masked[slot].buffer };
                 self.ranks[1].device.run(|| unsafe {
                     self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
                     self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[1].scratch.engram_raw[slot].buffer },
+                        CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[1].waves[wave_slot].engram_raw[slot].buffer },
                         src_raw,
                         raw_bytes,
                         self.ranks[1].stream.raw,
                     )?;
                     self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[1].scratch.engram_masked[slot].buffer },
+                        CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[1].waves[wave_slot].engram_masked[slot].buffer },
                         src_mask,
                         masked_bytes,
                         self.ranks[1].stream.raw,
@@ -1927,6 +2190,7 @@ impl<'a> Hy4Engine<'a> {
                                      pt_stride: usize,
                                      graphed: bool|
          -> Result<()> {
+            let w = &r.waves[wave_slot];
             let idx_cache = r.cache.dsa_index_layer(dsa_idx)?;
             let ip = format!("{p}.self_attn.compressed_indexer");
             let inv_freq = r.weights.inv_freq_dsa.buffer.ptr;
@@ -1950,22 +2214,22 @@ impl<'a> Hy4Engine<'a> {
                         let group_dst_off = batch_groups * 4 * IDX_DIM * 2;
                         if pending > 0 {
                             let dst_p = CuteafdDeviceBuffer {
-                                ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off).cast(),
+                                ptr: r.shared.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off).cast(),
                                 bytes: pending * IDX_DIM * 2,
-                                ..r.scratch.idx_group_tok.buffer
+                                ..r.shared.idx_group_tok.buffer
                             };
                             r.device.library.copy_d2d_async(dst_p, pending_buf, pending * IDX_DIM * 2, r.stream.raw)?;
                         }
                         let copy_from_cur = complete * 4 - pending;
                         let dst_cur = CuteafdDeviceBuffer {
-                            ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off + pending * IDX_DIM * 2).cast(),
+                            ptr: r.shared.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off + pending * IDX_DIM * 2).cast(),
                             bytes: copy_from_cur * IDX_DIM * 2,
-                            ..r.scratch.idx_group_tok.buffer
+                            ..r.shared.idx_group_tok.buffer
                         };
                         let src_cur = CuteafdDeviceBuffer {
-                            ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
+                            ptr: r.shared.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
                             bytes: copy_from_cur * IDX_DIM * 2,
-                            ..r.scratch.idx_tk.buffer
+                            ..r.shared.idx_tk.buffer
                         };
                         r.device.library.copy_d2d_async(dst_cur, src_cur, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
                         batch_groups += complete;
@@ -1978,17 +2242,17 @@ impl<'a> Hy4Engine<'a> {
                                 ..pending_buf
                             };
                             let src = CuteafdDeviceBuffer {
-                                ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
+                                ptr: r.shared.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
                                 bytes: m.row_len * IDX_DIM * 2,
-                                ..r.scratch.idx_tk.buffer
+                                ..r.shared.idx_tk.buffer
                             };
                             r.device.library.copy_d2d_async(dst, src, m.row_len * IDX_DIM * 2, r.stream.raw)?;
                         } else {
                             let tail_off = tok_src_base + (complete * 4 - pending) * IDX_DIM * 2;
                             let src = CuteafdDeviceBuffer {
-                                ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tail_off).cast(),
+                                ptr: r.shared.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tail_off).cast(),
                                 bytes: new_pending * IDX_DIM * 2,
-                                ..r.scratch.idx_tk.buffer
+                                ..r.shared.idx_tk.buffer
                             };
                             r.device.library.copy_d2d_async(pending_buf, src, new_pending * IDX_DIM * 2, r.stream.raw)?;
                         }
@@ -1998,13 +2262,13 @@ impl<'a> Hy4Engine<'a> {
                 if batch_groups > 0 {
                     r.programs.indexer_pool_group.launch(
                         &[
-                            r.scratch.idx_group_tok.buffer.ptr,
+                            r.shared.idx_group_tok.buffer.ptr,
                             r.weights.weight(&format!("{ip}.key_value_projection"))?.ptr,
                             r.weights.weight(&format!("{ip}.key_gate_projection"))?.ptr,
                             r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
                             r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
-                            r.scratch.idx_group_pos.buffer.ptr,
-                            r.scratch.idx_group_slots.buffer.ptr,
+                            w.idx_group_pos.buffer.ptr,
+                            w.idx_group_slots.buffer.ptr,
                             inv_freq,
                             idx_cache.ptr,
                         ],
@@ -2020,22 +2284,22 @@ impl<'a> Hy4Engine<'a> {
                     r.graphs.run(
                         GraphKey { layer, rows, section: GraphSection::DsaIndexQ },
                         &r.stream,
-                        || r.device.run(|| r.dsa_index_q(&p, rows)),
+                        || r.device.run(|| r.dsa_index_q(&p, wave_slot, rows)),
                     )?;
                 } else {
-                    r.device.run(|| r.dsa_index_q(&p, rows))?;
+                    r.device.run(|| r.dsa_index_q(&p, wave_slot, rows))?;
                 }
                 r.device.run(|| unsafe {
-                    let tile_cap = (r.scratch.idx_score_floats / max_groups).max(1);
+                    let tile_cap = (r.shared.idx_score_floats / max_groups).max(1);
                     for row_start in (0..rows).step_by(tile_cap) {
                         let tile_rows = (rows - row_start).min(tile_cap);
-                        let q_rot_ptr = r.scratch.idx_q_rot.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * IDX_DIM * 2).cast();
-                        let w_out_ptr = r.scratch.idx_w_out.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * 4).cast();
-                        let pt_ptr = r.scratch.dsa_page_table.buffer.ptr.cast::<u8>().wrapping_add(row_start * pt_stride * 4).cast();
-                        let lim_ptr = r.scratch.idx_limits.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
-                        let pos_ptr = r.scratch.positions_i32.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
-                        let cand_ptr = r.scratch.idx_cand_slots.buffer.ptr.cast::<u8>().wrapping_add(row_start * CANDIDATE_TOPK * 4).cast();
-                        let len_ptr = r.scratch.idx_cand_lens.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
+                        let q_rot_ptr = r.shared.idx_q_rot.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * IDX_DIM * 2).cast();
+                        let w_out_ptr = r.shared.idx_w_out.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * 4).cast();
+                        let pt_ptr = w.dsa_page_table.buffer.ptr.cast::<u8>().wrapping_add(row_start * pt_stride * 4).cast();
+                        let lim_ptr = w.idx_limits.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
+                        let pos_ptr = w.positions_i32.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
+                        let cand_ptr = r.shared.idx_cand_slots.buffer.ptr.cast::<u8>().wrapping_add(row_start * CANDIDATE_TOPK * 4).cast();
+                        let len_ptr = r.shared.idx_cand_lens.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
                         r.programs.indexer_score_groups.launch(
                             &[
                                 q_rot_ptr,
@@ -2043,14 +2307,14 @@ impl<'a> Hy4Engine<'a> {
                                 idx_cache.ptr,
                                 pt_ptr,
                                 lim_ptr,
-                                r.scratch.idx_scores.buffer.ptr,
+                                r.shared.idx_scores.buffer.ptr,
                             ],
                             &[Scalar::I32(tile_rows as i32), Scalar::I32(max_groups as i32), Scalar::I32(pt_stride as i32)],
                             r.stream.raw,
                         )?;
                         r.programs.indexer_topk_expand.launch(
                             &[
-                                r.scratch.idx_scores.buffer.ptr,
+                                r.shared.idx_scores.buffer.ptr,
                                 pos_ptr,
                                 pt_ptr,
                                 cand_ptr,
@@ -2066,11 +2330,11 @@ impl<'a> Hy4Engine<'a> {
                 r.device.run(|| unsafe {
                     r.programs.indexer_topk_expand.launch(
                         &[
-                            r.scratch.idx_scores.buffer.ptr,
-                            r.scratch.positions_i32.buffer.ptr,
-                            r.scratch.dsa_page_table.buffer.ptr,
-                            r.scratch.idx_cand_slots.buffer.ptr,
-                            r.scratch.idx_cand_lens.buffer.ptr,
+                            r.shared.idx_scores.buffer.ptr,
+                            w.positions_i32.buffer.ptr,
+                            w.dsa_page_table.buffer.ptr,
+                            r.shared.idx_cand_slots.buffer.ptr,
+                            r.shared.idx_cand_lens.buffer.ptr,
                         ],
                         &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I32(pt_stride as i32)],
                         r.stream.raw,
@@ -2107,19 +2371,19 @@ impl<'a> Hy4Engine<'a> {
                             || {
                                 r.device.run(|| {
                                     if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, rows, use_a)?;
+                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
-                                    r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)?;
-                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention)?;
+                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
+                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
                                     r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, rows, use_a)?;
+                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                                     if is_dense {
-                                        r.dense_ffn(&p, 1, rows)?;
+                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
                                     } else {
-                                        r.moe_router_shared(&p, 1, rows, routed_scale, true)?;
+                                        r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                         r.local_exl3(layer, 1, rows, skip_routed)?;
                                     }
-                                    r.ffn_combine_post(&p, is_dense, rows, !use_a)
+                                    r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                                 })
                             },
                         )?;
@@ -2130,27 +2394,27 @@ impl<'a> Hy4Engine<'a> {
                             || {
                                 r.device.run(|| {
                                     if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, rows, use_a)?;
+                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
-                                    r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)
+                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)
                                 })
                             },
                         )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
+                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
                             &r.stream,
                             || {
                                 r.device.run(|| {
                                     r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, rows, use_a)?;
+                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                                     if is_dense {
-                                        r.dense_ffn(&p, 1, rows)?;
+                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
                                     } else {
-                                        r.moe_router_shared(&p, 1, rows, routed_scale, true)?;
+                                        r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                         r.local_exl3(layer, 1, rows, skip_routed)?;
                                     }
-                                    r.ffn_combine_post(&p, is_dense, rows, !use_a)
+                                    r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                                 })
                             },
                         )?;
@@ -2163,10 +2427,10 @@ impl<'a> Hy4Engine<'a> {
                         || {
                             r.device.run(|| {
                                 if let Some(slot) = engram_slot {
-                                    r.engram_compute(&p, slot, rows, use_a)?;
+                                    r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                 }
-                                r.attn_pre(&p, layer, true, local_heads, rows, use_a, kv_cache_buf)?;
-                                r.dsa_index_wk(&p, rows)
+                                r.attn_pre(&p, layer, true, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
+                                r.dsa_index_wk(&p, wave_slot, rows)
                             })
                         },
                     )?;
@@ -2176,16 +2440,16 @@ impl<'a> Hy4Engine<'a> {
                         &r.stream,
                         || {
                             r.device.run(|| {
-                                r.dsa_attn(kv_cache_buf, rows, decode_attention)?;
+                                r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
                                 r.attn_out(&p, layer, true, 1, local_heads, rows)?;
-                                r.post_attn_ihc(&p, rows, use_a)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                                 if is_dense {
-                                    r.dense_ffn(&p, 1, rows)?;
+                                    r.dense_ffn(&p, 1, wave_slot, rows)?;
                                 } else {
-                                    r.moe_router_shared(&p, 1, rows, routed_scale, true)?;
+                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                     r.local_exl3(layer, 1, rows, skip_routed)?;
                                 }
-                                r.ffn_combine_post(&p, is_dense, rows, !use_a)
+                                r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                             })
                         },
                     )?;
@@ -2210,10 +2474,10 @@ impl<'a> Hy4Engine<'a> {
                             || {
                                 r.device.run(|| {
                                     if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, rows, use_a)?;
+                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
-                                    r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)?;
-                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention)?;
+                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
+                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
                                     r.attn_out(&p, layer, false, gpus, local_heads, rows)
                                 })
                             },
@@ -2225,13 +2489,13 @@ impl<'a> Hy4Engine<'a> {
                             || {
                                 r.device.run(|| {
                                     if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, rows, use_a)?;
+                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
-                                    r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)
+                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)
                                 })
                             },
                         )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
+                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
                             &r.stream,
@@ -2246,10 +2510,10 @@ impl<'a> Hy4Engine<'a> {
                         || {
                             r.device.run(|| {
                                 if let Some(slot) = engram_slot {
-                                    r.engram_compute(&p, slot, rows, use_a)?;
+                                    r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                 }
-                                r.attn_pre(&p, layer, true, local_heads, rows, use_a, kv_cache_buf)?;
-                                r.dsa_index_wk(&p, rows)
+                                r.attn_pre(&p, layer, true, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
+                                r.dsa_index_wk(&p, wave_slot, rows)
                             })
                         },
                     )?;
@@ -2259,14 +2523,14 @@ impl<'a> Hy4Engine<'a> {
                         &r.stream,
                         || {
                             r.device.run(|| {
-                                r.dsa_attn(kv_cache_buf, rows, decode_attention)?;
+                                r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
                                 r.attn_out(&p, layer, true, gpus, local_heads, rows)
                             })
                         },
                     )?;
                 }
             }
-            self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
+            self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
             // Defer post-attention norm + iHC post/pre into FfnFrontend so both fold into one graph.
             batch.post_attn_deferred = true;
             return Ok(());
@@ -2275,10 +2539,11 @@ impl<'a> Hy4Engine<'a> {
         // Eager path (prefill, ungraphed decode/scoring, dump_dir, or skip_routed_experts).
         if let Some(slot) = engram_slot {
             for r in &self.ranks {
-                r.device.run(|| r.engram_compute(&p, slot, rows, use_a))?;
+                r.device.run(|| r.engram_compute(&p, slot, wave_slot, rows, use_a))?;
             }
             if batch.dump_rows > 0 && layer <= 3 {
-                let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+                let w0 = &self.ranks[0].waves[wave_slot];
+                let r_cur = if use_a { w0.r_a.buffer } else { w0.r_b.buffer };
                 self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
             }
         }
@@ -2288,22 +2553,23 @@ impl<'a> Hy4Engine<'a> {
             } else {
                 r.cache.swa_layer_bank(self.swa_index_of[&layer])?
             };
-            r.device.run(|| r.attn_pre(&p, layer, is_sparse, local_heads, rows, use_a, kv_cache_buf))?;
+            r.device.run(|| r.attn_pre(&p, layer, is_sparse, local_heads, wave_slot, rows, use_a, kv_cache_buf))?;
             if is_sparse {
                 let dsa_idx = self.dsa_index_of[&layer];
-                r.device.run(|| r.dsa_index_wk(&p, rows))?;
+                r.device.run(|| r.dsa_index_wk(&p, wave_slot, rows))?;
                 run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
-                r.device.run(|| r.dsa_attn(kv_cache_buf, rows, decode_attention))?;
+                r.device.run(|| r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention))?;
             } else {
-                r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
+                r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
             }
             r.device.run(|| r.attn_out(&p, layer, is_sparse, gpus, local_heads, rows))?;
         }
-        self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
+        self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
         if batch.dump_rows > 0 && layer <= 3 {
-            let s0 = &self.ranks[0].scratch;
+            let s0 = &self.ranks[0].shared;
+            let w0 = &self.ranks[0].waves[wave_slot];
             let dump_rows = batch.dump_rows;
-            self.dump_bf16(&format!("l{layer:02}_attn_y"), s0.y.buffer, dump_rows * H)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_y"), w0.y.buffer, dump_rows * H)?;
             self.dump_bf16(&format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
             self.dump_bf16(&format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
             self.dump_bf16(&format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
@@ -2314,7 +2580,7 @@ impl<'a> Hy4Engine<'a> {
 
         // (C) post_proj_norm + fused attention iHC post + FFN iHC pre
         for r in &self.ranks {
-            r.device.run(|| r.post_attn_ihc(&p, rows, use_a))?;
+            r.device.run(|| r.post_attn_ihc(&p, wave_slot, rows, use_a))?;
         }
         batch.use_a = !batch.use_a;
         Ok(())
@@ -2325,6 +2591,7 @@ impl<'a> Hy4Engine<'a> {
         let p = format!("model.layers.{layer}");
         let gpus = self.ranks.len();
         let rows = batch.rows;
+        let wave_slot = batch.wave_slot;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let deferred = batch.post_attn_deferred;
         let use_a = batch.use_a;
@@ -2336,9 +2603,9 @@ impl<'a> Hy4Engine<'a> {
                     || {
                         r.device.run(|| {
                             if deferred {
-                                r.post_attn_ihc(&p, rows, use_a)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, rows, routed_scale, rank == 0 || local_experts)
+                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
                         })
                     },
                 )?;
@@ -2352,9 +2619,9 @@ impl<'a> Hy4Engine<'a> {
         for (rank, r) in self.ranks.iter().enumerate() {
             r.device.run(|| {
                 if deferred {
-                    r.post_attn_ihc(&p, rows, use_a)?;
+                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                 }
-                r.moe_router_shared(&p, gpus, rows, routed_scale, rank == 0 || local_experts)
+                r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
             })?;
         }
         if deferred {
@@ -2371,24 +2638,25 @@ impl<'a> Hy4Engine<'a> {
         let gpus = self.ranks.len();
         let rows = batch.rows;
         let is_dense = self.cfg.dense_layer[layer];
+        let wave_slot = batch.wave_slot;
 
         if is_dense {
-            self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.down_proj")), ReducePlanes::Delta)?;
+            self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.mlp.down_proj")), ReducePlanes::Delta)?;
         } else if gpus == 2 {
             if reduce_routed_tp2 {
-                self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None, ReducePlanes::Routed)?;
+                self.reduce_tp2_f32_to_bf16(wave_slot, rows, LATENT_H, None, ReducePlanes::Routed)?;
             } else {
                 // Spark reply landed on rank 0's routed_latent [rows, 1536] BF16: replicate to rank 1 via P2P.
                 let bytes = rows * LATENT_H * 2;
                 let (ev0, src0) = {
                     let r0 = &mut self.ranks[0];
                     r0.peer_ready.record(&r0.stream)?;
-                    (r0.peer_ready.raw, CuteafdDeviceBuffer { bytes, ..r0.scratch.routed_latent.buffer })
+                    (r0.peer_ready.raw, CuteafdDeviceBuffer { bytes, ..r0.shared.routed_latent.buffer })
                 };
                 self.ranks[1].device.run(|| unsafe {
                     self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
                     self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.routed_latent.buffer },
+                        CuteafdDeviceBuffer { bytes, ..self.ranks[1].shared.routed_latent.buffer },
                         src0,
                         bytes,
                         self.ranks[1].stream.raw,
@@ -2396,7 +2664,7 @@ impl<'a> Hy4Engine<'a> {
                 })?;
             }
             self.reduce_tp2_f32_to_bf16(
-                rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")), ReducePlanes::Shared,
+                wave_slot, rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")), ReducePlanes::Shared,
             )?;
         }
 
@@ -2406,26 +2674,28 @@ impl<'a> Hy4Engine<'a> {
                 r.graphs.run(
                     GraphKey { layer, rows, section: GraphSection::FfnFinish },
                     &r.stream,
-                    || r.device.run(|| r.ffn_combine_post(&p, is_dense, rows, use_a)),
+                    || r.device.run(|| r.ffn_combine_post(&p, is_dense, wave_slot, rows, use_a)),
                 )?;
             } else {
-                r.device.run(|| r.ffn_combine_post(&p, is_dense, rows, use_a))?;
+                r.device.run(|| r.ffn_combine_post(&p, is_dense, wave_slot, rows, use_a))?;
             }
         }
         batch.use_a = !batch.use_a;
 
         if batch.dump_rows > 0 {
             let dump_rows = batch.dump_rows;
-            let r_cur = if batch.use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+            let w0 = &self.ranks[0].waves[wave_slot];
+            let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
             self.dump_bf16(&format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
             if layer <= 3 {
-                let s0 = &self.ranks[0].scratch;
-                self.dump_bf16(&format!("l{layer:02}_ffn_y"), s0.y.buffer, dump_rows * H)?;
+                let s0 = &self.ranks[0].shared;
+                let w0 = &self.ranks[0].waves[wave_slot];
+                self.dump_bf16(&format!("l{layer:02}_ffn_y"), w0.y.buffer, dump_rows * H)?;
                 self.dump_bf16(&format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
                 self.dump_bf16(&format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
                 if !is_dense {
                     self.dump_bf16(&format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
-                    self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), s0.shared_out.buffer, dump_rows * H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), w0.shared_out.buffer, dump_rows * H)?;
                 }
             }
         }
@@ -2441,6 +2711,7 @@ impl<'a> Hy4Engine<'a> {
         let p = format!("model.layers.{layer}");
         let gpus = self.ranks.len();
         let rows = batch.rows;
+        let wave_slot = batch.wave_slot;
         let deferred = batch.post_attn_deferred;
         let use_a = batch.use_a;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
@@ -2455,18 +2726,18 @@ impl<'a> Hy4Engine<'a> {
                         || {
                             r.device.run(|| {
                                 if deferred {
-                                    r.post_attn_ihc(&p, rows, use_a)?;
+                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                                 }
-                                r.dense_ffn(&p, gpus, rows)
+                                r.dense_ffn(&p, gpus, wave_slot, rows)
                             })
                         },
                     )?;
                 } else {
                     r.device.run(|| {
                         if deferred {
-                            r.post_attn_ihc(&p, rows, use_a)?;
+                            r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                         }
-                        r.dense_ffn(&p, gpus, rows)
+                        r.dense_ffn(&p, gpus, wave_slot, rows)
                     })?;
                 }
             }
@@ -2485,9 +2756,9 @@ impl<'a> Hy4Engine<'a> {
                     || {
                         r.device.run(|| {
                             if deferred {
-                                r.post_attn_ihc(&p, rows, use_a)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, rows, routed_scale, true)?;
+                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, true)?;
                             r.local_exl3(layer, gpus, rows, skip_routed)
                         })
                     },
@@ -2507,22 +2778,23 @@ impl<'a> Hy4Engine<'a> {
         self.finish_ffn_combine_and_post(layer, batch, true)
     }
 
-    /// Project a `<= 64`-row tile of `r0.scratch.y[y_row_off .. y_row_off + count]` through the
-    /// vocabulary head into `r0.scratch.head_logits_f32 [count, vocab]` with zero host hop.
-    fn project_head_tile(&self, y_row_off: usize, count: usize) -> Result<DeviceLogits> {
+    /// Project a `<= 64`-row tile of `r0.waves[wave_slot].y[y_row_off .. y_row_off + count]` through the
+    /// vocabulary head into `r0.shared.head_logits_f32 [count, vocab]` with zero host hop.
+    fn project_head_tile(&self, wave_slot: usize, y_row_off: usize, count: usize) -> Result<DeviceLogits> {
         ensure!(count > 0 && count <= 64, "Hy4 head tile count {count} outside 1..=64");
         let vocab = self.cfg.vocab_size;
         let r0 = &self.ranks[0];
+        let w0 = &r0.waves[wave_slot];
         let head_out = r0
-            .scratch
+            .shared
             .head_logits_f32
             .as_ref()
             .context("rank 0 missing head_logits_f32")?
             .buffer;
         let x0_buf = CuteafdDeviceBuffer {
-            ptr: r0.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(y_row_off * H * 2).cast(),
+            ptr: w0.y.buffer.ptr.cast::<u8>().wrapping_add(y_row_off * H * 2).cast(),
             bytes: count * H * 2,
-            ..r0.scratch.y.buffer
+            ..w0.y.buffer
         };
         if self.ranks.len() == 1 {
             let out_buf = CuteafdDeviceBuffer {
@@ -2532,19 +2804,20 @@ impl<'a> Hy4Engine<'a> {
             r0.device.run(|| launch_rank_lm_head(r0, count, x0_buf, out_buf))?;
         } else {
             let r1 = &self.ranks[1];
+            let w1 = &r1.waves[wave_slot];
             let handoff = self.head_handoff.as_ref().context("TP2 head handoff missing")?;
             let local_v = r0.weights.local_vocab;
             let x1_buf = CuteafdDeviceBuffer {
                 bytes: count * H * 2,
-                ..r1.scratch.y.buffer
+                ..w1.y.buffer
             };
             let out0_buf = CuteafdDeviceBuffer {
                 bytes: count * local_v * 4,
-                ..r0.scratch.logits_tile.buffer
+                ..r0.shared.logits_tile.buffer
             };
             let out1_buf = CuteafdDeviceBuffer {
                 bytes: count * local_v * 4,
-                ..r1.scratch.logits_tile.buffer
+                ..r1.shared.logits_tile.buffer
             };
             handoff.project(
                 x0_buf,
@@ -2592,8 +2865,10 @@ impl<'a> Hy4Engine<'a> {
         mode: HeadMode,
         on_tile: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>,
     ) -> Result<()> {
+        let wave_slot = batch.wave_slot;
         let r0 = &self.ranks[0];
-        let r_cur = if batch.use_a { r0.scratch.r_a.buffer } else { r0.scratch.r_b.buffer };
+        let w0 = &r0.waves[wave_slot];
+        let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
         match mode {
             HeadMode::None => Ok(()),
             HeadMode::LastPerSeq => {
@@ -2613,16 +2888,16 @@ impl<'a> Hy4Engine<'a> {
                                 ..r_cur
                             };
                             let dst = CuteafdDeviceBuffer {
-                                ptr: r0.scratch.r_head_in.buffer.ptr.cast::<u8>().wrapping_add(idx * row_bytes).cast(),
+                                ptr: r0.shared.r_head_in.buffer.ptr.cast::<u8>().wrapping_add(idx * row_bytes).cast(),
                                 bytes: row_bytes,
-                                ..r0.scratch.r_head_in.buffer
+                                ..r0.shared.r_head_in.buffer
                             };
                             // SAFETY: r_cur and r_head_in are disjoint admitted buffers on rank 0.
                             unsafe { r0.device.library.copy_d2d_async(dst, src, row_bytes, r0.stream.raw)?; }
                         }
                         Ok(())
                     })?;
-                    r0.scratch.r_head_in.buffer.ptr
+                    r0.shared.r_head_in.buffer.ptr
                 };
                 r0.device.run(|| unsafe {
                     r0.programs.hc_head.launch(
@@ -2632,14 +2907,14 @@ impl<'a> Hy4Engine<'a> {
                             r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
                             r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
                             r0.weights.buf("model.norm.weight")?.ptr,
-                            r0.scratch.delta_norm.buffer.ptr,
-                            r0.scratch.y.buffer.ptr,
+                            r0.shared.delta_norm.buffer.ptr,
+                            w0.y.buffer.ptr,
                         ],
                         &[Scalar::I32(count as i32)],
                         r0.stream.raw,
                     )
                 })?;
-                let logits = self.project_head_tile(0, count)?;
+                let logits = self.project_head_tile(wave_slot, 0, count)?;
                 on_tile(0, logits)
             }
             HeadMode::Suffix(first_row) => {
@@ -2657,19 +2932,19 @@ impl<'a> Hy4Engine<'a> {
                             r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
                             r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
                             r0.weights.buf("model.norm.weight")?.ptr,
-                            r0.scratch.delta_norm.buffer.ptr,
-                            r0.scratch.y.buffer.ptr,
+                            r0.shared.delta_norm.buffer.ptr,
+                            w0.y.buffer.ptr,
                         ],
                         &[Scalar::I32(total as i32)],
                         r0.stream.raw,
                     )
                 })?;
                 if batch.dump_rows > 0 && first_row == 0 {
-                    self.dump_bf16("hc_head_y", r0.scratch.y.buffer, batch.dump_rows * H)?;
+                    self.dump_bf16("hc_head_y", w0.y.buffer, batch.dump_rows * H)?;
                 }
                 for tile_off in (0..total).step_by(64) {
                     let count = (total - tile_off).min(64);
-                    let logits = self.project_head_tile(tile_off, count)?;
+                    let logits = self.project_head_tile(wave_slot, tile_off, count)?;
                     on_tile(first_row + tile_off, logits)?;
                 }
                 Ok(())
@@ -2692,6 +2967,9 @@ impl<'a> Hy4Engine<'a> {
             self.set_graph_cycle(priority);
         }
         let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
+        let staged_frontiers = initial_starts.clone();
+        let staged_engram_tails: Vec<[u32; 2]> = placements.iter().map(|p| p.engram_tail).collect();
+        let run_waves = self.prefill_waves;
         let kind = match priority {
             ReadPriority::Decode => ExpertV2SourceKind::Decode,
             _ => ExpertV2SourceKind::Prefill,
@@ -2704,12 +2982,14 @@ impl<'a> Hy4Engine<'a> {
                 waves: Option<&'w mut Waves<'a>>,
                 placements: &'p mut [Hy4Placement],
                 initial_starts: &'p [usize],
+                staged_frontiers: Vec<usize>,
+                staged_engram_tails: Vec<[u32; 2]>,
                 sources: &'p [&'p [u32]],
                 priority: ReadPriority,
                 kind: ExpertV2SourceKind,
                 head_mode: F,
                 on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
-                active: Option<ActiveBatch>,
+                active: Vec<Option<ActiveBatch>>,
             }
             impl<F: Fn(&Unit) -> HeadMode> PrefillHooks for Hooks<'_, '_, '_, '_, F> {
                 type Ticket = Option<WaveTicket>;
@@ -2724,21 +3004,46 @@ impl<'a> Hy4Engine<'a> {
                     }
                 }
                 fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
-                    let batch = self.engine.begin_batch(self.placements, self.initial_starts, self.sources, unit, self.priority)?;
-                    self.active = Some(batch);
+                    let slot = unit.slot;
+                    ensure!(
+                        slot < self.active.len() && self.active[slot].is_none(),
+                        "Hy4 begin_unit slot {slot} invalid or already occupied"
+                    );
+                    let batch = self.engine.begin_batch(
+                        self.placements,
+                        self.initial_starts,
+                        &mut self.staged_frontiers,
+                        &mut self.staged_engram_tails,
+                        self.sources,
+                        unit,
+                        self.priority,
+                    )?;
+                    self.active[slot] = Some(batch);
                     Ok(())
                 }
-                fn attention(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+                fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
                     let local_route = self.route(layer) == FfnRoute::Local;
-                    let batch = self.active.as_mut().context("Hy4 attention without active unit")?;
+                    let batch = self
+                        .active
+                        .get_mut(unit.slot)
+                        .and_then(Option::as_mut)
+                        .context("Hy4 attention without active unit")?;
                     self.engine.run_layer_attention(layer, batch, local_route)
                 }
-                fn local_ffn(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
-                    let batch = self.active.as_mut().context("Hy4 FFN without active unit")?;
+                fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+                    let batch = self
+                        .active
+                        .get_mut(unit.slot)
+                        .and_then(Option::as_mut)
+                        .context("Hy4 FFN without active unit")?;
                     self.engine.run_layer_local_ffn(layer, batch)
                 }
                 fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Option<WaveTicket>> {
-                    let batch = self.active.as_mut().context("Hy4 send_experts without active unit")?;
+                    let batch = self
+                        .active
+                        .get_mut(unit.slot)
+                        .and_then(Option::as_mut)
+                        .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_router_and_shared(layer, batch, false)?;
                     let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
                     let rows = batch.rows;
@@ -2772,9 +3077,9 @@ impl<'a> Hy4Engine<'a> {
                                 rows * LATENT_H * 2,
                                 staging,
                                 [
-                                    r0.scratch.route_ids.buffer,
-                                    r0.scratch.route_weights.buffer,
-                                    r0.scratch.wire_in.buffer,
+                                    r0.shared.route_ids.buffer,
+                                    r0.shared.route_weights.buffer,
+                                    r0.shared.wire_in.buffer,
                                 ],
                                 r0.stream.raw,
                                 combined,
@@ -2796,10 +3101,14 @@ impl<'a> Hy4Engine<'a> {
                     })?;
                     Ok(Some(ticket))
                 }
-                fn land_experts(&mut self, layer: usize, _unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
+                fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
                     let ticket = ticket.context("Hy4 land_experts missing WaveTicket")?;
                     let slot = ticket.slot();
-                    let batch = self.active.as_mut().context("Hy4 land_experts without active unit")?;
+                    let batch = self
+                        .active
+                        .get_mut(unit.slot)
+                        .and_then(Option::as_mut)
+                        .context("Hy4 land_experts without active unit")?;
                     let rows = batch.rows;
                     let waves = self.waves.as_mut().context("Hy4 Spark land without active SparkLink")?;
                     let r0 = &self.engine.ranks[0];
@@ -2810,7 +3119,7 @@ impl<'a> Hy4Engine<'a> {
                             waves.reduce(
                                 slot,
                                 std::ptr::null(),
-                                r0.scratch.routed_latent.buffer.ptr.cast(),
+                                r0.shared.routed_latent.buffer.ptr.cast(),
                                 rows,
                                 r0.stream.raw,
                             )
@@ -2819,7 +3128,11 @@ impl<'a> Hy4Engine<'a> {
                     self.engine.finish_ffn_combine_and_post(layer, batch, false)
                 }
                 fn end_unit(&mut self, unit: &Unit) -> Result<()> {
-                    let batch = self.active.as_ref().context("Hy4 end_unit without active unit")?;
+                    let batch = self
+                        .active
+                        .get(unit.slot)
+                        .and_then(Option::as_ref)
+                        .context("Hy4 end_unit without active unit")?;
                     let mode = if unit.layers.end == self.engine.cfg.layers {
                         (self.head_mode)(unit)
                     } else {
@@ -2827,8 +3140,12 @@ impl<'a> Hy4Engine<'a> {
                     };
                     self.engine.finish_head(batch, mode, &mut |row_off, logits| (self.on_tile)(unit, row_off, logits))
                 }
-                fn commit_unit(&mut self, _unit: &Unit) -> Result<()> {
-                    let batch = self.active.take().context("Hy4 commit_unit without active unit")?;
+                fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
+                    let batch = self
+                        .active
+                        .get_mut(unit.slot)
+                        .and_then(Option::take)
+                        .context("Hy4 commit_unit without active unit")?;
                     for m in &batch.members {
                         let p = &mut self.placements[m.sequence];
                         p.len = m.pos_start + m.row_len;
@@ -2843,14 +3160,16 @@ impl<'a> Hy4Engine<'a> {
                 waves,
                 placements,
                 initial_starts: &initial_starts,
+                staged_frontiers,
+                staged_engram_tails,
                 sources,
                 priority,
                 kind,
                 head_mode,
                 on_tile,
-                active: None,
+                active: (0..run_waves).map(|_| None).collect(),
             };
-            run_prefill_units(&mut hooks, units, 1)?;
+            run_prefill_units(&mut hooks, units, run_waves)?;
             if spark.is_some() {
                 spark_waves::healthy()?;
             }
@@ -2925,6 +3244,61 @@ impl<'a> Hy4Engine<'a> {
         Ok(all_logits)
     }
 
+    /// Run a contiguous single-sequence span through layers `0..=last_layer` across `self.prefill_waves`
+    /// wave slots (multi-wave golden verification).
+    pub(crate) fn forward_span(&mut self, tokens: &[u32], unit_rows: usize, last_layer: usize) -> Result<Vec<f32>> {
+        use crate::shared::prefill_pipeline::sequence_units;
+        ensure!(!tokens.is_empty() && unit_rows > 0 && unit_rows <= self.max_rows, "invalid Hy4 span geometry");
+        ensure!(last_layer < self.cfg.layers, "last_layer {last_layer} >= {}", self.cfg.layers);
+        let start = self.golden_placement.len;
+        let mut units = sequence_units(tokens.len(), unit_rows, self.prefill_waves, last_layer + 1)?;
+        let last_idx = units.len() - 1;
+        for (i, u) in units.iter_mut().enumerate() {
+            let u_start = start + u.rows.start;
+            let u_end = start + u.rows.end;
+            u.rows = u_start..u_end;
+            u.segments = vec![UnitSegment {
+                sequence: 0,
+                rows: 0..u.rows.len(),
+                tokens: u_start..u_end,
+                prompt_end: i == last_idx,
+                snapshot: false,
+                head: last_layer + 1 == self.cfg.layers,
+            }];
+        }
+        let vocab = self.cfg.vocab_size;
+        let mut all_logits = if last_layer + 1 == self.cfg.layers {
+            vec![0f32; tokens.len() * vocab]
+        } else {
+            Vec::new()
+        };
+        let mut placement = [self.golden_placement.clone()];
+        let library = self.library();
+        let mode = if last_layer + 1 == self.cfg.layers {
+            HeadMode::Suffix(0)
+        } else {
+            HeadMode::None
+        };
+        self.run_units(
+            &mut placement,
+            &[tokens],
+            &units,
+            ReadPriority::Prefill,
+            |_| mode,
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                let dst = (u.rows.start - start + row_off) * vocab;
+                all_logits[dst..dst + tile.len()].copy_from_slice(&tile);
+                Ok(())
+            },
+        )?;
+        self.golden_placement = placement.into_iter().next().unwrap();
+        if last_layer + 1 < self.cfg.layers {
+            self.drain()?;
+        }
+        Ok(all_logits)
+    }
+
     /// Run a contiguous single-sequence chunk through layers `0..=last_layer` (golden API).
     pub(crate) fn forward_chunk(&mut self, tokens: &[u32], last_layer: usize) -> Result<Vec<f32>> {
         self.forward_chunk_opts(tokens, last_layer, true)
@@ -2987,6 +3361,235 @@ impl<'a> Hy4Engine<'a> {
         Ok(all_logits)
     }
 
+    /// Prove byte-identity of logits and `engram_tail` across multi-wave single-sequence execution
+    /// AND concurrent two-sequence execution (`prompt_a` in wave `k`, `prompt_b` in wave `k+1`)
+    /// versus solo `waves=1` execution, while asserting disjoint per-wave Engram buffers.
+    pub(crate) fn verify_concurrent_two_seq_waves(
+        &mut self,
+        prompt_a: &[u32],
+        prompt_b: &[u32],
+        unit_rows: usize,
+        last_layer: usize,
+    ) -> Result<TwoSeqWaveProof> {
+        use crate::shared::prefill_pipeline::sequence_units;
+        ensure!(
+            self.prefill_waves >= 2 && self.max_sequences >= 2,
+            "verify_concurrent_two_seq_waves requires prefill_waves >= 2 and max_sequences >= 2"
+        );
+        ensure!(
+            !prompt_a.is_empty() && !prompt_b.is_empty() && unit_rows > 0 && unit_rows <= self.max_rows,
+            "invalid prompt or unit_rows for wave verification"
+        );
+        ensure!(last_layer + 1 == self.cfg.layers, "verify_concurrent_two_seq_waves requires full 42 layers");
+        self.assert_disjoint_wave_engram_buffers()?;
+        let buffer_summary = self.wave_engram_buffer_summary();
+
+        let pages_a = prompt_a.len().div_ceil(PAGE_ROWS);
+        let pages_b = prompt_b.len().div_ceil(PAGE_ROWS);
+        ensure!(
+            pages_a + pages_b <= self.max_pages,
+            "two-sequence wave proof needs {} pages, engine has {}",
+            pages_a + pages_b,
+            self.max_pages
+        );
+        let vocab = self.cfg.vocab_size;
+        let pad_id = self.cfg.engram_pad_id;
+        let layers = self.cfg.layers;
+        let library = self.library();
+
+        let make_solo_units = |len: usize, waves: usize| -> Result<Vec<Unit>> {
+            let mut units = sequence_units(len, unit_rows, waves, layers)?;
+            let last_idx = units.len() - 1;
+            for (i, u) in units.iter_mut().enumerate() {
+                let span = u.rows.clone();
+                u.segments = vec![UnitSegment {
+                    sequence: 0,
+                    rows: 0..span.len(),
+                    tokens: span,
+                    prompt_end: i == last_idx,
+                    snapshot: false,
+                    head: true,
+                }];
+            }
+            Ok(units)
+        };
+
+        // 1. Prompt A solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
+        self.reset()?;
+        let units_a1 = make_solo_units(prompt_a.len(), 1)?;
+        let mut p_a1 = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
+        let mut logits_a_solo = vec![0f32; prompt_a.len() * vocab];
+        for mut unit in units_a1 {
+            unit.index = 0;
+            unit.slot = 0;
+            let src = &prompt_a[unit.rows.clone()];
+            self.run_units(
+                &mut p_a1,
+                &[src],
+                &[unit],
+                ReadPriority::Prefill,
+                |_| HeadMode::Suffix(0),
+                &mut |u, row_off, logits| {
+                    let tile = logits.to_host(library)?;
+                    let dst = (u.rows.start + row_off) * vocab;
+                    logits_a_solo[dst..dst + tile.len()].copy_from_slice(&tile);
+                    Ok(())
+                },
+            )?;
+        }
+        let tail_a_solo = p_a1[0].engram_tail;
+
+        // 2. Prompt B solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
+        self.reset()?;
+        let units_b1 = make_solo_units(prompt_b.len(), 1)?;
+        let mut p_b1 = [Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id)];
+        let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
+        for mut unit in units_b1 {
+            unit.index = 0;
+            unit.slot = 0;
+            let src = &prompt_b[unit.rows.clone()];
+            self.run_units(
+                &mut p_b1,
+                &[src],
+                &[unit],
+                ReadPriority::Prefill,
+                |_| HeadMode::Suffix(0),
+                &mut |u, row_off, logits| {
+                    let tile = logits.to_host(library)?;
+                    let dst = (u.rows.start + row_off) * vocab;
+                    logits_b_solo[dst..dst + tile.len()].copy_from_slice(&tile);
+                    Ok(())
+                },
+            )?;
+        }
+        let tail_b_solo = p_b1[0].engram_tail;
+
+        // 3. Prompt A solo at waves=W (cross-wave boundary tail + logits check).
+        self.reset()?;
+        let units_aw = make_solo_units(prompt_a.len(), self.prefill_waves)?;
+        ensure!(units_aw.len() >= 2, "prompt A must span >= 2 units at unit_rows={unit_rows} to cross wave boundary");
+        let mut p_aw = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
+        let mut logits_a_mw = vec![0f32; prompt_a.len() * vocab];
+        self.run_units(
+            &mut p_aw,
+            &[prompt_a],
+            &units_aw,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                let dst = (u.rows.start + row_off) * vocab;
+                logits_a_mw[dst..dst + tile.len()].copy_from_slice(&tile);
+                Ok(())
+            },
+        )?;
+        let tail_a_mw = p_aw[0].engram_tail;
+        let diff_a_mw = count_f32_bit_diffs(&logits_a_solo, &logits_a_mw);
+        ensure!(
+            diff_a_mw == 0 && tail_a_mw == tail_a_solo,
+            "single-sequence multi-wave (waves={}) diverged from waves=1: diff_elems={diff_a_mw} tail={tail_a_mw:?} != {tail_a_solo:?}",
+            self.prefill_waves
+        );
+
+        // 4. Prompt A and Prompt B concurrently in interleaved waves (A in wave k, B in wave k+1).
+        self.reset()?;
+        let a_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_a.len(), unit_rows, self.prefill_waves, 256)?;
+        let b_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_b.len(), unit_rows, self.prefill_waves, 256)?;
+        let mut interleaved = Vec::with_capacity(a_ranges.len() + b_ranges.len());
+        let max_len = a_ranges.len().max(b_ranges.len());
+        let mut idx = 0usize;
+        for step in 0..max_len {
+            if let Some(span) = a_ranges.get(step).cloned() {
+                interleaved.push(Unit {
+                    index: idx,
+                    sequence: 0,
+                    segments: vec![UnitSegment {
+                        sequence: 0,
+                        rows: 0..span.len(),
+                        tokens: span.clone(),
+                        prompt_end: step + 1 == a_ranges.len(),
+                        snapshot: false,
+                        head: true,
+                    }],
+                    rows: span,
+                    layers: 0..layers,
+                    slot: idx % self.prefill_waves,
+                    barrier: false,
+                });
+                idx += 1;
+            }
+            if let Some(span) = b_ranges.get(step).cloned() {
+                interleaved.push(Unit {
+                    index: idx,
+                    sequence: 1,
+                    segments: vec![UnitSegment {
+                        sequence: 1,
+                        rows: 0..span.len(),
+                        tokens: span.clone(),
+                        prompt_end: step + 1 == b_ranges.len(),
+                        snapshot: false,
+                        head: true,
+                    }],
+                    rows: span,
+                    layers: 0..layers,
+                    slot: idx % self.prefill_waves,
+                    barrier: false,
+                });
+                idx += 1;
+            }
+        }
+        let mut placements = [
+            Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id),
+            Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id),
+        ];
+        let mut logits_a_conc = vec![0f32; prompt_a.len() * vocab];
+        let mut logits_b_conc = vec![0f32; prompt_b.len() * vocab];
+        self.run_units(
+            &mut placements,
+            &[prompt_a, prompt_b],
+            &interleaved,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                let dst = (u.rows.start + row_off) * vocab;
+                if u.sequence == 0 {
+                    logits_a_conc[dst..dst + tile.len()].copy_from_slice(&tile);
+                } else {
+                    logits_b_conc[dst..dst + tile.len()].copy_from_slice(&tile);
+                }
+                Ok(())
+            },
+        )?;
+        let tail_a_conc = placements[0].engram_tail;
+        let tail_b_conc = placements[1].engram_tail;
+        let diff_a_conc = count_f32_bit_diffs(&logits_a_solo, &logits_a_conc);
+        let diff_b_conc = count_f32_bit_diffs(&logits_b_solo, &logits_b_conc);
+        ensure!(
+            diff_a_conc == 0 && tail_a_conc == tail_a_solo,
+            "concurrent 2-seq multi-wave prompt A diverged: diff_elems={diff_a_conc} tail={tail_a_conc:?} != {tail_a_solo:?}"
+        );
+        ensure!(
+            diff_b_conc == 0 && tail_b_conc == tail_b_solo,
+            "concurrent 2-seq multi-wave prompt B diverged: diff_elems={diff_b_conc} tail={tail_b_conc:?} != {tail_b_solo:?}"
+        );
+
+        Ok(TwoSeqWaveProof {
+            gpus: self.ranks.len(),
+            waves: self.prefill_waves,
+            unit_rows,
+            prompt_a_len: prompt_a.len(),
+            prompt_b_len: prompt_b.len(),
+            units_a: a_ranges.len(),
+            units_b: b_ranges.len(),
+            logits_a_solo,
+            logits_b_solo,
+            tail_a: tail_a_solo,
+            tail_b: tail_b_solo,
+            buffer_summary,
+        })
+    }
+
     /// Return the active 4-stream residual `[rows, 4, H]` F32 from rank 0 (for layer-0 boundary checks).
     pub(crate) fn read_residual_f32(&self, rows: usize) -> Result<Vec<f32>> {
         let r0 = &self.ranks[0];
@@ -2994,7 +3597,7 @@ impl<'a> Hy4Engine<'a> {
         let bytes = rows * HC * H * 2;
         let mut raw = vec![0u8; bytes];
         r0.device.run(|| {
-            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..r0.scratch.r_a.buffer })
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..r0.waves[0].r_a.buffer })
         })?;
         Ok(raw
             .chunks_exact(2)
@@ -3007,6 +3610,52 @@ impl Drop for Hy4Engine<'_> {
     fn drop(&mut self) {
         self.terminate();
     }
+}
+
+pub(crate) struct TwoSeqWaveProof {
+    pub(crate) gpus: usize,
+    pub(crate) waves: usize,
+    pub(crate) unit_rows: usize,
+    pub(crate) prompt_a_len: usize,
+    pub(crate) prompt_b_len: usize,
+    pub(crate) units_a: usize,
+    pub(crate) units_b: usize,
+    pub(crate) logits_a_solo: Vec<f32>,
+    pub(crate) logits_b_solo: Vec<f32>,
+    pub(crate) tail_a: [u32; 2],
+    pub(crate) tail_b: [u32; 2],
+    pub(crate) buffer_summary: Vec<String>,
+}
+
+fn count_f32_bit_diffs(a: &[f32], b: &[f32]) -> usize {
+    a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
+}
+
+/// Advance staged frontier and rolling Engram tail on `begin_unit` before any predecessor wave commits.
+fn stage_segment_frontier_and_tail(
+    sequence: usize,
+    token_start: usize,
+    tok_slice: &[u32],
+    staged_frontiers: &mut [usize],
+    staged_engram_tails: &mut [[u32; 2]],
+) -> Result<(usize, usize, [u32; 2], [u32; 2])> {
+    let pos_start = *staged_frontiers
+        .get(sequence)
+        .with_context(|| format!("Hy4 staged frontier sequence {sequence} out of range"))?;
+    ensure!(
+        token_start == pos_start,
+        "Hy4 segment start {token_start} differs from staged frontier {pos_start}"
+    );
+    let cur_tail = *staged_engram_tails
+        .get(sequence)
+        .with_context(|| format!("Hy4 staged Engram tail sequence {sequence} out of range"))?;
+    let pos_end = pos_start
+        .checked_add(tok_slice.len())
+        .context("Hy4 staged frontier overflow")?;
+    let next_tail = advance_tail(cur_tail, tok_slice, tok_slice.len());
+    staged_frontiers[sequence] = pos_end;
+    staged_engram_tails[sequence] = next_tail;
+    Ok((pos_start, pos_end, cur_tail, next_tail))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3080,6 +3729,305 @@ mod tests {
         assert_eq!(req.rows[1].route_offset, 16);
         assert_ne!(req.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
         assert!(build_hy4_spark_request(7, 1, 0, 3, 0, 1, ExpertV2Dtype::Fp8E4m3Ue8m0K32, vec![], vec![].into()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_engram_tails_advance_on_stage_across_waves_1_2_3() -> Result<()> {
+        use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
+        use cuteafd_loader::families::hy4_flash::engram::{Hy4EngramHasher, Hy4EngramHistory};
+
+        let pad = 0u32;
+        let prompt_a: Vec<u32> = (0..1536u32).map(|i| 100 + (i * 37) % 1000).collect();
+        let prompt_b: Vec<u32> = (0..1536u32).map(|i| 2000 + (i * 53) % 1000).collect();
+        let unit_rows = 512usize;
+        let layers = 4usize;
+        let routes = vec![FfnRoute::Local, FfnRoute::Spark, FfnRoute::Local, FfnRoute::Spark];
+
+        // Synthetic Engram hasher to prove hashed row IDs across wave boundaries match unchunked hashing.
+        let mut vocab_map = BTreeMap::new();
+        vocab_map.insert(1usize, vec![997u64; 16]);
+        let cfg = Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 42,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: (0..42).map(|i| i % 4 == 0).collect(),
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: (0..42).map(|i| i == 0).collect(),
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 3.998,
+            swiglu_limit: 10.0,
+            engram_layers: vec![1],
+            engram_vocab_sizes: vocab_map,
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: pad,
+            engram_seed: 10_007,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 4096,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        };
+        let lookup: Vec<i32> = (0..4096i32).collect();
+        let hasher = Hy4EngramHasher::new(&cfg, 1, lookup)?;
+        let mut expected_rows_a = Vec::new();
+        let mut hist_a = Hy4EngramHistory(vec![pad, pad]);
+        hasher.hash(&mut hist_a, &prompt_a, &mut expected_rows_a)?;
+        let mut expected_rows_b = Vec::new();
+        let mut hist_b = Hy4EngramHistory(vec![pad, pad]);
+        hasher.hash(&mut hist_b, &prompt_b, &mut expected_rows_b)?;
+
+        // (1) Single-sequence across waves=1, 2, 3: Begin(unit 1) executes BEFORE Commit(unit 0).
+        let mut ref_records = Vec::new();
+        let mut ref_final_tail = [0u32; 2];
+        for waves in [1usize, 2, 3] {
+            let mut units = sequence_units(prompt_a.len(), unit_rows, waves, layers)?;
+            for u in &mut units {
+                let span = u.rows.clone();
+                u.segments = vec![UnitSegment {
+                    sequence: 0,
+                    rows: 0..span.len(),
+                    tokens: span,
+                    prompt_end: false,
+                    snapshot: false,
+                    head: false,
+                }];
+            }
+            let steps = prefill_schedule(&routes, &units, waves)?;
+            let mut committed_tail = [pad, pad];
+            let mut staged_frontiers = vec![0usize];
+            let mut staged_tails = vec![[pad, pad]];
+            let mut in_flight: Vec<Option<[u32; 2]>> = vec![None; waves];
+            let mut unit_records: Vec<([u32; 2], Vec<u32>)> = Vec::new();
+            let mut hashed_rows = Vec::new();
+            let mut saw_uncommitted_overlap = false;
+
+            for step in steps {
+                match step {
+                    Step::Begin { unit } => {
+                        let u = &units[unit];
+                        let seg = &u.segments[0];
+                        let tok_slice = &prompt_a[seg.tokens.clone()];
+                        if unit > 0 && committed_tail == [pad, pad] {
+                            saw_uncommitted_overlap = true;
+                        }
+                        let (_, _, cur_tail, next_tail) = stage_segment_frontier_and_tail(
+                            seg.sequence,
+                            seg.tokens.start,
+                            tok_slice,
+                            &mut staged_frontiers,
+                            &mut staged_tails,
+                        )?;
+                        assert!(in_flight[u.slot].is_none(), "wave slot collision at unit {unit}");
+                        in_flight[u.slot] = Some(next_tail);
+                        unit_records.push((cur_tail, tok_slice.to_vec()));
+                        let mut h = Hy4EngramHistory(cur_tail.to_vec());
+                        hasher.hash(&mut h, tok_slice, &mut hashed_rows)?;
+                    }
+                    Step::Commit { unit } => {
+                        let u = &units[unit];
+                        committed_tail = in_flight[u.slot].take().expect("active wave on commit");
+                    }
+                    _ => {}
+                }
+            }
+            if waves > 1 {
+                assert!(saw_uncommitted_overlap, "waves={waves} must begin unit 1 before unit 0 commits");
+            }
+            assert_eq!(hashed_rows, expected_rows_a, "waves={waves} hashed Engram rows diverged across wave boundaries");
+            assert_eq!(committed_tail, [prompt_a[prompt_a.len() - 2], prompt_a[prompt_a.len() - 1]]);
+            if waves == 1 {
+                ref_records = unit_records;
+                ref_final_tail = committed_tail;
+            } else {
+                assert_eq!(unit_records, ref_records, "waves={waves} staged (cur_tail, tokens) diverged from waves=1");
+                assert_eq!(committed_tail, ref_final_tail, "waves={waves} committed engram_tail diverged from waves=1");
+            }
+        }
+
+        // (2) Two sequences interleaved (prompt A in wave k, prompt B in wave k+1) at waves=2 and 3.
+        for waves in [2usize, 3] {
+            let mut units = Vec::new();
+            let mut idx = 0usize;
+            for step in 0..(prompt_a.len() / unit_rows) {
+                let span = step * unit_rows..(step + 1) * unit_rows;
+                for seq in [0usize, 1] {
+                    units.push(Unit {
+                        index: idx,
+                        sequence: seq,
+                        segments: vec![UnitSegment {
+                            sequence: seq,
+                            rows: 0..span.len(),
+                            tokens: span.clone(),
+                            prompt_end: false,
+                            snapshot: false,
+                            head: false,
+                        }],
+                        rows: span.clone(),
+                        layers: 0..layers,
+                        slot: idx % waves,
+                        barrier: false,
+                    });
+                    idx += 1;
+                }
+            }
+            let steps = prefill_schedule(&routes, &units, waves)?;
+            let mut committed = [[pad, pad]; 2];
+            let mut staged_frontiers = vec![0usize; 2];
+            let mut staged_tails = vec![[pad, pad]; 2];
+            let mut in_flight: Vec<Option<(usize, [u32; 2])>> = vec![None; waves];
+            let mut hashed = [Vec::new(), Vec::new()];
+            let sources = [&prompt_a[..], &prompt_b[..]];
+
+            for step in steps {
+                match step {
+                    Step::Begin { unit } => {
+                        let u = &units[unit];
+                        let seg = &u.segments[0];
+                        let tok_slice = &sources[seg.sequence][seg.tokens.clone()];
+                        let (_, _, cur_tail, next_tail) = stage_segment_frontier_and_tail(
+                            seg.sequence,
+                            seg.tokens.start,
+                            tok_slice,
+                            &mut staged_frontiers,
+                            &mut staged_tails,
+                        )?;
+                        assert!(in_flight[u.slot].is_none());
+                        in_flight[u.slot] = Some((seg.sequence, next_tail));
+                        let mut h = Hy4EngramHistory(cur_tail.to_vec());
+                        hasher.hash(&mut h, tok_slice, &mut hashed[seg.sequence])?;
+                    }
+                    Step::Commit { unit } => {
+                        let (seq, tail) = in_flight[units[unit].slot].take().expect("active wave");
+                        committed[seq] = tail;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(hashed[0], expected_rows_a);
+            assert_eq!(hashed[1], expected_rows_b);
+            assert_eq!(committed[0], [prompt_a[prompt_a.len() - 2], prompt_a[prompt_a.len() - 1]]);
+            assert_eq!(committed[1], [prompt_b[prompt_b.len() - 2], prompt_b[prompt_b.len() - 1]]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn loader_admitted_attn_scratch_covers_runtime_requirement() -> Result<()> {
+        let cfg = Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 42,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: (0..42).map(|i| i % 4 == 0).collect(),
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: (0..42).map(|i| i == 0).collect(),
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 3.998,
+            swiglu_limit: 10.0,
+            engram_layers: vec![1, 11, 21, 31],
+            engram_vocab_sizes: BTreeMap::new(),
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: 120_002,
+            engram_seed: 10_007,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 120_818,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        };
+        for tp in [1usize, 2] {
+            for decode_rows in [1usize, 32, 64] {
+                let required = mla_split_scratch_bytes(decode_rows, tp);
+                for unit_rows in [1usize, 64, 128, 512, 2752, 4096] {
+                    let capacity_rows = unit_rows.max(decode_rows);
+                    for rank in 0..tp {
+                        let layout = SharedScratchLayout::new(
+                            &cfg,
+                            rank,
+                            tp,
+                            capacity_rows,
+                            decode_rows,
+                            64,
+                            16,
+                            cfg.vocab_size / tp,
+                        )?;
+                        let admitted = layout
+                            .arena
+                            .view("attn_scratch")
+                            .context("missing attn_scratch view")?
+                            .bytes();
+                        assert!(
+                            admitted >= required,
+                            "tp={tp} rank={rank} unit_rows={unit_rows} decode_rows={decode_rows}: loader admitted attn_scratch {admitted} < runtime required {required}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

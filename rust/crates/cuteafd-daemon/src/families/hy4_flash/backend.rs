@@ -140,7 +140,7 @@ impl<'a> Hy4Backend<'a> {
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
         let decode_rows = engine.decode_rows;
-        let prefill_waves = engine.prefill_waves;
+        let prefill_waves = engine.prefill_waves();
         let vocab = engine.cfg.vocab_size;
         let pad_id = engine.cfg.engram_pad_id;
         ensure!(
@@ -176,7 +176,7 @@ impl<'a> Hy4Backend<'a> {
                 continue;
             }
             calls.push(ends.len());
-            let units = sequence_units(chunk_end - at, self.unit_rows, 1, 1)?;
+            let units = sequence_units(chunk_end - at, self.unit_rows, self.prefill_waves, 1)?;
             ends.extend(units.iter().map(|unit| (at + unit.rows.end) as u64));
             at = chunk_end;
         }
@@ -463,7 +463,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         self.check(placement, tokens, pool)?;
         let start = placement.len;
         let layers = self.engine.borrow().cfg.layers;
-        let mut units = sequence_units(tokens.len(), self.unit_rows, 1, layers)?;
+        let mut units = sequence_units(tokens.len(), self.unit_rows, self.prefill_waves, layers)?;
         let last_idx = units.len() - 1;
         for (i, unit) in units.iter_mut().enumerate() {
             let u_start = start + unit.rows.start;
@@ -492,6 +492,8 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             },
         )?;
         *placement = next.into_iter().next().unwrap();
+        static FIRST_RECONCILE: std::sync::Once = std::sync::Once::new();
+        FIRST_RECONCILE.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
         Ok(last)
     }
 
@@ -511,7 +513,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         let start = placement.len;
         let first = start + tokens.len() - rows + 1;
         let layers = self.engine.borrow().cfg.layers;
-        let mut units = sequence_units(tokens.len(), self.unit_rows, 1, layers)?;
+        let mut units = sequence_units(tokens.len(), self.unit_rows, self.prefill_waves, layers)?;
         let last_idx = units.len() - 1;
         for (i, unit) in units.iter_mut().enumerate() {
             let u_start = start + unit.rows.start;

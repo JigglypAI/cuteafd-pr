@@ -9,6 +9,7 @@ use crate::shared::dense_trellis::{
 use crate::shared::experts::rtx::dense::DenseLoad;
 use crate::shared::fp8_linear::Fp8Scales;
 use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::weight_arena::{weight_allocation, DeviceWeightArena};
 use crate::shared::memory::Tag;
 use crate::shared::native_attention::{attention_records, AttentionRecord};
@@ -296,6 +297,23 @@ impl<'a> Hy4NativeCore<'a> {
             .map(|linear| linear.scratch_layout(head_rows))
             .transpose()
     }
+
+    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>, rank: usize) -> Result<()> {
+        for (stem, linear) in &self.linears {
+            match linear {
+                Hy4NativeLinear::Trellis { weights, .. } => {
+                    weights.payload.inventory(inventory, &format!("rank{rank}.{stem}.trellis"))?;
+                    weights.suh.inventory(inventory, &format!("rank{rank}.{stem}.suh"))?;
+                    weights.svh.inventory(inventory, &format!("rank{rank}.{stem}.svh"))?;
+                }
+                Hy4NativeLinear::Fp8 { payload, scales, .. } => {
+                    payload.inventory(inventory, &format!("rank{rank}.{stem}.payload"))?;
+                    scales.inventory(inventory, &format!("rank{rank}.{stem}.scales"))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Per-rank serialized scratch shared by all compact-core native projections (and tiled `lm_head`).
@@ -321,6 +339,16 @@ impl<'a> Hy4NativeScratch<'a> {
             scratch: core_layout.map(|l| alloc(l, "hy4_flash/native-core-scratch")).transpose()?,
             head_scratch: head_layout.map(|l| alloc(l, "hy4_flash/native-head-scratch")).transpose()?,
         })
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>, gpu: usize) -> Result<()> {
+        if let Some(scratch) = &self.scratch {
+            scratch.allocation_receipts(inventory, &format!("hy4_flash.target.{gpu}.native_scratch"))?;
+        }
+        if let Some(head_scratch) = &self.head_scratch {
+            head_scratch.allocation_receipts(inventory, &format!("hy4_flash.target.{gpu}.native_head_scratch"))?;
+        }
+        Ok(())
     }
 }
 

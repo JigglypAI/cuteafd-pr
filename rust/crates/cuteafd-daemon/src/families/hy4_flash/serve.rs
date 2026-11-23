@@ -1,22 +1,37 @@
-//! Hy4-flash HTTP/request lifecycle (`serve-hy4f`) over the shared scheduler.
+//! Hy4-flash HTTP/request lifecycle (`serve-hy4f`) over the shared scheduler
+//! and shared contract admission (`Hy4Inputs::admit`).
 use super::backend::Hy4Backend;
 use super::execution::Hy4Engine;
+use super::programs::Hy4Programs;
 use crate::shared::{
     experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy},
     inventory::{InventoryPhase, RuntimeInventory},
-    memory::device::Device,
+    memory::{device::Device, receipts::Inventory},
     prefix::{budget::HostBudget, PrefixArgs},
     qwen::scheduler::{self, Backend},
     token_io::{EmbedPlacement, SelectPlacement, TokenIoArgs},
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::hy4_flash::Hy4Encoding, ModelEncoding, ModelProfile, NativeRequest};
+use cuteafd_core::memory_layout::Category;
 use cuteafd_engine::prefix::PrefixFamily;
 use cuteafd_loader::{
-    families::hy4_flash::{execution::PAGE_ROWS, Hy4FlashConfig, Hy4KvCache},
+    families::hy4_flash::{
+        admission::{self, Coordinator, FactsRequest},
+        Hy4FlashConfig, Hy4KvCache,
+    },
+    placement::{
+        families::hy4_flash::{self as hy4_place, AdmittedHy4, Hy4Inputs},
+        planner::{
+            ComponentKind, CoordinatorDevices, Lifetime, Location, Operation, PrefillShape,
+            Receipt, Recipe, ResolvedPlan,
+        },
+        ArchContext, AttentionPlacement, Onboard,
+    },
     plan::Checkpoint,
 };
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -110,7 +125,12 @@ impl ServeArgs {
     }
 }
 
-fn resolve_expert_package(native_lib: &Path, explicit: Option<&Path>, gpus: usize, catalog: &cuteafd_loader::OfficialV41Catalog) -> Result<PathBuf> {
+fn resolve_expert_package(
+    native_lib: &Path,
+    explicit: Option<&Path>,
+    gpus: usize,
+    catalog: &cuteafd_loader::OfficialV41Catalog,
+) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
@@ -134,6 +154,212 @@ fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<&'static st
         ),
         _ => anyhow::bail!("Hy4-flash supports 1 or 2 coordinator GPUs, got {gpus}"),
     }
+}
+
+fn pending_code_allowance(
+    sample: &cuteafd_loader::placement::RuntimeSample,
+    rank: usize,
+    split: bool,
+) -> u64 {
+    let arch = ArchContext::for_device(&sample.arch, sample.total_bytes);
+    let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
+        "hy4_flash",
+        "exl3",
+        split,
+        rank as u8,
+        arch,
+        None,
+    );
+    let pending = code.pending(sample.context_bytes, arch.context_bytes);
+    tracing::info!(
+        device = sample.device,
+        family = "hy4_flash",
+        loaded_code_bytes = code.bytes,
+        untracked_bytes = sample.context_bytes,
+        basis = ?code.basis,
+        pending_bytes = pending,
+        "Hy4-flash loaded code reserved beside admission"
+    );
+    pending
+}
+
+fn publish_provenance(
+    args: &ServeArgs,
+    runtime: &RuntimeInventory,
+    admitted: &AdmittedHy4,
+    attention: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    let graph_layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(
+        runtime.gpus.len(),
+        args.peers.len(),
+    );
+    let graph_policies: Vec<_> = (0..runtime.gpus.len())
+        .map(|gpu| {
+            let (base, tail) =
+                cuteafd_loader::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
+            cuteafd_loader::placement::graph_reserve::current(gpu, false, base, tail)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": {
+            "schema_version": 1,
+            "family": "hy4_flash",
+            "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+            "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+            "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": hash(&args.native_lib)?,
+            "programs_sha256": hash(&args.manifest)?,
+            "layout": format!(
+                "{} RTX/{} Sparks; {attention}; context/{}; slots/{}",
+                runtime.gpus.len(),
+                args.peers.len(),
+                admitted.solved.served_context(),
+                args.max_sequences
+            ),
+            "devices": runtime.gpus,
+            "spark_world": args.peers.len(),
+            "onboard_layers": admitted.onboard,
+            "prefill": admitted.solved.decisions.prefill,
+            "kv_cache": format!("{:?}", args.kv_format),
+            "decode_graphs": graph_layout.is_some(),
+            "graph_basis": {
+                "basis": "bytes",
+                "layout": format!("{graph_layout:?}"),
+                "reserve_policy": graph_policies
+            }
+        }
+    }));
+    Ok(())
+}
+
+/// Reconcile every retained target weight arena and request/scratch/cache backing
+/// recorded by `Hy4Engine::inventory` against the solved `Hy4Inputs` admission plan.
+fn reconcile_runtime_inventory(
+    plan: &ResolvedPlan,
+    inputs: &Hy4Inputs,
+    weight_receipts: &[Receipt],
+    retained_receipts: &[Receipt],
+) -> Result<()> {
+    // 1. Target weight arenas: exactly one physical backing per coordinator GPU, matching bytes & location.
+    let mut target_backings = 0usize;
+    for receipt in weight_receipts.iter().filter(|r| r.allocation.view.is_none()) {
+        let actual = &receipt.allocation;
+        if actual.id.starts_with("hy4_flash/target/gpu") {
+            let planned = plan
+                .facts
+                .allocations
+                .iter()
+                .find(|owner| owner.view.is_none() && owner.id == actual.id)
+                .with_context(|| format!("Hy4-flash target arena backing not admitted: {}", actual.id))?;
+            ensure!(
+                actual.bytes == planned.bytes && actual.location == planned.location,
+                "Hy4-flash target arena backing {} differs: actual {} != admitted {}",
+                actual.id,
+                actual.bytes,
+                planned.bytes
+            );
+            target_backings += 1;
+        }
+    }
+    ensure!(
+        target_backings == inputs.gpus,
+        "Hy4-flash target arena backing count {target_backings} != {} GPUs",
+        inputs.gpus
+    );
+
+    // 2. Retained device backings: cache, packed rank scratch, packed wave scratches, head workspace, native scratch.
+    let contract = inputs.prepare(&plan.request)?;
+    let selected = |id: &str| {
+        id.starts_with("hy4_flash.cache.")
+            || id.starts_with("hy4_flash.scratch.")
+            || id.starts_with("hy4_flash.wave.")
+            || id.starts_with("hy4_flash.head.")
+            || id.starts_with("hy4_flash.target.")
+    };
+    let planned: BTreeMap<&str, &cuteafd_loader::placement::planner::Allocation> = plan
+        .facts
+        .allocations
+        .iter()
+        .filter(|a| a.view.is_none() && selected(&a.id))
+        .map(|a| (a.id.as_str(), a))
+        .collect();
+
+    let mut actual: BTreeMap<String, &Receipt> = BTreeMap::new();
+    for receipt in retained_receipts
+        .iter()
+        .filter(|r| r.allocation.view.is_none() && r.allocation.location != Location::HOST)
+    {
+        let stripped = receipt
+            .allocation
+            .id
+            .strip_prefix("retained.")
+            .unwrap_or(&receipt.allocation.id);
+        let canonical = stripped
+            .strip_suffix(".storage.projection_arena")
+            .unwrap_or(stripped)
+            .to_owned();
+        ensure!(
+            actual.insert(canonical.clone(), receipt).is_none(),
+            "Hy4-flash duplicate retained backing receipt {canonical}"
+        );
+    }
+
+    ensure!(
+        actual.len() == planned.len(),
+        "Hy4-flash retained owner count differs: missing {:?}, extra {:?}",
+        planned.keys().filter(|id| !actual.contains_key(**id)).collect::<Vec<_>>(),
+        actual.keys().filter(|id| !planned.contains_key(id.as_str())).collect::<Vec<_>>()
+    );
+
+    let pages = plan.pool_tokens.div_ceil(plan.pool_page_rows);
+    for (id, receipt) in actual {
+        let owner = planned
+            .get(id.as_str())
+            .with_context(|| format!("Hy4-flash unadmitted retained owner {id}"))?;
+        let curves: Vec<_> = contract
+            .components
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ComponentKind::Allocation { template, .. } if template.id == id => Some(&c.bytes),
+                _ => None,
+            })
+            .collect();
+        let curve = curves
+            .first()
+            .with_context(|| format!("Hy4-flash retained owner {id} missing contract curve"))?;
+        ensure!(
+            curves.iter().all(|other| *other == *curve),
+            "Hy4-flash retained owner {id} has ambiguous curves"
+        );
+        let piece = curve
+            .0
+            .iter()
+            .find(|piece| (piece.first..=piece.last).contains(&pages))
+            .with_context(|| format!("Hy4-flash retained owner {id} curve does not cover {pages} pages"))?;
+        let payload = pages
+            .checked_sub(piece.first)
+            .and_then(|p| piece.bytes_per_page.checked_mul(p))
+            .and_then(|b| piece.bytes_at_first.checked_add(b))
+            .context("Hy4-flash retained owner payload overflow")?;
+        ensure!(
+            piece.backings == 1
+                && receipt.address != 0
+                && receipt.allocation.bytes == payload
+                && receipt.allocation.location == owner.location
+                && curve.at(pages)? == owner.bytes,
+            "Hy4-flash retained owner {id} differs from admission: actual {}, requested {payload}, charged {}",
+            receipt.allocation.bytes,
+            owner.bytes
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
@@ -185,6 +411,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .map(Ok)
                 .unwrap_or_else(|| worker_args.attention.select(&worker_args.snapshot))?;
             worker_args.attention.validate_view(&view)?;
+            crate::cli::publish_core_view(&view);
             let checkpoint = Checkpoint::open_view(&view)?;
             let cfg = Hy4FlashConfig::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
@@ -193,6 +420,18 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 ensure!(
                     prev == cuteafd_core::ExpertGeometry::HY4_FLASH,
                     "Hy4-flash process geometry already fixed to {prev:?}"
+                );
+            }
+
+            let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+            let model = cuteafd_loader::plan::families::hy4_flash::Model::open(&checkpoint)?;
+            let routed_layers = cfg.routed_layers();
+            let onboard_req = worker_args.rtx_expert_layers.resolve(routed_layers.len());
+            if let Onboard::Layers(n) = onboard_req {
+                ensure!(
+                    n <= routed_layers.len(),
+                    "Hy4-flash RTX_EXPERT_LAYERS={n} exceeds {} routed layers",
+                    routed_layers.len()
                 );
             }
 
@@ -206,81 +445,127 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 device_ids.push(second);
             }
             let gpus = device_ids.len();
+            if gpus == 2 {
+                let probed = crate::shared::peer_split::probed_device(
+                    &library,
+                    device_ids[0],
+                    Some(device_ids[1]),
+                )?;
+                ensure!(
+                    probed == Some(device_ids[1]),
+                    "Hy4-flash TP2 requires bidirectional GPU-to-GPU peer access between devices {} and {}",
+                    device_ids[0],
+                    device_ids[1]
+                );
+            }
             let devices: Vec<Device<'_>> = device_ids.iter().map(|&id| Device { library: &library, id }).collect();
             let unit_rows = usize::try_from(prefill.unit_rows)?;
             let capacity_rows = unit_rows.max(decode_rows);
-            let max_context = match worker_args.max_context {
-                Some(0) | None => cfg.max_position,
-                Some(n) => n.min(cfg.max_position),
-            };
-            let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
-            let routed_layers = cfg.routed_layers();
-            let budget = usize::try_from(crate::shared::memory::budget::resident_weight_limit().0)
-                .unwrap_or(80usize << 30);
+            let prefill_waves = usize::try_from(prefill.waves)?;
 
-            let pre = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-            let min_free = pre.gpus.iter().map(|g| g.free_bytes).min().unwrap_or(0);
+            // Load coordinator AOT programs inside the pre-weight sample window so their
+            // module bytes are measured once and never double-charged.
+            let mut preloaded_programs: Vec<Hy4Programs<'_>> = Vec::with_capacity(gpus);
+            let pre = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| {
+                preloaded_programs.push(Hy4Programs::load(&programs, gpus, worker_args.kv_format)?);
+                Ok(())
+            })?;
+
             let policy = cuteafd_core::memory_policy::MemoryPolicy::current();
-            let effective_cap = pre
+            let samples: Vec<(u64, u64, u64)> = pre
                 .gpus
                 .iter()
-                .map(|g| policy.gpu_cap_bytes(g.total_bytes).min(g.free_bytes))
-                .min()
-                .unwrap_or(min_free);
-
-            let model = cuteafd_loader::plan::families::hy4_flash::Model::open(&checkpoint)?;
-            let modes = cuteafd_loader::placement::families::hy4_flash::layer_modes(
-                &cfg,
-                gpus,
-                cuteafd_loader::placement::AttentionPlacement::Heads,
-            );
-            let target_layouts = cuteafd_loader::families::hy4_flash::weight_layout::target_arenas(
-                &checkpoint,
-                &cfg,
-                &model.core,
-                &modes,
-                gpus,
-            )?;
-            let target_bytes = target_layouts.iter().map(|l| l.arena.bytes() as u64).max().unwrap_or(0);
-
-            // Resolve how many routed layers are onboarded on RTX vs dispatched to Spark peers.
-            let onboard_count = if worker_args.peers.is_empty() {
-                routed_layers.len()
+                .map(|g| (g.total_bytes, policy.gpu_cap_bytes(g.total_bytes), g.free_bytes))
+                .collect();
+            let loaded_code: Vec<u64> = pre
+                .gpus
+                .iter()
+                .enumerate()
+                .map(|(rank, sample)| pending_code_allowance(sample, rank, gpus == 2))
+                .collect();
+            let peer_strings: Vec<String> = worker_args.peers.iter().map(ToString::to_string).collect();
+            let spark_bytes = if peer_strings.is_empty() {
+                Vec::new()
             } else {
-                match worker_args.rtx_expert_layers.resolve(routed_layers.len()) {
-                    cuteafd_loader::placement::Onboard::Layers(n) => n.min(routed_layers.len()),
-                    cuteafd_loader::placement::Onboard::Auto => {
-                        let per_layer_bytes = catalog
-                            .exl3()
-                            .and_then(|e| e.residency(cuteafd_loader::V41Exl3Layer::Backbone(routed_layers[0]), gpus, 0).ok())
-                            .and_then(|r| r.device_arena_layout().ok())
-                            .map(|(_, b)| b as u64)
-                            .unwrap_or(1_400_000_000 / gpus as u64);
-                        // Leave headroom for target weights + KV + workspaces + Spark links.
-                        let weight_room = (budget as u64)
-                            .min(effective_cap.saturating_sub(14u64 << 30))
-                            .saturating_sub(target_bytes);
-                        let fit = (weight_room / per_layer_bytes.max(1)) as usize;
-                        // Keep at least 1 layer on Sparks when Spark peers are configured.
-                        fit.min(routed_layers.len().saturating_sub(1))
-                    }
-                }
+                cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&peer_strings)?
             };
+            let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+            let host_cache_bytes = match worker_args.prefix.host_cache_bytes {
+                HostBudget::Auto => None,
+                HostBudget::Bytes(bytes) => Some(bytes),
+            };
+            let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
+            let replies = cuteafd_core::spark_reply::requested();
+            let resident_weight_limit = Some(crate::shared::memory::budget::resident_weight_limit());
+
+            // Shared contract admission: identical `Hy4Inputs::admit` solver as `cuteafd plan --layout`.
+            let facts_req = FactsRequest {
+                checkpoint: &checkpoint,
+                catalog: &catalog,
+                cfg: &cfg,
+                model_core: &model.core,
+                kv_format: worker_args.kv_format,
+                manifest_path: Some(&worker_args.manifest),
+                coordinator: Coordinator::Measured { samples, loaded_code },
+                attention: AttentionPlacement::Heads,
+                spark_ranks: worker_args.peers.len(),
+                spark_bytes,
+                prefill: shape,
+                decode_rows: u32::try_from(decode_rows)?,
+                context_tokens: worker_args.max_context.unwrap_or(0) as u64,
+                pool_tokens: worker_args.pool_tokens,
+                target_pool_tokens: None,
+                sequences: worker_args.max_sequences as u64,
+                host,
+                host_cache_bytes,
+                prefix_entries: worker_args.prefix.prefix_cache_entries as u64,
+                prefix_mark_budget: worker_args.prefix.prefix_cache_mark_mib as u64 * (1 << 20),
+                prefix_slots: None,
+                replies,
+                resident_weight_limit,
+            };
+            let inputs = admission::gather(&facts_req)
+                .map_err(|refused| anyhow::anyhow!("{}: {}", refused.what, refused.how))?;
+            let solve_req = hy4_place::request(
+                inputs.context,
+                worker_args.pool_tokens,
+                onboard_req,
+                shape,
+                Operation::Serving,
+                inputs.resident_weight_limit,
+                replies,
+            );
+            let admitted = inputs.admit(solve_req).map_err(|error| match onboard_req {
+                Onboard::Layers(n) => anyhow::anyhow!(
+                    "Hy4-flash RTX_EXPERT_LAYERS={n} refused by shared admission: {error}"
+                ),
+                Onboard::Auto => anyhow::anyhow!("Hy4-flash shared admission refused: {error}"),
+            })?;
+
+            cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "hy4_flash");
+            publish_provenance(&worker_args, &pre, &admitted, resolved_attention)?;
+            let sampled_free: Vec<u64> = pre.gpus.iter().map(|g| g.free_bytes).collect();
+            pre.record("hy4_flash", &sampled_free);
+            cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+
+            let onboard_count = admitted.onboard;
             let onboarded_layers = routed_layers[..onboard_count].to_vec();
             let spark_layers = routed_layers[onboard_count..].to_vec();
+            let pool_tokens = admitted.solved.pool_tokens;
+            let chosen_pages = usize::try_from(pool_tokens / admitted.solved.pool_page_rows)?;
+            let served_context = usize::try_from(admitted.solved.served_context())?;
+            let admitted_context = usize::try_from(inputs.context.maximum)?;
+            let mark_slots = inputs.prefix_mark_slots;
+            let host_quota = inputs.host_prefix.quota_bytes;
 
             // Admit and bootstrap Spark workers for non-onboarded routed layers before GPU allocation.
-            let spark_link = if !worker_args.peers.is_empty() {
+            let spark_link = if !worker_args.peers.is_empty() && !spark_layers.is_empty() {
                 use crate::shared::{
                     placement::{spark_rings, SparkAdmission},
                     spark_intake::SparkLink,
                 };
                 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
-                use cuteafd_loader::placement::{
-                    families::hy4_flash as hy4_place,
-                    planner::PrefillShape,
-                    SparkWorkingSet,
-                };
+                use cuteafd_loader::placement::SparkWorkingSet;
                 use cuteafd_transport::{
                     expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
                     worker_selection::ModelAdmission,
@@ -325,14 +610,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 )?
                 .select(&worker_args.peers)?;
 
-                let shape = PrefillShape { rows: capacity_rows as u64, waves: prefill.waves };
-                let links = hy4_place::spark_link(
-                    0,
-                    worker_args.peers.len(),
-                    shape,
-                    cuteafd_core::spark_reply::requested(),
-                )?;
-                let geometry = links.into_iter().next().context("Hy4 Spark link geometry absent")?;
+                let geometry = inputs
+                    .links
+                    .first()
+                    .context("Hy4 admitted Spark link geometry absent")?
+                    .clone();
                 let mut link = devices[0].run(|| {
                     SparkLink::prepared(
                         &library,
@@ -365,6 +647,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     gpus,
                     &catalog,
                 )?;
+                let avail: Vec<usize> = (0..gpus)
+                    .map(|gpu| Ok(usize::try_from(admitted.solved.budgets[gpu].available()?)?))
+                    .collect::<Result<_>>()?;
                 if gpus == 1 {
                     let w = Exl3Tp2::load_whole_weights(
                         devices[0],
@@ -372,7 +657,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         &expert_pkg,
                         onboarded_layers.clone(),
                         capacity_rows,
-                        budget,
+                        avail[0],
                         RtxSelectionPolicy::FirstCapacity,
                     )?;
                     vec![Some(w.execution()?)]
@@ -384,99 +669,27 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         [expert_pkg.as_path(), expert_pkg.as_path()],
                         onboarded_layers.clone(),
                         capacity_rows,
-                        [budget, budget],
+                        [avail[0], avail[1]],
                         RtxSelectionPolicy::FirstCapacity,
                     )?;
                     vec![Some(w0.execution()?), Some(w1.execution()?)]
                 }
             };
 
-            // Measure remaining GPU free memory after routed experts, then size DSA KV pool safely.
-            let post_exp = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-            let after_exp_free = post_exp
-                .gpus
-                .iter()
-                .map(|g| g.free_bytes.min(effective_cap))
-                .min()
-                .unwrap_or(0);
-            let swa_ring_pages = ((cfg.sliding_window + capacity_rows).div_ceil(PAGE_ROWS) + 1)
-                .max(cuteafd_loader::families::hy4_flash::execution::SWA_RING_PAGES);
-            let swa_seq_bytes = (cfg.swa_layers().len() * swa_ring_pages * PAGE_ROWS * worker_args.kv_format.record_bytes()) as u64;
-            let cache_layout = cuteafd_loader::families::hy4_flash::execution::CacheLayout::new(
-                &cfg,
-                worker_args.kv_format,
-                worker_args.max_sequences,
-                cfg.sparse_layers().len(),
-                cfg.swa_layers().len(),
-            )?;
-            let mark_bytes = cache_layout.mark_bytes_per_slot as u64;
-            let mark_slots = if worker_args.prefix.prefix_cache_entries == 0 {
-                0
-            } else {
-                cuteafd_core::prefix::mark_slots_with_host(
-                    worker_args.max_sequences as u64,
-                    worker_args.prefix.prefix_cache_entries as u64,
-                    mark_bytes,
-                    worker_args.prefix.prefix_cache_mark_mib as u64 * (1 << 20),
-                    worker_args.prefix.host_cache_bytes != HostBudget::Bytes(0),
-                ) as usize
-            };
-            let est_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16);
-            let rank_ws_bytes = Hy4Engine::estimated_rank_workspace_bytes(
-                &cfg,
-                gpus,
-                capacity_rows,
-                decode_rows,
-                est_seq_pages,
-                worker_args.max_sequences,
-            );
-            let reserve_and_ws: u64 = target_bytes
-                + swa_seq_bytes * worker_args.max_sequences as u64
-                + mark_bytes * mark_slots as u64
-                + rank_ws_bytes
-                + (1u64 << 30); // CUDA driver/runtime headroom + selector + fragmentation tail
-            let kv_avail = after_exp_free.saturating_sub(reserve_and_ws);
-            let page_bytes_per_rank = (cfg.sparse_layers().len()
-                * (PAGE_ROWS * worker_args.kv_format.record_bytes()
-                    + (PAGE_ROWS / cfg.indexer_compress_ratio) * cuteafd_loader::families::hy4_flash::execution::INDEX_GROUP_RECORD_BYTES)) as u64;
-            let max_fit_pages = (kv_avail / page_bytes_per_rank.max(1)) as usize;
-            let min_pages = max_context.div_ceil(PAGE_ROWS);
-            let chosen_pages = match worker_args.pool_tokens {
-                Some(tokens) if tokens > 0 => {
-                    let req = usize::try_from(tokens.div_ceil(PAGE_ROWS as u64))?;
-                    ensure!(
-                        req <= max_fit_pages,
-                        "Hy4 requested pool {tokens} tokens ({req} pages) exceeds fitted GPU capacity ({max_fit_pages} pages)"
-                    );
-                    req
-                }
-                _ => {
-                    let cap_pages = policy
-                        .kv_max
-                        .map(|t| usize::try_from(t.div_ceil(PAGE_ROWS as u64)).unwrap_or(max_fit_pages))
-                        .unwrap_or(max_fit_pages);
-                    max_fit_pages.min(cap_pages)
-                }
-            };
-            ensure!(
-                chosen_pages >= min_pages.min(256),
-                "Hy4 fitted KV pool ({chosen_pages} pages) is below minimum usable context"
-            );
-            let served_context = max_context.min(chosen_pages * PAGE_ROWS);
-            let pool_tokens = (chosen_pages * PAGE_ROWS) as u64;
-
             let mut engine = Hy4Engine::new_serving(
                 &devices,
                 &programs,
+                Some(preloaded_programs),
                 &checkpoint,
                 cfg.clone(),
                 worker_args.kv_format,
                 unit_rows,
                 decode_rows,
-                usize::try_from(prefill.waves)?,
+                prefill_waves,
                 chosen_pages,
                 worker_args.max_sequences,
                 served_context,
+                admitted_context,
                 mark_slots,
                 false,
                 onboarded,
@@ -490,25 +703,32 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             );
             engine.configure_graphs(graph_layout)?;
 
+            // Register and reconcile every retained target arena, cache, scratch, wave, and head owner.
+            let coord_devices = CoordinatorDevices::new(&device_ids)?;
+            let mut weights_inv = Inventory::new(
+                coord_devices,
+                "hy4_flash_weights",
+                Lifetime::RESIDENT,
+                Category::Weights,
+                "Hy4-flash target weights",
+            );
+            let mut retained_inv = Inventory::new(
+                coord_devices,
+                "retained",
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4-flash retained owners",
+            );
+            engine.inventory(&mut weights_inv, &mut retained_inv)?;
+            reconcile_runtime_inventory(
+                &admitted.solved,
+                &inputs,
+                &weights_inv.receipts,
+                &retained_inv.receipts,
+            )?;
+            crate::shared::memory_report::release_load_staging(&library)?;
+
             let family = engine.prefix()?;
-            let host_total = cuteafd_loader::formats::mapped_preload::host_memory_before_process()
-                .map(|(total, _)| total)
-                .unwrap_or(0);
-            let host_quota = match worker_args.prefix.host_cache_bytes {
-                HostBudget::Bytes(0) => 0,
-                HostBudget::Bytes(b) => b,
-                HostBudget::Auto => {
-                    let layout = family.layout();
-                    let geom = cuteafd_core::prefix::HostCacheGeometry {
-                        unit_rows: PAGE_ROWS as u64,
-                        page_bytes: layout.page_bytes as u64,
-                        mark_bytes: layout.mark_bytes as u64,
-                        draft_bytes: 0,
-                    };
-                    geom.resolve(None, served_context as u64, worker_args.max_sequences as u64, host_total, geom.chunk_bytes())
-                        .unwrap_or(0)
-                }
-            };
             let host = (host_quota > 0 && worker_args.prefix.prefix_cache_entries > 0)
                 .then(|| worker_args.prefix.host_config_for(family.layout(), served_context, host_quota))
                 .transpose()?;
@@ -546,6 +766,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 None,
                 || {
                     backend.require_live()?;
+                    crate::shared::memory_report::reconcile::capture("ready");
                     RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PostLoad, |_| Ok(()))?
                         .record("hy4_flash-serving-loaded", &[]);
                     if let Some(ready) = ready.take() {
@@ -744,6 +965,225 @@ mod tests {
         assert!(source.contains("context::set_family(\"hy4_flash\")"));
         assert!(source.contains("shared::serve::forward_initialization("));
         assert!(source.contains("finish_scheduler(&mut worker"));
+        assert!(source.contains("admission::gather(&facts_req)"));
+        assert!(source.contains("inputs.admit(solve_req)"));
+        assert!(source.contains("engine.inventory(&mut weights_inv, &mut retained_inv)"));
+        assert!(source.contains("fault::set_inputs("));
+        assert!(source.contains("reserve::log_plan("));
+        assert!(!source.contains("14u64 << 30"));
+        assert!(!source.contains("1u64 << 30"));
         assert!(source.find("Hy4Encoding::from_snapshot").unwrap() < source.find("NativeLibrary::load").unwrap());
+    }
+
+    #[test]
+    fn reconcile_runtime_inventory_accepts_exact_and_rejects_drift() -> anyhow::Result<()> {
+        use cuteafd_loader::families::hy4_flash::weight_layout::CoordinatorWeights;
+        use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
+        use cuteafd_loader::formats::mapped_preload::MappedPlacement;
+        use cuteafd_loader::placement::families::hy4_flash::{
+            self as hy4_place, Hy4Inputs, LocalPackage, SparkCharge,
+        };
+        use cuteafd_loader::placement::planner::{
+            Allocation, Baseline, Budget, ComponentKind, Context, Device, Domain, Location,
+            Operation, PrefillShape, Receipt, Recipe,
+        };
+        use cuteafd_loader::placement::{
+            AttentionPlacement, Onboard, PoolFacts, PoolMemory,
+        };
+        use cuteafd_loader::serving_capacity::WeightArenaLayout;
+        use std::collections::BTreeMap;
+
+        let cfg = Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 42,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: (0..42).map(|i| i % 4 == 0).collect(),
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: (0..42).map(|i| i == 0).collect(),
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 3.998,
+            swiglu_limit: 10.0,
+            engram_layers: vec![1, 11, 21, 31],
+            engram_vocab_sizes: BTreeMap::new(),
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: 120_002,
+            engram_seed: 10_007,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 120_818,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        };
+        let prefill = PrefillShape { rows: 2048, waves: 3 };
+        let replies = cuteafd_core::spark_reply::SparkReplyFormats::default();
+        let context = Context::resolve(262_144, None);
+        let modes = hy4_place::layer_modes(&cfg, 1, AttentionPlacement::Heads);
+        let routed = cfg.routed_layers();
+        let mut facts = PoolFacts::new(context, None, 64);
+        facts.memory = vec![PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 12 * 64 * 1024 }];
+        let pool = cuteafd_loader::placement::prepare_pool(facts)?;
+        let target = CoordinatorWeights {
+            rank: 0,
+            layers: (0..42).collect(),
+            arena: WeightArenaLayout::new(
+                "hy4_flash/target/gpu0",
+                vec![("lm_head.weight".to_string(), 120_832 * 3072 * 2)],
+            )?,
+            core: BTreeMap::new(),
+            fp8: BTreeMap::new(),
+        };
+        let inputs = Hy4Inputs {
+            cfg,
+            kv_format: Hy4KvCache::Fp8,
+            gpus: 1,
+            spark_ranks: 1,
+            context,
+            pool,
+            prefill,
+            decode_rows: hy4_place::DECODE_ROWS,
+            sequences: 16,
+            prefix_mark_slots: 16,
+            targets: vec![target],
+            placement: AttentionPlacement::Heads,
+            modes,
+            routed: routed.clone(),
+            local: LocalPackage::Missing("synthetic".into()),
+            spark: vec![vec![SparkCharge { experts: 1 << 30, owners: 1 << 28, runtime: 1 << 28 }]; routed.len() + 1],
+            links: hy4_place::spark_link(0, 1, prefill, replies)?,
+            budgets: vec![
+                hy4_place::planned_budget(0, 96u64 << 30, 96u64 << 30, 1u64 << 30),
+                Budget {
+                    id: "spark0".into(),
+                    locations: vec![Location { device: Device::Spark(0), domain: Domain::Managed }],
+                    physical_bytes: 120u64 << 30,
+                    logical_bytes: 120u64 << 30,
+                    baseline: Baseline::Forecast { occupied: 0, source: "spark".into(), assumed: false },
+                    headroom: 4u64 << 30,
+                },
+                Budget {
+                    id: "host".into(),
+                    locations: vec![Location::HOST, Location::PINNED],
+                    physical_bytes: 512u64 << 30,
+                    logical_bytes: 512u64 << 30,
+                    baseline: Baseline::Forecast { occupied: 0, source: "host".into(), assumed: false },
+                    headroom: 16u64 << 30,
+                },
+            ],
+            code: vec![256u64 << 20],
+            graph_reserve: vec![0],
+            host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
+                quota_bytes: 0,
+                chunk_bytes: 1,
+            },
+            engram_mapped: MappedPlacement::resolve(4, 0, 0, 1 << 30, 64 << 30).admit_tables(1 << 30),
+            engram_row_cache_bytes: 16 << 20,
+            engram_staging_bytes: 32 << 20,
+            resident_weight_limit: None,
+        };
+        let req = hy4_place::request(
+            inputs.context,
+            None,
+            Onboard::Layers(0),
+            prefill,
+            Operation::Serving,
+            None,
+            replies,
+        );
+        let admitted = inputs.admit(req)?;
+        let contract = inputs.prepare(&admitted.solved.request)?;
+        let pages = admitted.solved.pool_tokens.div_ceil(admitted.solved.pool_page_rows);
+
+        // Synthesize exact receipts matching every admitted target arena and retained device backing.
+        let mut weights_receipts = Vec::new();
+        let mut retained_receipts = Vec::new();
+        let mut addr = 0x1000_0000u64;
+        for alloc in admitted.solved.facts.allocations.iter().filter(|a| a.view.is_none()) {
+            if alloc.id.starts_with("hy4_flash/target/gpu") {
+                weights_receipts.push(Receipt { allocation: alloc.clone(), address: addr });
+                addr += 0x1000;
+            } else if alloc.id.starts_with("hy4_flash.cache.")
+                || alloc.id.starts_with("hy4_flash.scratch.")
+                || alloc.id.starts_with("hy4_flash.wave.")
+                || alloc.id.starts_with("hy4_flash.head.")
+                || alloc.id.starts_with("hy4_flash.target.")
+            {
+                let curve = contract
+                    .components
+                    .iter()
+                    .find_map(|c| match &c.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == alloc.id => Some(&c.bytes),
+                        _ => None,
+                    })
+                    .expect("contract curve");
+                let piece = curve.0.iter().find(|p| (p.first..=p.last).contains(&pages)).unwrap();
+                let payload = piece.bytes_at_first + piece.bytes_per_page * (pages - piece.first);
+                let mut rec = alloc.clone();
+                rec.bytes = payload;
+                if rec.id.starts_with("hy4_flash.cache.") || rec.id.starts_with("hy4_flash.head.") {
+                    rec.id = format!("retained.{}", rec.id);
+                }
+                retained_receipts.push(Receipt { allocation: rec, address: addr });
+                addr += 0x1000;
+            }
+        }
+        super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &retained_receipts)?;
+
+        // Missing owner must fail.
+        let mut missing = retained_receipts.clone();
+        missing.pop();
+        assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &missing).is_err());
+
+        // Wrong-sized owner must fail.
+        let mut wrong_size = retained_receipts.clone();
+        wrong_size[0].allocation.bytes += 4096;
+        assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &wrong_size).is_err());
+
+        // Extra unadmitted owner must fail.
+        let mut extra = retained_receipts;
+        extra.push(Receipt {
+            allocation: Allocation::buffer(
+                "retained.hy4_flash.rogue",
+                Location::coordinator(0),
+                4096,
+                cuteafd_loader::placement::planner::Lifetime::TARGET,
+                cuteafd_core::memory_layout::Category::Workspace,
+                "rogue",
+            ),
+            address: addr,
+        });
+        assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &extra).is_err());
+        Ok(())
     }
 }

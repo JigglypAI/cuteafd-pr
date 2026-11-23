@@ -598,3 +598,171 @@ fn hy4_flash_plan_refuses_checkpoint_without_engram_fp8() {
         "expected refusal naming engram-fp8-layer-* shards, got: {err}"
     );
 }
+
+#[test]
+fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
+    use crate::families::hy4_flash::admission::{self, Coordinator, FactsRequest};
+    use crate::families::hy4_flash::Hy4KvCache;
+    use crate::placement::families::hy4_flash as hy4_place;
+    use crate::placement::planner::{Operation, PrefillShape};
+    use crate::placement::{ArchContext, Onboard};
+
+    let (dir, manifest) = concurrency_matrix_snapshot();
+    let selected = CheckpointView::select(dir.path(), CoreView::Original)?;
+    let checkpoint = crate::plan::Checkpoint::open_view(&selected)?;
+    let catalog = crate::read_expert_catalog_view(&selected)?;
+    let model = Model::open(&checkpoint)?;
+
+    let rtx_bytes = 96u64 << 30;
+    let arch = ArchContext::for_device("sm_120", rtx_bytes);
+    let code = crate::placement::inventory::loaded_code_allowance(
+        "hy4_flash",
+        "exl3",
+        false,
+        0,
+        arch,
+        None,
+    )
+    .bytes;
+    let prefill = PrefillShape { rows: 2048, waves: 3 };
+    let spark_bytes = vec![120u64 << 30; 4];
+    let replies = cuteafd_core::spark_reply::SparkReplyFormats::default();
+
+    let planned_inputs = admission::gather(&FactsRequest {
+        checkpoint: &checkpoint,
+        catalog: &catalog,
+        cfg: &model.cfg,
+        model_core: &model.core,
+        kv_format: Hy4KvCache::Fp8,
+        manifest_path: Some(&manifest),
+        coordinator: Coordinator::Planned { rtx_bytes: vec![rtx_bytes] },
+        attention: AttentionPlacement::Heads,
+        spark_ranks: 4,
+        spark_bytes: spark_bytes.clone(),
+        prefill,
+        decode_rows: hy4_place::DECODE_ROWS,
+        context_tokens: 0,
+        pool_tokens: None,
+        target_pool_tokens: None,
+        sequences: 16,
+        host: (512 << 30, 400 << 30),
+        host_cache_bytes: None,
+        prefix_entries: 64,
+        prefix_mark_budget: 2u64 << 30,
+        prefix_slots: None,
+        replies,
+        resident_weight_limit: None,
+    })?;
+    let measured_inputs = admission::gather(&FactsRequest {
+        checkpoint: &checkpoint,
+        catalog: &catalog,
+        cfg: &model.cfg,
+        model_core: &model.core,
+        kv_format: Hy4KvCache::Fp8,
+        manifest_path: Some(&manifest),
+        coordinator: Coordinator::Measured {
+            samples: vec![(rtx_bytes, rtx_bytes, rtx_bytes - arch.context_bytes)],
+            loaded_code: vec![code],
+        },
+        attention: AttentionPlacement::Heads,
+        spark_ranks: 4,
+        spark_bytes,
+        prefill,
+        decode_rows: hy4_place::DECODE_ROWS,
+        context_tokens: 0,
+        pool_tokens: None,
+        target_pool_tokens: None,
+        sequences: 16,
+        host: (512 << 30, 400 << 30),
+        host_cache_bytes: None,
+        prefix_entries: 64,
+        prefix_mark_budget: 2u64 << 30,
+        prefix_slots: None,
+        replies,
+        resident_weight_limit: None,
+    })?;
+
+    let req = hy4_place::request(
+        planned_inputs.context,
+        None,
+        Onboard::Auto,
+        prefill,
+        Operation::Serving,
+        None,
+        replies,
+    );
+    let p = planned_inputs.admit(req.clone())?;
+    let m = measured_inputs.admit(req)?;
+    assert_eq!(p.solved.pool_tokens, m.solved.pool_tokens);
+    assert_eq!(p.onboard, m.onboard);
+    assert_eq!(p.placement.items, m.placement.items);
+    Ok(())
+}
+
+#[test]
+fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyhow::Result<()> {
+    use crate::families::hy4_flash::admission::{self, Coordinator, FactsRequest};
+    use crate::families::hy4_flash::Hy4KvCache;
+    use crate::placement::families::hy4_flash as hy4_place;
+    use crate::placement::planner::{Operation, PrefillShape};
+    use crate::placement::Onboard;
+
+    let (dir, manifest) = concurrency_matrix_snapshot();
+    let selected = CheckpointView::select(dir.path(), CoreView::Original)?;
+    let checkpoint = crate::plan::Checkpoint::open_view(&selected)?;
+    let catalog = crate::read_expert_catalog_view(&selected)?;
+    let model = Model::open(&checkpoint)?;
+    let prefill = PrefillShape { rows: 2048, waves: 3 };
+    let replies = cuteafd_core::spark_reply::SparkReplyFormats::default();
+
+    let inputs = admission::gather(&FactsRequest {
+        checkpoint: &checkpoint,
+        catalog: &catalog,
+        cfg: &model.cfg,
+        model_core: &model.core,
+        kv_format: Hy4KvCache::Fp8,
+        manifest_path: Some(&manifest),
+        coordinator: Coordinator::Planned { rtx_bytes: vec![96u64 << 30] },
+        attention: AttentionPlacement::Heads,
+        spark_ranks: 4,
+        spark_bytes: vec![120u64 << 30; 4],
+        prefill,
+        decode_rows: hy4_place::DECODE_ROWS,
+        context_tokens: 0,
+        pool_tokens: None,
+        target_pool_tokens: None,
+        sequences: 16,
+        host: (512 << 30, 400 << 30),
+        host_cache_bytes: None,
+        prefix_entries: 64,
+        prefix_mark_budget: 2u64 << 30,
+        prefix_slots: None,
+        replies,
+        resident_weight_limit: None,
+    })?;
+
+    // 41 onboarded layers on a 1x 96 GiB RTX with original view cannot fit and must refuse, never clamp.
+    let unfitting = hy4_place::request(
+        inputs.context,
+        None,
+        Onboard::Layers(41),
+        prefill,
+        Operation::Serving,
+        None,
+        replies,
+    );
+    assert!(inputs.admit(unfitting).is_err(), "unfitting RTX_EXPERT_LAYERS=41 must refuse");
+
+    // Out-of-range layer count (> 41) must also refuse.
+    let too_many = hy4_place::request(
+        inputs.context,
+        None,
+        Onboard::Layers(99),
+        prefill,
+        Operation::Serving,
+        None,
+        replies,
+    );
+    assert!(inputs.admit(too_many).is_err(), "out-of-range RTX_EXPERT_LAYERS=99 must refuse");
+    Ok(())
+}

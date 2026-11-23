@@ -19,7 +19,9 @@ use super::super::{
     ExpertRange, FfnMode, HopSpec, HopStorage, LayerAssignment, LayerMode, Placement, PoolLimits,
     ResidentWeights, TerminalHome, Tp2Range,
 };
-use crate::families::hy4_flash::execution::{CacheLayout, UnitLayout, PAGE_ROWS};
+use crate::families::hy4_flash::execution::{
+    CacheLayout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+};
 use crate::families::hy4_flash::weight_layout::CoordinatorWeights;
 use crate::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use crate::serving_capacity::WeightArenaLayout;
@@ -413,23 +415,49 @@ impl Hy4Inputs {
         let location = Location::coordinator(gpu as u8);
         let cfg = &self.cfg;
         let rows = u32::try_from(self.prefill.rows).map_err(|_| Refusal::Overflow("Hy4 prefill rows"))?;
+        let capacity_rows = (rows as usize).max(self.decode_rows as usize);
         let mut out = Vec::new();
 
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
         if !target.core.is_empty() {
             out.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum));
-            if let Some(scratch) = target.trellis_scratch(rows as usize, DECODE_ROWS as usize).map_err(refusal)? {
-                out.extend(buffer(
-                    format!("hy4_flash.target.{gpu}.trellis"),
-                    location,
-                    scratch.packed_bytes().map_err(refusal)? as u64,
-                    Lifetime::TARGET,
-                    Category::Workspace,
-                    "serialized target trellis projection",
-                    maximum,
-                ));
-            }
+        }
+        if let Some(scratch) = target.native_core_scratch(capacity_rows).map_err(refusal)? {
+            out.extend(buffer(
+                format!("hy4_flash.target.{gpu}.native_scratch"),
+                location,
+                scratch.packed_bytes().map_err(refusal)? as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4-flash native compact-core scratch",
+                maximum,
+            ));
+        }
+        if let Some(head_scratch) = target
+            .native_head_scratch(capacity_rows.min(DECODE_ROWS as usize))
+            .map_err(refusal)?
+        {
+            out.extend(buffer(
+                format!("hy4_flash.target.{gpu}.native_head_scratch"),
+                location,
+                head_scratch.packed_bytes().map_err(refusal)? as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4-flash native compact-head scratch",
+                maximum,
+            ));
+        }
+        if target.has_bf16_head() {
+            out.extend(buffer(
+                format!("hy4_flash.head.{gpu}.workspace"),
+                location,
+                cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4-flash FP32 vocabulary head cuBLAS workspace",
+                maximum,
+            ));
         }
 
         // Owned DSA and SWA layers on this GPU.
@@ -450,47 +478,46 @@ impl Hy4Inputs {
             }
         }
 
-        let cache = CacheLayout::new(cfg, self.kv_format, self.sequences as usize, owned_dsa, owned_swa)
-            .map_err(refusal)?;
-        let context_split = self.modes.iter().any(|m| *m == LayerMode::ContextSplit);
-        // Under ContextSplit, page_rows doubles (128) and each GPU stores half the pages (1 page = 64 rows/GPU).
-        for (layer, &mode) in self.modes.iter().enumerate() {
-            if !cfg.sparse_layer[layer] {
-                continue;
-            }
-            let owns = match mode {
-                LayerMode::Whole { gpu: owner, .. } => usize::from(owner) == gpu,
-                LayerMode::HeadSplit | LayerMode::ContextSplit => true,
-            };
-            if !owns {
-                continue;
-            }
-            let kv_stride = cache.dsa_kv_page_bytes as u64;
-            let idx_stride = cache.dsa_index_page_bytes as u64;
-            let _ = context_split;
+        let cache = CacheLayout::for_unit(
+            cfg,
+            self.kv_format,
+            self.sequences as usize,
+            owned_dsa,
+            owned_swa,
+            capacity_rows,
+        )
+        .map_err(refusal)?;
+        // Contiguous multi-layer DSA KV and compressed-indexer backings matching `Hy4CacheRank`.
+        if owned_dsa > 0 {
+            let kv_page = (owned_dsa as u64)
+                .checked_mul(cache.dsa_kv_page_bytes as u64)
+                .ok_or(Refusal::Overflow("Hy4 DSA KV page"))?;
+            let idx_page = (owned_dsa as u64)
+                .checked_mul(cache.dsa_index_page_bytes as u64)
+                .ok_or(Refusal::Overflow("Hy4 DSA index page"))?;
             out.push(Component::allocation(
                 Allocation::buffer(
-                    format!("hy4_flash.kv.{layer}.{gpu}.records"),
+                    format!("hy4_flash.cache.{gpu}.dsa_kv"),
                     location,
-                    kv_stride,
+                    kv_page,
                     Lifetime::TARGET,
                     Category::Kv,
                     "DSA MLA paged KV records",
                 ),
-                ByteCurve::linear_rounded(kv_stride, kv_stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
+                ByteCurve::linear_rounded(kv_page, kv_page, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                 false,
                 maximum,
             ));
             out.push(Component::allocation(
                 Allocation::buffer(
-                    format!("hy4_flash.index.{layer}.{gpu}.groups"),
+                    format!("hy4_flash.cache.{gpu}.dsa_index"),
                     location,
-                    idx_stride,
+                    idx_page,
                     Lifetime::TARGET,
                     Category::Kv,
                     "DSA compressed-indexer group cache",
                 ),
-                ByteCurve::linear_rounded(idx_stride, idx_stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
+                ByteCurve::linear_rounded(idx_page, idx_page, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
                 false,
                 maximum,
             ));
@@ -507,7 +534,7 @@ impl Hy4Inputs {
             maximum,
         ));
         out.extend(buffer(
-            format!("hy4_flash.cache.{gpu}.indexer_pending"),
+            format!("hy4_flash.cache.{gpu}.pending_keys"),
             location,
             cache.active_indexer_pending_bytes as u64,
             Lifetime::TARGET,
@@ -528,46 +555,52 @@ impl Hy4Inputs {
             maximum,
         ));
 
-        // Decode + prefill unit workspaces.
-        let head_parts = if self.modes.iter().all(|m| matches!(m, LayerMode::HeadSplit | LayerMode::ContextSplit)) {
-            2
-        } else {
-            1
-        };
+        // Packed hook-local scratch arena (one per rank) + packed per-wave scratch arenas (one per rank per wave).
+        let max_seq_pages = usize::try_from(self.context.maximum)
+            .map_err(|_| Refusal::Overflow("Hy4 context pages"))?
+            .div_ceil(PAGE_ROWS)
+            .max(16);
+        let local_vocab = cfg.vocab_size / self.gpus;
+        let shared = SharedScratchLayout::new(
+            cfg,
+            gpu,
+            self.gpus,
+            capacity_rows,
+            self.decode_rows as usize,
+            max_seq_pages,
+            self.sequences as usize,
+            local_vocab,
+        )
+        .map_err(refusal)?;
         out.extend(buffer(
-            format!("hy4_flash.decode.{gpu}.mla_split_partials"),
+            SharedScratchLayout::arena_id(gpu),
             location,
-            crate::families::hy4_flash::execution::mla_split_scratch_bytes(self.decode_rows as usize, head_parts) as u64,
+            shared.arena.bytes() as u64,
             Lifetime::TARGET,
             Category::Workspace,
-            "Hy4-flash MLA split-K decode/verify partials",
+            "Hy4-flash packed rank scratch arena",
             maximum,
         ));
-        let decode_unit = UnitLayout::new(cfg, self.kv_format, self.decode_rows as usize, head_parts).map_err(refusal)?;
-        for (name, bytes) in decode_unit.buffers {
+        for slot in 0..usize::try_from(self.prefill.waves).map_err(|_| Refusal::Overflow("Hy4 waves"))? {
+            let wave = WaveScratchLayout::new(
+                cfg,
+                gpu,
+                slot,
+                self.gpus,
+                capacity_rows,
+                max_seq_pages,
+                self.sequences as usize,
+            )
+            .map_err(refusal)?;
             out.extend(buffer(
-                format!("hy4_flash.decode.{gpu}.{name}"),
+                WaveScratchLayout::arena_id(gpu, slot),
                 location,
-                bytes as u64,
+                wave.arena.bytes() as u64,
                 Lifetime::TARGET,
                 Category::Workspace,
-                "Hy4-flash decode unit workspace",
+                "Hy4-flash packed wave scratch arena",
                 maximum,
             ));
-        }
-        let prefill_unit = UnitLayout::new(cfg, self.kv_format, rows as usize, head_parts).map_err(refusal)?;
-        for slot in 0..self.prefill.waves {
-            for (name, &bytes) in &prefill_unit.buffers {
-                out.extend(buffer(
-                    format!("hy4_flash.unit.{gpu}.{slot}.{name}"),
-                    location,
-                    bytes as u64,
-                    Lifetime::TARGET,
-                    Category::Workspace,
-                    "Hy4-flash prefill unit workspace",
-                    maximum,
-                ));
-            }
         }
 
         // Canonical graph reserve, loaded code, and driver stream slabs.
@@ -596,30 +629,6 @@ impl Hy4Inputs {
             false,
             maximum,
         ));
-        Ok(out)
-    }
-
-    fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
-        let head = self.head_gpu();
-        // Also covers a full prefill scoring tile.
-        let rows = u64::from(DECODE_ROWS);
-        let mut out = Vec::new();
-        for (name, bytes) in [
-            ("tokens", rows * 4),
-            ("normalized", rows * self.cfg.hidden as u64 * 2),
-            ("logits_f32", rows * self.cfg.vocab_size as u64 * 4),
-            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64),
-        ] {
-            out.extend(buffer(
-                format!("hy4_flash.head.{name}"),
-                Location::coordinator(head),
-                bytes,
-                Lifetime::TARGET,
-                Category::Workspace,
-                "Hy4-flash FP32 vocabulary head rows",
-                maximum,
-            ));
-        }
         Ok(out)
     }
 }
@@ -651,7 +660,6 @@ impl Recipe for Hy4Inputs {
         for gpu in 0..self.gpus {
             components.extend(self.rank_owners(gpu, maximum)?);
         }
-        components.extend(self.head_owners(maximum)?);
         components.extend(
             serving::ServingOwners {
                 selector: serving::SelectorOwners {
@@ -900,7 +908,23 @@ pub fn planned_budget(gpu: u8, physical: u64, logical: u64, context: u64) -> Bud
         baseline: Baseline::Forecast {
             occupied: context,
             source: "CUDA context and modules on the coordinator GPU".into(),
-            assumed: false,
+            assumed: true,
+        },
+    }
+}
+
+/// The measured edge: one CUDA sample per GPU before weights.
+pub fn measured_budget(gpu: u8, physical: u64, logical: u64, free: u64) -> Budget {
+    Budget {
+        id: format!("rtx{gpu}"),
+        locations: vec![Location::coordinator(gpu)],
+        physical_bytes: physical,
+        logical_bytes: logical,
+        headroom: crate::placement::reserve::gpu("hy4_flash"),
+        baseline: Baseline::Sampled {
+            free,
+            phase: Phase::Load,
+            source: "Hy4-flash pre-weight CUDA sample".into(),
         },
     }
 }
