@@ -845,8 +845,8 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
                 bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()
             };
             packed_check(engine, &tokens, members, args.engine.prefill_packing)?;
-            if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact
-                && engine.packed_limits().is_some_and(|limits| limits.rows >= 2) {
+            if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
+                engine.configure_packing(crate::shared::prefill_packing::PackingMode::Unrestricted)?;
                 packed_decode_interleave(engine, &tokens)?;
             }
             if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
@@ -910,19 +910,24 @@ fn packed_decode_interleave(engine: &engine::Qwen4Engine<'_>, tokens: &[u32]) ->
     use crate::shared::qwen::scheduler::PrefillSeq;
     use crate::shared::decode_graph::device::{snapshots, Cycle};
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
-    let mut admit = || Ok::<_, anyhow::Error>([allocator.admit(16)?, allocator.admit(16)?]);
+    // Match the singleton arithmetic routes in this diagnostic separately from
+    // Exact serving's fail-closed singleton fallback. Both arms are above the
+    // 24-row PLE threshold and below the 80-row EXL3 threshold (#890).
+    const ROWS: usize = 29;
+    const TOKENS: usize = 2 * (ROWS + 1) + 1;
+    let mut admit = || Ok::<_, anyhow::Error>([allocator.admit(TOKENS)?, allocator.admit(TOKENS)?]);
     let (mut packed, mut single) = (admit()?, admit()?);
     let mut packed_draft = [speculate::MtpSeq::default(), speculate::MtpSeq::default()];
     let mut single_draft = packed_draft.clone();
     let neural = engine.weights.mtp.is_some();
-    let input: [[u32; 8]; 2] = std::array::from_fn(|i| std::array::from_fn(|j| tokens[(i * 97 + j) % tokens.len()]));
+    let input: [[u32; TOKENS]; 2] = std::array::from_fn(|i| std::array::from_fn(|j| tokens[(i * 97 + j) % tokens.len()]));
     let equal = |a: &[f32], b: &[f32]| a.iter().map(|x| x.to_bits()).eq(b.iter().map(|x| x.to_bits()));
     engine.prepare_serving_workspaces()?;
     let reserve = engine.configure_graph_cache()?;
     engine.warm_decode_graphs(2, false)?;
     let graph_hits = || snapshots().iter().filter_map(|s| s.cycles.get(&Cycle::Decode)).map(|c| c.hits).sum::<u64>();
-    for start in [0, 3] {
-        let end = start + 2;
+    for start in [0, ROWS + 1] {
+        let end = start + ROWS;
         let mut logits = [Vec::new(), Vec::new()];
         let mut batch = packed.iter_mut().zip(&mut packed_draft).zip(&input).map(|((placement, draft), ids)|
             PrefillSeq { placement, tokens: &ids[start..end], start, next: Some(ids[end]), draft, neural }).collect::<Vec<_>>();
