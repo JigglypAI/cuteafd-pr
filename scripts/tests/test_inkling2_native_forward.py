@@ -55,10 +55,12 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     prefill = (FAMILY/'prefill.rs').read_text()
     assert 'for member in members(unit)' in prefill
     assert 'owner.packed_metadata(' in prefill
-    assert 'layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
-    assert 'layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
+    assert 'layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, rows)' in prefill
+    assert 'layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, rows)' in prefill
     assert 'unit.reply_origins()' in prefill
-    assert 'layers::routed_ffn(self.kernels, owner,' in prefill
+    local = prefill.split('fn local_ffn(')[1].split('fn send_experts(')[0]
+    assert local.index('self.prepare_routes(layer, unit)?') < local.index('layers::dispatch_experts(owner,')
+    assert local.index('layers::dispatch_experts(owner,') < local.index('self.join(layer, unit)')
     assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
     assert 'self.head.embed_unit(' in prefill
     assert 'probe::head_spans(unit.rows.len(), 64)' in prefill
