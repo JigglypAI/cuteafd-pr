@@ -144,7 +144,7 @@ class StopHostScopeTest(StopHarness):
             config = self.root / "family.config"
             config.write_text(f"MODEL_ID=test/{family}\nSPARK_HOSTS=moa\nSPARK_COUNT=1\n"
                               "CONCURRENCY=32\nRTX_EXPERT_LAYERS=70\nPREFILL_BATCH_TOKENS=32\n"
-                              "KV_POOL_TOKENS=100\nMAX_CONTEXT_TOKENS=2097152\n")
+                              "MAX_CONTEXT_TOKENS=2097152\n")
             result, lines, _ = self.run_stop("--config", str(config))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(set(self.hosts(lines)), {"moa"})

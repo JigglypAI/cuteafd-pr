@@ -62,9 +62,6 @@ pub(crate) struct ServeArgs {
     /// Target seconds per long prefill chunk while another request decodes (experimental).
     #[arg(long, env = "CUTEAFD_MIMO_PREFILL_CHUNK_S")]
     pub prefill_chunk_s: Option<f64>,
-    /// Cap automatic pinned memory at MiMo's RAM ceiling; enable with --host-cache-bytes auto.
-    #[arg(long, default_value_t = false)]
-    pub mimo_host_cache: bool,
     /// Wait for an identical in-flight prefill's snapshot before admitting an extension.
     #[arg(long, env = "CUTEAFD_MIMO_SNAPSHOT_WAIT", default_value_t = false)]
     pub mimo_snapshot_wait: bool,
@@ -1438,11 +1435,11 @@ mod port_tests {
         assert_eq!(args.http_queue_depth, None);
         assert_eq!(args.http_queue_wait_ms, 25_000);
         assert!(!args.prefix.mimo_prefix_draft && !args.mimo_snapshot_wait);
-        assert!(!args.mimo_host_cache && args.prefill_chunk_s.is_none());
+        assert!(args.prefill_chunk_s.is_none());
         let enabled = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib",
             "--max-sequences", "16", "--http-queue-depth", "32", "--http-queue-wait-ms", "1234",
             "--mimo-prefix-draft", "--mimo-snapshot-wait",
-            "--mimo-host-cache", "--host-cache-bytes", "0", "--prefill-chunk-s", "4"]);
+            "--host-cache-bytes", "0", "--prefill-chunk-s", "4"]);
         assert_eq!((enabled.serve.max_sequences, enabled.serve.http_queue_depth), (Some(16), Some(32)));
         assert_eq!(enabled.serve.prefix.host_cache_bytes, crate::shared::prefix::HostBudget::Bytes(0));
         assert_eq!(enabled.serve.prefill_chunk_s, Some(4.0));

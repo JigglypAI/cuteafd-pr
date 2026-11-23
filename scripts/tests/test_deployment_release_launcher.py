@@ -509,12 +509,10 @@ def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str
             assert command[command.index("--media-cache-bytes") + 1] == quota
 
 
-@pytest.mark.parametrize("enabled", ["off", "on"])
-def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> None:
+def test_implicit_mimo_host_cache_matches_effective_serve_argv() -> None:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
     entry["set"].pop("HOST_CACHE_BYTES", None)
-    entry["set"]["MIMO_HOST_CACHE"] = enabled
-    result = capture(ROOT, f"implicit-host-cache-{enabled}", release_entry=entry)
+    result = capture(ROOT, "implicit-host-cache", release_entry=entry)
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
