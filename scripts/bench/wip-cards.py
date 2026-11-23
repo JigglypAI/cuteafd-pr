@@ -375,8 +375,12 @@ def probe_selection(items, cards, arms):
     return probes, scoped
 
 
+# Default --client limit; smoke bounds every hook at 7200 s.
+CLIENT_TIMEOUT_S = 3600
+
+
 def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None,
-             cold_hosts=None, binary=None):
+             cold_hosts=None, binary=None, client=None, client_timeout=CLIENT_TIMEOUT_S):
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
@@ -463,6 +467,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                 close=dict(argv=window_argv([s + ['stop', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
+    if client and (exact_state or cold_hosts):
+        raise ValueError(card + ': --client excludes --exact-state and --cold-window')
     if cold_hosts and entry.get('prefill_lengths'):
         # Every prefill point starts cold: the purge runs before its warm-up and
         # again before its timed request. Decode levels after them are
@@ -528,6 +534,25 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
             sample['argv'] = window_argv([previous['argv'], sample['argv']])
             sample['timeout_s'] += previous.get('timeout_s', 0)
         window['close'] = sample
+    if client:
+        # A client workload against the live server once it is ready, inside the
+        # card's turn (smoke's precheck hook: after readiness, before teardown,
+        # required). It runs in JOB/client with CUTEAFD_SMOKE_URL, the server's
+        # API key file (CUTEAFD_API_KEY_FILE) and CUTEAFD_CLIENT_OUT exported.
+        if entry.get('profile') != 'panels:' or entry.get('levels') or entry.get('prefill_lengths') or entry.get('window'):
+            raise ValueError(card + ': --client needs --panels none and no sweep, levels or measurement window')
+        if not 1 <= client_timeout <= 7200:
+            raise ValueError(card + ': --client-timeout must be 1..7200 seconds')
+        out = dest / 'client'
+        out.mkdir(exist_ok=True)
+        argv = ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={key_file}',
+                'sh', '-c', 'cd "$CUTEAFD_CLIENT_OUT" && exec "$@"', 'client', *client]
+        previous = entry.get('precheck')
+        entry['precheck'] = dict(argv=window_argv([previous['argv'], argv]) if previous else argv,
+                                 timeout_s=client_timeout + (previous['timeout_s'] if previous else 0), required=True)
+        if entry['precheck']['timeout_s'] > 7200:
+            raise ValueError(card + ': --client-timeout plus the card\'s own precheck exceeds smoke\'s 7200 s hook limit')
+        job['client'] = argv
     # Re-checked at grant: smoke runs prelaunch once it holds this card's locks.
     entry['prelaunch'] = dict(argv=hook + ['--preflight-job', str(dest / 'job.json')], timeout_s=300, required=True)
     save(dest / 'job.json', {**job, 'probes': sorted(probes)})
@@ -3373,6 +3398,12 @@ def main():
                         'composes with PROFILE=nsys')
     parser.add_argument('--exact-state', metavar='ARGV', help='run this exact prefix-state golden (shell-split argv; gets '
                         '--resume-url URL --output JOB/exact-state) against the live server at the end of the sweep; needs --levels')
+    parser.add_argument('--client', metavar='ARGV', help='run this client workload (shell-split argv) against the live server once '
+                        'the card is ready, inside its turn, in JOB/client with CUTEAFD_SMOKE_URL, CUTEAFD_API_KEY_FILE and '
+                        'CUTEAFD_CLIENT_OUT exported; a failing client fails the card. Needs --panels none (no sweep); '
+                        'excludes --exact-state and --cold-window')
+    parser.add_argument('--client-timeout', type=int, default=CLIENT_TIMEOUT_S, metavar='SECONDS',
+                        help=f'--client limit in seconds (1..7200, default {CLIENT_TIMEOUT_S})')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
                         'ones; a rerun job keeps its earlier attempt under attempt-N/')
     parser.add_argument('--preflight-only', action='store_true', help='run every CPU check (slots, packages, audio, containers, '
@@ -3523,10 +3554,12 @@ def main():
         if not parts or not all(x.isdigit() and 1 <= int(x) <= 256 for x in parts) or len(set(map(int, parts))) != len(parts):
             parser.error('--context-levels takes distinct concurrency levels in 1..256, e.g. 1,8,16')
         context_levels = [int(x) for x in parts]
+    if args.client and (args.panels is None or args.panels.strip() != 'none'):
+        parser.error('--client needs --panels none')
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not (levels or prefill_lengths or args.probe):
-            parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
+        if not selection and not (levels or prefill_lengths or args.probe or args.client):
+            parser.error('--panels none runs nothing without --levels, --prefill-lengths, --probe or --client')
         profile = 'panels:' + selection
         listed = requested_panels(profile, binary=panel_binary(args.binary, arms))
         for card in cards:
@@ -3658,7 +3691,7 @@ def main():
             key.write(secrets.token_hex(32) + '\n')
     if key_file.is_symlink() or key_file.stat().st_mode & 0o077:
         raise ValueError('API key file must be private (0600), not a symlink')
-    jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms), client=shlex.split(args.client) if args.client else None, client_timeout=args.client_timeout) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): resolved_card(c, {**arm_overrides.get(n, {}).get(c['name'], {}),
         **arm_config.get(n, {})}, arm_unsets.get(n, set())) for c in cards for n in arms}
     for job in jobs:
@@ -3714,6 +3747,8 @@ def main():
             if args.context_suffix is not None:
                 print('# context_suffix=' + str(job['entry']['context_suffix']))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
+            if job.get('client'):
+                print('# smoke client (after readiness, in the card\'s turn): ' + shlex.join(job['client']))
             for kind in ('observer', 'precheck'):
                 if kind in job['entry']:
                     print('# smoke ' + kind + ': ' + shlex.join(job['entry'][kind]['argv']))

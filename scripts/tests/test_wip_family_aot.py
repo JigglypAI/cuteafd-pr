@@ -1388,6 +1388,7 @@ def test_hy4_flash_wip_scope_requires_mul1_routed_index(tmp_path, monkeypatch):
     mul1_model = 'wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC'
     seed_exl3_index(tmp_path, mul1_model, codebook='mul1')
     _, scopes = aot.config_scopes({'FAMILY': 'hy4_flash', 'MODEL_ID': mul1_model, 'SPARK_COUNT': '2'})
+    assert scopes['CUTEAFD_WIP_HY4F_AOT'] == 'ON'
     assert scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
     assert scopes['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
     assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'hy4f=2'
@@ -1396,6 +1397,26 @@ def test_hy4_flash_wip_scope_requires_mul1_routed_index(tmp_path, monkeypatch):
     seed_exl3_index(tmp_path, mcg_model, codebook='mcg')
     with pytest.raises(ValueError, match='MUL1 only'):
         aot.config_scopes({'FAMILY': 'hy4_flash', 'MODEL_ID': mcg_model, 'SPARK_COUNT': '2'})
+
+
+def test_hy4_flash_dense_trellis_policies_are_mul1_k6_k8_with_f32_heads():
+    spec = importlib.util.spec_from_file_location(
+        'hy4_dense_trellis', ROOT / 'python/tools/aot/export_b12x_dense_trellis_k6_aot.py'
+    )
+    dense = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dense)
+    policies = dense.row_policies(('hy4f',))
+    assert policies, 'hy4f dense trellis policies must be populated'
+    assert {p['codebook'] for p in policies} == {'mul1'}
+    assert {p.get('bits', 6) for p in policies} == {6, 8}
+    heads = [p for p in policies if p['output_features'] in (120832, 60416)]
+    assert len(heads) == 4  # TP1/TP2 x K6/K8
+    assert all(p['output_program'].endswith('_f32') for p in heads)
+    # Every K-split TP2 projection keeps side=2 and BF16 output_program (F32 core reduced before svh egress).
+    ksplit = [p for p in policies if p['sharded_side'] == 2]
+    assert {(p['input_features'], p['output_features']) for p in ksplit} == {
+        (4096, 3072), (8192, 3072), (6912, 3072), (768, 3072)
+    }
 
 
 

@@ -47,7 +47,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     type Pass<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
     Pass::begin_request(first_transport)?;
     Pass::begin_request(second_transport)?;
-    Pass::decode_round(lib, runtime, first, second, requests, first_transport, second_transport,
+    Pass::decode_round(lib, runtime, first, Some(&mut *second), requests, first_transport, Some(&mut *second_transport),
         &mut active, &[vec![0], vec![]], Some(draft), &mut prefixes, &receive, admission::Wake::default())?;
     ensure!(active.iter().all(Option::is_none), "distributed serving round did not retire its request");
     ensure!(requests.cache().request_id(lease).is_err(), "retired target lease remains live");
@@ -644,7 +644,8 @@ struct Round<'r, 'w, 'a, P: ServingTarget<'w, 'a>> {
     runtime: &'r tokio::runtime::Runtime,
     first: &'r mut P,
     first_transport: &'r mut P::Transport,
-    second_transport: &'r mut P::Transport,
+    /// The second decode lane's link, absent with one resolved lane.
+    second_transport: Option<&'r mut P::Transport>,
     requests: &'r mut Requests<'a>,
     prefill: &'r mut super::prefill_target::PrefillSlots<'a, P>,
     draft: Option<&'r mut DraftRuntime<'w, 'a, P::Chain>>,
@@ -773,7 +774,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
     fn reset_links(&mut self) -> Result<()> {
         round_failure::count_reset();
         P::reset_connections(self.first_transport)?;
-        P::reset_connections(self.second_transport)?;
+        if let Some(second) = self.second_transport.as_deref_mut() { P::reset_connections(second)?; }
         for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
         Ok(())
     }
@@ -846,9 +847,9 @@ fn finish_startup<P>(decode_share: &crate::shared::prefill_share::DecodeShareArg
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     runtime: &tokio::runtime::Runtime, receive: &mut mpsc::Receiver<NativeRequest>,
-    first: &mut P, second: &mut P,
+    first: &mut P, mut second: Option<&mut P>,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
-    second_transport: &mut P::Transport, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
+    mut second_transport: Option<&mut P::Transport>, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
     mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
@@ -861,6 +862,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
+    let lanes = args.decode_lanes;
+    ensure!(second.is_some() == (lanes > 1) && second_transport.is_some() == (lanes > 1),
+        "V4.1 serve owners differ from the {lanes} resolved decode lane(s)");
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
@@ -895,7 +899,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(lib, |f| {
             first.visit_graph_banks(f)?;
-            second.visit_graph_banks(f)?;
+            if let Some(second) = second.as_deref_mut() { second.visit_graph_banks(f)?; }
             for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
             if let Some(draft) = draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
             Ok(())
@@ -935,7 +939,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
-        let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+        let mut loads = crate::shared::serve::lanes::rebalance(&mut active, lanes,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
         // Queued prompts keep the lane they were announced on and decode there.
@@ -1163,7 +1167,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         prefix_waiters.extend(next_wave);
         stall::mark(stall::Phase::Admission, active.iter().flatten().count() + admitted.len());
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
-            let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
+            let lane = cuteafd_loader::plan::decode_lanes::assign(loads, lanes);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
@@ -1172,7 +1176,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             drop(images);
             let ready = (|| -> Result<_> {
                 crate::shared::serve::RequestFailure::check_lane(id, loads[lane],
-                    active.len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS))?;
+                    lane_capacity(active.len(), usize::from(lanes)))?;
                 let constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
                     .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
                 // Nothing dispatched yet: the failure branch below only releases.
@@ -1210,7 +1214,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if prefills.due(active.iter().any(Option::is_some)) {
             stall::mark(stall::Phase::Admission, active.iter().flatten().count() + prefills.len());
             let mut round = Round { lib, args, runtime, first: &mut *first, first_transport: &mut *first_transport,
-                second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
+                second_transport: second_transport.as_deref_mut(), requests: &mut *requests, prefill: &mut *prefill_slots,
                 draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active, whole };
             // The packed pass runs inside the round's timed window: its time is owed too.
             let finished = prefills.round_with(&mut round, prepare_round::<P>,
@@ -1273,8 +1277,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // boundary past it (share 0 never gets here with prompts waiting).
         let cycle = (!whole && !prefills.is_empty()).then(Instant::now);
         stall::mark(stall::Phase::Decode, active.iter().flatten().count() + prefills.len());
-        let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
-            requests, first_transport, second_transport, &mut active, &members,
+        let result = room.and_then(|_| P::decode_round(lib, runtime, first, second.as_deref_mut(),
+            requests, first_transport, second_transport.as_deref_mut(), &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + prefills.len(),
@@ -1292,7 +1296,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
             round_failure::handle(&mut active, &error, || {
                 round_failure::count_reset();
-                P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+                P::reset_connections(first_transport)?;
+                if let Some(second) = second_transport.as_deref_mut() { P::reset_connections(second)?; }
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 Ok(())
             })?;
@@ -2055,6 +2060,12 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
     }.await;
     pass.set_route_capture(false);
     result
+}
+
+/// Members one decode lane holds: the request slots split across `lanes`
+/// lanes, capped by the per-lane member limit (`V41_MAX_LANE_MEMBERS`).
+pub(super) fn lane_capacity(slots: usize, lanes: usize) -> usize {
+    slots.div_ceil(lanes.max(1)).min(cuteafd_core::V41_MAX_LANE_MEMBERS)
 }
 
 fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<'a>>],

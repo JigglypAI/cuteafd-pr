@@ -98,6 +98,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
         ModelEncoding::Mistral(encoding) => encoding.render(&body, &super::mistral::MistralPromptOptions {
             tool_names: Vec::new(), response_format: None }).is_err(),
         ModelEncoding::Inkling(encoding) => encoding.render(&body, &super::inkling2::InklingPromptOptions::default()).is_err(),
+        ModelEncoding::Hy4Flash(encoding) => encoding.render(&body, &super::hy4_flash::Hy4PromptOptions::default()).is_err(),
         ModelEncoding::MiniMax(encoding) => encoding.render(&body, &super::minimax::MiniMaxPromptOptions::default()).is_err(),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };

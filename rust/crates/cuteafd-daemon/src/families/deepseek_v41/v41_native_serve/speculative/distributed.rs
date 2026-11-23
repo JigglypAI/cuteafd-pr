@@ -17,12 +17,11 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     /// no device scope survives a scheduler yield.
     pub fn with_distributed_requests(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, shards: [&'w VocabularyShard<'a>; 2],
-        capacity: u32, requests: u32) -> Result<DeviceOwner<'a, Self>> {
-        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
+        capacity: u32, requests: u32, lanes: u8) -> Result<DeviceOwner<'a, Self>> {
+        let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
+        let lane_count = lane_count as usize;
         devices[1].own(|| {
             let lib = devices[1].library;
-            let lane_count = if requests == 1 { 1 } else { 2 };
-            let lane_requests = requests.div_ceil(lane_count as u32);
             let lane_bytes = DistributedDsparkChain::device_bytes(weights, lane_requests, shards[0].tokens().end)?;
             let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
             if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
@@ -78,10 +77,10 @@ mod tests {
             devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?];
         let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
         let weights = devices[1].own(|| DsparkWeights::load_serving_with_width(&lib, &catalog,
-            80, 16, 32usize << 30, 16 << 20, 5))?;
+            80, 16, 2, 32usize << 30, 16 << 20, 5))?;
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
-            [&shards[0], &shards[1]], 80, 16)?;
-        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;
+            [&shards[0], &shards[1]], 80, 16, 2)?;
+        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16, 2))?;
         devices[1].run(|| actual.get_mut().capture_startup())?;
         assert!(actual.requests.is_empty());
         assert!(actual.pending.iter().all(Option::is_none));

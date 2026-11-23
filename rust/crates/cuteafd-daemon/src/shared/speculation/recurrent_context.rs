@@ -39,7 +39,7 @@ impl Rank<'_> {
             let features=view(features,first*pitch,rows*pitch)?;
             // SAFETY: ordered upload retains metadata until its copy completes;
             // permanent destinations survive every queued context consumer.
-            unsafe{lib.copy_h2d_ordered(self.buffer("context.positions")?,bytes(&positions[first..]),stream)?;}
+            unsafe{self.upload("context.positions",bytes(&positions[first..]))?;}
             let layer=&self.weights.tensors.layers[index];
             let alpha=self.weights.derived("derived.fuse_alpha")?.buffer;
             let alpha=view(alpha,index*self.config.taps.len()*2,self.config.taps.len()*2)?;
@@ -63,7 +63,7 @@ impl Rank<'_> {
                 "recurrent KV store destinations alias or lie outside admitted plane");
             // SAFETY: host plan checked every slot against the layer's physical
             // capacity; typed store checks row sources and stream retains cache.
-            unsafe{lib.copy_h2d_ordered(self.buffer("context.destinations")?,bytes(active),stream)?;
+            unsafe{self.upload("context.destinations",bytes(active))?;
                 self.programs.store.launch(&[self.buffer("context.key")?,self.buffer("context.value")?,
                     self.buffer("context.destinations")?,self.buffer(&format!("cache.layer.{index}.k"))?,
                     self.buffer(&format!("cache.layer.{index}.v"))?],rows,c.rms_norm_eps as f32,0,stream)?;}

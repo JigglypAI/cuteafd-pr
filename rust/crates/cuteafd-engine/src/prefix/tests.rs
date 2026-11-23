@@ -1959,3 +1959,119 @@ fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
     cache.release(&fake, &restored.placement.pages).unwrap();
     cache.clear(&fake).unwrap();
 }
+
+/// #2582: the `context_load` pattern on a staged-mark family with the host tier on (two device
+/// mark slots, the shipped default). One retained base, a warm wave of base + distinct suffix
+/// (each captures a prompt and a turn), then a timed wave with new suffixes: every timed request
+/// must restore the whole base exactly. Bases below and above the host tier's own minimum.
+#[test]
+fn a_short_shared_base_survives_the_warm_wave_on_two_staging_slots() {
+    const HOST_MIN: u32 = 32;
+    for pooled in [false, true] {
+        for base_len in [14usize, 40] {
+            for wave in [1usize, 3] {
+                let fake = if pooled { Fake::pooled(400, 8) } else { Fake::new(400, 8, 2) };
+                let host = HostConfig { bytes: 1 << 22, chunk_bytes: 1 << 16, min_tokens: HOST_MIN, ..HostConfig::default() };
+                let mut cache = PrefixCache::new(fake.layout(), config(20, fake.slots),
+                    Some((host, Shared(fake.mem.clone())))).unwrap();
+                let settle = |cache: &mut PrefixCache<Shared>| { fake.mem.borrow_mut().advance(10_000_000); cache.tick(); };
+                let base = seq(100, base_len);
+                let (_, _, p) = serve(&mut cache, &fake, 0, &base, &seq(5000, 3), 64);
+                cache.release(&fake, &p.pages).unwrap();
+                settle(&mut cache);
+                let suffixed = |phase: u32, i: usize| {
+                    let mut prompt = base.clone();
+                    prompt.extend(seq(10_000 + phase * 1000 + i as u32 * 10, 5));
+                    prompt
+                };
+                for (phase, name) in [(1u32, "warm"), (2, "timed")] {
+                    let promoted = cache.stats().mark_promotions;
+                    for i in 0..wave {
+                        let prompt = suffixed(phase, i);
+                        let (resume, _, mut p) = serve(&mut cache, &fake, 1 + i, &prompt, &seq(20_000 + i as u32 * 10, 4), 64);
+                        assert_eq!(resume, base_len, "pooled {pooled} base {base_len} C{wave}: {name} request {i}");
+                        let mut longer = prompt.clone();
+                        longer.extend(seq(20_000 + i as u32 * 10, 4));
+                        longer.push(7);
+                        fake.forward(&mut p, &longer).unwrap();
+                        cache.release(&fake, &p.pages).unwrap();
+                    }
+                    // Settled marks went to the host: the base's mark came back through the
+                    // host round trip, and the forwards above found every row exact.
+                    assert!(cache.stats().mark_promotions > promoted, "{name}: no host mark restore");
+                    settle(&mut cache);
+                }
+                // An exact repeat of the base restores from the host with the first token's logits
+                // of a fresh prefill and no forward.
+                let admitted = cache.admit(&fake, &base, 64, true,
+                    |pages| Placement { pages, ring: 7, len: 0, ring_from: 0 }).unwrap();
+                assert_eq!(admitted.resume, base_len);
+                assert!(admitted.source.as_ref().unwrap().host);
+                // The fake's logits are a pure function of the tokens a fresh prefill reads.
+                let v = u64::from_le_bytes(value(3, &base));
+                let fresh: Vec<f32> = (0..8).map(|i| ((v >> (i * 8)) & 0xff) as f32).collect();
+                assert_eq!(admitted.after.unwrap().logits.unwrap().to_vec(), fresh);
+                let mut p = admitted.placement;
+                let mut longer = base.clone();
+                longer.push(3);
+                fake.forward(&mut p, &longer).unwrap();
+                cache.release(&fake, &p.pages).unwrap();
+                // The base and every turn short of the host minimum went to the host tier.
+                assert_eq!(cache.host_config().unwrap().min_tokens, 1);
+                assert_eq!(cache.stats().host.unwrap().stores_skipped, 0);
+                // Idle: every entry holds one mark, on the device or only on the host.
+                let stats = cache.stats();
+                assert!(stats.mark_family && stats.marks_in_use <= 2);
+                assert_eq!(stats.marks_in_use + stats.marks_on_host, stats.entries_prompt + stats.entries_turn);
+                cache.clear(&fake).unwrap();
+                assert_eq!(cache.pool().free(), cache.pool().capacity());
+            }
+        }
+    }
+}
+
+/// The #2582 clamp is only for staged marks: with the host tier off, a mark family retains short
+/// marks in its full device arena as before, and a pages-only family keeps the host minimum (its
+/// device snapshot needs no slot, so a short one stays device-resident).
+#[test]
+fn host_minimum_clamps_only_for_staged_marks() {
+    const HOST_MIN: u32 = 32;
+    let host = |fake: &Fake| Some((HostConfig { bytes: 1 << 22, chunk_bytes: 1 << 16, min_tokens: HOST_MIN,
+        ..HostConfig::default() }, Shared(fake.mem.clone())));
+    // Host off: the device arena holds every bank's marks; the short base survives both waves.
+    let fake = Fake::new(400, 8, 42);
+    let mut cache = PrefixCache::new(fake.layout(), config(20, fake.slots), None).unwrap();
+    let base = seq(100, 14);
+    let (_, _, p) = serve(&mut cache, &fake, 0, &base, &seq(5000, 3), 64);
+    cache.release(&fake, &p.pages).unwrap();
+    for i in 0..6u32 {
+        let mut prompt = base.clone();
+        prompt.extend(seq(10_000 + i * 10, 5));
+        let (resume, _, p) = serve(&mut cache, &fake, 1, &prompt, &seq(20_000 + i * 10, 4), 64);
+        assert_eq!(resume, 14, "host-off request {i}");
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    assert!(cache.host_config().is_none());
+    cache.clear(&fake).unwrap();
+    // Pages-only: the host minimum stands and short snapshots are skipped there, served on device.
+    let fake = Fake { markless: true, ..Fake::new(400, 8, 1) };
+    let mut cache = PrefixCache::new(fake.layout(), config(20, 0), host(&fake)).unwrap();
+    assert_eq!(cache.host_config().unwrap().min_tokens, HOST_MIN);
+    let (_, _, p) = serve(&mut cache, &fake, 0, &base, &seq(5000, 3), 64);
+    cache.release(&fake, &p.pages).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    assert_eq!(cache.stats().host.unwrap().stores_skipped, 2);
+    for i in 0..6u32 {
+        let mut prompt = base.clone();
+        prompt.extend(seq(10_000 + i * 10, 5));
+        let (resume, _, p) = serve(&mut cache, &fake, 1, &prompt, &[], 64);
+        assert_eq!(resume, 14, "pages-only request {i}");
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    cache.clear(&fake).unwrap();
+    // A mark family with a larger device minimum keeps it on the host too.
+    let fake = Fake::new(400, 8, 2);
+    let cache: PrefixCache<Shared> = PrefixCache::new(fake.layout(), PrefixConfig { min_tokens: 64, ..config(20, 2) }, host(&fake)).unwrap();
+    assert_eq!(cache.host_config().unwrap().min_tokens, HOST_MIN);
+}

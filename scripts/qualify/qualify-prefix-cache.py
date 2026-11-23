@@ -242,9 +242,13 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
     if idle:
         if idle.get("pages", 0) - idle.get("pages_free", 0) != idle.get("pages_retained"):
             problems.append(f"idle pages leaked: {idle}")
-        # A pages-only family (GLM 5.3) has no mark arena: its snapshots hold no mark.
-        marks = idle.get("entries_prompt", 0) + idle.get("entries_turn", 0) if idle.get("mark_slots", 1) else 0
-        if idle.get("marks_in_use") != marks:
+        # Every retained snapshot of a mark family holds exactly one mark, on the device or, once
+        # its host copy landed and the staging slot went back, only on the host (#2582). A
+        # pages-only family (GLM 5.3) holds none.
+        entries = idle.get("entries_prompt", 0) + idle.get("entries_turn", 0)
+        mark_family = idle.get("mark_family", bool(idle.get("mark_slots", 1)))
+        marks = idle.get("marks_in_use", 0) + idle.get("marks_on_host", 0)
+        if marks != (entries if mark_family else 0) or (not mark_family and idle.get("marks_in_use")):
             problems.append(f"idle marks do not match entries: {idle}")
     else:
         problems.append("/v1/stats has no prefix_cache section")

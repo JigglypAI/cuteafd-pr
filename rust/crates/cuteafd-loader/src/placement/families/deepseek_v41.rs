@@ -213,8 +213,9 @@ pub fn expert_cost(
 /// local or TP2 expert wave.
 /// Per-layer expert costs, and the coordinator's expert workspaces: the
 /// prefill slots' (one per slot on one RTX at the `rows` unit; one shared TP2
-/// arena on two, planes at the `reserve`) and the two decode lanes' at
-/// `decode_rows`.
+/// arena on two, planes at the `reserve`) and each of the `lanes` decode
+/// lanes' at `decode_rows`.
+#[allow(clippy::too_many_arguments)]
 pub fn expert_inventory(
     catalog: &crate::OfficialV41Catalog,
     programs: &std::path::Path,
@@ -224,6 +225,7 @@ pub fn expert_inventory(
     slots: usize,
     reserve: u64,
     decode_rows: u64,
+    lanes: u8,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
@@ -237,7 +239,8 @@ pub fn expert_inventory(
     let (experts, slot) = expert_workspace(catalog, programs, slot_capacity, reserve, gpus, sms)?;
     let (_, decode) = expert_workspace(catalog, programs, decode_rows, decode_rows, gpus, sms)?;
     let slots = if gpus == 1 { slots as u64 } else { 1 };
-    Ok((experts, slot.checked_mul(slots).and_then(|n| n.checked_add(2 * decode))
+    ensure!(matches!(lanes, 1 | 2), "V4.1 runs one or two decode lanes");
+    Ok((experts, slot.checked_mul(slots).and_then(|n| n.checked_add(u64::from(lanes) * decode))
         .context("V4.1 expert workspaces overflow")?))
 }
 

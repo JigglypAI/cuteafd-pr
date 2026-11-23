@@ -60,7 +60,7 @@ impl<'a> Drafter<'a> {
             let lib=self.lead.stream.device.library;let stream=self.lead.stream.raw;
             // SAFETY: permanent metadata owner and stream retain staging; no
             // host hop occurs for recurrent state, features or intermediate IDs.
-            unsafe{lib.copy_h2d_ordered(self.lead.buffer("step.ids")?,&anchors,stream)?;}
+            unsafe{self.lead.upload("step.ids",&anchors)?;}
             self.lead.initialize_block(self.lead.buffer("step.ids")?,embedding,embed_norm,sequences.len())?;
             for (index,seq) in sequences.iter().enumerate(){
                 let source=self.lead.buffer("cache.last_features")?;

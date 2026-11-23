@@ -122,6 +122,13 @@ and arms for cleanup. Source worktrees are retained for inspection.
   then the drafts-off cases N at a time (never together), so the shared draft
   row budget is exercised; the pass records `concurrency` (N, per-wave max
   in-flight).
+- `--panels none --client 'ARGV'` runs a client workload (for example
+  `bench-agentic-session.py record`) against the live server once the card is
+  ready, inside the card's turn and before teardown. It is smoke's precheck
+  hook: it runs in `JOB/client/` with `CUTEAFD_SMOKE_URL`, `CUTEAFD_API_KEY_FILE`
+  and `CUTEAFD_CLIENT_OUT` exported, and a failing client fails the card.
+  `--client-timeout` (default 3600 s, at most 7200 s with any precheck) bounds
+  it. It excludes `--exact-state` and `--cold-window`, and `--dry-run` prints the hook.
 - `--prefill-idle-seconds N` waits after each ordinary prefill warm-up before
   the timed request (default 0). Each prefill point records `idle_seconds` in
   `sweep.json`; the wait is outside TTFT and the timed thermal window.

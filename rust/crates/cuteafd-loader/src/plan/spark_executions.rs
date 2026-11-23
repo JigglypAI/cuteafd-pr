@@ -89,10 +89,12 @@ impl SparkBackend {
 /// Admit the typed owners for `family` over the package's `exports` (an
 /// installed manifest's capacities, or [`SparkBackend::exports`]). `decode_rows`
 /// overrides the descriptor's decode extent only where the family's installed
-/// coordinator package fixes it (e.g. a V4 manifest's `decode_rows`).
+/// coordinator package fixes it (e.g. a V4 manifest's `decode_rows`). `lanes`
+/// is the resolved decode-lane count ([`super::decode_lanes::resolve`]): one
+/// Spark decode execution per lane, at most what the family can run.
 pub fn admit(family: &dyn crate::plan::Family, exports: &[u32], decode_rows: Option<u32>,
-    prefill: PrefillUnits) -> Result<SparkExecutions, ExecutionAdmissionError> {
-    let lanes = family.spark_decode().map_or(0, |_| family.decode_lanes().max_lanes());
+    prefill: PrefillUnits, lanes: u8) -> Result<SparkExecutions, ExecutionAdmissionError> {
+    let lanes = family.spark_decode().map_or(0, |_| lanes.clamp(1, family.decode_lanes().max_lanes()));
     let rows = decode_rows.or(family.spark_decode().map(|decode| decode.rows)).unwrap_or(0);
     SparkExecutions::admit(&vec![rows; usize::from(lanes)], prefill.unit_rows,
         prefill.unit_rows, prefill.waves, exports)
@@ -105,11 +107,19 @@ pub fn descriptor(family: &str) -> anyhow::Result<&'static dyn crate::plan::Fami
 }
 
 /// Admit `family` at its resolved prefill unit and wave count on the shared
-/// ladder. Plan, serve and golden all call this.
+/// ladder, with its default decode lanes. Plan, serve and golden all call this.
 pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
     unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
+    let lanes = descriptor(family)?.decode_lanes().default_lanes();
+    admit_family_lanes(family, exports, decode_rows, unit_rows, waves, lanes)
+}
+
+/// [`admit_family`] at a resolved decode-lane count (a family that runs one
+/// or two lanes admits one Spark decode execution per resolved lane).
+pub fn admit_family_lanes(family: &str, exports: &[u32], decode_rows: Option<u32>,
+    unit_rows: u64, waves: u64, lanes: u8) -> anyhow::Result<SparkExecutions> {
     let descriptor = descriptor(family)?;
-    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::ladder(unit_rows, waves))?)
+    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::ladder(unit_rows, waves), lanes)?)
 }
 
 #[cfg(test)]
@@ -146,7 +156,8 @@ mod tests {
                 for backend in [SparkBackend::Fp8, SparkBackend::Native, SparkBackend::Exlr8,
                     SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest),
                     SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::GlmFlashK64)] {
-                    let plan = admit(*family, &backend.exports(), None, PrefillUnits::ladder(unit, waves)).unwrap();
+                    let lanes = family.decode_lanes().max_lanes();
+                    let plan = admit(*family, &backend.exports(), None, PrefillUnits::ladder(unit, waves), lanes).unwrap();
                     assert_eq!(plan.prefill, PrefillExecution { capacity: unit as u32,
                         compiled_capacity: cuteafd_core::covering_export(&backend.exports(), unit as u32).unwrap(),
                         unit_rows: unit as u32, buffered_units: waves as u8 }, "{} {backend:?}", family.id());
@@ -184,13 +195,19 @@ mod tests {
             (SparkBackend::Exlr8, 64, 64), (k64, 16, 80), (k64, 80, 80),
             (SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), 16, 16),
             (SparkBackend::Fp8, 128, 256), (SparkBackend::Native, 128, 256)] {
-            let plan = admit(glm, &backend.exports(), Some(rows), PrefillUnits::ladder(2752, 3)).unwrap();
+            let plan = admit(glm, &backend.exports(), Some(rows), PrefillUnits::ladder(2752, 3), 1).unwrap();
             assert_eq!(plan.decode, [DecodeExecution { capacity: rows, compiled_capacity: compiled }], "{backend:?}");
         }
         // V4.1's unit selects its covering native main.
         let v41 = admit(&crate::plan::families::deepseek::DEEPSEEK_V41, &SparkBackend::V41.exports(), None,
-            PrefillUnits { unit_rows: 256, waves: 2 }).unwrap();
+            PrefillUnits { unit_rows: 256, waves: 2 }, 2).unwrap();
         assert_eq!(v41.decode, [DecodeExecution { capacity: 64, compiled_capacity: 64 }; 2]);
+        // One resolved lane admits one decode execution; a one-lane family never two.
+        let one = admit(&crate::plan::families::deepseek::DEEPSEEK_V41, &SparkBackend::V41.exports(), None,
+            PrefillUnits { unit_rows: 256, waves: 2 }, 1).unwrap();
+        assert_eq!(one.decode, [DecodeExecution { capacity: 64, compiled_capacity: 64 }]);
+        assert_eq!(one.prefill, v41.prefill);
+        assert_eq!(admit(glm, &SparkBackend::Fp8.exports(), None, PrefillUnits::ladder(2752, 3), 2).unwrap().decode.len(), 1);
         assert_eq!(v41.prefill, PrefillExecution { capacity: 256, compiled_capacity: 256, unit_rows: 256, buffered_units: 2 });
     }
 
@@ -199,21 +216,21 @@ mod tests {
         let glm = &crate::plan::families::glm::GLM5;
         let ladder = PrefillUnits::ladder;
         // A decode extent beyond the package's largest export is refused.
-        assert_eq!(admit(glm, &[1, 80, 4096], Some(4097), ladder(4096, 1)).unwrap_err(),
+        assert_eq!(admit(glm, &[1, 80, 4096], Some(4097), ladder(4096, 1), 1).unwrap_err(),
             ExecutionAdmissionError::Uncovered { owner: "decode", rows: 4097, exports: vec![1, 80, 4096] });
         // EXLR8 covers a wider decode extent only with its 4096-row arena.
-        assert_eq!(admit(glm, &SparkBackend::Exlr8.exports(), Some(80), ladder(4096, 1)).unwrap().decode[0].compiled_capacity, 4096);
+        assert_eq!(admit(glm, &SparkBackend::Exlr8.exports(), Some(80), ladder(4096, 1), 1).unwrap().decode[0].compiled_capacity, 4096);
         // Only the selected unit needs a covering export, not unused larger shapes.
-        assert_eq!(admit(glm, &[1, 80, 2048], None, ladder(2048, 4)).unwrap().prefill.compiled_capacity, 2048);
-        assert!(matches!(admit(glm, &[1, 80, 2048], None, ladder(2752, 3)),
+        assert_eq!(admit(glm, &[1, 80, 2048], None, ladder(2048, 4), 1).unwrap().prefill.compiled_capacity, 2048);
+        assert!(matches!(admit(glm, &[1, 80, 2048], None, ladder(2752, 3), 1),
             Err(ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 2752, .. })));
         // An over-capacity unit pin needs an export beyond the ladder.
-        assert!(matches!(admit(glm, &SparkBackend::Fp8.exports(), None, ladder(4160, 2)),
+        assert!(matches!(admit(glm, &SparkBackend::Fp8.exports(), None, ladder(4160, 2), 1),
             Err(ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 4160, .. })));
-        assert!(matches!(admit(glm, &SparkBackend::Fp8.exports(), None, ladder(2048, 5)),
+        assert!(matches!(admit(glm, &SparkBackend::Fp8.exports(), None, ladder(2048, 5), 1),
             Err(ExecutionAdmissionError::BufferedUnits { units: 5, .. })));
         assert!(admit_family("unknown", &SparkBackend::Fp8.exports(), None, 4096, 1).is_err());
-        assert!(matches!(admit(&crate::plan::families::dflash::DFLASH2, &SparkBackend::Fp8.exports(), None, ladder(4096, 1)),
+        assert!(matches!(admit(&crate::plan::families::dflash::DFLASH2, &SparkBackend::Fp8.exports(), None, ladder(4096, 1), 1),
             Err(ExecutionAdmissionError::DecodeLanes { lanes: 0, .. })));
     }
 }

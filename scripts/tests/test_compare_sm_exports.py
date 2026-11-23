@@ -1872,7 +1872,11 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     names = {name for name, _, _ in jobs}
     assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
             'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
-            'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+            'exl3/exl3-qwen4-k45', 'exl3/exl3-hy4f-k45-mul1',
+            'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    hy4f_job = next(extra for name, _, extra in jobs if name == 'exl3/exl3-hy4f-k45-mul1')
+    assert hy4f_job[hy4f_job.index('--bits') + 1] == '4,5'
+    assert hy4f_job[hy4f_job.index('--codebook') + 1] == 'mul1'
     assert set(publisher.V41_MANIFESTS) <= names
     for name, exporter, extra in jobs:
         if name.startswith(('fp8/', 'bf16/')):
@@ -1892,8 +1896,9 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     assert not any(name.startswith('fp8/fp8-step5') for name in names)
     args = jobs[0][2]
     geometry = set(args[args.index('--geometry') + 1].split(','))
-    assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'qwen35', 'qwen38',
+    assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'hy4f', 'hy4f2', 'qwen35', 'qwen38',
             'step5', 'kimik3', 'exlr8', 'exlr8_dense', 'dense_trellis_k6'} <= geometry
+    assert 'hy4f' in args[args.index('--dense-trellis-families') + 1].split(',')
     assert args[args.index('--exlr8-role') + 1] == 'coordinator'
     assert len(names) == len(jobs)
 

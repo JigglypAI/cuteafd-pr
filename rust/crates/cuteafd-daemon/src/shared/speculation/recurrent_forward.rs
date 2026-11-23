@@ -145,6 +145,10 @@ impl<'a> ProgramsForRank<'a> {
     }
 }
 
+/// Host-written metadata planes: reserved for ordered upload at allocation.
+pub(super) const UPLOADED: [&str; 6] = ["step.ids","step.tables","step.positions","cache.tables",
+    "context.positions","context.destinations"];
+
 pub(crate) struct Rank<'a> {
     pub weights:Weights<'a>,
     pub stream:Rc<Stream<'a>>,
@@ -168,7 +172,22 @@ impl<'a> Rank<'a> {
                 else{Tag::drafter_workspace("shared/recurrent-workspace")};
             Ok((name.clone(),Allocation::new(device,*bytes,tag)?))
         }).collect::<Result<BTreeMap<_,_>>>()?;
+        // #2544: every host-written metadata plane gets its ordered-upload
+        // staging and fence here, before readiness; the step refuses instead.
+        for name in UPLOADED.iter().filter(|name| buffers.contains_key(**name)) {
+            // SAFETY: a live admitted plane on this rank's device and stream.
+            device.run(|| unsafe { device.library.reserve_h2d_ordered(buffers[*name].buffer, stream.raw) })?;
+        }
         Ok(Self{weights,stream,config,layout,programs,buffers})
+    }
+    /// A host upload into one of this rank's reserved metadata planes.
+    ///
+    /// # Safety
+    /// As [`cuteafd_ffi::NativeLibrary::copy_h2d_reserved`] on this rank's stream.
+    pub(super) unsafe fn upload(&self,name:&str,bytes:&[u8])->Result<()> {
+        ensure!(UPLOADED.contains(&name),"recurrent plane {name} is not a reserved upload destination");
+        // SAFETY: forwarded; the destination was reserved on this stream at allocation.
+        unsafe{self.stream.device.library.copy_h2d_reserved(self.buffer(name)?,bytes,self.stream.raw)}
     }
     pub fn norm_first(&self,rows:usize)->Result<()> {
         // SAFETY: rank-local fixed-hidden BF16 planes and gamma are retained
@@ -269,5 +288,30 @@ impl<'a> Rank<'a> {
 impl Drop for Rank<'_> {
     fn drop(&mut self) {
         self.stream.drain_or_abort("recurrent rank retirement before weights/workspaces");
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    /// #2544: every recurrent-drafter host upload goes through the rank's
+    /// reserved planes; none can create ordered staging inside a draft step.
+    #[test]
+    fn every_drafter_upload_targets_a_plane_reserved_at_allocation() {
+        let sources = [include_str!("recurrent.rs"), include_str!("recurrent_step.rs"),
+            include_str!("recurrent_context.rs"), include_str!("recurrent_forward.rs")];
+        for source in sources {
+            let body = source.split("#[cfg(test)]").next().unwrap();
+            assert!(!body.contains("copy_h2d_ordered("), "recurrent drafter bypasses its reserved uploads");
+            for (at, _) in body.match_indices(".upload(\"") {
+                let name = body[at + 9..].split('"').next().unwrap();
+                assert!(super::UPLOADED.contains(&name), "unreserved recurrent upload {name}");
+            }
+        }
+        let allocate = include_str!("recurrent_forward.rs").split("pub fn allocate(").nth(1).unwrap()
+            .split("pub(super) unsafe fn upload(").next().unwrap();
+        assert!(allocate.contains("reserve_h2d_ordered(buffers[*name].buffer, stream.raw)"));
+        let upload = include_str!("recurrent_forward.rs").split("pub(super) unsafe fn upload(").nth(1).unwrap()
+            .split("\n    }\n").next().unwrap();
+        assert!(upload.contains("copy_h2d_reserved("));
     }
 }
