@@ -647,13 +647,39 @@ def serving_locks(jobs):
     return layout_locks(layouts)
 
 
+# Driver work per job inside the turn beyond smoke's own budgets: the at-grant
+# job preflight, the leftover-container check and result collection.
+JOB_DRIVER_SLACK_S = 600
+
+
+def job_max_run(job):
+    """Seconds one job may hold the serving turn: smoke's launch and run budget
+    (timeout_s + run_timeout_s + 120 s, the observer's bound), every hook's own
+    timeout, smoke's teardown and the driver's checks around it."""
+    entry = job['entry']
+    run = int(entry.get('run_timeout_s', 900))
+    bound = int(entry.get('timeout_s', 900)) + run + 120
+    if (entry.get('levels') or entry.get('prefill_lengths')) and entry.get('profile') != 'panels:':
+        bound += run  # panels and a sweep: smoke bounds only the panels by run_timeout_s
+    hooks = [entry.get('prelaunch'), entry.get('precheck'), *(entry.get('window') or {}).values()]
+    bound += sum(int(hook['timeout_s']) for hook in hooks if hook)
+    if entry.get('prefill_purge'):
+        # Before each prefill point's warm-up and again before its timed request.
+        points = len(entry.get('prefill_lengths') or []) * (2 if entry.get('prefill_repeat') else 1)
+        bound += 2 * points * int(entry['prefill_purge']['timeout_s'])
+    return bound + SMOKE_STOP_GRACE_S + JOB_DRIVER_SLACK_S
+
+
 @contextlib.contextmanager
 def serving_turn(jobs, env, wait):
     """Hold one post-build turn until every smoke has exited and torn down.
 
     The caller drains detached smokes before leaving, even on a stop signal:
     60 s smoke teardown, 75 s here, 80 s outer hwlock if used, 90 s systemd.
-    Never put a build or export inside this scope.
+    Never put a build or export inside this scope. The turn is bounded by the
+    sum of its jobs' budgets (`job_max_run`, so --run-timeout raises it), which
+    hwlock records and enforces, and which lets it backfill ahead of an older
+    ticket it cannot delay.
 
     Under an enclosing hwlock hold (`CUTEAFD_HW_LOCKS_HELD`), the turn's set
     must already be covered: an inner ticket for a lock the outer hold does not
@@ -673,7 +699,8 @@ def serving_turn(jobs, env, wait):
     with contextlib.ExitStack() as stack:
         if wanted:
             stack.enter_context(hwlock.hold(wanted, wait, 'wip-cards arms/repeats',
-                                            cancelled=lambda: STOP['signal'] is not None))
+                                            cancelled=lambda: STOP['signal'] is not None,
+                                            max_run=sum(job_max_run(job) for job in jobs)))
         env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(hwlock.canonical([*parent, *locks]))
         yield
 
@@ -3737,6 +3764,7 @@ def main():
     if args.dry_run:
         print('# single serving turn after all builds/seals: hwlock --locks ' +
               ','.join(serving_locks(jobs)) + ' --wait ' + str(args.wait) +
+              ' --max-run ' + str(round(sum(job_max_run(job) for job in jobs))) +
               '; held through all arms/repeats and final teardown')
         if groups and len(groups[0]) > 1:
             cmd = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
@@ -3939,10 +3967,14 @@ def main():
 
 def cli():
     try:
-        return main()
+        code = main()
     except (ValueError, RuntimeError, subprocess.SubprocessError, OSError) as error:
         print('wip-cards: ' + str(error), file=sys.stderr)
         return 2
+    if hwlock.OVERRAN[0]:
+        print("wip-cards: the serving turn's --max-run bound was reached; smokes stopped and torn down", file=sys.stderr)
+        return 124
+    return code
 
 
 if __name__ == '__main__':

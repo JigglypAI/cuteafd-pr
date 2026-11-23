@@ -4440,3 +4440,27 @@ def test_detached_termination_cannot_publish_child_success(tmp_path):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
+
+
+def test_serving_turn_is_bounded_by_its_jobs_budgets(entry, tmp_path, monkeypatch):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    # The card's own timeouts become the turn's hwlock --max-run (no new knob):
+    # launch + run budget, hooks, smoke teardown and driver slack, per job.
+    import contextlib
+    seen = []
+    @contextlib.contextmanager
+    def hold(names, wait, *args, **kwargs):
+        seen.append(kwargs['max_run'])
+        yield []
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    short = make({**entry, 'timeout_s': 100, 'run_timeout_s': 200}, tmp_path / 'a')
+    long = make({**entry, 'timeout_s': 100, 'run_timeout_s': 5000}, tmp_path / 'b')
+    with cards.serving_turn([short], {}, 5):
+        pass
+    with cards.serving_turn([short, long], {}, 5):
+        pass
+    expected = 100 + 200 + 120 + short['entry']['prelaunch']['timeout_s'] + cards.SMOKE_STOP_GRACE_S + cards.JOB_DRIVER_SLACK_S
+    assert seen[0] == expected == cards.job_max_run(short)
+    assert seen[1] == cards.job_max_run(short) + cards.job_max_run(long)
+    assert cards.job_max_run(long) - cards.job_max_run(short) == 4800

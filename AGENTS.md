@@ -41,7 +41,10 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
   `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock`. Never
   acquire an earlier lock while holding a later one. Every lock wait and run
-  has a timeout.
+  has a timeout. A job given `hwlock.py --max-run SECONDS` (enforced;
+  wip-cards and golden-run pass their timeouts) may start ahead of an older
+  ticket it cannot delay (rule in hwlock's docstring); a backfilled job takes
+  no further locks.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
   command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
   and let its completion wake you. Don't poll status or tail logs in between;
