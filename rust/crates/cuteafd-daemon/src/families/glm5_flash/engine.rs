@@ -5771,7 +5771,10 @@ mod prefill_lane_tests {
             // Fork #300 explicitly disables native scaling for NC: whole-shape deferral keeps
             // scaled-BF16 operands in both thin and wide tiles. Re-audited registry routes,
             // warps, groups and wide selection remain unchanged; no new row-count crossover.
-            ("integration/cuteafd/_fp8_gemv_nc.py", 0xe94e797f8b1fb0d9_u64),
+            // Fork #423 guards `_query_device_caps` with `aot_target.active_target()` when
+            // offline for CPU-only AOT export; kernel arithmetic, routes, warps, groups and
+            // exported objects are byte-identical.
+            ("integration/cuteafd/_fp8_gemv_nc.py", 0x8842_ec04_88e6_b1c3_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
