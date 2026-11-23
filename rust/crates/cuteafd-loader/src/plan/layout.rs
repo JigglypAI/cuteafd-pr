@@ -440,7 +440,7 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
     const MIB: u64 = 1 << 20;
     let at_4096 = match family {
         "mimo_v2" => 146 * MIB,
-        "glm5" => 1001 * MIB,
+        "glm5" | "hy4" => 1001 * MIB,
         "glm5_flash" => 569 * MIB,
         "deepseek_v41" | "deepseek_v4" => 208 * MIB,
         "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES,
