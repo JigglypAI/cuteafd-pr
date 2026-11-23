@@ -366,6 +366,12 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
 - Preserve graph pointer/shape/workspace lifetimes; drain queued work before
   publishing or releasing storage; weight and workspace admission precede
   allocation; zero steady-state graph captures per request.
+- Donor graph updates (a source capture fed to `cudaGraphExecUpdate` on an
+  existing executable) are not captures: they allocate nothing. They are
+  information, not a gate (TJ, 2026-11-24). Cards report them per timed band
+  (`graph_bands`: count, and update host time where recorded); a high count
+  or a visible share of band time flags a donor-tuning follow-up (lag, reserve
+  or working set), filed as an issue, never a merge blocker.
 - Rust: typed errors inside crates, `anyhow` at edges, `tracing`, no
   `unsafe` outside FFI and verbs layers, each block with a safety comment.
 - A change that adds, removes or changes a user-facing launch key, a
