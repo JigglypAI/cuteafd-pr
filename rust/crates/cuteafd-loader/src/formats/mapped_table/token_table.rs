@@ -62,6 +62,8 @@ impl TokenTable {
     /// Host bytes of a cache of `shares` rows of `row_bytes`.
     pub fn cache_bytes(row_bytes: usize, shares: [usize; 2]) -> usize { RowCache::host_bytes(row_bytes, shares) }
     pub fn table(&self) -> &MappedTable { &self.table }
+    pub fn cache(&self) -> &Arc<RowCache> { &self.cache }
+    pub fn rows_per_token(&self) -> usize { self.rows_per_token }
     pub fn row_bytes(&self) -> usize { self.table.row_bytes() }
 
     /// Gather `ids` (in order, duplicates allowed) into `output`, `row_bytes`
@@ -69,7 +71,12 @@ impl TokenTable {
     /// for, and the rest are read here (and published when the cache admits them).
     /// A demand gather of the first table reads ahead of look-ahead reads.
     pub fn gather(&self, ids: &[u64], output: &mut [u8], priority: ReadPriority) -> Result<()> {
-        let priority = priority.first();
+        self.gather_at_priority(ids, output, priority.first())
+    }
+
+    /// Gather `ids` into `output` at the caller's exact [`ReadPriority`] (multi-table
+    /// families pass `priority.first()` for their first table and `priority` for later ones).
+    pub fn gather_at_priority(&self, ids: &[u64], output: &mut [u8], priority: ReadPriority) -> Result<()> {
         let width = self.table.row_bytes();
         ensure!(output.len() == ids.len() * width, "token-table gather destination differs from its rows");
         // Distinct rows in order; duplicates are copied from their first slot.

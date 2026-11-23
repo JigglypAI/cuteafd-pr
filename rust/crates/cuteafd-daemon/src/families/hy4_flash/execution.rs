@@ -5,7 +5,7 @@
 use super::cache::{Hy4CacheRank, Hy4Placement, Hy4Prefix};
 use super::native::Hy4NativeScratch;
 use super::programs::Hy4Programs;
-use super::weights::{Hy4EngramHost, Hy4RankWeights};
+use super::weights::{Hy4EngramHost, Hy4EngramWave, Hy4RankWeights};
 use crate::shared::distributed_head::Handoff;
 use crate::shared::experts::rtx::exl3::Exl3Tp2;
 use crate::shared::experts::rtx::{ExpertInput, Routes, RtxExpertLayer};
@@ -19,9 +19,11 @@ use crate::shared::spark_intake::SparkLink;
 use crate::shared::spark_waves::{self, WaveTicket, Waves};
 use crate::shared::target_head::{self, TargetHead};
 use crate::shared::token_io::DeviceLogits;
+use crate::shared::token_table::{enqueue as enqueue_table_h2d, CopyPlane};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
+use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
@@ -394,7 +396,6 @@ struct ActiveMember {
     next_engram_tail: [u32; 2],
 }
 
-#[derive(Clone, Debug)]
 struct ActiveBatch {
     rows: usize,
     max_seq_end: usize,
@@ -403,12 +404,14 @@ struct ActiveBatch {
     dump_rows: usize,
     use_a: bool,
     members: Vec<ActiveMember>,
+    engram_wave: Hy4EngramWave,
 }
 
 /// Coordinator Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2, 0-Spark or Spark-backed).
 pub(crate) struct Hy4Engine<'a> {
     pub(crate) cfg: Hy4FlashConfig,
     pub(crate) max_rows: usize,
+    pub(crate) prefill_waves: usize,
     pub(crate) max_pages: usize,
     pub(crate) max_sequences: usize,
     pub(crate) max_context: usize,
@@ -483,7 +486,6 @@ impl<'a> Hy4Engine<'a> {
         kv_format: Hy4KvCache,
         max_rows: usize,
         max_pages: usize,
-        force_engram_bf16: bool,
         skip_routed_experts: bool,
         onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
     ) -> Result<Self> {
@@ -495,11 +497,11 @@ impl<'a> Hy4Engine<'a> {
             cfg,
             kv_format,
             max_rows,
+            1,
             max_pages,
             1,
             max_context,
             0,
-            force_engram_bf16,
             skip_routed_experts,
             onboarded_experts,
         )
@@ -514,11 +516,11 @@ impl<'a> Hy4Engine<'a> {
         cfg: Hy4FlashConfig,
         kv_format: Hy4KvCache,
         max_rows: usize,
+        prefill_waves: usize,
         max_pages: usize,
         max_sequences: usize,
         max_context: usize,
         mark_slots: usize,
-        force_engram_bf16: bool,
         skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
     ) -> Result<Self> {
@@ -540,9 +542,10 @@ impl<'a> Hy4Engine<'a> {
             );
         }
 
+        let prefill_waves = prefill_waves.max(1);
         let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, max_rows.min(64))?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
-        let engram = unsafe { Hy4EngramHost::open(checkpoint, &cfg, force_engram_bf16)? };
+        let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, max_rows, prefill_waves)? };
         let max_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16).min(max_pages);
 
         let mut ranks = Vec::with_capacity(gpus);
@@ -634,6 +637,7 @@ impl<'a> Hy4Engine<'a> {
         Ok(Self {
             cfg,
             max_rows,
+            prefill_waves,
             max_pages,
             max_sequences,
             max_context,
@@ -707,7 +711,7 @@ impl<'a> Hy4Engine<'a> {
             r.stream.drain()?;
             r.cache.drain()?;
         }
-        Ok(())
+        self.engram.drain()
     }
 
     pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
@@ -936,11 +940,7 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
 
-            let next_tail = match (p.engram_tail, tok_slice) {
-                (t, []) => t,
-                ([_, b], [x]) => [b, *x],
-                (_, slice) => [slice[slice.len() - 2], slice[slice.len() - 1]],
-            };
+            let next_tail = advance_tail(p.engram_tail, tok_slice, tok_slice.len());
             engram_members.push((p.engram_tail, tok_slice));
             members.push(ActiveMember {
                 sequence: seg.sequence,
@@ -973,14 +973,9 @@ impl<'a> Hy4Engine<'a> {
         }
         let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
 
-        // Precompute batched Engram host lookups for every Engram layer in this unit's layer span.
-        let mut engram_chunks: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
-        for &layer in &self.cfg.engram_layers {
-            if unit.layers.contains(&layer) {
-                let (raw_bytes, masked, _) = self.engram.lookup_batch(layer, &engram_members, priority)?;
-                engram_chunks.insert(layer, (raw_bytes, masked));
-            }
-        }
+        // Issue background FP8 Engram gather + BF16 decode across all Engram layers in this unit
+        // BEFORE launching embed/layer 0 so host I/O overlaps with GPU execution.
+        let engram_wave = self.engram.begin_wave(&unit.layers, &engram_members, priority)?;
 
         // Embed tokens on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
@@ -1006,7 +1001,8 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
 
-        // Upload unit metadata & Engram buffers ONCE on each rank's non-blocking stream.
+        // Upload unit metadata ONCE on each rank's non-blocking stream; Engram layers land
+        // from pinned staging right before each Engram layer runs.
         for r in &self.ranks {
             r.device.run(|| unsafe {
                 let s = r.stream.raw;
@@ -1023,11 +1019,6 @@ impl<'a> Hy4Engine<'a> {
                 if !g_pos_bytes.is_empty() {
                     r.device.library.copy_h2d_ordered(r.scratch.idx_group_pos.buffer, &g_pos_bytes, s)?;
                     r.device.library.copy_h2d_ordered(r.scratch.idx_group_slots.buffer, &g_slots_bytes, s)?;
-                }
-                for (&layer, (raw_bytes, masked)) in &engram_chunks {
-                    let slot = self.engram_index_of[&layer];
-                    r.device.library.copy_h2d_ordered(r.scratch.engram_raw[slot].buffer, raw_bytes, s)?;
-                    r.device.library.copy_h2d_ordered(r.scratch.engram_masked[slot].buffer, masked, s)?;
                 }
                 Ok(())
             })?;
@@ -1054,6 +1045,7 @@ impl<'a> Hy4Engine<'a> {
             dump_rows,
             use_a: true,
             members,
+            engram_wave,
         })
     }
 
@@ -1068,8 +1060,71 @@ impl<'a> Hy4Engine<'a> {
         let rows = batch.rows;
         let use_a = batch.use_a;
 
-        // (A) Engram layer (in-place update on active residual stream r_cur)
+        // (A) Engram layer (land overlapped pinned staging -> H2D (+ P2P on TP2), then in-place gate add)
         if let Some(&slot) = self.engram_index_of.get(&layer) {
+            let (mut lease, raw_bytes, masked_bytes) = batch.engram_wave.take_layer(layer)?;
+            {
+                let r0 = &mut self.ranks[0];
+                let result = r0.device.run(|| {
+                    let pinned = lease.slot_mut().context("empty Hy4 Engram lease")?;
+                    // SAFETY: pinned staging lease stays retained through copied_on; rank-0
+                    // engram_raw[slot] and engram_masked[slot] are consumed in r0.stream order.
+                    let copied = unsafe {
+                        enqueue_table_h2d(
+                            r0.device.library,
+                            pinned.bytes.buffer(),
+                            &[
+                                CopyPlane {
+                                    destination: r0.scratch.engram_raw[slot].buffer,
+                                    offset: 0,
+                                    bytes: raw_bytes,
+                                },
+                                CopyPlane {
+                                    destination: r0.scratch.engram_masked[slot].buffer,
+                                    offset: raw_bytes,
+                                    bytes: masked_bytes,
+                                },
+                            ],
+                            r0.stream.raw,
+                        )
+                    };
+                    // SAFETY: r0.stream contains all reads from this pinned source.
+                    let fenced = unsafe { pinned.bytes.copied_on(r0.stream.raw) };
+                    batch.engram_wave.retain_copy(lease);
+                    if copied.is_err() || fenced.is_err() {
+                        if r0.stream.drain().is_err() {
+                            r0.device.library.quarantine_module_after_failed_drain();
+                        }
+                    }
+                    copied?;
+                    fenced?;
+                    Ok(())
+                });
+                result?;
+                if gpus == 2 {
+                    r0.peer_ready.record(&r0.stream)?;
+                }
+            }
+            if gpus == 2 {
+                let ev0 = self.ranks[0].peer_ready.raw;
+                let src_raw = CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[0].scratch.engram_raw[slot].buffer };
+                let src_mask = CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[0].scratch.engram_masked[slot].buffer };
+                self.ranks[1].device.run(|| unsafe {
+                    self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+                    self.ranks[1].device.library.copy_peer_async(
+                        CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[1].scratch.engram_raw[slot].buffer },
+                        src_raw,
+                        raw_bytes,
+                        self.ranks[1].stream.raw,
+                    )?;
+                    self.ranks[1].device.library.copy_peer_async(
+                        CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[1].scratch.engram_masked[slot].buffer },
+                        src_mask,
+                        masked_bytes,
+                        self.ranks[1].stream.raw,
+                    )
+                })?;
+            }
             for r in &self.ranks {
                 let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
                 r.device.run(|| {

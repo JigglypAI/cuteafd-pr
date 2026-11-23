@@ -2,8 +2,8 @@
 //!
 //! Compares against the published Hy4-flash fidelity set (`0b1a914773`,
 //! `hy4-flash-v1_20261118_own-text-bf16-f32`, agg. NLL `1.283684105386`) and
-//! `python/reference/families/hy4_flash`, verifies Engram FP8 vs BF16 bitwise
-//! identity and unit N=1 vs N byte-exactness.
+//! `python/reference/families/hy4_flash`, reading FP8 Engram shards only and
+//! verifying unit `N=1` vs chunked byte-exactness and exact prefix restore.
 use super::execution::Hy4Engine;
 use crate::shared::golden_scores::{scored_nll, ReferenceRows};
 use crate::shared::memory::device::Device;
@@ -50,9 +50,6 @@ pub(crate) struct GoldenArgs {
     /// Compute NLL/KL/top-1 against reference tokens and optional logits.
     #[arg(long)]
     pub(crate) nll: bool,
-    /// Force BF16 Engram fallback tables instead of `engram_fp8` (for bitwise-identity verification).
-    #[arg(long)]
-    pub(crate) engram_bf16: bool,
     /// Chunk size (rows per unit) for unit-exactness verification (`N=1` vs chunked).
     #[arg(long)]
     pub(crate) prefill_units: Option<usize>,
@@ -172,12 +169,11 @@ fn check_headers_only(args: &GoldenArgs) -> Result<()> {
     )?;
     let total_arena_bytes: usize = arenas.iter().map(|a| a.arena.bytes()).sum();
     println!(
-        "hy4f-golden check-headers OK: view={view:?} gpus={} layers={} dsa={} swa={} engram_fp8={} target_arena_bytes={}",
+        "hy4f-golden check-headers OK: view={view:?} gpus={} layers={} dsa={} swa={} engram_fp8=required target_arena_bytes={}",
         gpus,
         cfg.layers,
         cfg.sparse_layers().len(),
         cfg.swa_layers().len(),
-        model.has_engram_fp8,
         total_arena_bytes,
     );
     Ok(())
@@ -342,11 +338,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             cfg.clone(),
             args.kv_cache,
             unit,
+            1,
             max_pages,
             2,
             max_pages * 64,
             if args.resume_host { 2 } else { 4 },
-            args.engram_bf16,
             args.skip_routed_experts,
             onboarded,
         )?
@@ -359,7 +355,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             args.kv_cache,
             unit,
             max_pages,
-            args.engram_bf16,
             args.skip_routed_experts,
             onboarded,
         )?
@@ -597,12 +592,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
     let digest = digest_f32(&logits);
     println!(
-        "hy4f-golden logits digest={} rows={} vocab={} unit={} engram={}",
+        "hy4f-golden logits digest={} rows={} vocab={} unit={} engram=engram_fp8",
         digest,
         tokens.len(),
         vocab,
         unit,
-        if args.engram_bf16 { "bf16" } else { "engram_fp8" }
     );
 
     if let Some(out_dir) = &args.save_logits {
@@ -902,7 +896,6 @@ mod tests {
             "--nll",
             "--split-device",
             "1",
-            "--engram-bf16",
             "--skip-routed-experts",
         ])
         .expect("hy4f-golden CLI parse");
@@ -911,9 +904,19 @@ mod tests {
         };
         assert!(args.nll);
         assert_eq!(args.split_device, Some(1));
-        assert!(args.engram_bf16);
         assert!(args.skip_routed_experts);
         assert_eq!(args.last_layer, 41);
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "cuteafd",
+                "hy4f-golden",
+                "--snapshot",
+                "/snapshot",
+                "--engram-bf16",
+            ])
+            .is_err(),
+            "--engram-bf16 must be rejected (FP8 Engram only)"
+        );
     }
 
     #[test]

@@ -16,10 +16,21 @@ use cuteafd_engine::{
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool},
 };
 use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
+use cuteafd_loader::formats::mapped_table::lookahead::LookaheadHandle;
 use cuteafd_loader::formats::mapped_table::ReadPriority;
-use std::cell::RefCell;
+use cuteafd_loader::TableUnitPlan;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::Path;
+
+#[inline]
+fn engram_tail_of(pad_id: u32, history: &[u32]) -> [u32; 2] {
+    match history {
+        [] => [pad_id, pad_id],
+        [a] => [pad_id, *a],
+        s => [s[s.len() - 2], s[s.len() - 1]],
+    }
+}
 
 fn check_writable(placement: &Hy4Placement, rows: usize, context: usize, pool: &RefPagePool) -> Result<()> {
     let end = placement.len.checked_add(rows).context("Hy4 append extent overflow")?;
@@ -108,11 +119,13 @@ pub(crate) struct Hy4Backend<'a> {
     context: usize,
     concurrency: usize,
     unit_rows: usize,
+    prefill_waves: usize,
     vocab: usize,
     pad_id: u32,
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
+    request_id: Cell<u64>,
 }
 
 impl<'a> Hy4Backend<'a> {
@@ -125,6 +138,7 @@ impl<'a> Hy4Backend<'a> {
         let library = engine.library();
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
+        let prefill_waves = engine.prefill_waves;
         let vocab = engine.cfg.vocab_size;
         let pad_id = engine.cfg.engram_pad_id;
         ensure!(
@@ -139,11 +153,34 @@ impl<'a> Hy4Backend<'a> {
             context,
             concurrency,
             unit_rows,
+            prefill_waves,
             vocab,
             pad_id,
             host,
             profile: RefCell::new([0.0; 2]),
             pending: RefCell::new(None),
+            request_id: Cell::new(0),
+        })
+    }
+
+    /// Build the scheduler-aligned prefill unit plan for `tokens[resume..end]`.
+    fn engram_units(&self, resume: usize, end: usize, chunk_ends: &[usize]) -> Result<TableUnitPlan> {
+        let mut ends = Vec::new();
+        let mut calls = Vec::new();
+        let mut at = resume;
+        for &chunk_end in chunk_ends.iter().filter(|&&e| e > resume).chain(std::iter::once(&end)) {
+            if chunk_end <= at {
+                continue;
+            }
+            calls.push(ends.len());
+            let units = sequence_units(chunk_end - at, self.unit_rows, 1, 1)?;
+            ends.extend(units.iter().map(|unit| (at + unit.rows.end) as u64));
+            at = chunk_end;
+        }
+        Ok(TableUnitPlan {
+            ends,
+            depth: self.prefill_waves.max(1),
+            calls,
         })
     }
 
@@ -323,6 +360,39 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
 
     fn history(&self, placement: &Hy4Placement) -> usize {
         placement.slot
+    }
+
+    fn read_ahead(
+        &self,
+        _placement: &Hy4Placement,
+        tokens: &[u32],
+        resume: usize,
+        chunk_ends: &[usize],
+    ) -> Option<LookaheadHandle> {
+        if resume >= tokens.len() {
+            return None;
+        }
+        let units = self.engram_units(resume, tokens.len(), chunk_ends).ok()?;
+        let tail = engram_tail_of(self.pad_id, &tokens[..resume]);
+        let id = self.request_id.get().wrapping_add(1);
+        self.request_id.set(id);
+        Some(self.engine.borrow().engram.start_lookahead(
+            id,
+            resume as u64,
+            tail,
+            tokens[resume..].to_vec(),
+            units,
+        ))
+    }
+
+    fn prefetch_decode(&self, history: &[u32], tokens: &[u32]) {
+        if tokens.is_empty() {
+            return;
+        }
+        let tail = engram_tail_of(self.pad_id, history);
+        if let Err(error) = self.engine.borrow().engram.prefetch_decode(&[(tail, tokens)]) {
+            tracing::warn!("Hy4 Engram decode prefetch: {error:#}");
+        }
     }
 
     fn require_live(&self) -> Result<()> {
@@ -649,6 +719,8 @@ mod tests {
         let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
         let exec = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
         assert!(backend.contains("Backend<'a> for Hy4Backend"));
+        assert!(backend.contains("fn read_ahead("));
+        assert!(backend.contains("fn prefetch_decode("));
         assert!(backend.contains("streamed_prefill_scoring(&self) -> bool { true }"));
         assert!(backend.contains("prefill_packing::plan("));
         assert!(backend.contains("registered_retained("));

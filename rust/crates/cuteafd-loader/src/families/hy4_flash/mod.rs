@@ -1,5 +1,5 @@
 //! Hy4-flash (`hy_v4_flash`, `HYV4FlashForConditionalGeneration`) checkpoint facts,
-//! Engram mapped-table reader (FP8 alternate default + BF16 fallback), packed
+//! FP8-only Engram mapped-table reader and multi-layer look-ahead, packed
 //! coordinator weight arenas, and shared-contract execution layouts.
 pub mod config;
 pub mod engram;
@@ -8,8 +8,9 @@ pub mod weight_layout;
 
 pub use config::{Hy4DflyConfig, Hy4FlashConfig, Hy4VisionConfig};
 pub use engram::{
-    decode_fp8_row, vendor_bf16_roundtrip, Hy4EngramHasher, Hy4EngramHistory, Hy4EngramStorage,
-    Hy4EngramTable, ENGRAM_EMBED_WIDTH, ENGRAM_FP8_ROW_BYTES,
+    advance_tail, decode_fp8_row, decode_fp8_rows_to_bf16_bytes, Hy4EngramHasher,
+    Hy4EngramHistory, Hy4EngramLookahead, Hy4EngramShape, Hy4EngramTable,
+    ENGRAM_DECODED_TOKEN_BYTES, ENGRAM_EMBED_WIDTH, ENGRAM_FP8_ROW_BYTES, ENGRAM_HEADS,
 };
 
 /// Paged KV cache precision for the 12 DSA layers (576-dim absorbed MLA record:
