@@ -29,6 +29,10 @@ NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "inkling2-nvfp4-min.config", "inkling2-exl3-min.config", "inkling2-exl3-max.config",
+                 "hy4-flash-exl3-k4-mc-min.config", "hy4-flash-exl3-k4-mc-max.config",
+                 "hy4-flash-exl3-k4-mc-k8-max.config", "hy4-flash-exl3-k4-mc-k6-max.config",
+                 "hy4-flash-exl3-k4-mc-fp8-max.config", "hy4-flash-exl3-k4-mc-1rtx-1spark.config",
+                 "hy4-flash-exl3-k4-mc-1rtx-4spark-k6.config",
                  "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
@@ -610,6 +614,7 @@ MC_CHECKPOINTS = {
     "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
     "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
     "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
+    "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
 }
 
 
@@ -703,7 +708,7 @@ def test_v6_smoke_matrix_retires_the_5090_column() -> None:
         identity = (entry["family"], values["MODEL_ID"], column)
         assert identity not in cards, identity
         cards.add(identity)
-    assert len(names) == len(smoke["entries"]) == 35
+    assert len(names) == len(smoke["entries"]) == 37
     # The approved v6 families and their columns.
     assert {(family, column) for family, _, column in cards} >= {
         ("deepseek_v41", "1rtx"), ("deepseek_v41", "2rtx"),
@@ -716,6 +721,7 @@ def test_v6_smoke_matrix_retires_the_5090_column() -> None:
         ("step5", "1rtx"), ("step5", "2rtx"),
         ("minimax_m3", "1rtx"), ("minimax_m3", "2rtx"),
         ("inkling2", "1rtx"), ("inkling2", "2rtx"),
+        ("hy4_flash", "1rtx"), ("hy4_flash", "2rtx"),
     }
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
@@ -743,7 +749,7 @@ def test_v6_mc_main_cards_use_the_original_core_except_kimi_1x() -> None:
 
 def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
     compact = json.loads((ROOT / V6_COMPACT).read_text())
-    assert len(compact["entries"]) == 21
+    assert len(compact["entries"]) == 24
     views: dict[str, set] = {}
     ports: dict[str, set] = {}
     for entry in compact["entries"]:

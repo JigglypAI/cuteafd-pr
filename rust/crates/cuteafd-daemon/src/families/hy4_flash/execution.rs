@@ -9,11 +9,14 @@ use super::weights::{Hy4EngramHost, Hy4RankWeights};
 use crate::shared::distributed_head::Handoff;
 use crate::shared::experts::rtx::exl3::Exl3Tp2;
 use crate::shared::experts::rtx::{ExpertInput, Routes, RtxExpertLayer};
+use crate::shared::experts::staging::RouteStaging;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::Tag;
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
+use crate::shared::spark_intake::SparkLink;
+use crate::shared::spark_waves::{self, WaveTicket, Waves};
 use crate::shared::target_head::{self, TargetHead};
 use crate::shared::token_io::DeviceLogits;
 use anyhow::{ensure, Context, Result};
@@ -24,7 +27,11 @@ use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use std::collections::BTreeMap;
+use cuteafd_transport::{
+    expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
+    ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 const H: usize = 3072;
@@ -397,7 +404,7 @@ struct ActiveBatch {
     members: Vec<ActiveMember>,
 }
 
-/// Coordinator-only Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2).
+/// Coordinator Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2, 0-Spark or Spark-backed).
 pub(crate) struct Hy4Engine<'a> {
     pub(crate) cfg: Hy4FlashConfig,
     pub(crate) max_rows: usize,
@@ -409,6 +416,10 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) dump_dir: Option<std::path::PathBuf>,
     ranks: Vec<RankRuntime<'a>>,
     head_handoff: Option<Handoff<'a>>,
+    spark: Option<SparkLink<'a>>,
+    onboarded_layers: BTreeSet<usize>,
+    next_identity: u64,
+    placement_version: u64,
     dsa_index_of: BTreeMap<usize, usize>,
     swa_index_of: BTreeMap<usize, usize>,
     engram_index_of: BTreeMap<usize, usize>,
@@ -569,6 +580,7 @@ impl<'a> Hy4Engine<'a> {
             .collect();
         let golden_placement = Hy4Placement::new((0..max_pages as u32).collect(), 0, cfg.engram_pad_id);
 
+        let onboarded_layers: BTreeSet<usize> = cfg.routed_layers().into_iter().collect();
         Ok(Self {
             cfg,
             max_rows,
@@ -580,12 +592,38 @@ impl<'a> Hy4Engine<'a> {
             dump_dir: None,
             ranks,
             head_handoff,
+            spark: None,
+            onboarded_layers,
+            next_identity: 1,
+            placement_version: 1,
             dsa_index_of,
             swa_index_of,
             engram_index_of,
             golden_placement,
             terminal: false,
         })
+    }
+
+    /// Attach a bootstrapped Spark expert link for routed layers not onboarded onto the RTX GPUs.
+    pub(crate) fn attach_spark(&mut self, link: SparkLink<'a>, onboarded_layers: impl IntoIterator<Item = usize>) {
+        self.spark = Some(link);
+        self.onboarded_layers = onboarded_layers.into_iter().collect();
+    }
+
+    /// Orderly terminal retirement: quiesce Spark link, drain device streams and caches, release link.
+    pub(crate) fn terminate(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        if let Some(spark) = &mut self.spark {
+            let _ = spark.terminal_quiesce();
+        }
+        let _ = self.drain();
+        if let Some(spark) = &mut self.spark {
+            let _ = spark.terminal_drain_copies();
+            let _ = spark.terminal_release();
+        }
     }
 
     pub(crate) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary {
@@ -1393,190 +1431,140 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    /// Run dense FFN (layer 0) or local onboarded LatentMoE (layers 1..=41) + post-FFN norm + iHC post.
-    fn run_layer_local_ffn(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
+    /// Run MoE router + latent down + FP8 K32 quant + shared expert on all ranks (used by both local & Spark FFN).
+    fn run_moe_router_and_shared(&mut self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let gpus = self.ranks.len();
         let rows = batch.rows;
-
         for r in &mut self.ranks {
             let s_rows = [Scalar::I32(rows as i32)];
             let dev = r.device;
             dev.run(|| {
                 // SAFETY: all buffers live through stream drain.
                 unsafe {
-                    if self.cfg.dense_layer[layer] {
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.gate_proj"),
-                            &r.programs.proj_dense_gate_up,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.ffn_gate.buffer,
-                        )?;
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.up_proj"),
-                            &r.programs.proj_dense_gate_up,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.ffn_up.buffer,
-                        )?;
-                        r.programs.post_silu_split_dense.launch(
-                            &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        launch_proj_split(
-                            r,
-                            gpus,
-                            &format!("{p}.mlp.down_proj"),
-                            &r.programs.proj_dense_down,
-                            rows,
-                            r.scratch.ffn_act.buffer,
-                            r.scratch.delta.buffer,
-                            r.scratch.delta_f32.buffer,
-                        )?;
-                    } else {
-                        r.programs.proj_router.launch(
-                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
-                        r.device.library.copy_d2d_async(
-                            r.scratch.router_select.buffer,
-                            r.scratch.router_logits.buffer,
-                            rows * EXPERTS * 4,
-                            r.stream.raw,
-                        )?;
-                        r.device.library.router_select(
-                            r.scratch.router_select.buffer.ptr,
-                            bias,
-                            std::ptr::null(),
-                            std::ptr::null(),
-                            r.scratch.route_ids.buffer.ptr,
-                            r.scratch.route_weights.buffer.ptr,
-                            rows,
-                            EXPERTS,
-                            TOPK,
-                            self.cfg.routed_scaling_factor as f32,
-                            true,
-                            r.stream.raw,
-                        )?;
-                        r.programs.route_weights.launch(
-                            &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.routed_expert_down_proj"),
-                            &r.programs.proj_latent_down,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.latent_in.buffer,
-                        )?;
-                        let grid = r.quantize_grid.blocks(rows, LATENT_H);
-                        r.programs.expert_input_quant.launch(
-                            &[
-                                r.scratch.latent_in.buffer.ptr,
-                                r.scratch.wire_in.buffer.ptr,
-                                r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
-                                r.scratch.wire_in.buffer.ptr,
-                            ],
-                            &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
-                            r.stream.raw,
-                        )?;
-
-                        if !self.skip_routed_experts {
-                            if let Some(experts) = &mut r.onboarded_experts {
-                                experts.enqueue(
-                                    layer,
-                                    rows,
-                                    ExpertInput::Fp8K32(r.scratch.wire_in.buffer.ptr),
-                                    Routes {
-                                        ids: r.scratch.route_ids.buffer.ptr,
-                                        weights: r.scratch.route_weights.buffer.ptr,
-                                    },
-                                    r.stream.raw,
-                                    &mut || (),
-                                )?;
-                                let exp_out = CuteafdDeviceBuffer {
-                                    ptr: experts.output(),
-                                    bytes: rows * LATENT_H * 4,
-                                    device_id: r.device.id,
-                                    flags: 0,
-                                };
-                                if gpus == 1 {
-                                    r.device.library.cuda_f32_to_bf16_async(
-                                        exp_out,
-                                        r.scratch.routed_latent.buffer,
-                                        rows * LATENT_H,
-                                        r.stream.raw,
-                                    )?;
-                                } else {
-                                    r.device.library.copy_d2d_async(
-                                        r.scratch.delta_f32.buffer,
-                                        exp_out,
-                                        rows * LATENT_H * 4,
-                                        r.stream.raw,
-                                    )?;
-                                }
-                            } else {
-                                anyhow::bail!(
-                                    "layer {layer}: no onboarded hy4f:exl3-k45-mul1 expert package loaded (pass --expert-package or --skip-routed-experts for non-expert diagnostics)"
-                                );
-                            }
-                        } else {
-                            r.device.library.cuda_zero_bytes_async(r.scratch.routed_latent.buffer, rows * LATENT_H * 2, r.stream.raw)?;
-                            if gpus == 2 {
-                                r.device.library.cuda_zero_bytes_async(r.scratch.delta_f32.buffer, rows * LATENT_H * 4, r.stream.raw)?;
-                            }
-                        }
-
-                        // Shared expert
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.shared_experts.gate_proj"),
-                            &r.programs.proj_shared_gate_up,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.ffn_gate.buffer,
-                        )?;
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.shared_experts.up_proj"),
-                            &r.programs.proj_shared_gate_up,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.ffn_up.buffer,
-                        )?;
-                        r.programs.post_silu_split_shared.launch(
-                            &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        launch_proj_split(
-                            r,
-                            gpus,
-                            &format!("{p}.mlp.shared_experts.down_proj"),
-                            &r.programs.proj_shared_down,
-                            rows,
-                            r.scratch.ffn_act.buffer,
-                            r.scratch.shared_out.buffer,
-                            r.scratch.shared_f32.buffer,
-                        )?;
-                    }
+                    r.programs.proj_router.launch(
+                        &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
+                    r.device.library.copy_d2d_async(
+                        r.scratch.router_select.buffer,
+                        r.scratch.router_logits.buffer,
+                        rows * EXPERTS * 4,
+                        r.stream.raw,
+                    )?;
+                    r.device.library.router_select(
+                        r.scratch.router_select.buffer.ptr,
+                        bias,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        r.scratch.route_ids.buffer.ptr,
+                        r.scratch.route_weights.buffer.ptr,
+                        rows,
+                        EXPERTS,
+                        TOPK,
+                        self.cfg.routed_scaling_factor as f32,
+                        true,
+                        r.stream.raw,
+                    )?;
+                    r.programs.route_weights.launch(
+                        &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.routed_expert_down_proj"),
+                        &r.programs.proj_latent_down,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.latent_in.buffer,
+                    )?;
+                    let grid = r.quantize_grid.blocks(rows, LATENT_H);
+                    r.programs.expert_input_quant.launch(
+                        &[
+                            r.scratch.latent_in.buffer.ptr,
+                            r.scratch.wire_in.buffer.ptr,
+                            r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
+                            r.scratch.wire_in.buffer.ptr,
+                        ],
+                        &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
+                        r.stream.raw,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.shared_experts.gate_proj"),
+                        &r.programs.proj_shared_gate_up,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.ffn_gate.buffer,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.shared_experts.up_proj"),
+                        &r.programs.proj_shared_gate_up,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.ffn_up.buffer,
+                    )?;
+                    r.programs.post_silu_split_shared.launch(
+                        &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_split(
+                        r,
+                        gpus,
+                        &format!("{p}.mlp.shared_experts.down_proj"),
+                        &r.programs.proj_shared_down,
+                        rows,
+                        r.scratch.ffn_act.buffer,
+                        r.scratch.shared_out.buffer,
+                        r.scratch.shared_f32.buffer,
+                    )?;
                 }
                 Ok(())
             })?;
         }
+        Ok(())
+    }
+
+    /// Finish post-FFN combine (`latent_up` + shared add + norm + iHC post) for dense or MoE layer.
+    /// When `reduce_routed_tp2 == false` on TP2, rank 0's `routed_latent` (from Spark) is replicated to rank 1.
+    fn finish_ffn_combine_and_post(&mut self, layer: usize, batch: &mut ActiveBatch, reduce_routed_tp2: bool) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let gpus = self.ranks.len();
+        let rows = batch.rows;
 
         if self.cfg.dense_layer[layer] {
             self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.down_proj")))?;
         } else {
             if gpus == 2 {
-                self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None)?;
+                if reduce_routed_tp2 {
+                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None)?;
+                    for r in &self.ranks {
+                        r.device.run(|| unsafe {
+                            r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)
+                        })?;
+                    }
+                } else {
+                    // Spark reply landed on rank 0's routed_latent [rows, 1536] BF16: replicate to rank 1 via P2P.
+                    let bytes = rows * LATENT_H * 2;
+                    let (ev0, src0) = {
+                        let r0 = &mut self.ranks[0];
+                        r0.peer_ready.record(&r0.stream)?;
+                        (r0.peer_ready.raw, CuteafdDeviceBuffer { bytes, ..r0.scratch.routed_latent.buffer })
+                    };
+                    self.ranks[1].device.run(|| unsafe {
+                        self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+                        self.ranks[1].device.library.copy_peer_async(
+                            CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.routed_latent.buffer },
+                            src0,
+                            bytes,
+                            self.ranks[1].stream.raw,
+                        )
+                    })?;
+                }
                 for r in &self.ranks {
                     r.device.run(|| unsafe {
-                        r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)?;
                         r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.shared_f32.buffer, rows * H * 4, r.stream.raw)
                     })?;
                 }
@@ -1649,6 +1637,114 @@ impl<'a> Hy4Engine<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Run dense FFN (layer 0) or local onboarded LatentMoE (layers 1..=41) + post-FFN norm + iHC post.
+    fn run_layer_local_ffn(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let gpus = self.ranks.len();
+        let rows = batch.rows;
+
+        if self.cfg.dense_layer[layer] {
+            for r in &mut self.ranks {
+                let s_rows = [Scalar::I32(rows as i32)];
+                let dev = r.device;
+                dev.run(|| {
+                    // SAFETY: all buffers live through stream drain.
+                    unsafe {
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.mlp.gate_proj"),
+                            &r.programs.proj_dense_gate_up,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.ffn_gate.buffer,
+                        )?;
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.mlp.up_proj"),
+                            &r.programs.proj_dense_gate_up,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.ffn_up.buffer,
+                        )?;
+                        r.programs.post_silu_split_dense.launch(
+                            &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
+                            &s_rows, r.stream.raw,
+                        )?;
+                        launch_proj_split(
+                            r,
+                            gpus,
+                            &format!("{p}.mlp.down_proj"),
+                            &r.programs.proj_dense_down,
+                            rows,
+                            r.scratch.ffn_act.buffer,
+                            r.scratch.delta.buffer,
+                            r.scratch.delta_f32.buffer,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            return self.finish_ffn_combine_and_post(layer, batch, true);
+        }
+
+        self.run_moe_router_and_shared(layer, batch)?;
+        for r in &mut self.ranks {
+            let dev = r.device;
+            dev.run(|| {
+                // SAFETY: all buffers live through stream drain.
+                unsafe {
+                    if !self.skip_routed_experts {
+                        if let Some(experts) = &mut r.onboarded_experts {
+                            experts.enqueue(
+                                layer,
+                                rows,
+                                ExpertInput::Fp8K32(r.scratch.wire_in.buffer.ptr),
+                                Routes {
+                                    ids: r.scratch.route_ids.buffer.ptr,
+                                    weights: r.scratch.route_weights.buffer.ptr,
+                                },
+                                r.stream.raw,
+                                &mut || (),
+                            )?;
+                            let exp_out = CuteafdDeviceBuffer {
+                                ptr: experts.output(),
+                                bytes: rows * LATENT_H * 4,
+                                device_id: r.device.id,
+                                flags: 0,
+                            };
+                            if gpus == 1 {
+                                r.device.library.cuda_f32_to_bf16_async(
+                                    exp_out,
+                                    r.scratch.routed_latent.buffer,
+                                    rows * LATENT_H,
+                                    r.stream.raw,
+                                )?;
+                            } else {
+                                r.device.library.copy_d2d_async(
+                                    r.scratch.delta_f32.buffer,
+                                    exp_out,
+                                    rows * LATENT_H * 4,
+                                    r.stream.raw,
+                                )?;
+                            }
+                        } else {
+                            anyhow::bail!(
+                                "layer {layer}: no onboarded hy4f:exl3-k45-mul1 expert package loaded (pass --expert-package or --skip-routed-experts for non-expert diagnostics)"
+                            );
+                        }
+                    } else {
+                        r.device.library.cuda_zero_bytes_async(r.scratch.routed_latent.buffer, rows * LATENT_H * 2, r.stream.raw)?;
+                        if gpus == 2 {
+                            r.device.library.cuda_zero_bytes_async(r.scratch.delta_f32.buffer, rows * LATENT_H * 4, r.stream.raw)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        self.finish_ffn_combine_and_post(layer, batch, true)
     }
 
     /// Project a `<= 64`-row tile of `r0.scratch.y[y_row_off .. y_row_off + count]` through the
@@ -1833,74 +1929,172 @@ impl<'a> Hy4Engine<'a> {
     ) -> Result<()> {
         self.require_live()?;
         let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
-        struct Hooks<'e, 'a, 'p, F> {
-            engine: &'e mut Hy4Engine<'a>,
-            placements: &'p mut [Hy4Placement],
-            initial_starts: &'p [usize],
-            sources: &'p [&'p [u32]],
-            priority: ReadPriority,
-            head_mode: F,
-            on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
-            active: Option<ActiveBatch>,
-        }
-        impl<F: Fn(&Unit) -> HeadMode> PrefillHooks for Hooks<'_, '_, '_, F> {
-            type Ticket = ();
-            fn route(&self, _layer: usize) -> FfnRoute {
-                FfnRoute::Local
-            }
-            fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
-                let batch = self.engine.begin_batch(self.placements, self.initial_starts, self.sources, unit, self.priority)?;
-                self.active = Some(batch);
-                Ok(())
-            }
-            fn attention(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
-                let batch = self.active.as_mut().context("Hy4 attention without active unit")?;
-                self.engine.run_layer_attention(layer, batch)
-            }
-            fn local_ffn(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
-                let batch = self.active.as_mut().context("Hy4 FFN without active unit")?;
-                self.engine.run_layer_local_ffn(layer, batch)
-            }
-            fn send_experts(&mut self, _layer: usize, _unit: &Unit) -> Result<()> {
-                anyhow::bail!("Hy4 Spark remote dispatch not yet bound")
-            }
-            fn land_experts(&mut self, _layer: usize, _unit: &Unit, _ticket: ()) -> Result<()> {
-                anyhow::bail!("Hy4 Spark remote dispatch not yet bound")
-            }
-            fn end_unit(&mut self, unit: &Unit) -> Result<()> {
-                let batch = self.active.as_ref().context("Hy4 end_unit without active unit")?;
-                let mode = if unit.layers.end == self.engine.cfg.layers {
-                    (self.head_mode)(unit)
-                } else {
-                    HeadMode::None
-                };
-                self.engine.finish_head(batch, mode, &mut |row_off, logits| (self.on_tile)(unit, row_off, logits))
-            }
-            fn commit_unit(&mut self, _unit: &Unit) -> Result<()> {
-                let batch = self.active.take().context("Hy4 commit_unit without active unit")?;
-                for m in &batch.members {
-                    let p = &mut self.placements[m.sequence];
-                    p.len = m.pos_start + m.row_len;
-                    p.state_len = p.len;
-                    p.engram_tail = m.next_engram_tail;
-                }
-                Ok(())
-            }
-        }
-        let mut hooks = Hooks {
-            engine: self,
-            placements,
-            initial_starts: &initial_starts,
-            sources,
-            priority,
-            head_mode,
-            on_tile,
-            active: None,
+        let kind = match priority {
+            ReadPriority::Decode => ExpertV2SourceKind::Decode,
+            _ => ExpertV2SourceKind::Prefill,
         };
-        let result = run_prefill_units(&mut hooks, units, 1);
+        let mut spark = self.spark.take();
+        let result = (|| {
+            let waves = spark.as_mut().map(|s| s.exchange()).transpose()?;
+            struct Hooks<'e, 'a, 'p, 'w, F> {
+                engine: &'e mut Hy4Engine<'a>,
+                waves: Option<&'w mut Waves<'a>>,
+                placements: &'p mut [Hy4Placement],
+                initial_starts: &'p [usize],
+                sources: &'p [&'p [u32]],
+                priority: ReadPriority,
+                kind: ExpertV2SourceKind,
+                head_mode: F,
+                on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
+                active: Option<ActiveBatch>,
+            }
+            impl<F: Fn(&Unit) -> HeadMode> PrefillHooks for Hooks<'_, '_, '_, '_, F> {
+                type Ticket = Option<WaveTicket>;
+                fn route(&self, layer: usize) -> FfnRoute {
+                    if self.engine.cfg.dense_layer[layer]
+                        || self.waves.is_none()
+                        || self.engine.onboarded_layers.contains(&layer)
+                    {
+                        FfnRoute::Local
+                    } else {
+                        FfnRoute::Spark
+                    }
+                }
+                fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+                    let batch = self.engine.begin_batch(self.placements, self.initial_starts, self.sources, unit, self.priority)?;
+                    self.active = Some(batch);
+                    Ok(())
+                }
+                fn attention(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_mut().context("Hy4 attention without active unit")?;
+                    self.engine.run_layer_attention(layer, batch)
+                }
+                fn local_ffn(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_mut().context("Hy4 FFN without active unit")?;
+                    self.engine.run_layer_local_ffn(layer, batch)
+                }
+                fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Option<WaveTicket>> {
+                    let batch = self.active.as_ref().context("Hy4 send_experts without active unit")?;
+                    self.engine.run_moe_router_and_shared(layer, batch)?;
+                    let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
+                    let rows = batch.rows;
+                    let identity = self.engine.next_identity;
+                    self.engine.next_identity = identity.checked_add(1).context("Hy4 Spark identity exhausted")?;
+                    let version = self.engine.placement_version;
+                    let dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
+                    let staging = RouteStaging::new(rows, TOPK, dtype.row_bytes(LATENT_H)?)?;
+                    let kind = self.kind;
+                    let origins: Vec<(u64, u64)> = unit
+                        .segments
+                        .iter()
+                        .flat_map(|seg| seg.tokens.clone().map(move |pos| (seg.sequence as u64 + 1, pos as u64)))
+                        .collect();
+                    let packed = unit.reply_origins()?;
+                    let combined = if kind == ExpertV2SourceKind::Prefill {
+                        packed
+                            .as_ref()
+                            .map_or_else(|| spark_waves::single_reply_eligible(rows, kind), |o| o.combined_reply_eligible())
+                    } else {
+                        spark_waves::single_reply_eligible(rows, kind)
+                    };
+                    let source = unit.sequence as u64 + 1;
+                    let start = unit.rows.start;
+                    let r0 = &self.engine.ranks[0];
+                    let ticket = r0.device.run(|| {
+                        // SAFETY: admitted rank-0 scratch owns route_ids/route_weights/wire_in on r0.stream.
+                        unsafe {
+                            waves.send(
+                                rows,
+                                rows * LATENT_H * 2,
+                                staging,
+                                [
+                                    r0.scratch.route_ids.buffer,
+                                    r0.scratch.route_weights.buffer,
+                                    r0.scratch.wire_in.buffer,
+                                ],
+                                r0.stream.raw,
+                                combined,
+                                Box::new(move |routes, wire| {
+                                    let mut req = build_hy4_spark_request(identity, version, layer, source, start, rows, dtype, routes, wire)?;
+                                    if let Some(packed) = packed {
+                                        packed.apply(&mut req)?;
+                                    }
+                                    ensure!(origins.len() == req.rows.len(), "Hy4 Spark origin count differs");
+                                    for (row, &(src_id, pos)) in req.rows.iter_mut().zip(&origins) {
+                                        row.source_request_id = src_id;
+                                        row.token_position = pos;
+                                        row.source_kind = kind;
+                                    }
+                                    Ok(req)
+                                }),
+                            )
+                        }
+                    })?;
+                    Ok(Some(ticket))
+                }
+                fn land_experts(&mut self, layer: usize, _unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
+                    let ticket = ticket.context("Hy4 land_experts missing WaveTicket")?;
+                    let slot = ticket.slot();
+                    let batch = self.active.as_mut().context("Hy4 land_experts without active unit")?;
+                    let rows = batch.rows;
+                    let waves = self.waves.as_mut().context("Hy4 Spark land without active SparkLink")?;
+                    let r0 = &self.engine.ranks[0];
+                    r0.device.run(|| {
+                        waves.land(ticket, r0.stream.raw)?;
+                        // SAFETY: wave landed on r0.stream before reduction into rank-0 routed_latent.
+                        unsafe {
+                            waves.reduce(
+                                slot,
+                                std::ptr::null(),
+                                r0.scratch.routed_latent.buffer.ptr.cast(),
+                                rows,
+                                r0.stream.raw,
+                            )
+                        }
+                    })?;
+                    self.engine.finish_ffn_combine_and_post(layer, batch, false)
+                }
+                fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_ref().context("Hy4 end_unit without active unit")?;
+                    let mode = if unit.layers.end == self.engine.cfg.layers {
+                        (self.head_mode)(unit)
+                    } else {
+                        HeadMode::None
+                    };
+                    self.engine.finish_head(batch, mode, &mut |row_off, logits| (self.on_tile)(unit, row_off, logits))
+                }
+                fn commit_unit(&mut self, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.take().context("Hy4 commit_unit without active unit")?;
+                    for m in &batch.members {
+                        let p = &mut self.placements[m.sequence];
+                        p.len = m.pos_start + m.row_len;
+                        p.state_len = p.len;
+                        p.engram_tail = m.next_engram_tail;
+                    }
+                    Ok(())
+                }
+            }
+            let mut hooks = Hooks {
+                engine: self,
+                waves,
+                placements,
+                initial_starts: &initial_starts,
+                sources,
+                priority,
+                kind,
+                head_mode,
+                on_tile,
+                active: None,
+            };
+            run_prefill_units(&mut hooks, units, 1)?;
+            if spark.is_some() {
+                spark_waves::healthy()?;
+            }
+            Ok(())
+        })();
+        self.spark = spark;
         if result.is_err() {
-            let _ = hooks.engine.drain();
-            hooks.engine.terminal = true;
+            self.terminate();
         }
         result
     }
@@ -1980,5 +2174,86 @@ impl<'a> Hy4Engine<'a> {
             .chunks_exact(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
             .collect())
+    }
+}
+
+impl Drop for Hy4Engine<'_> {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hy4_spark_request(
+    identity: u64,
+    version: u64,
+    layer: usize,
+    source: u64,
+    start: usize,
+    rows: usize,
+    dtype: ExpertV2Dtype,
+    routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes,
+) -> Result<ExpertProtocolV2Request> {
+    ensure!(
+        identity > 0 && version > 0 && source > 0 && (1..42).contains(&layer) && (1..=4096).contains(&rows),
+        "Hy4 Spark request geometry/identity differs (layer={layer}, rows={rows})"
+    );
+    let descriptors = (0..rows)
+        .map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: (start + row) as u64,
+            source_kind: ExpertV2SourceKind::Prefill,
+            source_request_id: source,
+            token_position: (start + row) as u64,
+            route_offset: (row * TOPK) as u32,
+            route_count: TOPK as u32,
+        })
+        .collect();
+    let mut request = ExpertProtocolV2Request::new_bytes(
+        identity,
+        version,
+        u32::try_from(layer)?,
+        LATENT_H as u32,
+        dtype,
+        descriptors,
+        routes,
+        wire,
+    )?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hy4_spark_request_uses_latent_1536_k16_fp8k32_compact_bf16() -> Result<()> {
+        let routes: Vec<ExpertProtocolV2RouteEntry> = (0..32)
+            .map(|i| ExpertProtocolV2RouteEntry {
+                row_index: i / 16,
+                expert_id: i,
+                gate_weight: 0.0625,
+            })
+            .collect();
+        let req = build_hy4_spark_request(
+            7,
+            1,
+            15,
+            3,
+            100,
+            2,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            routes,
+            vec![0u8; 2 * (1536 + 1536 / 32)].into(),
+        )?;
+        assert_eq!(req.header.hidden_dim, 1536);
+        assert_eq!(req.header.hidden_dtype, ExpertV2Dtype::Fp8E4m3Ue8m0K32);
+        assert_eq!(req.header.hidden_row_stride_bytes, 1584);
+        assert_eq!(req.rows[0].route_count, 16);
+        assert_eq!(req.rows[1].route_offset, 16);
+        assert_ne!(req.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+        assert!(build_hy4_spark_request(7, 1, 0, 3, 0, 1, ExpertV2Dtype::Fp8E4m3Ue8m0K32, vec![], vec![].into()).is_err());
+        Ok(())
     }
 }

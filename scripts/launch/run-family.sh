@@ -494,7 +494,7 @@ if [[ "$family" == qwen3_5 ]]; then
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
-if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 ]]; then
+if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
     [[ -z "$(get "$key")" ]] || graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -1337,7 +1337,7 @@ detected_family="$(release_config_family "$config" "$core_view")"
 core_view_args=(--core-view "$core_view")
 serve_core_view_args=()
 case "$family" in
-  glm5|glm5_flash|kimi_k3|step5|muse_spark|inkling2) serve_core_view_args=("${core_view_args[@]}") ;;
+  glm5|glm5_flash|kimi_k3|step5|muse_spark|inkling2|hy4_flash) serve_core_view_args=("${core_view_args[@]}") ;;
   *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
 esac
 
@@ -1410,15 +1410,22 @@ case "$family" in
   kimi_k3) serve=serve-kimi ;;
   minimax_m3) serve=serve-minimax ;;
   inkling2) serve=serve-inkling2 ;;
+  hy4_flash) serve=serve-hy4f ;;
   step5) serve=serve-step5 ;;
   muse_spark) serve=serve-muse ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5, Muse Spark, Inkling and Hy4-flash checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
 # These commands own automatic context, pool and Spark budgets independently of media.
 standalone_family=0
-[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
+[[ "$family" != minimax_m3 && "$family" != kimi_k3 && "$family" != inkling2 && "$family" != hy4_flash && "$family" != step5 && "$family" != muse_spark ]] || standalone_family=1
 if [[ "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == step5 ]]; then
   case "$audio" in auto|off) audio=off ;; *) release_die "$family has no bundled audio execution owner" ;; esac
+fi
+if [[ "$family" == hy4_flash ]]; then
+  case "$vision:$audio" in
+    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
+    *) release_die "Hy4-flash bundled media execution is not enabled yet; use VISION=off AUDIO=off" ;;
+  esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
@@ -1859,7 +1866,7 @@ kv_reserve_args=()
 [[ -z "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)" ]] ||
   kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark|minimax_m3|inkling2)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark|minimax_m3|inkling2|hy4_flash)
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
@@ -1921,7 +1928,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 prefill_packing="$(get PREFILL_PACKING)"
 if [[ -n "$prefill_packing" ]]; then
-  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark || "$family" == minimax_m3 ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == hy4_flash ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
     unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
     *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;
@@ -2022,6 +2029,12 @@ if [[ $family == inkling2 ]]; then
   else
     family_args+=(--dspark=false)
   fi
+fi
+if [[ $family == hy4_flash ]]; then
+  hy4_kv="$(get KV_CACHE fp8)"
+  case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$hy4_kv")
+  family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
@@ -2136,7 +2149,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*|inkling2:*) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*|inkling2:*|hy4_flash:*) ;;
   qwen4:*|qwen3_5:*) ;; # Shared admission selects contiguous whole-layer owners.
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
@@ -2352,7 +2365,7 @@ case "$family" in
   deepseek_v4)
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
-  glm5|glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3|inkling2) ;;
+  glm5|glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2|minimax_m3|inkling2|hy4_flash) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2474,7 +2487,10 @@ audio_encoder_hash=""
     plan_draft_args+=(--kv-cache "$inkling_kv")
     if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$inkling_draft_kv"); fi
   fi
-  if [[ "$family" == minimax_m3 || "$family" == inkling2 ]]; then
+  if [[ "$family" == hy4_flash ]]; then
+    plan_draft_args+=(--kv-cache "$hy4_kv")
+  fi
+  if [[ "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2597,7 +2613,7 @@ audio_encoder_hash=""
       *) release_die "DECODE_GRAPHS must be on or off" ;;
     esac
   fi
-  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 ]]; then
+  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")

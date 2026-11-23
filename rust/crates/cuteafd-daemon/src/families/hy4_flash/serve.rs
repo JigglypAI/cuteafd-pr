@@ -108,8 +108,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Hy4-flash serving requires GPU embedding and device token selection"
     );
     ensure!(
-        args.peers.is_empty(),
-        "Hy4-flash Spark --peers remote expert serving is wired in Step 4D; 0-Spark RTX cards (1x or 2x RTX PRO 6000) are active"
+        args.peers.len() <= 6 && args.peers.iter().collect::<std::collections::BTreeSet<_>>().len() == args.peers.len(),
+        "Hy4-flash supports 0..=6 distinct Spark peer endpoints"
     );
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
@@ -171,12 +171,6 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 Some(n) => n.min(cfg.max_position),
             };
             let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
-            let expert_pkg = resolve_expert_package(
-                &worker_args.native_lib,
-                worker_args.expert_package.as_deref(),
-                gpus,
-                &catalog,
-            )?;
             let routed_layers = cfg.routed_layers();
             let budget = usize::try_from(crate::shared::memory::budget::resident_weight_limit().0)
                 .unwrap_or(80usize << 30);
@@ -191,39 +185,6 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .min()
                 .unwrap_or(min_free);
 
-            let onboarded: Vec<Option<Exl3Tp2<'_>>> = if gpus == 1 {
-                let w = Exl3Tp2::load_whole_weights(
-                    devices[0],
-                    &catalog,
-                    &expert_pkg,
-                    routed_layers.clone(),
-                    unit_rows,
-                    budget,
-                    RtxSelectionPolicy::FirstCapacity,
-                )?;
-                vec![Some(w.execution()?)]
-            } else {
-                let [w0, w1] = Exl3Tp2::load_pair_weights(
-                    [devices[0], devices[1]],
-                    &catalog,
-                    cuteafd_core::ExpertGeometry::HY4_FLASH,
-                    [expert_pkg.as_path(), expert_pkg.as_path()],
-                    routed_layers.clone(),
-                    unit_rows,
-                    [budget, budget],
-                    RtxSelectionPolicy::FirstCapacity,
-                )?;
-                vec![Some(w0.execution()?), Some(w1.execution()?)]
-            };
-
-            // Measure remaining GPU free memory after routed experts, then size DSA KV pool safely.
-            let post_exp = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-            let after_exp_free = post_exp
-                .gpus
-                .iter()
-                .map(|g| g.free_bytes.min(effective_cap))
-                .min()
-                .unwrap_or(0);
             let model = cuteafd_loader::plan::families::hy4_flash::Model::open(&checkpoint)?;
             let modes = cuteafd_loader::placement::families::hy4_flash::layer_modes(
                 &cfg,
@@ -238,6 +199,163 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 gpus,
             )?;
             let target_bytes = target_layouts.iter().map(|l| l.arena.bytes() as u64).max().unwrap_or(0);
+
+            // Resolve how many routed layers are onboarded on RTX vs dispatched to Spark peers.
+            let onboard_count = if worker_args.peers.is_empty() {
+                routed_layers.len()
+            } else {
+                match worker_args.rtx_expert_layers.resolve(routed_layers.len()) {
+                    cuteafd_loader::placement::Onboard::Layers(n) => n.min(routed_layers.len()),
+                    cuteafd_loader::placement::Onboard::Auto => {
+                        let per_layer_bytes = catalog
+                            .exl3()
+                            .and_then(|e| e.residency(cuteafd_loader::V41Exl3Layer::Backbone(routed_layers[0]), gpus, 0).ok())
+                            .and_then(|r| r.device_arena_layout().ok())
+                            .map(|(_, b)| b as u64)
+                            .unwrap_or(1_400_000_000 / gpus as u64);
+                        // Leave headroom for target weights + KV + workspaces + Spark links.
+                        let weight_room = (budget as u64)
+                            .min(effective_cap.saturating_sub(14u64 << 30))
+                            .saturating_sub(target_bytes);
+                        let fit = (weight_room / per_layer_bytes.max(1)) as usize;
+                        // Keep at least 1 layer on Sparks when Spark peers are configured.
+                        fit.min(routed_layers.len().saturating_sub(1))
+                    }
+                }
+            };
+            let onboarded_layers = routed_layers[..onboard_count].to_vec();
+            let spark_layers = routed_layers[onboard_count..].to_vec();
+
+            // Admit and bootstrap Spark workers for non-onboarded routed layers before GPU allocation.
+            let spark_link = if !worker_args.peers.is_empty() {
+                use crate::shared::{
+                    placement::{spark_rings, SparkAdmission},
+                    spark_intake::SparkLink,
+                };
+                use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+                use cuteafd_loader::placement::{
+                    families::hy4_flash as hy4_place,
+                    planner::PrefillShape,
+                    SparkWorkingSet,
+                };
+                use cuteafd_transport::{
+                    expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+                    worker_selection::ModelAdmission,
+                    ExpertV2Dtype, SparkSessionShape, TcpTransportConfig,
+                };
+                let working = SparkWorkingSet {
+                    rtx_layers: onboarded_layers.clone(),
+                    spark_layers: spark_layers.clone(),
+                    spark_ranks: worker_args.peers.len(),
+                    prefill_lanes: hy4_place::LANES,
+                };
+                let endpoint = SparkEndpoint {
+                    ring_depth: None,
+                    capacity: u32::try_from(unit_rows)?,
+                    ingress: SparkIngress::Fp8K32,
+                    partial_reply_bytes: None,
+                };
+                let tcp = TcpTransportConfig::default();
+                let backend_exec = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
+                let executions = cuteafd_loader::plan::spark_executions::admit_family(
+                    "hy4_flash",
+                    &backend_exec.exports(),
+                    None,
+                    prefill.unit_rows,
+                    prefill.waves,
+                )?;
+                let model_adm = ModelAdmission::for_clients(
+                    ExpertGeometry::HY4_FLASH,
+                    endpoint,
+                    spark_rings(tcp.max_frame_bytes)?,
+                    1,
+                    executions,
+                )?;
+                SparkAdmission::plan_view(
+                    &view,
+                    ExpertGeometry::HY4_FLASH,
+                    Some(&catalog),
+                    &working,
+                    worker_args.peers.len(),
+                    model_adm,
+                    None,
+                )?
+                .select(&worker_args.peers)?;
+
+                let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
+                let links = hy4_place::spark_link(
+                    0,
+                    worker_args.peers.len(),
+                    shape,
+                    cuteafd_core::spark_reply::requested(),
+                )?;
+                let geometry = links.into_iter().next().context("Hy4 Spark link geometry absent")?;
+                let mut link = devices[0].run(|| {
+                    SparkLink::prepared(
+                        &library,
+                        SparkWorld::canonical(worker_args.peers.len())?,
+                        &worker_args.peers,
+                        tcp,
+                        geometry,
+                    )
+                })?;
+                link.enable_terminal_ownership(Arc::clone(&library))?;
+                let mut session = SparkSessionShape::new(
+                    u32::try_from(unit_rows)?,
+                    u32::try_from(cfg.routed_expert_hidden)?,
+                    u32::try_from(cfg.topk)?,
+                    ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                )?;
+                session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                devices[0].run(|| link.bootstrap(&session))?;
+                Some(link)
+            } else {
+                None
+            };
+
+            let onboarded: Vec<Option<Exl3Tp2<'_>>> = if onboarded_layers.is_empty() {
+                (0..gpus).map(|_| None).collect()
+            } else {
+                let expert_pkg = resolve_expert_package(
+                    &worker_args.native_lib,
+                    worker_args.expert_package.as_deref(),
+                    gpus,
+                    &catalog,
+                )?;
+                if gpus == 1 {
+                    let w = Exl3Tp2::load_whole_weights(
+                        devices[0],
+                        &catalog,
+                        &expert_pkg,
+                        onboarded_layers.clone(),
+                        unit_rows,
+                        budget,
+                        RtxSelectionPolicy::FirstCapacity,
+                    )?;
+                    vec![Some(w.execution()?)]
+                } else {
+                    let [w0, w1] = Exl3Tp2::load_pair_weights(
+                        [devices[0], devices[1]],
+                        &catalog,
+                        cuteafd_core::ExpertGeometry::HY4_FLASH,
+                        [expert_pkg.as_path(), expert_pkg.as_path()],
+                        onboarded_layers.clone(),
+                        unit_rows,
+                        [budget, budget],
+                        RtxSelectionPolicy::FirstCapacity,
+                    )?;
+                    vec![Some(w0.execution()?), Some(w1.execution()?)]
+                }
+            };
+
+            // Measure remaining GPU free memory after routed experts, then size DSA KV pool safely.
+            let post_exp = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
+            let after_exp_free = post_exp
+                .gpus
+                .iter()
+                .map(|g| g.free_bytes.min(effective_cap))
+                .min()
+                .unwrap_or(0);
             let swa_ring_pages = ((cfg.sliding_window + unit_rows).div_ceil(PAGE_ROWS) + 1)
                 .max(cuteafd_loader::families::hy4_flash::execution::SWA_RING_PAGES);
             let swa_seq_bytes = (cfg.swa_layers().len() * swa_ring_pages * PAGE_ROWS * worker_args.kv_format.record_bytes()) as u64;
@@ -287,7 +405,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let served_context = max_context.min(chosen_pages * PAGE_ROWS);
             let pool_tokens = (chosen_pages * PAGE_ROWS) as u64;
 
-            let engine = Hy4Engine::new_serving(
+            let mut engine = Hy4Engine::new_serving(
                 &devices,
                 &programs,
                 &checkpoint,
@@ -302,6 +420,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 false,
                 onboarded,
             )?;
+            if let Some(link) = spark_link {
+                engine.attach_spark(link, onboarded_layers.clone());
+            }
 
             let family = engine.prefix()?;
             let host_total = cuteafd_loader::formats::mapped_preload::host_memory_before_process()
@@ -329,7 +450,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("max-context-tokens", served_context)
                 .value("pool-tokens", pool_tokens)
-                .value("rtx-expert-layers", routed_layers.len())
+                .value("rtx-expert-layers", onboarded_layers.len())
                 .value("prefill-rows", unit_rows)
                 .value("prefill-waves", prefill.waves)
                 .publish();
@@ -464,6 +585,37 @@ mod tests {
                 .publish();
             Ok(())
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn serve_hy4f_spark_peers_cli_parses() -> anyhow::Result<()> {
+        for (peers_csv, expected) in [
+            ("10.55.0.1:19441", 1usize),
+            ("10.55.0.1:19441,10.55.0.2:19441,10.55.0.3:19441,10.55.0.4:19441", 4usize),
+        ] {
+            let argv = [
+                "cuteafd",
+                "serve-hy4f",
+                "--snapshot",
+                "/model",
+                "--native-lib",
+                "/opt/cuteafd/lib/libcuteafd_native.so",
+                "--device",
+                "0",
+                "--peers",
+                peers_csv,
+                "--core-view",
+                "k6-compact",
+                "--rtx-expert-layers",
+                "auto",
+            ];
+            let crate::cli::Commands::ServeHy4f(args) = crate::cli::Cli::try_parse_from(argv)?.command else {
+                anyhow::bail!("Hy4-flash Spark CLI not parsed");
+            };
+            assert_eq!(args.peers.len(), expected);
+            assert!(args.split_device.is_none());
+        }
         Ok(())
     }
 
