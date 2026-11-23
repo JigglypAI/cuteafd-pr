@@ -774,31 +774,34 @@ The old `-HQA` checkpoints were withdrawn from Hugging Face. Historical results 
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `DRAFT_LENGTH` | unset (follows `DRAFT_POLICY`) | positive int | Measurement override: verify a fixed number of draft tokens per step, min(value, the drafter's native block), further capped by the row budget at high concurrency. Overrides `DRAFT_POLICY`; acceptance history is still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo/Kimi drafter precision: unset, `auto` and `on` select single-copy FP8 body linear projection weights; `off` keeps BF16. Rust resolves the same MiMo precision for planning and serving, independent of checkpoint alias or core view. Kimi block DSpark supports TP1 and physical TP2 with native BF16 norms/Markov tensors; FP8 applies to content-paired K3.1 DSpark in every core view and layout. Kimi MLA includes QKV-A, Q-B, absorbed UK/UV and output; embeddings, norms, codebooks and prediction heads remain native. Independent of `DRAFT_KV_CACHE`. Inkling accepts `auto` or `off` only (checkpoint native). |
-| `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies. `history` keeps the leading drafts whose individual scores exceed the applicable cutoff and also plans the first position at or below it for exploration. `off` verifies no drafts. See the score sources and verify-row budget below. |
+| `DRAFT_POLICY` | `history` | `history`, `off` | How many drafted positions each request verifies. `history` keeps the leading drafts while the product of their calibrated per-position probabilities stays above 0.3, and also plans the first position past that for exploration. `off` verifies no drafts. See the score sources and verify-row budget below. |
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
-| `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. Shared `draft_round` records include each request's numeric engine ticket and HTTP `request_id` (the identity in `usage.speculation`), per-position history probabilities/counts, per-token `score` when available, exploration and verifier outcomes. V4.1, MiMo and GLM Flash rounds also carry `lane`, the host-clock `round_us`/`draft_us`/`verify_us` their console round measures, and each request's committed `context`; the shared scheduler's `cycle` record and GLM 5.3's `cycle` lines carry the same times. |
+| `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. Shared `draft_round` records include each request's numeric engine ticket and HTTP `request_id` (the identity in `usage.speculation`), per-position history probabilities/counts, the per-token `score` the policy keys on, the drafter's raw per-token `head` and its engine-calibrated `calibrated` probability (one online per-position calibration trained on verifier-reached positions, for dSpark heads, DFlash2 candidate probabilities and Inkling's candidate probability), exploration and verifier outcomes. Scores are read back under `history` or whenever this trace is open, so fixed `DRAFT_LENGTH` traces carry them too. V4.1, MiMo and GLM Flash rounds also carry `lane`, the host-clock `round_us`/`draft_us`/`verify_us` their console round measures, and each request's committed `context`; the shared scheduler's `cycle` record and GLM 5.3's `cycle` lines carry the same times. |
 | `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM; Rust resolves `w8a8` with an external FP8 drafter, `w8a16` otherwise. |
 
-`history` uses one keep rule across families. It judges each token separately,
-without multiplying the scores along the prefix:
+`history` uses one keep rule for every family and score source (#2460): keep
+the leading drafts while the cumulative product of their calibrated
+per-position acceptance probabilities is strictly greater than 0.3, the
+estimated chance the whole prefix survives verification. The probabilities:
 
-- Trained confidence head (dSpark): keep if the probability from the online,
-  per-position Platt fit is strictly greater than 0.3. Only positions reached
-  by the verifier train the fit.
-- Raw candidate-token probability (DFlash2): keep if the uncalibrated
-  probability is strictly greater than 0.5.
-- No per-token score (MTP), or a history copy extending an agreeing draft:
-  keep if that track's per-position history estimate is strictly greater than
-  0.3. The estimate uses the request's accepted/reached counts over its last
-  8 verify rounds, shrunk toward the server-wide rate over the last 256 rounds
-  that reached the position. The prior starts at 8 and fades linearly to zero
-  over the request's first 3 completed verify rounds. An unreached position
-  stops the plan after the fade; the cold server rate is 1 for neural drafts
-  and 0.25 for copies.
+- Per-token score: a trained confidence head (dSpark), a raw candidate-token
+  probability (DFlash2), or Inkling's recurrent-head candidate probability (its
+  argmax log-softmax). Every score goes through one online, per-position Platt
+  fit; only positions reached by the verifier train it. A cold fit is the
+  identity.
+- No per-token score (MTP): that track's per-position history estimate. The
+  estimate uses the request's accepted/reached counts over its last 8 verify
+  rounds, shrunk toward the server-wide rate over the last 256 rounds that
+  reached the position. The prior starts at 8 and fades linearly to zero over
+  the request's first 3 completed verify rounds. An unreached position stops
+  the plan after the fade; the cold server rate is 1 for neural drafts and
+  0.25 for copies.
+- A history copy extending an agreeing draft keeps its per-position rule: each
+  copy position is kept while its own history estimate exceeds 0.3.
 
 Scored drafters can propose their full native block (7 drafts for V4.1).
-The plan includes the first position at or below the cutoff as an explore if
+The plan includes the first position past the kept prefix as an explore if
 that position exists; there is no separate head skip. If the round's verify-row
 budget cannot fit the plan, the next position of each request's prefix competes
 for rows by the same score or history estimate, highest first.

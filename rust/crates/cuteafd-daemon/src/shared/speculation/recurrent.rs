@@ -10,11 +10,14 @@ pub(crate) struct Drafter<'a> {
     pub split:Option<GqaHeadSplit<'a,Rank<'a>>>,
     pub context:ContextBank,
     live:Cell<bool>,
+    /// Read each drafted token's candidate probability back (policy or trace).
+    scores:Cell<bool>,
 }
 impl<'a> Drafter<'a> {
+    pub fn set_score_readback(&self,enabled:bool){ self.scores.set(enabled); }
     pub fn whole(lead:Rank<'a>,context:ContextBank)->Result<Self>{
         ensure!(lead.layout.rank.ranks==1,"whole recurrent constructor requires one rank");
-        Ok(Self{lead,split:None,context,live:Cell::new(true)})
+        Ok(Self{lead,split:None,context,live:Cell::new(true),scores:Cell::new(false)})
     }
     pub fn pair(lead:Rank<'a>,peer:Rank<'a>,context:ContextBank)->Result<Self>{
         use crate::shared::{memory::Tag,peer_split::{PeerExchange,RankDevice}};
@@ -32,7 +35,7 @@ impl<'a> Drafter<'a> {
         let device=peer.stream.device;
         let split=GqaHeadSplit::new(device.own(||Ok(Box::new(peer)))?,exchange,0,bytes,
             [Tag::drafter_workspace("recurrent/tp2-reduce");2])?;
-        Ok(Self{lead,split:Some(split),context,live:Cell::new(true)})
+        Ok(Self{lead,split:Some(split),context,live:Cell::new(true),scores:Cell::new(false)})
     }
     pub fn drain(&self)->Result<()> {
         self.lead.stream.drain()?;
@@ -78,7 +81,15 @@ impl<'a> Drafter<'a> {
             let mut bytes=vec![0;count];
             lib.copy_d2h(&mut bytes,Buffer{bytes:count,..selected})?;
             let tokens=bytes.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
-            Ok(tokens.chunks_exact(self.lead.config.predictions()).map(|tokens|Draft{tokens:tokens.to_vec(),features:vec![],confidence:vec![]}).collect())
+            let predictions=self.lead.config.predictions();
+            // Candidate probability per drafted token (exp of the argmax log-softmax),
+            // read only while the policy or a speculation trace uses it.
+            let confidence=if self.scores.get() {
+                lib.copy_d2h(&mut bytes,Buffer{bytes:count,..self.lead.buffer("head.logprob")?})?;
+                bytes.chunks_exact(4).map(|v|f32::from_le_bytes(v.try_into().unwrap()).exp()).collect::<Vec<_>>()
+            } else { Vec::new() };
+            Ok(tokens.chunks_exact(predictions).enumerate().map(|(index,tokens)|Draft{tokens:tokens.to_vec(),features:vec![],
+                confidence:confidence.get(index*predictions..(index+1)*predictions).map_or_else(Vec::new,<[f32]>::to_vec)}).collect())
         })();
         if result.is_err(){
             self.live.set(false);

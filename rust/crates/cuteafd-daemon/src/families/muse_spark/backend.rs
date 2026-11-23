@@ -532,8 +532,8 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
         self.draft.as_ref().map_or(cuteafd_core::HeadScore::None, |d| d.drafter.score_source())
     }
-    fn configure_draft_scores(&self, enabled: bool) {
-        if let Some(d) = &self.draft { d.drafter.set_selector_readback(false, enabled); }
+    fn configure_draft_scores(&self, traced: bool, scored: bool) {
+        if let Some(d) = &self.draft { d.drafter.set_selector_readback(traced, scored); }
     }
     fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
 

@@ -74,10 +74,11 @@ mod tests {
             188, Qwen4KvCache::Fp8, 0, 1, 0)?;
         // Five K/V pairs + table + last features, seven context planes,
         // twelve block planes, six projection/metadata owners and seventeen head planes.
-        assert_eq!(runtime.buffers.len(), 54);
+        assert_eq!(runtime.buffers.len(), 56);
         let bytes = |name: &str| runtime.buffers.iter().find(|(id, _)| id == name).unwrap().1;
         assert_eq!(bytes("step.ids"), 256);
         assert_eq!(bytes("head.tokens"), 16 * 7 * 4);
+        assert_eq!(bytes("head.logprob"), 16 * 7 * 4);
         assert_eq!(bytes("head.hidden"), 16 * 7 * config.transformer.hidden * 2);
         assert_eq!(bytes("head.base"), 16 * 7 * config.padded_vocab * 2);
         assert_eq!(bytes("step.tables"), 256);
@@ -181,7 +182,7 @@ impl RecurrentRuntimeLayout {
                 ("raw", 3*r, 4), ("base", (c.block-1)*config.padded_vocab, 2),
                 ("correction_f32", config.padded_vocab, 4), ("correction", config.padded_vocab, 2),
                 ("logits_bf16", config.valid_vocab, 2), ("logits", config.valid_vocab, 4),
-                ("tokens", c.block-1, 4), ("previous", 1, 4), ("status", 1, 4)] {
+                ("tokens", c.block-1, 4), ("logprob", c.block-1, 4), ("previous", 1, 4), ("step_logprob", 1, 4), ("status", 1, 4)] {
                 add(format!("head.{name}"), mul(&[sequences, width, element])?);
             }
         }

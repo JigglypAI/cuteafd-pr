@@ -1,8 +1,11 @@
-//! The `history` policy keeps the leading drafts whose individual token scores
-//! clear the cut, plus one explore. Trained heads use an online per-position
-//! Platt fit; DFlash2 uses raw candidate probability. Token-only drafters and
-//! history copies retain the rolling per-position acceptance rule, with a
-//! server prior fading over the first three request rounds.
+//! The `history` policy keeps the leading drafts while the cumulative product of
+//! their calibrated per-position acceptance probabilities stays above one cut,
+//! plus one explore (#2460, TJ 2026-11-23). Every per-token score (trained heads
+//! and raw candidate probabilities alike) is calibrated by one online
+//! per-position Platt fit trained on verifier-reached positions. Token-only
+//! drafters multiply their rolling per-position acceptance history, with a
+//! server prior fading over the first three request rounds. History copies keep
+//! their per-position rule.
 //!
 //! Plan before drafting, refine from the actual scores, optionally extend with
 //! an agreeing copy, then settle the verify-row budget by highest next score
@@ -24,11 +27,10 @@ pub const SERVER_WINDOW: usize = 256;
 pub const PRIOR_STRENGTH: f64 = 8.;
 /// Completed verify rounds until server influence is exactly zero.
 pub const FADE_ROUNDS: u64 = 3;
-/// A position is kept while its probability is above this.
+/// A neural prefix is kept while the product of its calibrated probabilities is
+/// above this; a copy position while its own probability is (#2460: one cut for
+/// every family and score source).
 pub const KEEP_CUT: f64 = 0.3;
-// #2460: fixed-width replay favors a shared cut for each kind of score.
-const TRAINED_HEAD_KEEP_CUT: f64 = 0.3;
-const CANDIDATE_KEEP_CUT: f64 = 0.5;
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
 /// Server rate of an unreached copy position: below KEEP_CUT=0.3 so a
@@ -50,15 +52,8 @@ pub enum HeadScore {
 }
 
 impl HeadScore {
-    fn trained(self) -> bool { matches!(self, Self::Logit | Self::Probability) }
-
-    fn cut(self) -> Option<f64> {
-        match self {
-            Self::None => None,
-            Self::Logit | Self::Probability => Some(TRAINED_HEAD_KEEP_CUT),
-            Self::CandidateProbability => Some(CANDIDATE_KEEP_CUT),
-        }
-    }
+    /// Every per-token score gets the online per-position calibration.
+    fn scored(self) -> bool { !matches!(self, Self::None) }
 }
 
 /// Everything a drafter declares to the policy.
@@ -289,6 +284,8 @@ struct Round {
 struct Planned {
     p: f64,
     score: Option<f64>,
+    /// The engine's online calibration of this position's per-token score.
+    calibrated: Option<f64>,
     accepted: u32,
     reached: u32,
     server: f64,
@@ -352,7 +349,7 @@ impl DraftHistory {
         Self {
             spec, control,
             server: [vec![Window::new(); spec.block], vec![Window::new(); spec.copy]],
-            platt: if spec.head.trained() { vec![Platt::new(); spec.block] } else { Vec::new() },
+            platt: if spec.head.scored() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
@@ -386,7 +383,7 @@ impl DraftHistory {
         let denominator = f64::from(reached) + prior;
         // Unknown after the fade: stop here and explore this position.
         let p = if denominator == 0. { 0. } else { (f64::from(accepted) + prior * server) / denominator };
-        Planned { p, score: None,
+        Planned { p, score: None, calibrated: None,
             accepted, reached, server, server_reached: window.len as u32 }
     }
 
@@ -397,14 +394,17 @@ impl DraftHistory {
         self.position(request, NEURAL, position).p
     }
 
-    /// Positions of a track to verify: the leading ones above the cut plus one explore.
+    /// Positions of a track to verify: the leading kept ones plus one explore.
+    /// A neural track keeps while the product of its history estimates stays
+    /// above the cut; a copy track while each position's own estimate does.
     fn track_plan(&self, request: &Request, track: usize, limit: usize) -> (Vec<Planned>, usize) {
         let mut planned = Vec::with_capacity(limit.min(8));
-        let mut keep = 0;
+        let (mut keep, mut product) = (0, 1.);
         for position in 0..limit {
             let entry = self.position(request, track, position);
             planned.push(entry);
-            if entry.p > KEEP_CUT { keep += 1; } else { break; }
+            product = if track == NEURAL { product * entry.p } else { entry.p };
+            if product > KEEP_CUT { keep += 1; } else { break; }
         }
         (planned, keep)
     }
@@ -415,7 +415,7 @@ impl DraftHistory {
     /// the drafts to ask the drafter for, in request order. With per-token
     /// scores the verify budget is applied only after the draft pass.
     pub fn plan(&mut self, requests: &[(u64, usize)], max_rows: usize) -> Vec<usize> {
-        let scored = self.control == DraftControl::History && self.spec.head.cut().is_some();
+        let scored = self.control == DraftControl::History && self.spec.head.scored();
         let mut depths = Vec::with_capacity(if scored { requests.len() } else { 0 });
         for &(id, room) in requests {
             let request = self.requests.remove(&id).unwrap_or_default();
@@ -443,25 +443,27 @@ impl DraftHistory {
         self.settle(&ids, max_rows)
     }
 
-    /// Cut the proposal to its score-based keep prefix and one explore.
-    /// Token-only drafters keep their original count-based plan.
+    /// Cut the proposal to its keep prefix (calibrated product above the cut)
+    /// and one explore. Token-only drafters keep their history-based plan.
     pub fn refine(&mut self, id: u64, drafted: usize, scores: Option<&[f32]>) -> usize {
         let Some(pending) = self.requests.get_mut(&id).and_then(|request| request.pending.as_mut()) else { return 0 };
         let planned = &mut pending.planned[NEURAL];
         planned.truncate(drafted);
-        if let Some(cut) = self.spec.head.cut() {
+        if self.spec.head.scored() {
             let scores = scores.unwrap_or_default();
-            if self.spec.head.trained() {
-                pending.head = scores[..scores.len().min(planned.len())].to_vec();
-            }
+            pending.head = scores[..scores.len().min(planned.len())].to_vec();
             for (position, (entry, &score)) in planned.iter_mut().zip(scores).enumerate() {
-                entry.score = score.is_finite().then(|| {
-                    if self.spec.head.trained() { self.platt[position].apply(logit(self.spec.head, score)) }
-                    else { f64::from(score) }
-                });
+                if !score.is_finite() { continue; }
+                let calibrated = self.platt[position].apply(logit(self.spec.head, score));
+                entry.calibrated = Some(calibrated);
+                entry.score = Some(calibrated);
             }
             if self.control == DraftControl::History {
-                pending.keep = planned.iter().take_while(|entry| entry.score.is_some_and(|p| p > cut)).count();
+                let mut product = 1.;
+                pending.keep = planned.iter().take_while(|entry| {
+                    product *= entry.score.unwrap_or(0.);
+                    product > KEEP_CUT
+                }).count();
                 planned.truncate(pending.keep + 1);
             }
         }
@@ -501,7 +503,7 @@ impl DraftHistory {
             let pending = self.requests[&ids[index]].pending.as_ref().expect("wanted positions have a plan");
             if taken < wanted[index][NEURAL] {
                 let entry = &pending.planned[NEURAL][taken];
-                if self.control == DraftControl::History && self.spec.head.cut().is_some() {
+                if self.control == DraftControl::History && self.spec.head.scored() {
                     entry.score.unwrap_or(0.)
                 } else { entry.p }
             } else { pending.planned[COPY][taken - wanted[index][NEURAL]].p }
@@ -551,7 +553,7 @@ impl DraftHistory {
                     } else { (&mut self.stats.copy_reached, &mut self.stats.copy_accepted) };
                     reached[position] += 1;
                     accepted[position] += u64::from(hit);
-                    if track == NEURAL && self.spec.head.trained() {
+                    if track == NEURAL && self.spec.head.scored() {
                         if let Some(&score) = pending.head.get(position).filter(|score| score.is_finite()) {
                             self.platt[position].observe(logit(self.spec.head, score), hit);
                         }
@@ -581,7 +583,7 @@ impl DraftHistory {
                             server_reached: planned.server_reached,
                             explore: explores && if track == NEURAL { position >= pending.keep }
                                 else { position + 1 == pending.planned[COPY].len() && planned.p <= KEEP_CUT },
-                            head, calibrated: head.and(planned.score),
+                            head, calibrated: planned.calibrated,
                             outcome: (position < reached[track]).then_some(position < kept[track]) });
                     }
                 }
@@ -606,7 +608,7 @@ impl DraftHistory {
             self.server[track].iter().enumerate().map(|(position, window)| serde_json::json!({
                 "position": position + 1, "window_rate": window.rate(Self::cold(track)), "window_rounds": window.len,
                 "reached": reached[position], "accepted": accepted[position],
-                "calibration": (track == NEURAL && self.spec.head.trained())
+                "calibration": (track == NEURAL && self.spec.head.scored())
                     .then(|| self.platt[position].theta),
             })).collect()
         };
@@ -629,12 +631,12 @@ impl DraftHistory {
 fn logit(kind: HeadScore, score: f32) -> f64 {
     let score = f64::from(score);
     match kind {
-        HeadScore::Probability => {
+        HeadScore::Probability | HeadScore::CandidateProbability => {
             let p = score.clamp(1e-6, 1. - 1e-6);
             (p / (1. - p)).ln()
         }
         HeadScore::Logit => score.clamp(-30., 30.),
-        HeadScore::None | HeadScore::CandidateProbability => unreachable!("not a trained head"),
+        HeadScore::None => unreachable!("no per-token score"),
     }
 }
 
@@ -812,7 +814,11 @@ mod tests {
                 }
             }
             assert!(short * 50 < rounds - 400, "block {block}: {short} short rounds");
-            assert!(drafts as f64 >= 0.97 * fixed as f64, "block {block}: kept {drafts} of {fixed}");
+            // The product rule verifies the prefix whose estimated survival stays above the
+            // cut: native blocks keep nearly every accepted token, a 16-wide block gives up
+            // its unlikely tail (0.92^k falls under 0.3 past k = 14, sooner on noisy windows).
+            let floor = if block <= 8 { 0.97 } else { 0.8 };
+            assert!(drafts as f64 >= floor * fixed as f64, "block {block}: kept {drafts} of {fixed}");
         }
     }
 
@@ -859,39 +865,44 @@ mod tests {
     }
 
     #[test]
-    fn trained_head_keeps_individual_calibrated_scores_and_explores_the_stop() {
+    fn trained_head_keeps_while_the_calibrated_product_clears_the_cut_and_explores_the_stop() {
         let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
-        policy.platt[2].theta = [1., -4.];
         assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
-        // 0.45 * 0.45 < 0.3, yet both pass. Only calibration stops the third.
-        assert_eq!(policy.refine(1, 4, Some(&[0.45, 0.45, 0.9, 0.99])), 3);
+        // Each position clears 0.3 alone, but 0.7 * 0.6 = 0.42 > 0.3 and 0.42 * 0.6 = 0.252 does not.
+        assert_eq!(policy.refine(1, 4, Some(&[0.7, 0.6, 0.6, 0.99])), 3);
         let trace = policy.observe(&[outcome(1, 3, 2)], true).unwrap();
         let req = &trace.requests[0];
         assert_eq!((req.keep, req.proposed), (2, 3));
         let explore = &req.positions[2];
-        assert!(explore.explore && explore.calibrated.unwrap() < TRAINED_HEAD_KEEP_CUT);
+        assert!(explore.explore && explore.calibrated.unwrap() > KEEP_CUT, "the stop is the product, not the token");
         assert_eq!(explore.outcome, Some(false));
         assert_eq!(policy.stats().explored, 1);
     }
 
     #[test]
-    fn raw_probability_uses_a_strict_cut_without_calibration_or_history() {
+    fn raw_probability_is_calibrated_online_on_reached_positions_and_keyed_by_product() {
         let spec = DrafterSpec { block: 4, head: HeadScore::CandidateProbability, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History);
-        for _ in 0..REQUEST_WINDOW {
+        // A cold calibration is the identity: 0.9 * 0.5 = 0.45 keeps two, 0.45 * 0.6 = 0.27 stops.
+        assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
+        assert_eq!(policy.refine(1, 4, Some(&[0.9, 0.5, 0.6, 0.99])), 3);
+        policy.observe(&[outcome(1, 3, 0)], false);
+        // Overconfident 0.9 that the target keeps rejecting at position 0.
+        for _ in 0..64 {
             assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
-            assert_eq!(policy.refine(1, 4, Some(&[0.1; 4])), 1);
+            policy.refine(1, 4, Some(&[0.9; 4]));
             policy.observe(&[outcome(1, 1, 0)], false);
         }
-        assert_eq!(policy.probability(1, 0), 0.);
+        // Only reached positions train: position 0 was judged every round, position 3 never.
+        assert!(policy.platt[0].theta != [1., 0.] && policy.platt[3].theta == [1., 0.]);
         assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
-        assert_eq!(policy.refine(1, 4, Some(&[0.6, 0.6, 0.5, 0.99])), 3);
-        let trace = policy.observe(&[outcome(1, 3, 3)], true).unwrap();
-        assert_eq!(trace.requests[0].keep, 2);
-        let explore = &trace.requests[0].positions[2];
-        assert_eq!((explore.score, explore.calibrated, explore.outcome), (Some(0.5), None, Some(true)));
-        assert!(policy.platt.is_empty());
+        // Calibrated 0.9 at position 0 is now under the cut: nothing kept, only the explore.
+        assert_eq!(policy.refine(1, 4, Some(&[0.9, 0.99, 0.99, 0.99])), 1);
+        let trace = policy.observe(&[outcome(1, 1, 0)], true).unwrap();
+        let first = &trace.requests[0].positions[0];
+        assert!(first.calibrated.unwrap() < KEEP_CUT && first.score == first.calibrated);
+        assert!((first.head.unwrap() - 0.9).abs() < 1e-6, "the raw score stays in the trace");
     }
 
     #[test]
@@ -1074,7 +1085,7 @@ mod tests {
         assert_eq!(explore["explore"], true);
         assert_eq!(explore["head"], -2.);
         assert_eq!(explore["score"], explore["calibrated"]);
-        assert!(explore["calibrated"].as_f64().unwrap() < TRAINED_HEAD_KEEP_CUT);
+        assert!(explore["calibrated"].as_f64().unwrap() < KEEP_CUT);
         assert_eq!(explore["outcome"], true);
         let snapshot = policy.snapshot();
         assert_eq!(snapshot["positions"][0]["reached"], 5);

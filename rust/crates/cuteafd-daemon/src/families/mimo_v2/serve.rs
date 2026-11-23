@@ -547,7 +547,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     if let Some(drafter) = drafter {
-        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+        { let (traced, scored) = crate::shared::draft::history::score_readback(policy.length.control());
+            drafter.set_selector_readback(traced && trace.is_some(), scored); }
     }
     let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
