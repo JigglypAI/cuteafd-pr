@@ -499,7 +499,11 @@ def chain_session(args, seed: int, repeat: int) -> dict:
     value = nonce(args.label + "/chain", seed, repeat)
     turns, tasks, previous, index = [], [dict(task=order[0]["name"], cycle=0, first_turn=0)], None, 0
     stop = "max_turns"
+    began = time.monotonic()
     for turn in range(args.max_turns):
+        if args.deadline_s and time.monotonic() - began >= args.deadline_s:
+            stop = "deadline"
+            break
         started = time.perf_counter()
         result = stream_turn(args.base_url, request_body(args, with_nonce(messages, value), args.max_tokens), args.api_key)
         metrics = turn_metrics(result, previous, turn, time.perf_counter() - started)
@@ -511,6 +515,8 @@ def chain_session(args, seed: int, repeat: int) -> dict:
         for call, sent in zip(result["calls"], assistant.get("tool_calls", [])):
             output, _ = workspace.execute(call["name"], call["arguments"])
             messages.append({"role": "tool", "tool_call_id": sent["id"], "content": output})
+        if args.progress is not None:
+            args.progress(dict(seed=seed, task="chain", chain=tasks, stop="in_progress", messages=messages, turns=turns))
         print(f"[chain#{seed}] turn {turn} task {index}: prompt {metrics['prompt_tokens']} "
               f"completion {metrics['completion_tokens']} calls {metrics['tool_calls']}", flush=True)
         if (metrics["prompt_tokens"] or 0) + (metrics["completion_tokens"] or 0) >= args.target_context:
@@ -643,6 +649,8 @@ def main(argv: list[str] | None = None) -> int:
                            help="one growing session per seed that works the tasks back to back (see chain_session)")
             p.add_argument("--target-context", type=int, default=None, metavar="N",
                            help="with --chain-tasks: stop once prompt + completion reach N tokens")
+            p.add_argument("--deadline-s", type=float, default=None,
+                           help="with --chain-tasks: start no turn after this many seconds (the session so far is kept)")
         else:
             p.add_argument("--recording", type=Path, required=True)
             p.add_argument("--max-tokens-from", choices=["flag", "recording"], default="flag",
@@ -661,6 +669,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "record" and args.chain_tasks and args.target_context < 1024:
         parser.error("--target-context must be at least 1024 tokens")
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.progress = None
+    if args.mode == "record" and args.chain_tasks:
+        # Every turn rewrites the output, so a killed run still leaves its session.
+        def progress(session):
+            args.output.write_text(json.dumps(dict(mode="record", partial=True, sessions=[session], tools=TOOLS,
+                                                   model=args.model, label=args.label), indent=1) + "\n")
+        args.progress = progress
+    elif args.mode == "record" and args.deadline_s is not None:
+        parser.error("--deadline-s needs --chain-tasks")
     report = dict(mode=args.mode, base_url=args.base_url, model=args.model, label=args.label,
                   echo_reasoning=args.echo_reasoning, max_tokens=args.max_tokens, runs=[], started=time.time())
     if args.mode == "replay":

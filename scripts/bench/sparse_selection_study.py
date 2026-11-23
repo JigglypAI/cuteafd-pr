@@ -31,12 +31,16 @@ decode records in step order (one record per decode step at C1). Definitions
 * shared index: layer pairs whose selections are recorded identical at every
   common step (GLM 5.3 records only full-indexer layers; shared layers reuse
   them by construction: listed from the config, verified absent in the dump).
-* cache simulation (per layer, per segment chain of one request): resident
-  capacity R units (2K..32K) with LRU, and LRU with the last 1K tokens'
-  units pinned (outside R). Misses per step = selected units not resident.
-  Prefetch: before step t, load the previous step's set (prev) or, for
-  layers with a source layer, that layer's step-t set (shared); hit rate is
-  the share of step t's units resident after the prefetch.
+* cache simulation (per layer, one cache per request; positions restarting
+  mark a new request): LRU over units at step granularity with resident
+  capacity R units (2K..32K), computed exactly from stack distances (a unit
+  hits iff fewer than R distinct other units were referenced since its last
+  reference; a step's units count as referenced together). `lru_pin1k` pins
+  the last 1K tokens' units outside R. Misses per step = selected units not
+  resident. A previous-step prefetch is the same as LRU here (the previous
+  set is resident), so the prefetch figure is `source_covers`: the share of a
+  layer's misses at R that the nearest earlier selecting layer (same unit)
+  selected at the same step, i.e. what a one-layer-ahead prefetch could hide.
 * resident bytes: page tables at 4 bytes per page per virtual token / P, plus
   the index-key bytes per token given per family, plus the smallest LRU R
   (in tokens of KV) whose miss rate per step is below 1%, 0.1% and 0.
@@ -104,11 +108,12 @@ def unit_tokens_of(ids: np.ndarray, dump) -> tuple[np.ndarray, np.ndarray]:
     return first, first + dump["unit_tokens"] - 1
 
 
-def pages_of(ids: np.ndarray, dump, page: int) -> np.ndarray:
-    """Distinct (page, head) keys a set touches when paged at `page` tokens."""
+def pages_of(ids: np.ndarray, dump, page: int, position: int) -> np.ndarray:
+    """Distinct (page, head) keys a set touches when paged at `page` tokens
+    (a unit's tokens past `position`, the open block's tail, are not read)."""
     heads, ut = dump["heads"], dump["unit_tokens"]
     unit, head = ids // heads, ids % heads
-    lo, hi = unit * ut // page, (unit * ut + ut - 1) // page
+    lo, hi = unit * ut // page, np.minimum(unit * ut + ut - 1, position) // page
     if np.all(lo == hi):
         keys = lo * heads + head
     else:
@@ -121,41 +126,66 @@ def frontier_units(position: int, dump) -> int:
     return max(1, (position + 1) // dump["unit_tokens"] + ((position + 1) % dump["unit_tokens"] > 0)) * dump["heads"]
 
 
-class Lru:
-    def __init__(self, capacity: int):
-        self.capacity, self.items = capacity, collections.OrderedDict()
+class Fenwick:
+    """Counts per decode step (index = step + 1), vectorized point add and prefix sum."""
 
-    def access(self, keys, pinned=frozenset()) -> int:
-        misses = 0
-        for key in keys:
-            if key in pinned:
-                continue
-            if key in self.items:
-                self.items.move_to_end(key)
-            else:
-                misses += 1
-                self.items[key] = None
-                if len(self.items) > self.capacity:
-                    self.items.popitem(last=False)
-        return misses
+    def __init__(self, n: int):
+        self.n, self.tree = n + 1, np.zeros(n + 2, dtype=np.int64)
 
-    def load(self, keys, pinned=frozenset()):
-        for key in keys:
-            if key in pinned:
-                continue
-            self.items[key] = None
-            self.items.move_to_end(key)
-            if len(self.items) > self.capacity:
-                self.items.popitem(last=False)
+    def add(self, index: np.ndarray, value: np.ndarray):
+        index = np.asarray(index, dtype=np.int64) + 1
+        value = np.asarray(value, dtype=np.int64)
+        while index.size:
+            np.add.at(self.tree, index, value)
+            index = index + (index & -index)
+            keep = index <= self.n
+            index, value = index[keep], value[keep]
 
-    def contains(self, key) -> bool:
-        return key in self.items
+    def prefix(self, index: np.ndarray) -> np.ndarray:
+        """Sum of counts at steps < index."""
+        index = np.asarray(index, dtype=np.int64)
+        out = np.zeros(index.shape, dtype=np.int64)
+        while np.any(index > 0):
+            live = index > 0
+            out[live] += self.tree[index[live]]
+            index = np.where(live, index - (index & -index), 0)
+        return out
 
 
-def pinned_units(position: int, dump) -> frozenset:
+def stack_distances(sets: list[np.ndarray], resets: np.ndarray, pinned: list[np.ndarray] | None, key_space: int):
+    """Per step, the LRU stack distance of each selected (unpinned) unit at step
+    granularity: the number of distinct other units referenced since its last
+    reference (inf for a first reference in this request). Requests reset the
+    cache where `resets` is set. A unit hits at capacity R iff distance < R."""
+    last = np.full(key_space, -1, dtype=np.int64)
+    tree = Fenwick(len(sets))
+    out = []
+    for t, ids in enumerate(sets):
+        if resets[t]:
+            live = last >= 0
+            tree.add(last[live], -np.ones(int(live.sum()), dtype=np.int64))
+            last[:] = -1
+        keys = ids if pinned is None else np.setdiff1d(ids, pinned[t], assume_unique=True)
+        prev = last[keys]
+        seen = prev >= 0
+        dist = np.full(len(keys), np.inf)
+        if seen.any():
+            # distinct units whose latest reference is at or after the unit's last one,
+            # minus the unit itself
+            total = tree.prefix(np.array([t]))[0]
+            dist[seen] = total - tree.prefix(prev[seen]) - 1
+        if seen.any():
+            tree.add(prev[seen], -np.ones(int(seen.sum()), dtype=np.int64))
+        tree.add(np.array([t]), np.array([len(keys)]))
+        last[keys] = t
+        out.append(dist)
+    return out
+
+
+def pinned_units(position: int, dump) -> np.ndarray:
     lo = max(0, position + 1 - PIN_TOKENS)
-    first, last = lo // dump["unit_tokens"], position // dump["unit_tokens"]
-    return frozenset(u * dump["heads"] + h for u in range(first, last + 1) for h in range(dump["heads"]))
+    units = np.arange(lo // dump["unit_tokens"], position // dump["unit_tokens"] + 1)
+    return (units[:, None] * dump["heads"] + np.arange(dump["heads"])[None, :]).ravel().astype(np.int32)
 
 
 def analyze_layer(dump, source_sets=None) -> dict:
@@ -195,7 +225,7 @@ def analyze_layer(dump, source_sets=None) -> dict:
         tokens = int(np.sum(np.minimum(last, pos[t]) - first + 1))
         row = dict(band=band_of(int(pos[t])), position=int(pos[t]), units=len(ids), tokens=tokens)
         for p in PAGES:
-            n = len(pages_of(ids, dump, p))
+            n = len(pages_of(ids, dump, p, int(pos[t])))
             row[f"pages_{p}"] = n
             row[f"amplification_{p}"] = p * n / tokens if tokens else math.nan
         dist = pos[t] - np.minimum(last, pos[t])
@@ -204,27 +234,27 @@ def analyze_layer(dump, source_sets=None) -> dict:
                    dist_p99=float(np.percentile(dist, 99)), dist_max=int(dist.max()),
                    reach_fraction=float(dist.max() / max(1, pos[t])))
         out["cluster"].append(row)
-    # 6. cache simulation
-    for capacity in RESIDENT:
-        for policy in ("lru", "lru_pin1k", "prefetch_prev", "prefetch_source"):
-            if policy == "prefetch_source" and source_sets is None:
-                continue
-            cache = Lru(capacity)
-            for t, ids in enumerate(sets):
-                if t and seg_of[t] != seg_of[t - 1] and pos[t] < pos[t - 1]:
-                    cache = Lru(capacity)  # a new request (positions restart): its own cache
-                pinned = pinned_units(int(pos[t]), dump) if policy != "lru" else frozenset()
-                keys = ids.tolist()
-                if policy == "prefetch_prev" and t:
-                    cache.load(sets[t - 1].tolist(), pinned)
-                elif policy == "prefetch_source" and source_sets is not None:
-                    cache.load(source_sets.get(int(pos[t]), np.empty(0, np.int32)).tolist(), pinned)
-                live = [k for k in keys if k not in pinned]
-                misses = cache.access(keys, pinned)
-                out["cache"].append(dict(band=band_of(int(pos[t])), position=int(pos[t]), policy=policy,
-                                         resident_units=capacity, resident_tokens=capacity * dump["unit_tokens"] // dump["heads"],
-                                         selected=len(keys), unpinned=len(live), misses=misses,
-                                         miss_rate=misses / len(keys) if len(keys) else 0.0))
+    # 6. cache simulation (step-granular LRU stack distances, every capacity at once)
+    resets = np.zeros(len(sets), dtype=bool)
+    resets[0] = True
+    resets[1:] = pos[1:] < pos[:-1]  # positions restart: a new request, its own cache
+    key_space = int(max((s.max() for s in sets if len(s)), default=0)) + 1
+    pins = [pinned_units(int(p), dump) for p in pos]
+    for policy, pinned in (("lru", None), ("lru_pin1k", pins)):
+        dist = stack_distances(sets, resets, pinned, key_space)
+        for t, d in enumerate(dist):
+            row = dict(band=band_of(int(pos[t])), position=int(pos[t]), policy=policy, selected=len(sets[t]),
+                       unpinned=len(d), first_reference=int(np.isinf(d).sum()))
+            for capacity in RESIDENT:
+                misses = int(np.sum(d >= capacity))
+                row[f"misses_{capacity}"] = misses
+                # one layer ahead: misses of this layer that an earlier selecting layer picked at this step
+                if source_sets is not None and policy == "lru_pin1k":
+                    keys = sets[t] if pinned is None else np.setdiff1d(sets[t], pinned[t], assume_unique=True)
+                    missed = keys[d >= capacity]
+                    src = source_sets.get(int(pos[t]))
+                    row[f"source_covers_{capacity}"] = int(np.isin(missed, src).sum()) if src is not None else None
+            out["cache"].append(row)
     return out
 
 
@@ -266,42 +296,46 @@ def summarize(family: str, dumps: dict, per_layer: dict, index_bytes: float) -> 
             for k in ("share_1", "share_4", "share_16", "dist_p50", "dist_p90", "dist_p99", "reach_fraction"):
                 table[key][k] = float(np.mean([r[k] for r in cl]))
             table[key]["dist_max"] = int(max(r["dist_max"] for r in cl))
-            for policy in ("lru", "lru_pin1k", "prefetch_prev", "prefetch_source"):
+            for policy in ("lru", "lru_pin1k"):
+                rows = [r for r in out["cache"] if r["band"] == band and r["policy"] == policy]
+                if not rows:
+                    continue
+                sel = sum(r["selected"] for r in rows)
+                table[key][f"{policy}_first_reference_rate"] = sum(r["first_reference"] for r in rows) / max(1, sel)
+                table[key][f"{policy}_first_reference_per_step"] = float(np.mean([r["first_reference"] for r in rows]))
                 for capacity in RESIDENT:
-                    rows = [r for r in out["cache"] if r["band"] == band and r["policy"] == policy and r["resident_units"] == capacity]
-                    if rows:
-                        sel = sum(r["selected"] for r in rows)
-                        table[key][f"{policy}_{capacity}_hit"] = 1 - sum(r["misses"] for r in rows) / max(1, sel)
-                        table[key][f"{policy}_{capacity}_miss_per_step"] = float(np.mean([r["misses"] for r in rows]))
-                        table[key][f"{policy}_{capacity}_zero_miss_steps"] = float(np.mean([r["misses"] == 0 for r in rows]))
+                    misses = [r[f"misses_{capacity}"] for r in rows]
+                    table[key][f"{policy}_{capacity}_hit"] = 1 - sum(misses) / max(1, sel)
+                    table[key][f"{policy}_{capacity}_miss_per_step"] = float(np.mean(misses))
+                    table[key][f"{policy}_{capacity}_zero_miss_steps"] = float(np.mean([m == 0 for m in misses]))
+                    covers = [r.get(f"source_covers_{capacity}") for r in rows]
+                    if any(c is not None for c in covers):
+                        table[key][f"{policy}_{capacity}_source_covers_misses"] = (
+                            sum(c or 0 for c in covers) / max(1, sum(misses)))
     return {f"{layer}|{band}": v for (layer, band), v in table.items()}
 
 
 def resident_bytes(dumps: dict, per_layer: dict, index_bytes: float, kv_bytes: float) -> list[dict]:
-    """Bytes resident per virtual token: page tables (4 B per page entry), index keys
-    (given), and the smallest simulated LRU (pinned 1K window) meeting each miss bar,
-    expressed as KV tokens per request (resident set, not per virtual token)."""
-    rows = []
-    for p in PAGES:
-        rows.append(dict(item=f"page_table_P{p}", bytes_per_virtual_token=4 / p))
+    """Bytes resident per virtual token (page tables at 4 B per page entry, index keys as
+    given) and, per layer and band, the smallest simulated LRU (1K pinned window) that keeps
+    the per-step miss rate within each bar, as KV tokens of that layer per request."""
+    rows = [dict(item=f"page_table_P{p}", bytes_per_virtual_token=4 / p) for p in PAGES]
     rows.append(dict(item="index_keys", bytes_per_virtual_token=index_bytes))
-    for bar_name, bar in (("1%", 0.01), ("0.1%", 0.001), ("0", 0.0)):
-        for layer, out in per_layer.items():
-            for band in [b for _, _, b in BANDS]:
-                need = None
-                for capacity in RESIDENT:
-                    cache = [r for r in out["cache"] if r["band"] == band and r["policy"] == "lru_pin1k" and r["resident_units"] == capacity]
-                    if not cache:
-                        continue
-                    sel = sum(r["selected"] for r in cache)
-                    rate = sum(r["misses"] for r in cache) / max(1, sel)
-                    if rate <= bar and (bar > 0 or all(r["misses"] == 0 for r in cache)):
-                        need = cache[0]["resident_tokens"]
-                        break
-                if any(r["band"] == band for r in out["cache"]):
-                    rows.append(dict(item=f"resident_lru_pin1k_miss_{bar_name}", layer=layer, band=band,
-                                     resident_tokens=need if need is not None else f">{RESIDENT[-1] * dumps[layer]['unit_tokens'] // dumps[layer]['heads']}",
-                                     kv_bytes=need * kv_bytes if need is not None else None))
+    for layer, out in per_layer.items():
+        d = dumps[layer]
+        for band in [b for _, _, b in BANDS]:
+            cache = [r for r in out["cache"] if r["band"] == band and r["policy"] == "lru_pin1k"]
+            if not cache:
+                continue
+            sel = sum(r["selected"] for r in cache)
+            for bar_name, bar in (("1%", 0.01), ("0.1%", 0.001), ("0", 0.0)):
+                need = next((c for c in RESIDENT if sum(r[f"misses_{c}"] for r in cache) <= bar * sel
+                             and (bar > 0 or all(r[f"misses_{c}"] == 0 for r in cache))), None)
+                tokens = None if need is None else need * d["unit_tokens"] // d["heads"]
+                rows.append(dict(item=f"resident_lru_pin1k_miss_{bar_name}", layer=layer, band=band,
+                                 resident_units=need if need is not None else f">{RESIDENT[-1]}",
+                                 resident_tokens=tokens, pinned_tokens=PIN_TOKENS,
+                                 kv_bytes=None if tokens is None else (tokens + PIN_TOKENS) * kv_bytes))
     return rows
 
 
@@ -320,14 +354,13 @@ def figure(family: str, per_layer: dict, out: Path):
         axes[0, 1].plot([r["position"] for r in ch], [r["jaccard"] for r in ch], lw=0.5, alpha=0.6)
         axes[1, 0].plot(x, [r["amplification_64"] for r in cl], lw=0.5, alpha=0.6)
         cache = [r for r in data["cache"] if r["policy"] == "lru_pin1k"]
-        caps = sorted({r["resident_tokens"] for r in cache})
-        axes[1, 1].plot(caps, [1 - sum(r["misses"] for r in cache if r["resident_tokens"] == c)
-                               / max(1, sum(r["selected"] for r in cache if r["resident_tokens"] == c)) for c in caps],
+        sel = max(1, sum(r["selected"] for r in cache))
+        axes[1, 1].plot(RESIDENT, [1 - sum(r[f"misses_{c}"] for r in cache) / sel for c in RESIDENT],
                         marker="o", lw=1, label=f"L{layer}")
     axes[0, 0].set(title="share of selected units within 4K tokens", xlabel="position")
     axes[0, 1].set(title="step-to-step Jaccard (within a turn)", xlabel="position")
     axes[1, 0].set(title="read amplification at 64-token pages", xlabel="position")
-    axes[1, 1].set(title="LRU + pinned 1K: hit rate vs resident tokens", xlabel="resident tokens", xscale="log")
+    axes[1, 1].set(title="LRU + pinned 1K: hit rate vs resident units", xlabel="resident units", xscale="log")
     if len(per_layer) <= 12:
         axes[1, 1].legend(fontsize=6)
     fig.suptitle(f"{family}: per-layer selection on an agentic session")

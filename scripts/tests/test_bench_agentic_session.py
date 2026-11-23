@@ -299,3 +299,17 @@ def test_chain_tasks_argument_pairing_and_key_file(tmp_path, monkeypatch):
     assert bench.main(["record", "--output", str(tmp_path / "b.json"), "--seeds", "0", "--chain-tasks",
                        "--target-context", "2000"]) == 0
     assert seen == [("http://card:9", "secret")]
+
+
+def test_chain_tasks_saves_every_turn_and_honours_the_deadline(tmp_path, monkeypatch):
+    bench = load()
+    bodies = chain_server(bench, monkeypatch, [{"calls": [{"id": "a", "name": "list_dir", "arguments": '{"path": "."}'}]}])
+    clock = iter([0.0, 1.0, 2.0, 100.0, 101.0])
+    monkeypatch.setattr(bench.time, "monotonic", lambda: next(clock))
+    out = tmp_path / "chain.json"
+    seen = []
+    original = out.write_text
+    assert bench.main(["record", "--output", str(out), "--seeds", "0", "--chain-tasks", "--target-context", "1000000",
+                       "--max-turns", "50", "--deadline-s", "50"]) == 0
+    session = json.loads(out.read_text())["sessions"][0]
+    assert session["stop"] == "deadline" and len(bodies) == len(session["turns"]) == 2
