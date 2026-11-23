@@ -227,7 +227,7 @@ impl ScoreRows {
     /// only the id is meaningful and only its own path reads the score.
     pub fn from_sampled(vocab: usize, sampled: &SampledTargetRows, greedy: &[bool]) -> Result<Self> {
         ensure!(
-            !sampled.ids.is_empty() && sampled.ids.len() <= 80,
+            !sampled.ids.is_empty() && sampled.ids.len() <= cuteafd_core::V41_VOCAB_ROWS,
             "invalid sampled target rows"
         );
         ensure!(
@@ -260,7 +260,10 @@ impl ScoreRows {
     /// Compact construction: the ids are known (device-selected greedy rows or
     /// the compact lane) and no row has logits yet.
     pub fn from_greedy(vocab: usize, values: Vec<(u32, f32)>) -> Result<Self> {
-        ensure!(!values.is_empty() && values.len() <= 80, "invalid compact target rows");
+        ensure!(
+            !values.is_empty() && values.len() <= cuteafd_core::V41_VOCAB_ROWS,
+            "invalid compact target rows"
+        );
         ensure!(values.iter().all(|&(id, score)| (id as usize) < vocab && score.is_finite()),
             "invalid token or non-finite target logit");
         let best = values.into_iter().map(|v| v.0).collect::<Vec<_>>();
@@ -507,6 +510,31 @@ mod tests {
         assert!(ScoreRows::from_greedy(VOCAB, vec![(0, f32::INFINITY)]).is_err());
         assert!(ScoreRows::from_greedy(VOCAB, vec![(VOCAB as u32, 1.)]).is_err());
         assert!(ScoreRows::from_greedy(VOCAB, vec![]).is_err());
+        assert_eq!(ScoreRows::from_greedy(VOCAB, vec![(17, 1.0); 128]).unwrap().rows(), 128);
+        assert_eq!(
+            ScoreRows::from_greedy(VOCAB, vec![(17, 1.0); cuteafd_core::V41_VOCAB_ROWS]).unwrap().rows(),
+            cuteafd_core::V41_VOCAB_ROWS
+        );
+        assert!(ScoreRows::from_greedy(VOCAB, vec![(17, 1.0); cuteafd_core::V41_VOCAB_ROWS + 1]).is_err());
+        let sampled_256 = SampledTargetRows {
+            ids: vec![17; cuteafd_core::V41_VOCAB_ROWS],
+            scores: vec![1.0; cuteafd_core::V41_VOCAB_ROWS],
+            status: vec![0; cuteafd_core::V41_VOCAB_ROWS],
+            status_detail: vec![0; cuteafd_core::V41_VOCAB_ROWS],
+            logits: cuteafd_ffi::CuteafdDeviceBuffer::default(),
+        };
+        assert_eq!(
+            ScoreRows::from_sampled(VOCAB, &sampled_256, &vec![true; cuteafd_core::V41_VOCAB_ROWS]).unwrap().rows(),
+            cuteafd_core::V41_VOCAB_ROWS
+        );
+        let sampled_over = SampledTargetRows {
+            ids: vec![17; cuteafd_core::V41_VOCAB_ROWS + 1],
+            scores: vec![1.0; cuteafd_core::V41_VOCAB_ROWS + 1],
+            status: vec![0; cuteafd_core::V41_VOCAB_ROWS + 1],
+            status_detail: vec![0; cuteafd_core::V41_VOCAB_ROWS + 1],
+            logits: cuteafd_ffi::CuteafdDeviceBuffer::default(),
+        };
+        assert!(ScoreRows::from_sampled(VOCAB, &sampled_over, &vec![true; cuteafd_core::V41_VOCAB_ROWS + 1]).is_err());
     }
     #[test]
     fn new_constraint_reselects_an_exact_cached_frontier() {

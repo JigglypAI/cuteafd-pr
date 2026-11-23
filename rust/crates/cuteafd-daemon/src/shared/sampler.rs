@@ -14,7 +14,7 @@ use crate::shared::memory::Tag;
 pub(crate) const SAMPLING_HISTOGRAM_BUCKETS: usize = 2048;
 
 /// The largest mask arena the wave can address (`mask_row` is a `u32`).
-const SAMPLING_MAX_MASK_ROWS: usize = 128;
+const SAMPLING_MAX_MASK_ROWS: usize = cuteafd_core::V41_VOCAB_ROWS;
 
 /// Per-row stride of the chunk-3a rank-ordered retained-id arena, in ids
 /// (design §4.5/§11.1: "who allocates them and how the §11.1 top-k region is
@@ -809,7 +809,7 @@ mod allocation_accounting_tests {
         fixture.configure_memory(&library, 1, 1 << 30)?;
         library.cuda_set_device(1)?;
         let physical = [1];
-        for capacity in [1, 16, 64, 128] {
+        for capacity in [1, 16, 64, 128, 256] {
             for vocab in [33, 200064] {
                 let mut wave = TargetSamplingWave::new(&library, capacity, vocab)?;
                 wave.params.reserve(capacity);
@@ -849,7 +849,7 @@ mod allocation_accounting_tests {
 
     #[test]
     fn shared_device_bytes_match_every_sampler_arena() {
-        for rows in [1, 7, 64, 128] {
+        for rows in [1, 7, 64, 128, 256] {
             for vocab in [1usize, 31, 32, 33, 128896] {
                 let expected = rows * (cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES
                     + cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES

@@ -1781,8 +1781,8 @@ pub fn receipt_key(id: &str) -> Option<&'static str> {
 
 /// Maximum retained sampler storage, shared by admission and allocation.
 pub fn allocations(capacity: usize, vocab: usize) -> Result<Vec<SamplerAllocation>, &'static str> {
-    if !(1..=128).contains(&capacity) || vocab == 0 {
-        return Err("sampler capacity must be 1..=128 and vocabulary nonzero");
+    if !(1..=crate::V41_VOCAB_ROWS).contains(&capacity) || vocab == 0 {
+        return Err("sampler capacity must be 1..=256 and vocabulary nonzero");
     }
     let row = capacity.checked_mul(4).ok_or("sampler row overflow")?;
     let param = capacity.checked_mul(64).ok_or("sampler params overflow")?;
@@ -1831,7 +1831,7 @@ mod allocation_tests {
 
     #[test]
     fn sampler_owner_census_matches_device_formula_and_pinned_arenas() {
-        for rows in [1, 64, 128] {
+        for rows in [1, 64, 128, 256] {
             for vocab in [1, 32, 33, 154880] {
                 let owners = allocations(rows, vocab).unwrap();
                 assert_eq!(owners.len(), 22);
@@ -1842,7 +1842,7 @@ mod allocation_tests {
                 assert_eq!(ids.len(), owners.len());
             }
         }
-        for (rows, vocab) in [(0, 1), (129, 1), (1, 0), (128, usize::MAX)] {
+        for (rows, vocab) in [(0, 1), (257, 1), (1, 0), (256, usize::MAX)] {
             assert!(allocations(rows, vocab).is_err());
         }
     }
