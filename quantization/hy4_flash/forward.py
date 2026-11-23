@@ -92,13 +92,17 @@ class Reader(reference.Checkpoint):
                 weights[leaf] = self.load(name, native=leaf == "engram_layer.lookup_table")
         return Layer(index, prefix, weights)
 
+    @staticmethod
+    def draft_targets(config):
+        return draft_targets(config)
+
     def load_draft_layer(self, index):
         prefix = f"model.dfly_layers.{index}."
         weights = {name.removeprefix(prefix): self.load(name)
                    for name in self.index if name.startswith(prefix)}
         if not weights:
             raise ValueError(f"missing Hy4 DFly2 layer {index}")
-        targets, _ = draft_targets(self.config)
+        targets, _ = self.draft_targets(self.config)
         return Layer(targets[index], prefix, weights)
 
     def load_draft_aux(self):
@@ -158,17 +162,23 @@ class Model:
         gate = layer.project(p + "linear_gate", inputs, project).sigmoid()
         return AttentionFirst(q, kv, kr, gate)
 
+    rotate = staticmethod(reference.rotate)
+    rotate_tail = staticmethod(reference.rotate_tail)
+
+    def rope_base(self, index):
+        return self.config.rope_parameters[self.config.layer_types[index]]["rope_theta"]
+
     def attention_expand(self, projected, layer, positions, project=native_projection,
                          *, context=None):
         """Expand q_b and kv_b. DFly2 uses the same draft kv_b on shared latents."""
         c, w = self.config, layer.weights
         h, nope, rope, vdim = c.attention(layer.index)
         p = "self_attn."
-        base = c.rope_parameters[c.layer_types[layer.index]]["rope_theta"]
+        base = self.rope_base(layer.index)
         cos, sin = reference.phase(positions, rope, base)
         q = layer.project(p + "q_b_proj", projected.normalized_q, project)
-        q = reference.rotate_tail(q.reshape(len(q), h, nope + rope), cos, sin)
-        kr = reference.rotate(projected.rope_key.unsqueeze(1), cos, sin).squeeze(1)
+        q = self.rotate_tail(q.reshape(len(q), h, nope + rope), cos, sin)
+        kr = self.rotate(projected.rope_key.unsqueeze(1), cos, sin).squeeze(1)
         kv = projected.kv
         if context is not None:
             ck, cr = context
@@ -233,10 +243,10 @@ class Model:
         weight = layer.weights["self_attn.post_proj_norm.weight"]
         return reference.norm(output, weight, self.config.rms_norm_eps)
 
-    def attention(self, inputs, layer, project=native_projection, *, capture_tap=False):
+    def attention(self, inputs, layer, project=native_projection, *, capture_tap=False, **index_args):
         first = self.attention_first(inputs, layer, project)
         output_inputs, tap = self.attention_output_inputs(inputs, first, layer, project,
-                                                         capture_tap=capture_tap)
+                                                         capture_tap=capture_tap, **index_args)
         return self.attention_finish(output_inputs, layer, project), tap
 
     def mlp_start(self, residual, attention_post, output, layer):
@@ -252,6 +262,9 @@ class Model:
         up = layer.project(prefix + "up_proj", inputs, project)
         active = F.silu(gate) * up
         return layer.project(prefix + "down_proj", active, project)
+
+    def routing_scores(self, inputs, layer):
+        return reference.routing_scores(inputs, layer.weights, self.config)
 
     def moe_route(self, inputs, layer, project=native_projection):
         # Router and shared expert see full-width states. Only routed experts
@@ -292,9 +305,9 @@ class Model:
             weight = layer.weights["mlp.combine_output_norm.weight"]
         return post * reference.norm(result, weight, c.rms_norm_eps).unsqueeze(1) + state
 
-    def forward_layer(self, state, tokens, layer, project=native_projection, *, capture_tap=False):
+    def forward_layer(self, state, tokens, layer, project=native_projection, *, capture_tap=False, **index_args):
         residual, attention_post, inputs = self.attention_start(state, tokens, layer)
-        output, tap = self.attention(inputs, layer, project, capture_tap=capture_tap)
+        output, tap = self.attention(inputs, layer, project, capture_tap=capture_tap, **index_args)
         state, post, inputs = self.mlp_start(residual, attention_post, output, layer)
         routed = None
         if self.config.mlp_layer_types[layer.index] == "sparse":
@@ -354,10 +367,17 @@ class Drafter:
     target bonus token, not a replacement for the final committed token.
     """
 
+    linear = staticmethod(linear)
+    block_size = DRAFT_BLOCK_SIZE
+    target_layers = staticmethod(draft_targets)
+
+    def selection_ratio(self):
+        return self.config.compressed_indexer_compress_ratio
+
     def __init__(self, model, *, layers=None, aux=None):
         self.model = model
         self.config = model.config
-        self.kv_layers, self.index_layers = draft_targets(self.config)
+        self.kv_layers, self.index_layers = self.target_layers(self.config)
         self.layers = tuple(layers) if layers is not None else tuple(
             model.reader.load_draft_layer(i) for i in range(len(self.kv_layers)))
         if tuple(layer.index for layer in self.layers) != self.kv_layers:
@@ -368,7 +388,8 @@ class Drafter:
         values = embedding.index_select(0, ids.to(embedding.device))
         return values.to(ids.device, dtype=torch.float32)
 
-    def start(self, bonus, target_hidden, embedding, *, width=DRAFT_BLOCK_SIZE):
+    def start(self, bonus, target_hidden, embedding, *, width=None):
+        width = self.block_size if width is None else width
         if bonus.ndim != 0 or target_hidden.ndim != 1 or not 2 <= width <= 17:
             raise ValueError("invalid Hy4 DFly2 anchor or block width")
         w, c = self.aux, self.config
@@ -381,7 +402,7 @@ class Drafter:
             reference.norm(anchor, w[p + "enorm.weight"], c.rms_norm_eps),
             reference.norm(target_hidden, w[p + "hnorm.weight"], c.rms_norm_eps),
         ))
-        states[0] = anchor + w[p + "gate"] * linear(joined, w[p + "eh_proj.weight"])
+        states[0] = anchor + w[p + "gate"] * self.linear(joined, w[p + "eh_proj.weight"])
         return states
 
     def attention_inputs(self, hidden, stage):
@@ -391,7 +412,7 @@ class Drafter:
     def attention_output_inputs(self, first, stage, taps, end, project=native_projection):
         kv = taps[self.kv_layers[stage]]
         selection = taps[self.index_layers[stage]]
-        indices = recalled_context(selection, end, self.config.compressed_indexer_compress_ratio)
+        indices = recalled_context(selection, end, self.selection_ratio())
         if len(kv.kv) != len(selection.kv):
             raise ValueError("DFly2 KV and selection tap lengths differ")
         context = (kv.kv[indices], kv.rope_key[indices])
@@ -427,9 +448,9 @@ class Drafter:
             reference.norm(hidden, w[p + "hidden_norm.weight"], c.rms_norm_eps),
             reference.norm(previous_embed, w[p + "embed_norm.weight"], c.rms_norm_eps),
         ))
-        gate = linear(joined, w[p + "gate_proj.weight"])
-        up = linear(joined, w[p + "up_proj.weight"])
-        return hidden + linear(F.silu(gate) * up, w[p + "down_proj.weight"])
+        gate = self.linear(joined, w[p + "gate_proj.weight"])
+        up = self.linear(joined, w[p + "up_proj.weight"])
+        return hidden + self.linear(F.silu(gate) * up, w[p + "down_proj.weight"])
 
     def proposals(self, hidden, bonus, embedding, *, head=native_projection, head_weight=None):
         """Return the sequentially corrected FP32 logits of draft slots 1..m."""
@@ -443,7 +464,7 @@ class Drafter:
         return torch.stack(logits)
 
     def forward(self, bonus, target_hidden, taps, end, embedding, project=native_projection,
-                *, head=native_projection, head_weight=None, width=DRAFT_BLOCK_SIZE):
+                *, head=native_projection, head_weight=None, width=None):
         hidden = self.start(bonus, target_hidden, embedding, width=width)
         for stage in range(len(self.layers)):
             hidden = self.layer(hidden, stage, taps, end, project)

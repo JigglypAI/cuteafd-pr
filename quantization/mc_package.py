@@ -786,12 +786,12 @@ def validate(output, *, verification='full'):
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
     family = state['identity']['family']
-    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash')
+    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash', 'hy4')
             or 'direct_expected_specs' not in state or state.get('copies') != {}):
         raise ValueError('streaming receipts require an independent direct package')
     if verification == 'streaming-receipts':
         source_names = set(state['core_tensors']['original'])
-        if family == 'hy4_flash':
+        if family in ('hy4_flash', 'hy4'):
             source_names.update(n for n in state['direct_expected_specs']['original']
                                 if '.mlp.experts.' not in n)
         if set(state['source_tensor_locations']) != source_names:
@@ -809,7 +809,7 @@ def validate(output, *, verification='full'):
     if family != 'ml4':
         manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
         _validate_direct_engram(output, manifest, state)
-    if family == 'hy4_flash' and (state['identity'].get('codebook') != 'mul1'
+    if family in ('hy4_flash', 'hy4') and (state['identity'].get('codebook') != 'mul1'
             or state['identity'].get('codebook_multiplier') != MUL1
             or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
         raise ValueError('Hy4 package, manifest and producer must agree on MUL1')
@@ -825,7 +825,7 @@ def validate(output, *, verification='full'):
                 raise ValueError('direct selected index differs from committed tensor inventory')
             selected = state['direct_core_selection']
             markers = (_hy4_markers(inv, q, load_json(output / config), selected, view)
-                       if family == 'hy4_flash' else {})
+                       if family in ('hy4_flash', 'hy4') else {})
             for module, geometry in selected.items():
                 if view == 'original':
                     if module in q['tensor_storage']:

@@ -24,14 +24,15 @@ def _storage_entry(module, geometry):
                                        mcg_multiplier=None, mul1_multiplier=package.MUL1)
 
 
-def _native_specs(source_inventory, selection):
-    excluded = {module + '.weight' for module in selection} | recipe.expert_source_specs().keys()
+def _native_specs(source_inventory, selection, family_recipe=recipe):
+    excluded = {module + '.weight' for module in selection} | family_recipe.expert_source_specs().keys()
     return {name: spec for name, spec in source_inventory['specs'].items() if name not in excluded}
 
 
-def view_metadata(document, inventory, selection, experts, identity, *, k6_drafter_bits):
+def view_metadata(document, inventory, selection, experts, identity, *, k6_drafter_bits,
+                  family_recipe=recipe):
     """Bind each view to its own index/metadata and exact packed tensor shapes."""
-    native = _native_specs(inventory, selection)
+    native = _native_specs(inventory, selection, family_recipe)
     configs, quantizes = {}, {}
     for view in VIEWS:
         index, _, quantize, bits = package.mc_manifest.FILES[view]
@@ -48,8 +49,10 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
         modules = experts | core
         # Exact name patterns for core plus a bounded routed range. The source
         # has no fused expert names in the EXL3 view.
-        patterns = [r'^model\.layers\.(?:[1-9]|[1-3][0-9]|4[01])\.mlp\.experts\.'
-                    r'(?:[0-9]|[1-9][0-9]|[1-4][0-9]{2}|50[0-9]|51[01])\.(?:gate_proj|up_proj|down_proj)$']
+        layers = sorted({name.split('.')[2] for name in experts}, key=int)
+        ids = sorted({name.split('.')[5] for name in experts}, key=int)
+        patterns = [rf"^model\.layers\.(?:{'|'.join(layers)})\.mlp\.experts\.(?:{'|'.join(ids)})"
+                    r"\.(?:gate_proj|up_proj|down_proj)$"]
         patterns.extend('^' + re.escape(name) + '$' for name in sorted(core))
         retained = native if compact else native | {name + '.weight': inventory['specs'][name + '.weight']
                                                   for name in selection}
@@ -58,7 +61,7 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
             retained_native_tensors={name: dict(dtype=dtype, shape=shape)
                                      for name, (dtype, shape) in retained.items()},
             provenance=identity, core_view=view, upstream_activations='k8-compact',
-            engram_checkpoint_dtype='BF16')
+            **({'engram_checkpoint_dtype': 'BF16'} if family_recipe.ENGRAM_TABLES else {}))
         meta, config = package.gptqmodel_mc_view(config, meta, bits=4,
             core_bits=bits if compact else None, module_include=patterns, codebook='mul1')
         config['quantization_config']['safetensors_index'] = index
@@ -71,7 +74,8 @@ def view_metadata(document, inventory, selection, experts, identity, *, k6_draft
     return configs, quantizes
 
 
-def verify_original_discovery(output, expected_mapping):
+def verify_original_discovery(output, expected_mapping, *, model_type="hy_v4_flash",
+                              reference_revision=recipe.REFERENCE_REVISION):
     """Run the pinned Transformers default discovery without loading weights."""
     from transformers import AutoConfig
     from transformers.modeling_utils import _get_resolved_checkpoint_files
@@ -81,13 +85,13 @@ def verify_original_discovery(output, expected_mapping):
     files, metadata = _get_resolved_checkpoint_files(
         output, variant=None, gguf_file=None, use_safetensors=True,
         user_agent=None, is_remote_code=False, download_kwargs={"local_files_only": True})
-    if (config.model_type != "hy_v4_flash" or not metadata
+    if (config.model_type != model_type or not metadata
             or metadata["weight_map"] != expected_mapping
             or {Path(path) for path in files} != {output / shard for shard in expected_mapping.values()}
             or not all(Path(path).is_file() for path in files)):
         raise ValueError("Transformers default discovery differs from verified Hy4 original headers")
     return dict(status="passed", scope="default config, index and sealed header inventory",
-                reference_revision=recipe.REFERENCE_REVISION,
+                reference_revision=reference_revision,
                 config_type=type(config).__name__, shards=len(files), tensors=len(expected_mapping))
 
 
@@ -194,19 +198,22 @@ class DirectMCWriter(SharedDirectMCWriter):
 
     family = 'hy4_flash'
     prove_shared_source = True
+    recipe = recipe
+    card = staticmethod(model_card)
 
     def __init__(self, output, source_snapshot, identity, source_inventory, **kwargs):
         if identity.get('codebook') != 'mul1' or identity.get('codebook_multiplier') != package.MUL1:
             raise ValueError('Hy4 direct writer requires the frozen MUL1 producer identity')
-        super().__init__(output, source_snapshot, recipe.BASE_REPO, recipe.BASE_REVISION,
+        super().__init__(output, source_snapshot, self.recipe.BASE_REPO, self.recipe.BASE_REVISION,
                          identity, source_inventory, **kwargs)
 
-    def finalize(self, *, core_selection, engram, document, error_csv, card_path,
+    def finalize(self, *, core_selection, engram=None, document, error_csv, card_path,
                  k6_drafter_bits=6, retained_by_gate=()):
         """Seal and independently validate exact complete per-view inventories."""
-        if set(engram['tables']) != recipe.ENGRAM_TABLES.keys() or k6_drafter_bits not in (6, 8):
+        tables = engram['tables'] if engram is not None else {}
+        if tables.keys() != self.recipe.ENGRAM_TABLES.keys() or k6_drafter_bits not in (6, 8):
             raise ValueError('Hy4-flash requires all dedicated Engram tables and a reviewed drafter width')
-        reviewed = recipe.reviewed_core_modules(
+        reviewed = self.recipe.reviewed_core_modules(
             include_head='lm_head' in core_selection or 'lm_head' in retained_by_gate,
             include_kv_b=any(name.endswith('.kv_b_proj') for name in (*core_selection, *retained_by_gate)))
         if any(module not in reviewed or any(g[key] != reviewed[module][key] for key in
@@ -216,19 +223,19 @@ class DirectMCWriter(SharedDirectMCWriter):
         if {n for n in core_selection if n.startswith('model.dfly_layers.')} != {
                 n for n in reviewed if n.startswith('model.dfly_layers.') and n not in retained_by_gate}:
             raise ValueError('compact views require every selected DFly2 matrix')
-        native = _native_specs(self.source_inventory, core_selection)
-        experts = recipe.reviewed_expert_modules()
+        native = _native_specs(self.source_inventory, core_selection, self.recipe)
+        experts = self.recipe.reviewed_expert_modules()
         shared = native | {name: spec for module, g in experts.items()
-                           for name, spec in recipe.packed_specs(module, g).items()}
+                           for name, spec in self.recipe.packed_specs(module, g).items()}
         configs, quantizes = view_metadata(document, self.source_inventory, core_selection,
-                                          experts, self.identity, k6_drafter_bits=k6_drafter_bits)
+                                          experts, self.identity, k6_drafter_bits=k6_drafter_bits, family_recipe=self.recipe)
         assets = {name: self.source / name for name in ASSETS if (self.source / name).is_file()}
         if not {'LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
                 'generation_config.json', 'processor_config.json'} <= assets.keys():
             raise ValueError('source license, tokenizer or processor assets are incomplete')
         aliases = {module for module, geometry in core_selection.items()
                    if geometry['group'] == 'mtp'} if k6_drafter_bits == 8 else ()
-        alias_tensors = {name for module in aliases for name in recipe.packed_specs(
+        alias_tensors = {name for module in aliases for name in self.recipe.packed_specs(
             module, core_selection[module], bits=8)}
         sizes = Counter()
         for group in self.state['groups'].values():
@@ -236,8 +243,8 @@ class DirectMCWriter(SharedDirectMCWriter):
                 sizes[kind] += sum(members.values())
                 if kind == 'k8-compact':
                     sizes['k6-compact'] += sum(members[n] for n in alias_tensors.intersection(members))
-        sizes['shared'] += sum(self.source_inventory['sizes'][n] for n in engram['tables'])
-        assets['README.md'] = model_card(card_path, engram, k6_drafter_bits=k6_drafter_bits,
+        sizes['shared'] += sum(self.source_inventory['sizes'][n] for n in tables)
+        assets['README.md'] = self.card(card_path, engram, k6_drafter_bits=k6_drafter_bits,
                                         selection=core_selection, identity=self.identity,
                                         view_bytes={view: sizes[view] + sizes['shared'] for view in VIEWS})
         attributes = Path(card_path).parent / 'hy4-hub.gitattributes'

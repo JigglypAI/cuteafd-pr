@@ -17,27 +17,27 @@ SOURCE = Path.home() / (".cache/huggingface/hub/models--tencent--Hy4-flash/snaps
                         "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959")
 
 
-def command(arguments, phase):
+def command(arguments, phase, *, family="hy4-flash", task=TASK, build=BUILD):
     if socket.gethostname().split(".")[0] != "maxq":
         raise ValueError("Hy4 quantization must run on maxq")
-    if phase not in ("build", "pilot", "production"):
+    if phase not in ("build", "preflight", "pilot", "production"):
         raise ValueError("unrecognized Hy4 container phase")
-    python = TASK / "environment/bin/python"
-    argv = sm120_command(arguments, name="cuteafd-hy4-flash-" + phase,
-                         memory_gib=80, build_root=BUILD / "exllamav3")
+    python = task / "environment/bin/python"
+    argv = sm120_command(arguments, name=f"cuteafd-{family}-{phase}",
+                         memory_gib=80, build_root=build / "exllamav3")
     gpu = argv.index("--gpus")
     argv[gpu:gpu + 2] = ["--device", "nvidia.com/gpu=all"]
     argv[argv.index("--workdir") + 1] = str(REPO)
     argv[argv.index("--entrypoint") + 1] = str(python)
     for i, value in enumerate(argv):
         if value.startswith("LD_LIBRARY_PATH="):
-            torch_lib = TASK / "environment/lib/python3.12/site-packages/torch/lib"
+            torch_lib = task / "environment/lib/python3.12/site-packages/torch/lib"
             argv[i] = f"LD_LIBRARY_PATH={torch_lib}:/usr/local/cuda-13.4/lib64"
     image = next(i for i, arg in enumerate(argv) if arg.startswith("cuteafd-coordinator-dev:"))
     argv[image:image] = [
         "-e", f"PYTHONPATH={REPO}/quantization:{REPO}/python/reference",
-        "-e", f"TORCH_EXTENSIONS_DIR={BUILD}/torch-extensions",
-        "-e", f"CUDA_CACHE_PATH={BUILD}/cuda-cache",
+        "-e", f"TORCH_EXTENSIONS_DIR={build}/torch-extensions",
+        "-e", f"CUDA_CACHE_PATH={build}/cuda-cache",
         "-e", "HF_HUB_OFFLINE=1",
         "-e", "NVIDIA_TF32_OVERRIDE=0",
         "-e", "PYTHONUNBUFFERED=1",
@@ -45,12 +45,12 @@ def command(arguments, phase):
     return argv
 
 
-def main():
+def main(*, family="hy4-flash", task=TASK, build=BUILD):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("build", "pilot", "production"))
+    parser.add_argument("phase", choices=("build", "preflight", "pilot", "production"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    name = "cuteafd-hy4-flash-" + args.phase
+    name = f"cuteafd-{family}-{args.phase}"
     child = None
 
     def interrupted(signum, frame):
@@ -59,7 +59,7 @@ def main():
     for value in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(value, interrupted)
     try:
-        child = subprocess.Popen(command(args.arguments, args.phase))
+        child = subprocess.Popen(command(args.arguments, args.phase, family=family, task=task, build=build))
         return child.wait()
     finally:
         if child is not None and child.poll() is None:

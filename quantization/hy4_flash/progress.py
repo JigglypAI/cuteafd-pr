@@ -64,18 +64,18 @@ def engram_progress(now):
                 observed_at=latest.isoformat(), forecast=eta(now, "Engram export only", total - done, rates))
 
 
-def layer_progress(now, status, events):
+def layer_progress(now, status, events, *, target_layers=42, expert_projections=1536):
     complete = [r for r in events if r.get("phase") == "target_layer_complete"]
     interrupted = {r["current_layer"] for r in events if r.get("phase") == "expert_group_replayed"}
     started = [r["current_layer"] for r in events if r.get("phase") == "target_layer"]
     interrupted.update(i for i in set(started) if started.count(i) > 1)
     measured = [r["layer_seconds"] for r in complete if r.get("current_layer", 0) > 0
                 and r["current_layer"] not in interrupted and r.get("layer_seconds", 0) > 0][-6:]
-    left = status.get("target_layers", 42) - status.get("completed_target_layers", 0)
+    left = status.get("target_layers", target_layers) - status.get("completed_target_layers", 0)
     if left <= 0 or not status.get("phase", "").startswith(("target_layer", "expert_", "core_")):
         return None, len(complete)
     partial = status.get("expert_projections", 0)
-    expert_layer_total = status.get("total_expert_projections", 1536)
+    expert_layer_total = status.get("total_expert_projections", expert_projections)
     if status.get("current_layer", 0) < status.get("completed_target_layers", 0):
         partial = 0
     if measured:
@@ -104,18 +104,27 @@ def read_events():
 
 
 def main():
+    full = os.environ.get("CUTEAFD_HY4_FAMILY") == "hy4"
+    name = "Hy4" if full else "Hy4-flash"
+    unit = "cuteafd-" + name.lower()
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     status = read(PRODUCTION / "status.json")
     events = read_events()
-    forecast, completed = layer_progress(now, status, events)
+    forecast, completed = layer_progress(now, status, events, target_layers=78 if full else 42,
+                                         expert_projections=768 if full else 1536)
+    if full and not status:
+        status.update(phase="preflight", status="running", completed_target_layers=0,
+                      target_layers=78, committed_encodes=0, completed_drafter_layers=0, drafter_layers=5)
     if not events and status.get("status") != "blocked":
         parity = read(ROOT / "reference-forward-passed.json")
+        if full and parity.get("status") == "failed":
+            status.update(phase="reference preflight", status="blocked", error=parity.get("error"))
         if parity.get("status") == "passed":
             status.update(phase="production preparation")
         status.update(preflight_layers=len(parity.get("layers", [])), preflight_status=parity.get("status"))
     failed = subprocess.run(["systemctl", "--user", "list-units", "--failed", "--plain", "--no-legend",
-                             "cuteafd-hy4-flash-production.service", "cuteafd-hy4-flash-publish.service",
-                             "cuteafd-hy4-flash-handoff.service", "cuteafd-hy4-flash-cleanup.service"],
+                             f"{unit}-production.service", f"{unit}-publish.service",
+                             f"{unit}-handoff.service", f"{unit}-cleanup.service"],
                              capture_output=True, text=True, timeout=5)
     if failed.stdout.strip():
         status.update(status="blocked", failed_units=[line.split()[0] for line in failed.stdout.splitlines()])
@@ -135,7 +144,7 @@ def main():
         else:
             status.update(phase="publication", status="running")
     snapshot = dict(as_of=now.isoformat(), status=status, completed_layer_receipts=completed,
-                    forecast=forecast, engram=engram_progress(now),
+                    forecast=forecast, engram=None if full else engram_progress(now),
                     publication={k: publication[k] for k in ("status", "url", "revision") if k in publication},
                     handoff=handoff.get("status"), cleanup=cleanup.get("status"))
     path = ROOT / "progress-updates/latest.json"
@@ -145,12 +154,12 @@ def main():
     if "--snapshot-only" in sys.argv:
         return
     message = (
-        f"Scheduled 30-minute Hy4-flash K4 MC update requested by TJ. Read {path} and task receipts. "
+        f"Scheduled 30-minute {name} K4 MC update requested by TJ. Read {path} and task receipts. "
         "Report phase, current layer/projection progress, time remaining and completion date/time in "
         "Asia/Taipei. Use measured throughput and uncertainty, or explicitly say both estimates are "
         "unavailable if there is no measured basis. Keep head, DFly2, Engram export, upload and "
         "placement separate from layer estimates. Continue the already authorized process from "
-        "/home/tj/Developer/cuteafd/hy4-flash-k4-mc-quant.md with full v2 preflight and production gates. "
+        f"/home/tj/Developer/cuteafd/{name.lower()}-k4-mc-quant.md with full v2 preflight and production gates. "
         "No separate pilot. After a reboot, report status only until TJ explicitly asks to resume. Do not duplicate live work or restart completed jobs."
     )
     subprocess.run([os.environ.get("CODEX_CLI", "codex"), "queue", "--thread",
@@ -158,7 +167,7 @@ def main():
                    check=True, timeout=45)
     if cleanup.get("status") == handoff.get("status") == "passed":
         subprocess.run(["systemctl", "--user", "disable", "--now",
-                        "cuteafd-hy4-flash-progress.timer"], check=True, timeout=20)
+                        f"{unit}-progress.timer"], check=True, timeout=20)
 
 
 if __name__ == "__main__":

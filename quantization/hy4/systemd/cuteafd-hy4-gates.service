@@ -1,0 +1,12 @@
+[Unit]
+Description=Report newly sealed Hy4 production quality gates on issue 2550
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4_flash.report_gates --root %h/Developer/quantization-runs/hy4-k4-mc/production
+TimeoutStartSec=10min
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/progress-updates/gate-report.log
+StandardError=inherit

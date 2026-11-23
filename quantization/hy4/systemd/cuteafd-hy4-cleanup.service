@@ -1,0 +1,17 @@
+[Unit]
+Description=Retire full Hy4 quantization intermediates after verified placement
+ConditionPathExists=%h/Developer/quantization-runs/hy4-k4-mc/production/handoff-complete.json
+OnSuccess=cuteafd-hy4-progress.service
+OnFailure=cuteafd-hy4-progress.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4.handoff --root %h/Developer/quantization-runs/hy4-k4-mc/production --output %h/Developer/quantization-runs/hy4-k4-mc/package --cleanup --cleanup-request %h/Developer/quantization-runs/hy4-k4-mc/cleanup-request.json
+ExecStartPost=/usr/bin/systemctl --user disable --now cuteafd-hy4-progress.timer
+TimeoutStartSec=infinity
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/progress-updates/cleanup.log
+StandardError=inherit

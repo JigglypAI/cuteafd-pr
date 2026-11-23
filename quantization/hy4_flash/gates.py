@@ -18,15 +18,15 @@ TARGET_GATES = frozenset({0, 1, min(recipe.SWA_LAYERS), min(i for i in recipe.SP
 DRAFT_STAGES = ("attn-first", "attn-expand", "attn-out", "mlp-first", "mlp-down")
 
 
-def nmse(inputs, weight, restored):
+def nmse(inputs, weight, restored, *, projection=native_projection):
     """Aggregate energy over full output columns, bounding peak logits for the head."""
     sums = torch.zeros(2, dtype=torch.float64, device=restored.device)
     weight = weight.to(device=restored.device, dtype=torch.float32)
     if inputs.ndim != 2 or not len(inputs) or weight.shape != restored.shape:
         raise ValueError("invalid held-out projection geometry")
     for chunk in inputs.split(128):
-        expected = native_projection("", chunk, weight)
-        actual = native_projection("", chunk, restored)
+        expected = projection("", chunk, weight)
+        actual = projection("", chunk, restored)
         sums[0] += (actual - expected).square().sum(dtype=torch.float64)
         sums[1] += expected.square().sum(dtype=torch.float64)
     numerator, denominator = sums.tolist()
@@ -40,8 +40,8 @@ def packed_bpw(values, name, width, shape):
     return sum(t.element_size() * t.numel() for t in packed) * 8 / math.prod(shape)
 
 
-def evaluated(row, inputs, weight, restored, selection):
-    error = nmse(inputs, weight, restored)
+def evaluated(row, inputs, weight, restored, selection, *, projection=native_projection):
+    error = nmse(inputs, weight, restored, projection=projection)
     row.update(heldout_nmse=error, heldout_rows=len(inputs), heldout_bar=BARS[row["bits"]],
                heldout_selection=selection, heldout_passed=error <= BARS[row["bits"]])
 
@@ -49,7 +49,9 @@ def evaluated(row, inputs, weight, restored, selection):
 class ExpertWitness:
     """Independent natural-route combine for held-out prompts, including across group recovery."""
 
-    def __init__(self, routes, layer, limit):
+    def __init__(self, routes, layer, limit, *, target_gates=TARGET_GATES, projection=native_projection):
+        self.projection = projection
+        self.target_gates = target_gates
         self.routes = routes
         self.combined = torch.zeros_like(routes.latent)
         self.layer, self.limit = layer, limit
@@ -57,10 +59,11 @@ class ExpertWitness:
     def add(self, expert, matrices, *, names=None, native=None, metrics=None):
         rows, gamma = self.routes.expert(expert)
         rows = rows.to(self.combined.device)
-        inputs = self.routes.latent.index_select(0, rows)
-        check = self.layer in TARGET_GATES and metrics is not None
+        check = self.layer in self.target_gates and metrics is not None
         selection = "heldout-natural-routes"
-        if not len(rows):
+        if len(rows):
+            inputs = self.routes.latent.index_select(0, rows)
+        else:
             if not check:
                 return
             # An unrouted expert still has a real projection to evaluate. Use
@@ -68,20 +71,29 @@ class ExpertWitness:
             inputs = self.routes.latent[-128:]
             selection = "heldout-latent-tail-no-natural-routes"
         gate, up, down = matrices
-        gated = native_projection("", inputs, gate).clamp_max(self.limit)
-        lifted = native_projection("", inputs, up).clamp(-self.limit, self.limit)
-        active = F.silu(gated) * lifted
+        # The projection results are private temporaries. Keep the same GEMM
+        # shapes and FP32 operation order when reusing their storage.
+        active = self.projection("", inputs, gate).clamp_max_(self.limit)
+        lifted = self.projection("", inputs, up).clamp_(-self.limit, self.limit)
+        F.silu(active, inplace=True).mul_(lifted)
+        del lifted
+        if not check:
+            del inputs
         if len(rows):
-            output = native_projection("", active, down)
-            self.combined.index_copy_(0, rows, self.combined.index_select(0, rows)
-                                      + output * gamma.to(output.device)[:, None])
+            gamma = gamma.to(active.device)[:, None]
+            output = self.projection("", active, down)
+            output.mul_(gamma)
+            accumulated = self.combined.index_select(0, rows)
+            accumulated.add_(output)
+            self.combined.index_copy_(0, rows, accumulated)
+            del output, accumulated
         if check:
-            down_inputs = active * gamma.to(active.device)[:, None] if len(rows) else active
+            down_inputs = active.mul_(gamma) if len(rows) else active
             for row, name, xs, weight, reconstruction in zip(metrics[-3:], names, (inputs, inputs, down_inputs),
                                                              native, matrices, strict=True):
                 if row["module"] != name or row["bits"] != 4:
                     raise ValueError("held-out expert metric ordering differs from encode order")
-                evaluated(row, xs, weight, reconstruction, selection)
+                evaluated(row, xs, weight, reconstruction, selection, projection=self.projection)
                 row["heldout_natural_rows"] = len(rows)
                 if not row["heldout_passed"]:
                     raise ValueError(f"{name} K4 held-out NMSE {row['heldout_nmse']:.6g} exceeds {BARS[4]}")

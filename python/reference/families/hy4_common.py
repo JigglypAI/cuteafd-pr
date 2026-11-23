@@ -131,10 +131,10 @@ def project(x, w, name, bias=False):
     return linear(x, w[name + ".weight"], w[name + ".bias"] if bias else None)
 
 
-def hyper(x, weights, name, c):
+def hyper(x, weights, name, c, matmul=linear):
     p = name + ".hc_pre.hc_"
     flat = x.flatten(-2)
-    pre, post = (linear(flat, weights[p + "fn"]) * inverse_rms(flat, c.rms_norm_eps)).chunk(2, dim=-1)
+    pre, post = (matmul(flat, weights[p + "fn"]) * inverse_rms(flat, c.rms_norm_eps)).chunk(2, dim=-1)
     bp, bo = weights[p + "base"].chunk(2, dim=-1)
     sp, so = weights[p + "scale"].unbind(0)
     pre = (pre * sp + bp).sigmoid() + c.hc_eps
@@ -142,9 +142,9 @@ def hyper(x, weights, name, c):
     return (x * pre.unsqueeze(-1)).sum(-2), post.unsqueeze(-1)
 
 
-def head_features(hidden, w, c):
+def head_features(hidden, w, c, matmul=linear):
     flat = hidden.flatten(-2)
-    mix = linear(flat, w[OUTER_NAMES[1]]) * inverse_rms(flat, c.rms_norm_eps)
+    mix = matmul(flat, w[OUTER_NAMES[1]]) * inverse_rms(flat, c.rms_norm_eps)
     pre = (mix * w[OUTER_NAMES[3]] + w[OUTER_NAMES[2]]).sigmoid() + c.hc_eps
     return norm((hidden * pre.unsqueeze(-1)).sum(-2), w[OUTER_NAMES[4]], c.rms_norm_eps)
 
@@ -226,8 +226,8 @@ def dense(x, w, prefix):
                    w, prefix + "down_proj")
 
 
-def routing_scores(x, w, c):
-    scores = project(x, w, "mlp.gate").sigmoid()
+def routing_scores(x, w, c, matmul=linear):
+    scores = matmul(x, w["mlp.gate.weight"]).sigmoid()
     choice = scores + w["mlp.gate.e_score_correction_bias"]
     group_scores = choice.reshape(len(x), c.n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
     groups = group_scores.topk(c.topk_group, dim=-1, sorted=False).indices

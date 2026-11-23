@@ -1,0 +1,5 @@
+[Unit]
+Description=Report each committed Hy4 frontier
+
+[Path]
+PathChanged=%h/Developer/quantization-runs/hy4-k4-mc/production/frontier.json

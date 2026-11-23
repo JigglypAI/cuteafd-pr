@@ -26,22 +26,22 @@ def gh(*args, data=None):
                           check=True, text=True, timeout=90).stdout
 
 
-def posted_parts():
+def posted_parts(issue_path=ISSUE):
     user = gh("user", "--jq", ".login").strip()
     # The API paginates in creation order; only fetch the matching comment's
     # marker and ID into memory. Ignore text copied into someone else's reply.
-    lines = gh(ISSUE + "?per_page=100", "--paginate", "--jq",
+    lines = gh(issue_path + "?per_page=100", "--paginate", "--jq",
                '.[] | select(.user.login == ' + json.dumps(user) +
                ' and (.body | startswith(' + json.dumps(MARK) + '))) | '
                '[ (.body | split("\\n")[0]), (.id | tostring) ] | @tsv')
     return {key: int(value) for line in lines.splitlines() for key, value in [line.split("\t", 1)]}
 
 
-def forecast(events, stage, as_of):
+def forecast(events, stage, as_of, *, target_layers=42):
     if not stage.startswith("target-"):
         return "Target layers complete (0 remaining)."
     layer = int(stage.split("-")[1])
-    remaining = 41 - layer
+    remaining = target_layers - 1 - layer
     if not remaining:
         return "Target layers complete (0 remaining)."
     starts = Counter(r["current_layer"] for r in events if r["phase"] == "target_layer")
@@ -171,6 +171,9 @@ def report(root):
     identity = json.loads(identity_bytes)
     if identity.get("schema") != "cuteafd-hy4-causal-mc-v2" or identity.get("codebook") != "mul1":
         raise ValueError("refusing to report a different production identity")
+    full = identity.get("source_repo") == "tencent/Hy4"
+    issue_number = 2550 if full else 2478
+    issue_path = f"repos/tpurtell/cuteafd/issues/{issue_number}/comments"
     run_id = xxhash.xxh3_128_hexdigest(identity_bytes)
     directory = root / "gate-posts"
     directory.mkdir(exist_ok=True)
@@ -184,14 +187,14 @@ def report(root):
             digest = xxhash.xxh3_128_hexdigest(error.encode())
             local = directory / f"failure-{digest}.json"
             if not local.exists():
-                remote = posted_parts()
+                remote = posted_parts(issue_path)
                 marker = f"{MARK}{run_id}/failed/{digest}/1 -->"
                 if marker not in remote:
                     body = (marker + "\n\n**Hy4 production stopped at a projection gate**\n\n" +
                             error + f"\n\nLayer {status.get('current_layer', 'unknown')}, "
                             f"{status.get('expert_projections', 0)} sealed expert projections. "
                             "Time remaining and Asia/Taipei completion time unavailable while blocked.")
-                    remote[marker] = int(gh(ISSUE, "--method", "POST", "--input", "-", "--jq", ".id",
+                    remote[marker] = int(gh(issue_path, "--method", "POST", "--input", "-", "--jq", ".id",
                                             data=json.dumps({"body": body})))
                 atomic_json(local, dict(run=run_id, error=error, comment_ids=[remote[marker]]))
         for path in receipts:
@@ -221,19 +224,19 @@ def report(root):
                            for r in receipt["projections"])):
                 raise ValueError(f"{label} gate and committed projection evidence disagree")
             as_of = datetime.fromtimestamp(path.stat().st_mtime, TAIPEI)
-            sections = list(comment_parts(receipt, forecast(events, label, as_of), as_of))
+            sections = list(comment_parts(receipt, forecast(events, label, as_of, target_layers=78 if full else 42), as_of))
             if remote is None:
-                remote = posted_parts()
+                remote = posted_parts(issue_path)
             ids = []
             for part, body in enumerate(sections, 1):
                 marker = f"{MARK}{run_id}/{label}/{digest}/{part} -->"
                 if marker not in remote:
                     header = f"`{label}` · {part}/{len(sections)}\n\n" if part > 1 else ""
                     data = json.dumps({"body": marker + "\n\n" + header + body})
-                    remote[marker] = int(gh(ISSUE, "--method", "POST", "--input", "-", "--jq", ".id", data=data))
+                    remote[marker] = int(gh(issue_path, "--method", "POST", "--input", "-", "--jq", ".id", data=data))
                 ids.append(remote[marker])
-            atomic_json(local, dict(run=run_id, receipt=digest, issue=2478, comment_ids=ids))
-            print(f"{label}: {len(ids)} comments verified on #2478", flush=True)
+            atomic_json(local, dict(run=run_id, receipt=digest, issue=issue_number, comment_ids=ids))
+            print(f"{label}: {len(ids)} comments verified on #{issue_number}", flush=True)
 
 
 def main():

@@ -1,0 +1,12 @@
+[Unit]
+Description=Report full Hy4 quantization progress
+
+[Service]
+Type=oneshot
+# Set CODEX_THREAD_ID and the absolute CODEX_CLI path for this run in the user manager.
+PassEnvironment=CODEX_THREAD_ID CODEX_CLI
+Environment=CUTEAFD_HY4_TASK=%h/Developer/quantization-runs/hy4-k4-mc
+Environment=CUTEAFD_HY4_FAMILY=hy4
+ExecStart=/usr/bin/python3 %h/Developer/cute-worktrees/hy4-k4-mc/quantization/hy4_flash/progress.py
+ExecStartPost=/usr/bin/systemctl --user --no-block start cuteafd-hy4-gates.service
+TimeoutStartSec=75

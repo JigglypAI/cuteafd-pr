@@ -1,0 +1,20 @@
+[Unit]
+Description=Check the full Tencent Hy4 calibration forward against pinned reference operators
+ConditionPathExists=!%h/Developer/quantization-runs/hy4-k4-mc/production/identity.json
+OnSuccess=cuteafd-hy4-production.service
+OnFailure=cuteafd-hy4-progress.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization:%h/Developer/cute-worktrees/hy4-k4-mc/python/reference
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4.container preflight -m hy4.parity --source /mnt/sparknest/hf-home/hub/models--tencent--Hy4/snapshots/c10c0de5b6f850703fb0a90e65d1c32b558b9167 --corpus %h/Developer/quantization-runs/hy4-k4-mc/prepared-corpus --output %h/Developer/quantization-runs/hy4-k4-mc/reference-forward-passed.json
+Restart=no
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+KillMode=mixed
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/reference-forward.log
+StandardError=inherit

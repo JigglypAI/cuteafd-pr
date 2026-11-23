@@ -14,7 +14,7 @@ from kimi_k3.core_k6.storage import StageStore
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, checkpoint_io, fsync_directory, read_header, verify_receipt
 
 
-_FIELDS = {"F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
+_FIELDS = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "I64": torch.int64,
            "I32": torch.int32, "I16": torch.int16}
 
 
@@ -186,6 +186,47 @@ def select_recovery(neighbors, gammas, natural_counts, first_rank, minimum):
             for expert, parts in pieces.items()}
 
 
+class HostExpertStaging:
+    """One reusable GPU row bank and one bounded host gather buffer for a layer."""
+
+    def __init__(self, latent, device, chunk_rows, max_bytes):
+        if latent.device.type != "cpu":
+            raise ValueError("expert staging requires host-resident calibration inputs")
+        width = latent.shape[1]
+        capacity = min(len(latent), max_bytes // (width * latent.element_size()))
+        if capacity < min(len(latent), chunk_rows):
+            raise ValueError("expert staging must fit one numerical chunk")
+        self.latent = latent
+        self.chunk_rows = chunk_rows
+        self.staged = torch.empty((capacity, width), dtype=latent.dtype, device=device)
+        self.host_chunk = torch.empty((min(chunk_rows, capacity), width), dtype=latent.dtype,
+                                      device="cpu", pin_memory=self.staged.is_cuda)
+
+    def copy_rows(self, selected, target):
+        host = self.host_chunk[:len(selected)]
+        torch.index_select(self.latent, 0, selected, out=host)
+        # Blocking H2D makes the host buffer immediately safe to refill. The
+        # ordinary current stream orders reuse of the GPU slice with its readers.
+        target.copy_(host)
+
+    def select(self, rows):
+        """Return a repeatable reader accepting a natural or augmented row count."""
+        if len(rows) <= len(self.staged):
+            for offset in range(0, len(rows), self.chunk_rows):
+                part = rows[offset:offset + self.chunk_rows]
+                self.copy_rows(part, self.staged[offset:offset + len(part)])
+            return lambda count: self.staged[:count].split(self.chunk_rows)
+
+        # An exceptionally hot expert streams the same ordered chunks on each
+        # pass. Its row count never increases the GPU or pinned-memory ceiling.
+        def stream(count):
+            for part in rows[:count].split(self.chunk_rows):
+                chunk = self.staged[:len(part)]
+                self.copy_rows(part, chunk)
+                yield chunk
+        return stream
+
+
 class Routes:
     """Stable expert-major view of immutable token-major route records."""
 
@@ -247,6 +288,16 @@ class Routes:
     def expert(self, index):
         start, stop = self.bounds[index:index + 2]
         return self.rows[start:stop], self.gamma[start:stop]
+
+    def input_chunks(self, selected, chunk_rows, staging):
+        if staging is not None:
+            return staging.select(selected)
+        rows = selected.to(self.latent.device)
+
+        def gather(count):
+            for part in rows[:count].split(chunk_rows):
+                yield self.latent.index_select(0, part)
+        return gather
 
     def calibration(self, index):
         if self.recovery is None:
