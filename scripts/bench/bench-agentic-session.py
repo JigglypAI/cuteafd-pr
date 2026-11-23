@@ -628,7 +628,8 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--base-url", default=os.environ.get("CUTEAFD_SMOKE_URL", "http://127.0.0.1:8000"),
                        help="default: CUTEAFD_SMOKE_URL (a wip-cards --client hook), else http://127.0.0.1:8000")
-        p.add_argument("--model", default=os.environ.get("CUTEAFD_API_MODEL", "default"))
+        p.add_argument("--model", default=os.environ.get("CUTEAFD_API_MODEL", "default"),
+                       help="'auto' asks the server's /v1/models for its served id")
         p.add_argument("--api-key")
         p.add_argument("--api-key-file", type=Path, default=Path(os.environ["CUTEAFD_API_KEY_FILE"])
                        if os.environ.get("CUTEAFD_API_KEY_FILE") else None,
@@ -668,6 +669,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--chain-tasks and --target-context go together")
     if args.mode == "record" and args.chain_tasks and args.target_context < 1024:
         parser.error("--target-context must be at least 1024 tokens")
+    if args.model == "auto":
+        request = urllib.request.Request(args.base_url.rstrip("/") + "/v1/models",
+                                         headers={"Authorization": "Bearer " + args.api_key} if args.api_key else {})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            args.model = json.load(response)["data"][0]["id"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.progress = None
     if args.mode == "record" and args.chain_tasks:
