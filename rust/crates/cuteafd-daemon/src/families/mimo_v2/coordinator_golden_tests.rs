@@ -145,7 +145,7 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
     let _ = cuteafd_core::set_expert_geometry(cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
         experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
-        draft_stages: 0, draft_experts: 0 }.geometry()?);
+        draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped }.geometry()?);
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
@@ -168,7 +168,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
     let _ = cuteafd_core::set_expert_geometry(cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
         experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
-        draft_stages: 0, draft_experts: 0 }.geometry()?);
+        draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped }.geometry()?);
     let library = library()?;
     library.cuda_set_device(0)?;
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }

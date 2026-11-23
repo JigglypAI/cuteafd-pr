@@ -591,7 +591,8 @@ mod tests {
         // vocabulary, MCG markers and audio/vision classes retain source shapes.
         assert_eq!((cfg.layers, cfg.experts, cfg.topk), (2, 2, 2));
         let shape = crate::RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts, topk: cfg.topk,
-            hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+            hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         for layer in 0..cfg.layers {
             for (leaf, wanted) in [("weight", vec![cfg.experts, cfg.hidden]),
                 ("e_score_correction_bias", vec![cfg.experts])] {
@@ -685,7 +686,7 @@ mod tests {
             hidden: 256,
             intermediate: 384,
             draft_stages: 0,
-            draft_experts: 0,
+            draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         };
         let compact = serde_json::json!({
             "bits": 2.0, "checkpoint_format": "exl3", "codebook": "mcg", "desc_act": false,

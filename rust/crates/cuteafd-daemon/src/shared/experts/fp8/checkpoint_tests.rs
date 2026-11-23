@@ -232,7 +232,7 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
         let metadata = unsafe { Fp8MoeMetadata::read(&directory) }?;
         let tp = metadata.info.tp;
         let tensors = Fp8ExpertTensors::read(&snapshot, RoutedExpertShape { layers: 92, first_layer: 3,
-            experts: 352, topk: 8, hidden: 4096, intermediate: 1536, draft_stages: 0, draft_experts: 0 })?;
+            experts: 352, topk: 8, hidden: 4096, intermediate: 1536, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluPostClamp7 })?;
         if label == "BF16" {
             let mixed = tensors.homogeneous_layers(&[3, 90])?;
             ensure!(mixed.len() == 2 && mixed[0].0.format() == format

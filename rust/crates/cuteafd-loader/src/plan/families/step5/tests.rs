@@ -1131,7 +1131,8 @@ fn official_nvfp4_layer30_headers_keep_router_and_stacked_parameters_distinct() 
     let dir = tempfile::tempdir().unwrap();
     testing::write_snapshot(dir.path(), &config, &tensors, None);
     let shape = RoutedExpertShape { layers:91, first_layer:30, experts:352, topk:8,
-        hidden:4096, intermediate:1536, draft_stages:0, draft_experts:0 };
+        hidden:4096, intermediate:1536, draft_stages:0, draft_experts:0,
+        activation: cuteafd_core::ExpertActivation::SiluPostClamp7 };
     let selected = [30].into_iter().collect();
     let catalog = Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap();
     assert_eq!(catalog.format(), ExpertFormat::Nvfp4);

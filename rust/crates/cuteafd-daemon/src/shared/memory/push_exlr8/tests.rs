@@ -242,6 +242,6 @@ pub(crate) fn fixture_catalog(root: &Path) -> Result<cuteafd_loader::OfficialV41
         cuteafd_loader::RoutedExpertShape {
             layers: config["num_hidden_layers"].as_u64().context("fixture layers")? as usize,
             first_layer: 3, experts: 2, topk: 1, hidden: 128, intermediate: 384,
-            draft_stages: 0, draft_experts: 0,
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         }))
 }

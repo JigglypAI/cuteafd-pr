@@ -745,7 +745,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         context, attention, gpu_count, maximum_pages)?;
     additional.extend(retained_expert_metadata(&checkpoint.snapshot, &cfg, cfg.layers, gpu_count, metadata, maximum_pages)?);
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: geometry.native_frame_budget(
         u32::try_from(rows.max(glm::DECODE_ROWS))?).context("EXLR8 native frame geometry")?,
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };

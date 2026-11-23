@@ -558,7 +558,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 .and_then(|moe| {
                     let geometry = cuteafd_core::ExpertGeometry { hidden: model.spec().hidden as u32,
                         experts: moe.experts as u32, topk: moe.top_k as u32,
-                        intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32 };
+                        intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32,
+                        activation: cuteafd_core::ExpertActivation::SiluClamp10 };
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
                         .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,

@@ -440,7 +440,7 @@ fn real_fp8_nvfp4_tp4_tp6_bytes_match_existing_windows() {
             hidden: get(&["hidden_size"]),
             intermediate: get(&["moe_intermediate_size"]),
             draft_stages: 0,
-            draft_experts: 0,
+            draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         };
         let layer = shape.first_layer;
         let tensors = Fp8ExpertTensors::read_layers(&snapshot, shape, &[layer].into()).unwrap();

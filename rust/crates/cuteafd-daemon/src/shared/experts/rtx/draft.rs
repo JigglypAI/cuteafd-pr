@@ -52,6 +52,7 @@ mod tests {
                 topk: 3,
                 intermediate: 2304,
                 layers: 3,
+                activation: cuteafd_core::ExpertActivation::SiluClamp10,
             },
             stages: 3,
             owner: 1,

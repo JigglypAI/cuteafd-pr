@@ -108,7 +108,8 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
     config["quantization_config"] = exl3_compact(4);
     let cfg = GlmDsaConfig::from_hf(&config)?;
     let geometry = ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        intermediate: cfg.moe_intermediate as u32, topk: cfg.topk as u32, layers: cfg.layers as u32 };
+        intermediate: cfg.moe_intermediate as u32, topk: cfg.topk as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("unexpected geometry {g:?}"))?;
     let root = tempfile::tempdir()?;
     let tensors = [1, 2].into_iter().flat_map(|layer| (0..cfg.experts).flat_map(move |expert|

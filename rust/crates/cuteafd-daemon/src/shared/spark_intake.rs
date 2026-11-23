@@ -2083,7 +2083,8 @@ mod tests {
                     &cuteafd_loader::plan::testing::glm5_config())?;
                 let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
                     experts: cfg.experts as u32, topk: cfg.topk as u32,
-                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+                    activation: cuteafd_core::ExpertActivation::SiluUnclamped };
                 let hidden_bytes = if dtype == ExpertV2Dtype::Bf16 { geometry.hidden * 2 }
                     else { geometry.hidden + geometry.hidden / 32 };
                 let request = ExpertProtocolV2Request::new(1, 17, 0, geometry.hidden, dtype,

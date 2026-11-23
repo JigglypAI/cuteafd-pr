@@ -104,7 +104,7 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
             hidden,
             intermediate: 4096,
             draft_stages: 0,
-            draft_experts: 0,
+            draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         },
         &[0].into(),
     )?;

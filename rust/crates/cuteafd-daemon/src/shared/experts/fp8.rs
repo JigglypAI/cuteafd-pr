@@ -1333,7 +1333,7 @@ mod tests {
             write_snapshot(root.path(), &serde_json::json!({}), &headers, None);
             let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
                 layers: 6, first_layer: 1, experts, topk: 8, hidden, intermediate,
-                draft_stages: 0, draft_experts: 0 })?.for_coordinator().for_layer_metadata(layers[0])?;
+                draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped })?.for_coordinator().for_layer_metadata(layers[0])?;
             for tp in [1, 2] {
                 for rank in 0..tp {
                     let slicing = tensors.slicing_for_directory(std::path::Path::new("tp2"), tp);
@@ -1370,7 +1370,7 @@ mod tests {
         use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors,Slicing};
         let dir = tempfile::tempdir().unwrap();
         let shape = cuteafd_loader::RoutedExpertShape { layers:1,first_layer:0,experts:2,topk:1,
-            hidden:128,intermediate:1536,draft_stages:0,draft_experts:0 };
+            hidden:128,intermediate:1536,draft_stages:0,draft_experts:0,activation:cuteafd_core::ExpertActivation::SiluPostClamp7 };
         let fixture = [("gate",1536,128),("up",1536,128),("down",128,1536)].map(|(p,n,k)|
             t(format!("model.layers.0.moe.{p}_proj.weight"),"BF16",&[2,n,k]));
         // A real declaration supplies the activation independently of this reduced test geometry.
@@ -1488,7 +1488,8 @@ mod tests {
         let info = &metadata.info;
         let tensors = Fp8ExpertTensors::read(&snapshot, RoutedExpertShape { layers: layer + 1,
             first_layer: layer, experts: info.experts, topk: info.topk, hidden: info.hidden,
-            intermediate: info.intermediate, draft_stages: 0, draft_experts: 0 })?;
+            intermediate: info.intermediate, draft_stages: 0, draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped })?;
         let layouts = [exact_layout(&package, &tensors, 2, 0), exact_layout(&package, &tensors, 2, 1)];
         let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
         let budgets = [0, 1].map(|rank| Fp8Layer::bytes_for(&tensors, 2, rank, layouts[rank].1)

@@ -433,7 +433,8 @@ impl FamilyModel for Model {
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let moe = self.spec.moe.as_ref()?;
         let geometry = cuteafd_core::ExpertGeometry { hidden: self.spec.hidden as u32, experts: moe.experts as u32,
-            topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: 0 };
+            topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         if !geometry.same_shape(&cuteafd_core::ExpertGeometry::MISTRAL_LARGE4) {
             return None;
         }

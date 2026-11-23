@@ -277,7 +277,8 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         let intake_rows = if waves == 1 { unit_rows } else { shape.units().slot_rows() };
         let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(cfg.hidden)?,
             experts: u32::try_from(cfg.experts)?, topk: u32::try_from(cfg.topk)?,
-            intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+            intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)?,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         cuteafd_loader::serving_capacity::spark_host_transport(geometry,
             cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), spark_ranks, false, true,
             spark_bf16, unit_rows, intake_rows, waves, None)?

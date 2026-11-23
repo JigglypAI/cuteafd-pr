@@ -186,7 +186,7 @@ impl WorkerSelection {
     }
     pub fn geometry(&self) -> cuteafd_core::ExpertGeometry {
         let [hidden, experts, topk, intermediate, layers] = self.identity.geometry;
-        cuteafd_core::ExpertGeometry { hidden, experts, topk, intermediate, layers }
+        cuteafd_core::ExpertGeometry::from_wire_dims(hidden, experts, topk, intermediate, layers)
     }
     pub fn digest(&self) -> Result<String> { Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?))) }
 

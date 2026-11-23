@@ -835,7 +835,8 @@ pub fn production_links(cfg: &GlmDsaConfig, ranks: usize, prefill: PrefillShape,
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
     if ranks == 0 { return Ok((None, None)); }
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     let endpoint = |name, shape: PrefillShape, prefill, reply| PreparedSparkLink::endpoint(name, 0,
         SparkEndpointOwners { ranks, geometry, endpoint: cuteafd_core::SparkEndpoint {
             capacity: u32::try_from(shape.rows).map_err(|_| Refusal::Overflow("GLM transport rows"))?,
