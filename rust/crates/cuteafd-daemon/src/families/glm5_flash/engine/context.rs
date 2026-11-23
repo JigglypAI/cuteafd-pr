@@ -368,15 +368,11 @@ impl<'a> GlmfEngine<'a> {
         let k = self.cfg.index_topk / KPOOL;
         if !tables.long {
             let local_lengths = view(&own.local, DECODE_ROWS * k * 4, t * 4)?.ptr;
-            self.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
+            return self.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
                 ("local_pools", own.local.buffer.ptr), ("local_lengths", local_lengths),
                 ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
                 ("lengths", w.lengths.buffer.ptr)],
-                &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)])?;
-            // Short steps already have local record indices; compute this GPU's own partial
-            // inside the same local graph before the query exchange.
-            self.context_local_partial(rank, w, index, rows, t, w.query.buffer.ptr, rank)?;
-            return Ok(());
+                &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)]);
         }
         let admitted = split.admitted_pages;
         ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
@@ -395,7 +391,7 @@ impl<'a> GlmfEngine<'a> {
 
     pub(super) fn context_local_merge_and_partials(&self, rank: usize, w: &Workspace<'_>, index: usize,
         rows: Scalar, tables: &StepTables, peer_scores: *mut c_void, peer_indices: *mut c_void,
-        peer_query: *mut c_void) -> Result<()> {
+        assembled_query: *mut c_void) -> Result<()> {
         let t = tables.positions.len();
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
@@ -412,8 +408,10 @@ impl<'a> GlmfEngine<'a> {
             ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
             ("lengths", w.lengths.buffer.ptr)],
             &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)])?;
-        self.context_local_partial(rank, w, index, rows, t, peer_query, 1 - rank)?;
-        self.context_local_partial(rank, w, index, rows, t, w.query.buffer.ptr, rank)
+        // Both partials read the assembled [rows, H, D] query returned by `wait_query`,
+        // matching `shared/peer_split/attention.rs::context_decode` (never half-stride `w.query`).
+        self.context_local_partial(rank, w, index, rows, t, assembled_query, 1 - rank)?;
+        self.context_local_partial(rank, w, index, rows, t, assembled_query, rank)
     }
 
     pub(super) fn context_local_partial(&self, rank: usize, w: &Workspace<'_>, index: usize,

@@ -268,39 +268,50 @@ impl<'a> GlmfEngine<'a> {
                         peer_candidates[rank] = self.context_local_wait_candidates(rank, slots[rank])?;
                     }
                 }
-                let peer_queries = [
+                let assembled_queries = [
                     self.context_local_wait_query(0, slots[0])?,
                     self.context_local_wait_query(1, slots[1])?,
                 ];
 
                 // Phase 1: long captures merge + expand + peer partial + own partial (4 kernels >= 3);
-                // short already ran own partial in Phase 0 and runs peer partial directly (1 kernel).
-                if tables.long {
+                // short runs peer partial, pushes partials, then runs own partial overlapping the P2P copy
+                // (identical to `shared/peer_split/attention.rs::context_decode`). Both partials read the
+                // assembled `[rows, H, D]` query from `wait_query` (never half-stride `w.query`).
+                let received = if tables.long {
                     for rank in 0..2 {
                         let key = GraphKey::new_sub(index, 1, t, rank_tables[rank]).normalized(Some(layer0.attention));
                         let wr = workspaces[rank];
                         let tr = rank_tables[rank];
                         let (ps, pi) = peer_candidates[rank];
-                        let pq = peer_queries[rank];
+                        let aq = assembled_queries[rank];
                         self.replay_on(rank, key, || {
-                            self.context_local_merge_and_partials(rank, wr, index, rows, tr, ps, pi, pq)
+                            self.context_local_merge_and_partials(rank, wr, index, rows, tr, ps, pi, aq)
                         })?;
                     }
+                    for rank in 0..2 {
+                        self.context_local_push_partial(rank, slots[rank], t)?;
+                    }
+                    [
+                        self.context_local_wait_partial(0, slots[0])?,
+                        self.context_local_wait_partial(1, slots[1])?,
+                    ]
                 } else {
                     for rank in 0..2 {
                         self.context_local_partial(rank, workspaces[rank], index, rows, t,
-                            peer_queries[rank], 1 - rank)?;
+                            assembled_queries[rank], 1 - rank)?;
                     }
-                }
-
-                // ContextExchange partials outside capture: push both, then wait both.
-                for rank in 0..2 {
-                    self.context_local_push_partial(rank, slots[rank], t)?;
-                }
-                let received = [
-                    self.context_local_wait_partial(0, slots[0])?,
-                    self.context_local_wait_partial(1, slots[1])?,
-                ];
+                    for rank in 0..2 {
+                        self.context_local_push_partial(rank, slots[rank], t)?;
+                    }
+                    for rank in 0..2 {
+                        self.context_local_partial(rank, workspaces[rank], index, rows, t,
+                            assembled_queries[rank], rank)?;
+                    }
+                    [
+                        self.context_local_wait_partial(0, slots[0])?,
+                        self.context_local_wait_partial(1, slots[1])?,
+                    ]
+                };
 
                 // Combine + o_proj (2 kernels: outside capture to avoid SmallGraphCapture <= 2).
                 for rank in 0..2 {
@@ -467,5 +478,10 @@ mod tests {
                     "rank-local capture closure unexpectedly contains {forbidden}");
             }
         }
+        // `context_local_partial` requires the assembled [rows, H, D] query returned by
+        // `wait_query`, never the half-stride producer buffer `w.query.buffer.ptr`.
+        let context_src = include_str!("context.rs");
+        assert!(!context_src.contains("context_local_partial(rank, w, index, rows, t, w.query.buffer.ptr"),
+            "context_local_partial must never receive half-stride w.query.buffer.ptr");
     }
 }
