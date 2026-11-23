@@ -1,0 +1,18 @@
+[Unit]
+Description=Quantize the frozen Hy4 v2 calibration stream with production gates
+ConditionPathExists=!%h/Developer/quantization-runs/hy4-k4-mc/production/numerical-complete.json
+OnSuccess=cuteafd-hy4-publish.service
+OnFailure=cuteafd-hy4-progress.service
+
+[Service]
+WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization:%h/Developer/cute-worktrees/hy4-k4-mc/python/reference
+Restart=no
+TimeoutStopSec=60
+KillMode=mixed
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
+ExecStart=%h/Developer/quantization-runs/hy4-k4-mc/environment/bin/python -m hy4.container production -m hy4.run --source /mnt/sparknest/hf-home/hub/models--tencent--Hy4/snapshots/c10c0de5b6f850703fb0a90e65d1c32b558b9167 --corpus %h/Developer/quantization-runs/hy4-k4-mc/prepared-corpus --preflight %h/Developer/quantization-runs/hy4-k4-mc/reference-forward-passed.json --root %h/Developer/quantization-runs/hy4-k4-mc/production --output %h/Developer/quantization-runs/hy4-k4-mc/package
+StandardOutput=append:%h/Developer/quantization-runs/hy4-k4-mc/progress-updates/production.log
+StandardError=inherit
