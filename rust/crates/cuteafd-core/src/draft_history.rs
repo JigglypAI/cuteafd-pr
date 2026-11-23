@@ -663,7 +663,8 @@ impl DraftHistory {
             if let Some(&raw) = pending.head.get(k).filter(|score| score.is_finite()) {
                 let bin = score_bin(self.spec.head, raw);
                 let joint = pending.planned[NEURAL][..=k].iter().map(|p| p.score.unwrap_or(0.)).product::<f64>();
-                stops.push((i, pending.planned[NEURAL][k], self.last_judged[k][bin], (joint - self.round_cut).abs()));
+                stops.push((i, pending.planned[NEURAL][k], self.last_judged[k][bin], (joint - self.round_cut).abs(),
+                    std::mem::take(&mut pending.planned[COPY])));
             }
             pending.granted = [k, 0];
             pending.planned[NEURAL].truncate(k);
@@ -678,16 +679,22 @@ impl DraftHistory {
         if let (Some(before), Some(after)) = (bucket(rows), bucket(rows + 1)) {
             if after > 8 && after > before { return granted; }
         }
-        let best = stops.into_iter().filter(|(i, _, _, _)| {
+        let best = stops.into_iter().filter(|(i, _, _, _, _)| {
             let p = self.requests[&ids[*i]].pending.as_ref().expect("excluded stop");
             p.granted[NEURAL] == p.keep
-        }).min_by(|(i, _, a, da), (j, _, b, db)| a.cmp(b).then_with(|| da.total_cmp(db))
+        }).min_by(|(i, _, a, da, _), (j, _, b, db, _)| a.cmp(b).then_with(|| da.total_cmp(db))
             .then_with(|| ids[*i].cmp(&ids[*j])));
-        if let Some((i, stop, _, _)) = best {
+        if let Some((i, stop, _, _, mut copy)) = best {
+            // The chosen stop still supports its agreeing copy. Keep only
+            // what fits after the kept drafts and within the admitted shape.
+            let limit = bucket(rows + 1).map_or(max_rows, |shape| shape.min(max_rows));
+            copy.truncate(limit - (rows + 1));
             let p = self.requests.get_mut(&ids[i]).and_then(|r| r.pending.as_mut()).expect("eligible stop");
             p.planned[NEURAL].push(stop);
             p.granted[NEURAL] += 1;
-            granted[i] += 1;
+            pending.granted[COPY] = copy.len();
+            granted[i] += 1 + copy.len();
+            pending.planned[COPY] = copy;
         }
         granted
     }
@@ -1349,7 +1356,7 @@ mod tests {
             assert_eq!(policy.extend_copy(id, 2), 1);
         }
         let granted = policy.settle_with_padding(&ids, 64, |_| None);
-        assert_eq!(granted, [1, 2, 1, 1, 1]);
+        assert_eq!(granted, [1, 3, 1, 1, 1]);
         let trace = policy.observe(&ids.into_iter().zip(granted).map(|(id, n)| outcome(id, n, 1)).collect::<Vec<_>>(), true).unwrap();
         assert_eq!(trace.policy, "history");
         assert_eq!(policy.stats().position_reached, [5, 1, 0]);
