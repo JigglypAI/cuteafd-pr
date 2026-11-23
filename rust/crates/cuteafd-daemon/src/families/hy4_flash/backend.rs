@@ -216,12 +216,10 @@ impl<'a> Hy4Backend<'a> {
         };
         let mut engine = self.engine.borrow_mut();
         let warm_long = engine.max_pages >= 33 && engine.max_context > 2048;
+        let warm_pos = if warm_long { 2048 } else { 0 };
         engine.warming_graphs(|engine| {
             for &(rows, _) in &selected {
-                engine.warm_row_shape(rows, 0)?;
-                if warm_long {
-                    engine.warm_row_shape(rows, 2048)?;
-                }
+                engine.warm_row_shape(rows, warm_pos)?;
             }
             Ok(())
         })?;

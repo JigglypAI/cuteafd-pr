@@ -1848,7 +1848,7 @@ HY4_LAYOUTS = {
 }
 HY4_GEOMETRY = re.compile(
     r"Key \{ layer: (\d+), rows: (\d+), section: "
-    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish|Head) \}"
+    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish) \}"
 )
 
 
@@ -1909,17 +1909,20 @@ def generate_hy4_flash(traces, layout):
         identities = {key: graph for key, graph in inventory.items() if key[1] in rows}
         if {key[1] for key in identities} != rows:
             raise ValueError(f"Hy4-flash rank {rank} lacks a selected row geometry")
-        positive = [int(g["capture_bytes"]) for g in identities.values() if int(g["capture_bytes"]) > 0]
-        if not positive:
+        total_measured = sum(int(g["capture_bytes"]) for g in identities.values())
+        if total_measured <= 0:
             raise ValueError(f"Hy4-flash rank {rank} has no positive measured capture shares")
-        mean = math.ceil(sum(positive) / len(positive))
-        costs = {key: int(graph["capture_bytes"]) or mean for key, graph in identities.items()}
+        # CUDA allocates graph storage in 2 MiB slabs; completed_capture records per-section
+        # slab jumps (0 or 2 MiB), so sum(capture_bytes) is the exact physical arena cost of
+        # the selected set rather than multiplying a 2 MiB jump across zero-delta siblings.
+        amortized = math.ceil(total_measured / len(identities))
+        costs = {key: int(graph["capture_bytes"]) for key, graph in identities.items()}
         entries = [
             {
                 "rows": row,
                 "pin": hot[row],
                 "replay_hits": heat[row],
-                "capture_bytes": sum(cost for key, cost in costs.items() if key[1] == row),
+                "capture_bytes": sum(costs[key] for key in identities if key[1] == row),
                 "sections": [
                     {
                         "layer": key[0],
@@ -1936,11 +1939,11 @@ def generate_hy4_flash(traces, layout):
         ranks.append(
             {
                 "rank": rank,
-                "reserve_base_bytes": packed(sum(costs.values())),
+                "reserve_base_bytes": packed(total_measured),
                 "reserve_extra_bytes": CHUNK,
                 "entries": entries,
                 "zero_replay_sibling_bytes": sum(
-                    costs[key] for key, graph in identities.items() if qwen_replay(graph) == 0
+                    costs[key] or amortized for key, graph in identities.items() if qwen_replay(graph) == 0
                 ),
                 "lazy_zero_replay_bytes": sum(
                     int(graph["capture_bytes"]) for key, graph in inventory.items() if key[1] not in rows

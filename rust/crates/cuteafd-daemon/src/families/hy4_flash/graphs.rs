@@ -40,8 +40,6 @@ pub(crate) enum Section {
     FfnFrontend,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
-    /// Terminal TP1 decode head (`hc_head` + `lm_head`).
-    Head,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -273,13 +271,14 @@ mod tests {
                 for section in [
                     Section::SwaLocal,
                     Section::SwaAttn,
+                    Section::SwaExtendPre,
+                    Section::SwaExtendPost,
                     Section::DsaPre,
                     Section::DsaIndexQ,
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
                     Section::FfnFinish,
-                    Section::Head,
                 ] {
                     for rows in [1, 4, 16, 64] {
                         assert!(bank

@@ -2350,7 +2350,7 @@ def hy4_trace(device=0):
             row(0, 1, "SwaLocal", 40, 2 << 20, [10, 10, 10, 10]),
             row(1, 1, "DsaPre", 40, 1 << 20, [10, 10, 10, 10]),
             row(1, 1, "DsaIndexQ", 0, 512 << 10, [0, 0, 0, 0]),
-            row(42, 1, "Head", 40, 0, [10, 10, 10, 10], nodes=2),
+            row(1, 1, "DsaLocalPost", 40, 0, [10, 10, 10, 10], nodes=12),
             row(0, 4, "SwaLocal", 12, 2 << 20, [6, 6, 0, 0, 0]),
             row(0, 16, "SwaLocal", 0, 2 << 20, [0, 0, 0, 0]),
         ],
@@ -2362,6 +2362,8 @@ def test_hy4_flash_selects_replayed_rows_prices_siblings_and_rejects_bad_topolog
     assert result["family"] == "hy4_flash"
     rank0 = result["ranks"][0]
     assert [(e["rows"], e["pin"]) for e in rank0["entries"]] == [(1, True), (4, False)]
+    # Conserves measured slab bytes (2+1+0.5+0+2 = 5.5 MiB -> 6 MiB packed) without inflating 0-delta siblings.
+    assert rank0["reserve_base_bytes"] == 6 << 20
     assert rank0["zero_replay_sibling_bytes"] == 512 << 10
     assert rank0["lazy_zero_replay_bytes"] == 2 << 20
     assert rank0["reserve_extra_bytes"] == 2 << 20

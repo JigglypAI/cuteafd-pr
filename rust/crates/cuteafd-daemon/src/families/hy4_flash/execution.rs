@@ -375,6 +375,9 @@ fn launch_rank_lm_head(
 }
 
 struct RankRuntime<'a> {
+    /// Must be first so CUDA graphs drain and destroy before any captured storage
+    /// or `RankCompletion` event in `onboarded_experts` drops.
+    graphs: Hy4Graphs<'a>,
     device: Device<'a>,
     stream: Rc<Stream<'a>>,
     peer_ready: Event<'a>,
@@ -386,7 +389,6 @@ struct RankRuntime<'a> {
     f32_add: F32Add<'a>,
     quantize_grid: Fp8QuantizeGrid,
     onboarded_experts: RefCell<Option<Exl3Tp2<'a>>>,
-    graphs: Hy4Graphs<'a>,
 }
 
 impl<'a> RankRuntime<'a> {
@@ -1133,6 +1135,7 @@ impl<'a> Hy4Engine<'a> {
             let f32_add = device.run(|| device.library.f32_add())?;
             let quantize_grid = Fp8QuantizeGrid::new(device.run(|| device.library.sm_count())?, None)?;
             ranks.push(RankRuntime {
+                graphs: Hy4Graphs::new(),
                 device,
                 stream,
                 peer_ready,
@@ -1144,7 +1147,6 @@ impl<'a> Hy4Engine<'a> {
                 f32_add,
                 quantize_grid,
                 onboarded_experts: RefCell::new(onboarded_experts[rank].take()),
-                graphs: Hy4Graphs::new(),
             });
         }
 
@@ -2616,61 +2618,6 @@ impl<'a> Hy4Engine<'a> {
                 let total = batch.rows - first_row;
                 if total == 0 {
                     return Ok(());
-                }
-                if batch.graphed && self.ranks.len() == 1 && first_row == 0 && total <= 64 {
-                    let vocab = self.cfg.vocab_size;
-                    let head_out = r0
-                        .scratch
-                        .head_logits_f32
-                        .as_ref()
-                        .context("rank 0 missing head_logits_f32")?
-                        .buffer;
-                    let x0_buf = CuteafdDeviceBuffer {
-                        bytes: total * H * 2,
-                        ..r0.scratch.y.buffer
-                    };
-                    let out_buf = CuteafdDeviceBuffer {
-                        bytes: total * vocab * 4,
-                        ..head_out
-                    };
-                    r0.graphs.run(
-                        GraphKey {
-                            layer: self.cfg.layers,
-                            rows: total,
-                            section: GraphSection::Head,
-                        },
-                        &r0.stream,
-                        || {
-                            r0.device.run(|| {
-                                // SAFETY: admitted arena weights and scratch live through stream drain.
-                                unsafe {
-                                    r0.programs.hc_head.launch(
-                                        &[
-                                            r_cur.ptr,
-                                            r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                                            r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                                            r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                                            r0.weights.buf("model.norm.weight")?.ptr,
-                                            r0.scratch.delta_norm.buffer.ptr,
-                                            r0.scratch.y.buffer.ptr,
-                                        ],
-                                        &[Scalar::I32(total as i32)],
-                                        r0.stream.raw,
-                                    )?;
-                                }
-                                launch_rank_lm_head(r0, total, x0_buf, out_buf)
-                            })
-                        },
-                    )?;
-                    let logits = DeviceLogits {
-                        ptr: head_out.ptr,
-                        rows: total,
-                        vocab,
-                        stride: vocab,
-                        stream: r0.stream.raw,
-                        greedy: None,
-                    };
-                    return on_tile(0, logits);
                 }
                 let hc_src_ptr = r_cur.ptr.cast::<u8>().wrapping_add(first_row * HC * H * 2).cast();
                 r0.device.run(|| unsafe {

@@ -196,6 +196,31 @@ mod tests {
         assert!(prewarm(None).is_none());
         assert_eq!(reserve(None, 0), (0, 0));
         assert!(selected_rows(None, 64).unwrap().is_empty());
+        assert_eq!(reserve(Some(Hy4GraphLayout::Exl3Max), 0), (0, 0));
+        assert_eq!(reserve(Some(Hy4GraphLayout::Exl3MinSpark), 0), (0, 0));
         assert_eq!(reserve(Some(Hy4GraphLayout::Exl3MaxSpark), 0), (0, 0));
+    }
+
+    #[test]
+    fn traced_exl3_min_layout_validates_and_selects_pinned_and_replayed_rows() {
+        let trace = prewarm(Some(Hy4GraphLayout::Exl3Min)).expect("exl3-k4-mc-1rtx-0spark traced");
+        assert_eq!(trace.ranks.len(), 1);
+        assert_eq!(reserve(Some(Hy4GraphLayout::Exl3Min), 0), (85_983_232, 2 << 20));
+        assert_eq!(reserve(Some(Hy4GraphLayout::Exl3Min), 1), (0, 0));
+        let selected = selected_rows(Some(Hy4GraphLayout::Exl3Min), 64).unwrap();
+        assert_eq!(
+            selected,
+            vec![
+                (1, true),
+                (4, true),
+                (2, true),
+                (8, true),
+                (16, true),
+                (3, false),
+                (7, false),
+                (14, false),
+                (15, false),
+            ]
+        );
     }
 }
