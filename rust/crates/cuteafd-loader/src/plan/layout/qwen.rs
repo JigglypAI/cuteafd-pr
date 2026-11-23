@@ -302,7 +302,7 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         Some(PleHost::new(cfg, unit_rows, waves, tensor.meta.byte_length / tensor.meta.shape[0] as u64)?)
     } else { None };
     let uploads = UploadInputs { prefill_rows: usize::try_from(unit_rows)?, waves: usize::try_from(waves)?,
-        spark: ranks > 0, mtp: mtp && cfg.mtp_layers > 0 && options.native_mtp_layers > 0, ple_ids: !mapped };
+        spark: ranks > 0, mtp: mtp && cfg.mtp_layers > 0 && options.native_mtp_layers > 0, ple_ids: !mapped, packed_decode_tables: owners == 1 };
     let (bounds, mtp_upload) = uploads.bounds(cfg)?;
     let spark = if ranks > 0 {
         let intake_rows = if waves == 1 { unit_rows } else {

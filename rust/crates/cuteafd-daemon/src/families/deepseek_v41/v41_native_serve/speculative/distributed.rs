@@ -17,14 +17,14 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     /// no device scope survives a scheduler yield.
     pub fn with_distributed_requests(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, shards: [&'w VocabularyShard<'a>; 2],
-        capacity: u32, requests: u32, lanes: u8) -> Result<DeviceOwner<'a, Self>> {
+        capacity: u32, decode_rows: u32, requests: u32, lanes: u8) -> Result<DeviceOwner<'a, Self>> {
         let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
         let lane_count = lane_count as usize;
         devices[1].own(|| {
             let lib = devices[1].library;
             let lane_bytes = DistributedDsparkChain::device_bytes(weights, lane_requests, shards[0].tokens().end)?;
             let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-            if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
+            if lane_count > 1 { mains.push(weights.main_context(decode_rows, DsparkMainContext::device_bytes(lib, decode_rows)?)?); }
             let chains = (0..lane_count).map(|_| DistributedDsparkChain::new(devices, weights, table,
                 shards, lane_requests, lane_bytes)).collect::<Result<Vec<_>>>()?;
             let window = || DsparkWindow::new(lib, requests as usize, capacity,
@@ -35,7 +35,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 mains, chains, windows: [window()?, window()?, window()?],
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
                 requests: Default::default(), pending: vec![None; lane_count],
-                request_limit: requests as usize, draft_limit: weights.draft_width(), draft_width: weights.draft_width(),
+                request_limit: requests as usize, verify_rows: decode_rows as usize, draft_limit: weights.draft_width(), draft_width: weights.draft_width(),
                 confidence_trace: Default::default(), neural_lengths: Default::default(), length: Default::default(), policy: None,
                 lanes: vec![LaneDraft::default(); lane_count],
             })
@@ -79,8 +79,8 @@ mod tests {
         let weights = devices[1].own(|| DsparkWeights::load_serving_with_width(&lib, &catalog,
             80, 16, 2, 32usize << 30, 16 << 20, 5))?;
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
-            [&shards[0], &shards[1]], 80, 16, 2)?;
-        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16, 2))?;
+            [&shards[0], &shards[1]], 80, cuteafd_core::V41_VERIFY_ROWS as u32, 16, 2)?;
+        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, cuteafd_core::V41_VERIFY_ROWS as u32, 16, 2))?;
         devices[1].run(|| actual.get_mut().capture_startup())?;
         assert!(actual.requests.is_empty());
         assert!(actual.pending.iter().all(Option::is_none));

@@ -93,8 +93,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             "TP2 DFlash requires two coordinator GPUs and checkpoint-derived physical owners");
         let spark_ranks = match report.placement { ExpertPlacement::Local => 0, ExpertPlacement::Sparks { ranks } => ranks };
         let lanes = prefill.waves;
-        let decode_rows = options.glmf_decode_rows;
-        anyhow::ensure!(ranks == 1 || decode_rows == 64, "a head split takes --decode-rows 64");
+        let decode_rows_req = u64::from(options.decode_rows);
+        let decode_rows = if decode_rows_req > 64 { 128 } else { 64 };
+        anyhow::ensure!(ranks == 1 || decode_rows_req <= 64, "a head split takes --decode-rows <= 64");
         let draft_config = if options.glmf_drafter_disabled || options.drafter_bytes > 0 { None } else {
             let path = options.glmf_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
@@ -379,7 +380,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         if let Some((_, metadata)) = exlr8 {
             if spark_ranks > 0 {
                 let executions = super::planned_spark_executions("glm5_flash", SparkBackend::Exlr8,
-                    Some(u32::try_from(decode_rows)?), options)?;
+                    Some(options.decode_rows), options)?;
                 let geometry = catalog.routed_experts().geometry()?;
                 process.spark_candidates = crate::plan::exlr8::spark_candidate_bytes(metadata,
                     manifest.context("EXLR8 Spark owners require PROGRAMS.json")?, geometry, &executions,
@@ -562,7 +563,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             }
             let charged = input.expert_catalog().and_then(SparkBackend::for_catalog).and_then(|backend|
                 super::planned_spark_executions("glm5_flash", backend,
-                    Some(u32::try_from(options.glmf_decode_rows)?), options))
+                    Some(options.decode_rows), options))
                 .and_then(|executions| spark_slots::charge_executions(&mut device, input, &working, "glm5_flash", &executions));
             if let Err(error) = charged {
                 report.placement_supported = false;

@@ -1523,19 +1523,16 @@ def test_muse_audio_scope_matches_card_request(tmp_path, audio, enabled):
 @pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
 def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, [f'muse-spark-exl3-{size}'])[0]
+    card = cards.load_cards(kit, [f'muse-spark-exl3-k4-mc-{size}'])[0]
     values = {**cards.config(card['config']), **card['set']}
     hosts = ['ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa'][:count]
     assert card['family'] == 'muse_spark' and card['gpus'] == gpus
     assert card['sparks'] == hosts and values['SPARK_COUNT'] == str(count)
-    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
-    assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC'
+    assert values['MODEL_REVISION'] == 'cc5dc2537083177e3f02ea0b2d9dfc179d40425c'
     assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
     assert values['VISION'] == ('spark' if size == 'min' else 'auto')
     assert values['AUDIO'] == 'auto'
-    if size == 'min':
-        context = int(values['MAX_CONTEXT_TOKENS'])
-        assert context > 262144 and context % 64 == 0
     for rank, host in enumerate(hosts):
         assert values[f'SPARK_{rank}_HOST'] == host
         assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
@@ -1543,6 +1540,40 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
                for entry in json.loads(matrix.read_text())['entries']]
     for key in ('ADDR', 'EXPERT_PORT'):
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+    # The retired standalone Core-K6 checkpoint has no gate card.
+    with pytest.raises(ValueError, match='unknown cards'):
+        cards.load_cards(kit, [f'muse-spark-exl3-{size}'])
+
+
+def test_gate_kit_cards_load_live_matrix_checkpoints():
+    # 2026-11-23: a retired gate card loaded the 635 GB official Step-5 FP8
+    # release off the NAS. Every card must load a checkpoint the published
+    # matrix still carries as a live cell (current, held or pending), and must
+    # not be a card the matrix lists as retired.
+    kit = ROOT / 'scripts/bench/kits/gate'
+    published = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())
+    live = {row['checkpoint'] for row in published['cells']
+            if any(row[column]['status'] != 'na' for column in ('1rtx', '2rtx'))}
+    retired = {entry['name'] for entry in published['retired']}
+    names = [entry['name'] for matrix in sorted(kit.glob('matrix-*.json'))
+             for entry in json.loads(matrix.read_text())['entries']]
+    assert names
+    stale = {}
+    for card in cards.load_cards(kit, names):
+        model = {**cards.config(card['config']), **card['set']}.get('MODEL_ID')
+        if model not in live:
+            stale[card['name']] = model
+    assert not stale, f'gate cards load checkpoints that are not live in current-matrix.json: {stale}'
+    # Nor may a card sit on a (checkpoint, layout) cell the matrix retired. A
+    # retired-list name alone is history (e.g. a v3 card on the same config);
+    # what removes a card is its own cell's retirement.
+    for card in cards.load_cards(kit, names):
+        model = {**cards.config(card['config']), **card['set']}['MODEL_ID']
+        row = next(row for row in published['cells'] if row['checkpoint'] == model)
+        cell = row[f"{len(card['gpus'])}rtx"]
+        assert not (cell['status'] == 'na' and cell.get('reason', '').lower().startswith('retired')), \
+            f"{card['name']}: its {len(card['gpus'])}rtx cell is retired ({cell['reason']})"
+    assert retired  # names the matrix retired are history, not gate cards by themselves
 
 
 @pytest.mark.parametrize('size,count', [('min', 4), ('max', 6)])
@@ -1576,12 +1607,15 @@ def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
 
 
-def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
-    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
+@pytest.mark.parametrize('size,gpus,count', [('min', [1], 4), ('max', [0, 1], 6)])
+def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, count):
+    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'glm53-mc-original-{size}'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
-    assert values['MODEL_ID'] == 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6'
-    assert values['MODEL_REVISION'] == '5a4e83a09a11f3145332ed632d28a9894ea88225'
-    assert card['gpus'] == [0, 1] and len(card['sparks']) == 6
+    assert card['config'].endswith(f'glm53-exl3-k4-mc-{size}.config')
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC'
+    assert values['MODEL_REVISION'] == '2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e'
+    assert values['CORE_VIEW'] == 'original'
+    assert card['gpus'] == gpus and card['sparks'] == list(cards.HOSTS[:count])
 
 
 def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
@@ -1716,7 +1750,7 @@ def test_default_state_is_fresh_when_the_default_task_collides(entry, tmp_path, 
 
 def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path, monkeypatch):
     gate = ROOT / 'scripts/bench/kits/gate'
-    argv = ['--kit', str(gate), '--cards', 'mimo26-flash-max', 'glmf-exl3-max', '--matrix', '--arm', 'c=x:s',
+    argv = ['--kit', str(gate), '--cards', 'mimo26-flash-max', 'glmf-mc-original-max', '--matrix', '--arm', 'c=x:s',
             '--state', str(tmp_path / 'state')]
     with pytest.raises(ValueError) as caught:
         _run_main(monkeypatch, argv, slot=_fake_slot(packages=['fp8/fp8-mimof'], audio=False))
@@ -1728,12 +1762,12 @@ def test_preflight_refuses_missing_packages_and_audio_before_any_launch(tmp_path
     assert json.loads((tmp_path / 'state' / 'preflight.json').read_text())['status'] == 'failed'
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
         packages=['fp8/fp8-mimof', 'exl3/exl3-glmf-k34', 'fp8/fp8-glmf'], audio=True))
-    assert rc == 0 and sorted(launched) == ['glmf-exl3-max/c', 'mimo26-flash-max/c']
+    assert rc == 0 and sorted(launched) == ['glmf-mc-original-max/c', 'mimo26-flash-max/c']
 
 
 @pytest.mark.parametrize('pcm_audio', [False, None])
 def test_muse_preflight_refuses_missing_pcm_before_any_launch(tmp_path, monkeypatch, pcm_audio):
-    argv = ['--kit', str(ROOT / 'scripts/bench/kits/gate'), '--cards', 'muse-spark-exl3-max',
+    argv = ['--kit', str(ROOT / 'scripts/bench/kits/gate'), '--cards', 'muse-spark-exl3-k4-mc-max',
             '--matrix', '--arm', 'c=x:s', '--state', str(tmp_path / 'state')]
     with pytest.raises(ValueError, match='cuteafd_pcm_required'):
         _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-muse-k45'],
@@ -1742,7 +1776,7 @@ def test_muse_preflight_refuses_missing_pcm_before_any_launch(tmp_path, monkeypa
     assert json.loads((tmp_path / 'state' / 'preflight.json').read_text())['status'] == 'failed'
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_fake_slot(
         packages=['exl3/exl3-muse-k45'], audio=True, pcm_audio=True))
-    assert rc == 0 and launched == ['muse-spark-exl3-max/c']
+    assert rc == 0 and launched == ['muse-spark-exl3-k4-mc-max/c']
 
 
 def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
@@ -1906,9 +1940,9 @@ def test_prefill_sweep_rows(entry, tmp_path):
 def test_build_scopes_are_per_card_zero_spark_and_family_counts():
     base = {'config': '/dev/null'}
     qwen_model = 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1'
-    glm_model = 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1'
+    glm_model = 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC'
     local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'MODEL_ID': qwen_model, 'SPARK_COUNT': '0'}}
-    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'MODEL_ID': glm_model, 'SPARK_COUNT': '6'}}
+    glm = {**base, 'name': 'glm53-mc-original-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'MODEL_ID': glm_model, 'SPARK_COUNT': '6'}}
     mixed = cards.build_scopes([glm, local])
     spark = set(mixed['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
     assert not any(scope.startswith('qwen4:') for scope in spark)
@@ -2938,11 +2972,24 @@ def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
 def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
     job = make(entry, tmp_path)
-    with cards.hwlock.hold(['gpu0'], 1):
+    locks = cards.hwlock.LOCK_DIR
+    marker = tmp_path / 'holding'
+    # Another job (not an ancestor: hwlock refuses to nest inside one) holds gpu0.
+    other = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'), '--locks', 'gpu0', '--wait', '10', '--',
+                              sys.executable, '-c', f'import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(30)'],
+                             env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+    try:
+        end = time.time() + 10
+        while not marker.exists():
+            assert time.time() < end, 'the other holder never started'
+            time.sleep(0.02)
         with pytest.raises(TimeoutError, match='no turn'):
             with cards.serving_turn([job], {}, 0.02):
                 pytest.fail('a conflicting turn cannot be granted')
-    assert not list((cards.hwlock.LOCK_DIR / 'hwq').glob('*.ticket'))
+        assert not list((locks / 'hwq').glob('*.ticket'))
+    finally:
+        other.terminate()
+        other.wait(timeout=30)
 
 
 def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):

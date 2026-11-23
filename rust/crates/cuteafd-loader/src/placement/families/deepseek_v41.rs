@@ -236,8 +236,12 @@ pub fn expert_inventory(
         u64::from(cuteafd_core::coordinator_programs::v41_aot_rows(u32::try_from(rows)?)
             .context("invalid V4.1 prefill rows")?)
     } else { rows };
+    let decode_capacity = if gpus == 1 {
+        cuteafd_core::V41_TARGET_CAPACITIES.into_iter().find(|&c| c >= decode_rows)
+            .context("invalid V4.1 decode expert rows")?
+    } else { decode_rows };
     let (experts, slot) = expert_workspace(catalog, programs, slot_capacity, reserve, gpus, sms)?;
-    let (_, decode) = expert_workspace(catalog, programs, decode_rows, decode_rows, gpus, sms)?;
+    let (_, decode) = expert_workspace(catalog, programs, decode_capacity, decode_rows, gpus, sms)?;
     let slots = if gpus == 1 { slots as u64 } else { 1 };
     ensure!(matches!(lanes, 1 | 2), "V4.1 runs one or two decode lanes");
     Ok((experts, slot.checked_mul(slots).and_then(|n| n.checked_add(u64::from(lanes) * decode))

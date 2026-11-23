@@ -14,6 +14,14 @@ impl PackingMode {
     pub(crate) fn resolve(explicit: Option<Self>, packed_check: bool) -> Self {
         explicit.unwrap_or(if packed_check { Self::Exact } else { Self::Unrestricted })
     }
+
+    /// A family that attests no coordinator packed-route cap serves only
+    /// `unrestricted`; `exact` refuses by name instead of packing unchecked.
+    pub(crate) fn require_unrestricted(self, family: &str) -> Result<()> {
+        ensure!(self == Self::Unrestricted,
+            "{family} PREFILL_PACKING=exact is unsupported: no coordinator packed-route cap is attested; use unrestricted");
+        Ok(())
+    }
 }
 
 /// How a coordinator program receives rows in a packed pass. No implicit role:
@@ -143,6 +151,32 @@ pub(crate) struct Limits {
     pub taps: Option<usize>,
 }
 
+/// Capacity of contiguous record and index page-table planes, in entries
+/// (not physical KV pages). Sharing a KV page does not share its table entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableBudget(pub [usize; 2]);
+
+impl TableBudget {
+    fn append(self, offset: [usize; 2], entries: [usize; 2]) -> Option<[usize; 2]> {
+        let end = [offset[0].checked_add(entries[0])?, offset[1].checked_add(entries[1])?];
+        (end[0] <= self.0[0] && end[1] <= self.0[1]).then_some(end)
+    }
+
+    pub(crate) fn fits(self, tables: impl IntoIterator<Item = [usize; 2]>) -> bool {
+        tables.into_iter().try_fold([0; 2], |offset, entries| self.append(offset, entries)).is_some()
+    }
+
+    pub(crate) fn offsets(self, tables: impl IntoIterator<Item = [usize; 2]>) -> Result<Vec<[usize; 2]>> {
+        let mut end = [0; 2];
+        tables.into_iter().map(|entries| {
+            let offset = end;
+            end = self.append(offset, entries).ok_or_else(||
+                anyhow::anyhow!("packed page-table metadata exceeds its admitted capacity {:?}", self.0))?;
+            Ok(offset)
+        }).collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Segment {
     pub first: usize,
@@ -218,6 +252,17 @@ pub(crate) fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> 
 pub(crate) fn row_shares(rows: &[usize]) -> Vec<f64> {
     let total: usize = rows.iter().sum();
     rows.iter().map(|&r| if total == 0 { 1.0 / rows.len() as f64 } else { r as f64 / total as f64 }).collect()
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::PackingMode;
+    #[test]
+    fn uncapped_families_accept_only_unrestricted() {
+        assert!(PackingMode::Unrestricted.require_unrestricted("X").is_ok());
+        let error = PackingMode::Exact.require_unrestricted("X").unwrap_err().to_string();
+        assert!(error.contains("X PREFILL_PACKING=exact is unsupported"), "{error}");
+    }
 }
 
 #[cfg(test)]

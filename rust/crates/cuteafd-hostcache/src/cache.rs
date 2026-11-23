@@ -773,12 +773,35 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         &mut self.metrics
     }
 
-    /// Add one pin to a resident snapshot; test support for the class-exhaustion retry.
-    #[doc(hidden)]
+    /// Add one pin to a resident snapshot: it is never evicted until [`HostCache::release_pin`].
+    /// The engine pins a snapshot that holds the only copy of a live device entry's positional
+    /// mark, so host pressure cannot orphan the entry's pages. An unknown key is a no-op.
     pub fn pin(&mut self, key: Key) {
         if let Some(snapshots) = self.snapshots.as_mut() {
             snapshots.pin(key);
         }
+        self.refresh_gauges();
+    }
+
+    /// Drop a pin taken with [`HostCache::pin`]; an unknown key is a no-op.
+    pub fn release_pin(&mut self, key: Key) {
+        self.unpin(key);
+        self.refresh_gauges();
+    }
+
+    /// Remove a resident snapshot regardless of pins. Test support only: it violates the pin
+    /// contract on purpose, to exercise the engine's dead-mark path.
+    #[doc(hidden)]
+    pub fn remove_for_test(&mut self, key: Key) -> bool {
+        self.payloads.remove(&key);
+        let removed = self.snapshots.as_mut().is_some_and(|s| s.remove(key));
+        self.refresh_gauges();
+        removed
+    }
+
+    /// Whether `key` is resident and pinned (test support and invariant checks).
+    pub fn pinned(&self, key: Key) -> bool {
+        self.snapshots.as_ref().and_then(|s| s.get(key)).is_some_and(|s| s.pins > 0)
     }
 
     /// Why `snapshot` is not cached, or `None` when it is.

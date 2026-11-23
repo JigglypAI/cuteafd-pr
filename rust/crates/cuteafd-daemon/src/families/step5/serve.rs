@@ -85,7 +85,8 @@ pub(crate) struct ServeArgs {
     device: i32,
     #[arg(long)]
     split_device: Option<i32>,
-    #[arg(long, value_delimiter = ',', required = true)]
+    /// Spark expert ranks; empty serves every routed layer on the RTX GPUs.
+    #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
     #[arg(long)]
     pool_tokens: Option<u64>,
@@ -331,7 +332,7 @@ fn with_backend<T>(args: &ServeArgs,
     let graph_layout = cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
         &catalog, &contract, ids.len(), args.peers.len());
     let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&args.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?, graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
-        host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+        host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_formats: cuteafd_core::spark_reply::requested(), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
@@ -706,6 +707,15 @@ mod tests {
     }
 
     #[test]
+    fn zero_spark_serving_parses_without_peers() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so"]).unwrap();
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert!(args.peers.is_empty());
+        args.validate().unwrap();
+    }
+
+    #[test]
     fn decode_graphs_default_on_and_allow_explicit_off() {
         assert!(args().decode_graphs);
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
@@ -951,7 +961,7 @@ mod tests {
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
         let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
-            host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            host: Default::default(), resident_weight_limit: None, spark_reply_formats: Default::default(),
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },

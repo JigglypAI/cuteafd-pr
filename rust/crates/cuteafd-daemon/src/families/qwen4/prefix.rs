@@ -523,7 +523,7 @@ fn drafting_resume_check(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>,
     let plan = RestorePlan { snapshot_end: at, target_end: at, lag: cuteafd_engine::prefix::LaggedState {
         source_end: at, replay_start: at }, fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
     family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&saved), &mut reader, &plan,
-        &RestoreContext { native_tokens: tokens, media: &[] }).map_err(err)?;
+        &RestoreContext { native_tokens: tokens, media: &[], approximate_from: None }).map_err(err)?;
     ensure!(canonical(&reader)? == expected, "drafting reader differs byte-exactly from cold MTP state");
     let mut resumed = MtpSeq::default();
     speculate::restore_pending(engine, &reader, at, None, &mut resumed)?;

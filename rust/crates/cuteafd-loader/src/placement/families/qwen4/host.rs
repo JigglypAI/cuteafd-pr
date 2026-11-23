@@ -158,6 +158,7 @@ pub struct UploadInputs {
     pub mtp: bool,
     /// PLE ids staged per step only when the table is not mapped.
     pub ple_ids: bool,
+    pub packed_decode_tables: bool,
 }
 
 impl UploadInputs {
@@ -165,9 +166,9 @@ impl UploadInputs {
     pub fn bounds(self, cfg: &Qwen4Config) -> Result<([UploadBound; 2], Option<UploadBound>), Refusal> {
         let units = if self.spark && self.waves > 1 { self.waves } else { 0 };
         let prefill = UploadBound::of(|pages, pools| upload_shape(self.prefill_rows, false, pages, pools,
-            cfg.ple_rows(), cfg.layers, units, self.spark, self.mtp, self.ple_ids))?;
+            cfg.ple_rows(), cfg.layers, units, self.spark, self.mtp, self.ple_ids, false))?;
         let decode = UploadBound::of(|pages, pools| upload_shape(VERIFY_ROWS, true, pages, pools,
-            cfg.ple_rows(), cfg.layers, 0, self.spark, self.mtp, self.ple_ids))?;
+            cfg.ple_rows(), cfg.layers, 0, self.spark, self.mtp, self.ple_ids, self.packed_decode_tables))?;
         let mtp = (units > 0 && self.mtp).then(|| UploadBound::of(|pages, pools|
             mtp_upload_shape(self.prefill_rows, pages, pools, units))).transpose()?;
         Ok(([prefill, decode], mtp))
@@ -367,7 +368,7 @@ impl QwenHost {
     /// device-only admission fixtures (tests and diagnostics).
     pub fn ample(cfg: &Qwen4Config, owners: usize, prefill_rows: usize) -> Result<Self, Refusal> {
         let (bounds, _) = UploadInputs { prefill_rows: prefill_rows.max(64), waves: 1, spark: false,
-            mtp: false, ple_ids: cfg.ple_layers.is_empty() }.bounds(cfg)?;
+            mtp: false, ple_ids: cfg.ple_layers.is_empty(), packed_decode_tables: owners == 1 }.bounds(cfg)?;
         Ok(Self { memory: HostMemory { total: 1 << 40, available: 1 << 40 }, ple: None,
             uploads: vec![bounds; owners], mtp_upload: None, pinned_logits: 0, mtp_pinned_logits: 0, scoring_logits: 0,
             prefix_quota: 0, prefix_chunk: 0, loaded_media_cache: 0, host_embedding: 0, table_reactor: 0,
@@ -418,15 +419,15 @@ mod tests {
         for spark in [false, true] {
             for mtp in [false, true] {
                 for ple_ids in [false, true] {
-                    let inputs = UploadInputs { prefill_rows: 4096, waves: if spark { 3 } else { 1 }, spark, mtp, ple_ids };
+                    let inputs = UploadInputs { prefill_rows: 4096, waves: if spark { 3 } else { 1 }, spark, mtp, ple_ids, packed_decode_tables: true };
                     let ([prefill, decode], extra) = inputs.bounds(&cfg).unwrap();
                     let units = if spark && inputs.waves > 1 { inputs.waves } else { 0 };
                     for pools in (1..=200).chain([255, 256, 257, 511, 513, 1023, 1025, 2047, 2049, 4095, 4097, 4100,
                         8191, 8193, 16383, 16385, 65537, 262145]) {
                         let pages = pools * QWEN_UNIT_PAGES;
                         let exact = |shape: crate::shared::token_table::UploadShape| shape.capacity_bytes().unwrap() as u64;
-                        let p = exact(upload_shape(4096, false, pages, pools, cfg.ple_rows(), cfg.layers, units, spark, mtp, ple_ids).unwrap());
-                        let d = exact(upload_shape(VERIFY_ROWS, true, pages, pools, cfg.ple_rows(), cfg.layers, 0, spark, mtp, ple_ids).unwrap());
+                        let p = exact(upload_shape(4096, false, pages, pools, cfg.ple_rows(), cfg.layers, units, spark, mtp, ple_ids, false).unwrap());
+                        let d = exact(upload_shape(VERIFY_ROWS, true, pages, pools, cfg.ple_rows(), cfg.layers, 0, spark, mtp, ple_ids, true).unwrap());
                         assert!(prefill.at(pools as u64).unwrap() >= p, "prefill {pools}: {} < {p}", prefill.at(pools as u64).unwrap());
                         assert!(decode.at(pools as u64).unwrap() >= d, "decode {pools}: {} < {d}", decode.at(pools as u64).unwrap());
                         // Conservative but not loose: within 1% plus the fixed term.

@@ -468,7 +468,6 @@ pub struct DraftHistory {
     cost: RoundCost,
     /// The neural keep cut of the round being planned.
     round_cut: f64,
-    shared_explore: bool,
     calibration_round: u64,
     last_judged: Vec<[u64; SCORE_BINS]>,
 }
@@ -485,7 +484,10 @@ impl DraftHistory {
             platt: if spec.head.scored() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
             rule: CutRule::Fixed, cost: RoundCost::default(), round_cut: KEEP_CUT,
-            shared_explore: false, calibration_round: 0, last_judged: Vec::new(),
+            calibration_round: 0,
+            last_judged: if control == DraftControl::History && spec.head.scored() {
+                vec![[0; SCORE_BINS]; spec.block]
+            } else { Vec::new() },
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
                 position_reached: vec![0; spec.block], position_accepted: vec![0; spec.block],
@@ -501,17 +503,6 @@ impl DraftHistory {
     pub fn with_cut_rule(mut self, rule: CutRule) -> Self { self.rule = rule; self }
     pub fn cut_rule(&self) -> CutRule { self.rule }
 
-    /// Share one scored explore; skip growth into padded verify shapes above eight rows.
-    pub fn with_shared_explore(mut self, enabled: bool) -> Self {
-        self.shared_explore = enabled;
-        if enabled && self.spec.head.scored() { self.last_judged = vec![[0; SCORE_BINS]; self.spec.block]; }
-        self
-    }
-
-    pub fn label(&self) -> String {
-        if self.control == DraftControl::History && self.shared_explore { "history-shared-explore".into() }
-        else { self.control.label() }
-    }
     /// The neural keep cut the last planned round used.
     pub fn round_cut(&self) -> f64 { self.round_cut }
 
@@ -685,7 +676,7 @@ impl DraftHistory {
         // The smallest verify shapes are bandwidth-bound; only protect
         // crossings into larger buckets, where the padding becomes expensive.
         if let (Some(before), Some(after)) = (bucket(rows), bucket(rows + 1)) {
-            if after > 8 && (after > before || rows == ids.len()) { return granted; }
+            if after > 8 && after > before { return granted; }
         }
         let best = stops.into_iter().filter(|(i, _, _, _)| {
             let p = self.requests[&ids[*i]].pending.as_ref().expect("excluded stop");
@@ -810,7 +801,7 @@ impl DraftHistory {
             }
             self.requests.insert(outcome.id, request);
         }
-        trace.then(|| RoundTrace { policy: self.label(), block: self.spec.block,
+        trace.then(|| RoundTrace { policy: self.control.label(), block: self.spec.block,
             rounds: self.stats.rounds, short_rounds: self.stats.short_rounds, short_share: self.stats.short_share(),
             explored: self.stats.explored, explore_accepted: self.stats.explore_accepted,
             requests })
@@ -830,7 +821,7 @@ impl DraftHistory {
             })).collect()
         };
         serde_json::json!({
-            "policy": self.label(), "block": self.spec.block, "head": self.spec.head,
+            "policy": self.control.label(), "block": self.spec.block, "head": self.spec.head,
             "copy_positions": self.spec.copy, "request_window": REQUEST_WINDOW, "server_window": SERVER_WINDOW,
             "prior_strength": PRIOR_STRENGTH, "fade_rounds": FADE_ROUNDS, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
@@ -1350,7 +1341,7 @@ mod tests {
     #[test]
     fn shared_explore_adds_only_one_exact_row_and_drops_dependent_copy_suffixes() {
         let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 2 };
-        let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
+        let mut policy = DraftHistory::new(spec, DraftControl::History);
         let ids = [31, 11, 21, 41, 51];
         assert_eq!(policy.plan(&ids.map(|id| (id, 5)), 64), [3; 5]);
         for id in ids {
@@ -1360,14 +1351,29 @@ mod tests {
         let granted = policy.settle_with_padding(&ids, 64, |_| None);
         assert_eq!(granted, [1, 2, 1, 1, 1]);
         let trace = policy.observe(&ids.into_iter().zip(granted).map(|(id, n)| outcome(id, n, 1)).collect::<Vec<_>>(), true).unwrap();
-        assert_eq!(trace.policy, "history-shared-explore");
+        assert_eq!(trace.policy, "history");
         assert_eq!(policy.stats().position_reached, [5, 1, 0]);
+    }
+
+    #[test]
+    fn warm_clamped_uses_the_same_single_explore_budget() {
+        let spec = DrafterSpec { block: 3, head: HeadScore::Probability, copy: 0 };
+        let mut policy = DraftHistory::new(spec, DraftControl::History).with_cut_rule(CutRule::Clamped);
+        for rows in [8, 32, 64] {
+            for _ in 0..20 { policy.observe_cost(0, rows, 0.010 + 0.002 * rows as f64); }
+        }
+        policy.begin_round(0, 8);
+        assert_eq!(policy.round_cut(), clamped::HI);
+        let ids = [2, 1];
+        assert_eq!(policy.plan(&[(2, 3), (1, 3)], 64), [3; 2]);
+        for id in ids { assert_eq!(policy.refine(id, 3, Some(&[0.9, 0.45, 0.4])), 2); }
+        assert_eq!(policy.settle_with_padding(&ids, 64, |_| None), [1, 2]);
     }
 
     #[test]
     fn shared_explore_keeps_token_only_identical_to_history() {
         let mut baseline = policy(3);
-        let mut shared = policy(3).with_shared_explore(true);
+        let mut shared = policy(3);
         let requests = [(21, 3), (11, 3)];
         for _ in 0..8 {
             let expected = baseline.plan(&requests, 64);
@@ -1383,7 +1389,7 @@ mod tests {
     #[test]
     fn shared_explore_prefers_staleness_then_cut_distance_and_checks_padding() {
         let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 0 };
-        let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
+        let mut policy = DraftHistory::new(spec, DraftControl::History);
         let ids = [1, 2, 3];
         let requests = ids.map(|id| (id, 3));
         let plan = |policy: &mut DraftHistory| {

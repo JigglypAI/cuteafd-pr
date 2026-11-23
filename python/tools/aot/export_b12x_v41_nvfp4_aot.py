@@ -130,7 +130,7 @@ def export(
     if role not in ROLES:
         raise ValueError(f"unsupported NVFP4 expert role {role!r}")
     experts, intermediate, topk, capability = ROLES[role]
-    from b12x._lib.aot_target import describe_target
+    from b12x._lib.aot_target import describe_target, target_for
 
     describe_target(capability)
     import torch
@@ -146,9 +146,9 @@ def export(
             f"got {properties.major}{properties.minor}"
         )
     device = torch.device("cuda", torch.cuda.current_device())
-    workspace_sms = 188 if capability == (12, 0) else 48
     # The dynamic kernel takes its cooperative grid as a runtime scalar.
-    # Reserve the architecture capacity, retaining explicit tuning overrides.
+    # Reserve the canonical ceiling even under a synthetic smaller-SM export.
+    workspace_sms = target_for(capability).multi_processor_count
     launch_clusters = workspace_sms if max_active_clusters is None else max_active_clusters
     if type(launch_clusters) is not int or not 0 < launch_clusters <= 2 * workspace_sms:
         raise ValueError(f"invalid NVFP4 cooperative launch capacity: {launch_clusters}")

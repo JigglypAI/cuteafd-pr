@@ -1717,10 +1717,12 @@ impl<'a> GlmfEngine<'a> {
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
-        ensure!(decode_rows == DECODE_ROWS || decode_rows == WIDE_DECODE_ROWS,
-            "decode steps of up to {decode_rows} rows: the programs take {DECODE_ROWS} or {WIDE_DECODE_ROWS}");
-        let verify_rows = verify_budget(decode_rows, sms);
-        tracing::info!(decode_rows, verify_rows, sms, "GLM Flash decode and verify step rows");
+        ensure!((1..=WIDE_DECODE_ROWS).contains(&decode_rows),
+            "decode steps of up to {decode_rows} rows exceed GLM Flash's exported {WIDE_DECODE_ROWS}-row capacity");
+        let verify_cap = decode_rows;
+        let decode_rows = if verify_cap > DECODE_ROWS { WIDE_DECODE_ROWS } else { DECODE_ROWS };
+        let verify_rows = verify_budget(decode_rows, sms).min(verify_cap);
+        tracing::info!(decode_rows, verify_cap, verify_rows, sms, "GLM Flash decode and verify step rows");
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!((1..=MAX_PREFILL_WAVES).contains(&prefill_waves) && prefill_rows > 0,
             "{prefill_waves} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_WAVES} lanes)");

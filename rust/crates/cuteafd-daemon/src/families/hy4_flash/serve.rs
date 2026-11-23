@@ -59,6 +59,9 @@ pub(crate) struct ServeArgs {
     pub prefill_rows: Option<usize>,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
     pub prefill_waves: Option<u8>,
+    /// `exact` needs an attested coordinator route cap, which Hy4 does not report yet.
+    #[arg(long, value_enum, default_value = "unrestricted")]
+    pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     /// Optional explicit path to `exl3-hy4f-k45-mul1/rtx-tp{1,2}` package directory.
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
@@ -120,6 +123,7 @@ fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<&'static st
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("hy4_flash", args.max_sequences as u64)?;
+    args.prefill_packing.require_unrestricted("Hy4-flash")?;
     ensure!(
         args.token_io.embed_placement == EmbedPlacement::Gpu && args.token_io.token_select == SelectPlacement::Device,
         "Hy4-flash serving requires GPU embedding and device token selection"
@@ -623,6 +627,23 @@ mod tests {
                 .publish();
             Ok(())
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn serve_hy4f_accepts_unrestricted_packing_and_refuses_exact_by_name() -> anyhow::Result<()> {
+        use crate::shared::prefill_packing::PackingMode;
+        let base = ["cuteafd", "serve-hy4f", "--snapshot", "/model", "--native-lib", "/lib.so"];
+        for (extra, mode) in [(&[][..], PackingMode::Unrestricted),
+            (&["--prefill-packing", "unrestricted"][..], PackingMode::Unrestricted),
+            (&["--prefill-packing", "exact"][..], PackingMode::Exact)] {
+            let crate::cli::Commands::ServeHy4f(args) =
+                crate::cli::Cli::try_parse_from(base.iter().chain(extra))?.command else { anyhow::bail!("not serve-hy4f") };
+            assert_eq!(args.prefill_packing, mode);
+            let checked = args.prefill_packing.require_unrestricted("Hy4-flash");
+            assert_eq!(checked.is_ok(), mode == PackingMode::Unrestricted);
+            if let Err(error) = checked { assert!(error.to_string().contains("PREFILL_PACKING=exact")); }
+        }
         Ok(())
     }
 

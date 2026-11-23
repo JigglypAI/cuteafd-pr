@@ -66,6 +66,16 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
         deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
     )
     serve_max = _line(res_max, "serve-hy4f --snapshot")
+    assert _flag(serve_max, "--prefill-packing") is None and _flag(serve_max, "--prefix-cache-mark-mib") is None
+    marked = _family_launch_result(
+        tmp_path / "marked", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+        keys_max + "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\n",
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    marked_serve, marked_plan = _line(marked, "serve-hy4f --snapshot"), _line(marked, "cuteafd plan")
+    assert _flag(marked_serve, "--prefill-packing") == "unrestricted"
+    assert _flag(marked_serve, "--prefix-cache-mark-mib") == _flag(marked_plan, "--prefix-cache-mark-mib") == "1024"
     assert (_flag(serve_max, "--device"), _flag(serve_max, "--split-device")) == ("0", "1")
     assert _flag(serve_max, "--core-view") == "original"
     assert _flag(serve_max, "--kv-cache") == "fp8"
@@ -110,6 +120,17 @@ def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path)
     assert _flag(pair_serve, "--peers") == _flag(serve, "--peers")
     assert _flag(pair_plan, "--speculator") == "dspark"
     assert "--dspark" in shlex.split(pair_serve)
+
+
+def test_inkling_packing_and_mark_budget_reach_plan_and_serve(tmp_path: Path) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = ("SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\n" + SIX)
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    serve, plan = _line(result, "serve-inkling2 --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--prefill-packing") == "unrestricted"
+    assert _flag(serve, "--prefix-cache-mark-mib") == _flag(plan, "--prefix-cache-mark-mib") == "1024"
 
 
 @pytest.mark.parametrize("setting, enabled", [("", True), ("auto", True), ("off", False), ("dspark", True)])
@@ -182,6 +203,24 @@ def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_pat
     assert entry["config"] == "examples/configs/minimax-m31-flash-nvfp4-min.config"
 
 
+def test_minimax_forwards_core_view_and_still_media_keys(tmp_path: Path) -> None:
+    config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 2}, "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    three = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
+    keys = ("SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=auto\nAUDIO=off\nCORE_VIEW=original\n"
+            "VISION_REPLICAS=2\nMEDIA_CACHE_BYTES=2GiB\n" + three)
+    result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    serve, plan = _line(result, "serve-minimax --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--core-view") == _flag(plan, "--core-view") == "original"
+    assert _flag(serve, "--vision-replicas") == _flag(plan, "--vision-replicas") == "2"
+    assert _flag(serve, "--media-cache-bytes") == _flag(plan, "--media-cache-bytes") == "2GiB"
+    marked = _family_launch_result(tmp_path / "marked", config, "MiniMaxAI/MiniMax-M3.1-Flash",
+        keys + "PREFIX_CACHE_MARK_MIB=1024\n", extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    assert _flag(_line(marked, "serve-minimax --snapshot"), "--prefix-cache-mark-mib") == \
+        _flag(_line(marked, "cuteafd plan"), "--prefix-cache-mark-mib") == "1024"
+
+
 @pytest.mark.parametrize("gpus,placement", [(1, "auto"), (2, "layers"), (2, "heads")])
 @pytest.mark.parametrize("selection", [None, "auto", "dspark", "off"])
 def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, gpus, placement, selection):
@@ -205,7 +244,7 @@ def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, 
         assert _flag(serve, "--split-device") == "1"
 
 
-@pytest.mark.parametrize("mode", [None, "history", "history-shared-explore", "clamped", "off"])
+@pytest.mark.parametrize("mode", [None, "history", "clamped", "off"])
 def test_minimax_passes_the_shared_draft_policy(tmp_path, mode):
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
@@ -216,7 +255,6 @@ def test_minimax_passes_the_shared_draft_policy(tmp_path, mode):
     serve = _line(result, "serve-minimax --snapshot")
     assert ("--draft-policy off" in serve) == (mode == "off")
     assert ("--draft-policy clamped" in serve) == (mode == "clamped")
-    assert ("--draft-policy history-shared-explore" in serve) == (mode == "history-shared-explore")
     assert "CUTEAFD_DRAFT_POLICY" not in serve
 
 
@@ -749,12 +787,18 @@ def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, spar
 
 
 @pytest.mark.parametrize("name,gpus,sparks,package", [
-    ("step5-fp8-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "fp8/fp8-step5"),
-    ("step5-nvfp4-min", [1], ["ostrich", "dodo", "emu", "kiwi"], "fp8/fp8-step5-nvfp4a4"),
+    ("step5-mc-original-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "exl3/exl3-step5-k46"),
+    ("step5-mc-original-min", [1], ["ostrich", "dodo", "emu"], "exl3/exl3-step5-k46"),
 ])
 def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, gpus, sparks, package) -> None:
+    # The gate kit cards the live K4-MC checkpoint; the official FP8 and NVFP4
+    # releases keep their example configs (tested above) but no gate card.
     card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [name])[0]
     assert card["family"] == "step5" and card["gpus"] == gpus and card["sparks"] == sparks
+    values = {**cards.config(card["config"]), **card["set"]}
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC"
+    assert values["MODEL_REVISION"] == "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"
+    assert values["CORE_VIEW"] == "original"
     assert card["profile"] == "smoke"
     assert cards.slot_needs(card)["spark"] == [package]
     key = tmp_path / "key"
@@ -851,6 +895,14 @@ def test_muse_target_kv_reaches_plan_and_serve(tmp_path: Path, selection: str, e
     result = _muse(tmp_path, keys)
     serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
     assert _flag(serve, "--kv-cache") == _flag(plan, "--kv-cache") == expected
+
+
+def test_muse_plan_and_serve_share_graph_reserve_and_media_cache(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "VISION=auto\nGPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB\nMEDIA_CACHE_BYTES=2GiB\n")
+    serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
+    for line in (plan, serve):
+        assert "CUTEAFD_GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB" in line
+    assert _flag(serve, "--media-cache-bytes") == _flag(plan, "--media-cache-bytes") == "2GiB"
 
 
 def test_muse_invalid_target_kv_is_refused_before_launch(tmp_path: Path) -> None:

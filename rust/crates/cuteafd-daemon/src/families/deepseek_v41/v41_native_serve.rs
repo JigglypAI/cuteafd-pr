@@ -158,12 +158,24 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     // Every later owner, admission and scheduler reads the resolved count.
     args.decode_lanes = lanes;
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
+    let decode_rows = cuteafd_loader::plan::resolve_decode_rows(
+        "deepseek_v41",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(),
+            concurrency: u64::from(args.concurrency),
+            decode_lanes: lanes,
+            rtx_gpus: args.rtx_gpus as usize,
+            draft_length: if args.dspark { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
+        },
+    )?;
+    args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(decode_rows);
+    cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     Ok(lanes)
 }
 
 fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(args.draft_length.effective(cuteafd_core::MAX_DSPARK_PROPOSALS)),
+        args.resolved_decode_rows() as usize, args.dspark.then_some(args.draft_length.effective(cuteafd_core::MAX_DSPARK_PROPOSALS)),
         args.attention_plan_rows)?;
     cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
     Ok(plan)
@@ -387,7 +399,9 @@ fn worker(
         .context("invalid V4.1 prefill batch")?;
     let rows = capacity as usize;
     // Live requests capture decode shapes and the full prefill chunk only.
+    let decode_rows = args.resolved_decode_rows();
     super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
+    super::graph_policy::set_decode_rows(decode_rows)?;
     let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot,
     )?;
     cuteafd_bench::context::set_family(catalog.config().family_id());
@@ -401,7 +415,6 @@ fn worker(
     ensure!(admitted.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         admitted.unit_cap);
     let slots = admitted.waves;
-    let decode_rows = DECODE_LANE_ROWS;
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
@@ -479,10 +492,12 @@ fn worker(
     })?;
     admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     use crate::families::deepseek_v41::v41_target_pass::TargetTapWave;
-    let head = || head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS,
+    let decode_rows_usize = decode_rows as usize;
+    let decode_head = || head_weights.wave(&vocabulary, decode_rows_usize,
+        TargetHeadWave::device_bytes(decode_rows_usize)?);
+    let prefill_head = || head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS,
         TargetHeadWave::device_bytes(cuteafd_core::V41_VERIFY_ROWS)?);
     // A decode lane: every owner private at decode width.
-    let decode_rows_usize = decode_rows as usize;
     // Each component under its own ledger scope (the plan == runtime check
     // names the one that differs).
     let make_decode_pass = || TargetPass::new(
@@ -499,7 +514,7 @@ fn worker(
         admission::scoped(DECODE_LANES_SCOPE, "engram gates", || Ok([
             EngramGate::new(&engram_weights[0], decode_rows_usize, 1024 * 1024 * 1024)?,
             EngramGate::new(&engram_weights[1], decode_rows_usize, 1024 * 1024 * 1024)?]))?,
-        admission::scoped(DECODE_LANES_SCOPE, "target head", head)?,
+        admission::scoped(DECODE_LANES_SCOPE, "target head", decode_head)?,
         admission::scoped(DECODE_LANES_SCOPE, "target taps", || TargetTapWave::new(&lib, decode_rows_usize,
             TargetTapWave::device_bytes(decode_rows_usize)?))?,
         Duration::from_secs(120),
@@ -535,7 +550,7 @@ fn worker(
         EngramDeviceRows::on_storage(slot_storage.upload.clone())?,
         [EngramGate::on_storage(&engram_weights[0], slot_storage.gates[0].clone())?,
          EngramGate::on_storage(&engram_weights[1], slot_storage.gates[1].clone())?],
-        admission::scoped(p, "target heads", head)?,
+        admission::scoped(p, "target heads", prefill_head)?,
         TargetTapWave::on_storage(slot_storage.taps.clone())?,
         Duration::from_secs(120),
     )).collect::<Result<Vec<_>>>()?;
@@ -602,7 +617,7 @@ fn worker(
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     let mut draft = draft_weights
         .as_ref()
-        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency, lanes))
+        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, decode_rows, args.concurrency, lanes))
         .transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_length(args.draft_length)?;
@@ -630,7 +645,7 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     if local_workspace > 0 {
         admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 1, capacity,
-            slots, reserve as u64, lanes, local_workspace)?;
+            slots, reserve as u64, decode_rows, lanes, local_workspace)?;
     }
     pass.bind_execution_plan(&pool.placement)?;
     if let Some(second) = &mut second { second.bind_execution_plan(&pool.placement)?; }
@@ -648,8 +663,9 @@ fn worker(
         (ExpertLayer::BackboneFull { layer }, budget.resident_bytes)).collect::<Vec<_>>();
     let resident_bytes = selected.iter().try_fold(0usize, |sum, (_, bytes)| sum.checked_add(*bytes))
         .context("V4.1 local expert resident bytes overflow")?;
+    let decode_expert_capacity = decode_expert_capacity(decode_rows)?;
     let lane_bytes = |rows: u32| LocalExpertWave::device_bytes_for(&lib, rows, catalog.nvfp4().is_some());
-    let (per_slot, per_decode) = if local_layers > 0 { (lane_bytes(aot_capacity)?, lane_bytes(decode_rows)?) }
+    let (per_slot, per_decode) = if local_layers > 0 { (lane_bytes(aot_capacity)?, lane_bytes(decode_expert_capacity)?) }
         else { (0, 0) };
     let admitted_experts = pool.placement.expert_ranges[0];
     let expected = resident_bytes + if local_layers > 0 {
@@ -713,7 +729,7 @@ fn worker(
                 transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_slot)?)?;
             }
             for transport in std::iter::once(&mut transport).chain(second_transport.as_mut()) {
-                transport.install_local(LocalExpertWave::new(&lib, weights.clone(), decode_rows, per_decode)?)?;
+                transport.install_local(LocalExpertWave::new(&lib, weights.clone(), decode_expert_capacity, per_decode)?)?;
             }
         }
         tracing::info!(layers=local_layers, elapsed_ms=local_started.elapsed().as_millis(),
@@ -876,6 +892,14 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 /// draft trim already bounds).
 pub(crate) const DECODE_LANE_ROWS: u32 = cuteafd_loader::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS as u32;
 
+/// Smallest exported V4.1 target AOT expert capacity covering `decode_rows`
+/// (single-GPU local expert waves require an exact `V41_TARGET_CAPACITIES` bucket).
+pub(crate) fn decode_expert_capacity(decode_rows: u32) -> Result<u32> {
+    let cap = cuteafd_core::V41_TARGET_CAPACITIES.into_iter().find(|&c| c >= u64::from(decode_rows))
+        .with_context(|| format!("V4.1 local expert decode capacity exceeds 4096 ({decode_rows})"))?;
+    Ok(cap as u32)
+}
+
 /// Ledger scopes of the target owners the planner charges (WP6 plan == runtime).
 pub(crate) const DECODE_LANES_SCOPE: &str = "v41/workspace:decode-lanes";
 pub(crate) const PREFILL_SLOTS_SCOPE: &str = "v41/workspace:prefill-slots";
@@ -962,10 +986,15 @@ const SCORING_ROWS: usize = 48;
 struct ScoringPlan {
     path: crate::shared::probe::ScorePath,
     rows: usize,
+    max_decode_rows: usize,
 }
 
 impl ScoringPlan {
     fn new(spec: &cuteafd_api::openai::probe::ProbeSpec) -> Result<Self> {
+        Self::with_decode_limit(spec, SCORING_ROWS)
+    }
+
+    fn with_decode_limit(spec: &cuteafd_api::openai::probe::ProbeSpec, max_decode_rows: usize) -> Result<Self> {
         use crate::shared::probe::ScorePath;
         let path = ScorePath::parse(spec.score_path.as_deref(), ScorePath::Prefill)?;
         let rows = match path {
@@ -975,16 +1004,16 @@ impl ScoringPlan {
             }
             ScorePath::Decode => {
                 let rows = spec.verify_rows.unwrap_or(8);
-                ensure!((1..=SCORING_ROWS).contains(&rows),
-                    "unsupported probe verify_rows={rows} for deepseek_v41; supports 1..={SCORING_ROWS}");
+                ensure!((1..=max_decode_rows).contains(&rows),
+                    "unsupported probe verify_rows={rows} for deepseek_v41; supports 1..={max_decode_rows}");
                 rows
             }
         };
-        Ok(Self { path, rows })
+        Ok(Self { path, rows, max_decode_rows })
     }
 
-    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize) -> Result<Self> {
-        let mut plan = Self::new(spec)?;
+    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize, max_decode_rows: usize) -> Result<Self> {
+        let mut plan = Self::with_decode_limit(spec, max_decode_rows)?;
         if plan.path == crate::shared::probe::ScorePath::Prefill && spec.score_positions.is_some() {
             // Sparse scoring keeps the head bounded while exercising the actual prefill geometry.
             ensure!(chunk_rows > 0, "prefill scoring capacity is zero");
@@ -999,7 +1028,11 @@ impl ScoringPlan {
             && probe.spec.score_positions.is_some();
         let mut rows: Vec<usize> = (0..step.len())
             .filter(|&row| !sparse || probe.wants(step.start + row + 1)).collect();
-        ensure!(rows.len() <= SCORING_ROWS, "scored prefill selection exceeds target head capacity");
+        let head_cap = match self.path {
+            crate::shared::probe::ScorePath::Prefill => SCORING_ROWS,
+            crate::shared::probe::ScorePath::Decode => self.max_decode_rows,
+        };
+        ensure!(rows.len() <= head_cap, "scored selection exceeds target head capacity ({head_cap})");
         if rows.is_empty() { rows.push(step.len() - 1); }
         Ok(rows)
     }
@@ -1045,7 +1078,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, retained: Option<RetainedScores>, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    let plan = ScoringPlan::for_probe(&probe.spec, shape.rows)?;
+    let plan = ScoringPlan::for_probe(&probe.spec, shape.rows, super::graph_policy::max_decode_rows() as usize)?;
     ensure!((1..tokens.len()).contains(&from), "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let (decode_pass, decode_transport) = decode_lane;
@@ -1238,23 +1271,31 @@ mod scoring_tests {
     fn sparse_prefill_uses_backbone_capacity_without_changing_decode_head_indices() {
         let spec = ProbeSpec { score_path: Some("prefill".into()),
             score_positions: Some(vec![101, 1100, 2048]), ..ProbeSpec::default() };
-        let plan = ScoringPlan::for_probe(&spec, 2048).unwrap();
+        let plan = ScoringPlan::for_probe(&spec, 2048, SCORING_ROWS).unwrap();
         assert_eq!(plan.rows, 2048);
         let probe = Probe::new(spec.clone());
         assert_eq!(plan.head_rows(&probe, &(100..2148)).unwrap(), vec![0, 999, 1947]);
         assert_eq!(plan.head_rows(&probe, &(2148..4196)).unwrap(), vec![2047]);
-        assert!(ScoringPlan::for_probe(&spec, 0).is_err());
+        assert!(ScoringPlan::for_probe(&spec, 0, SCORING_ROWS).is_err());
         let too_many = Probe::new(ProbeSpec { score_positions: Some((101..150).collect()),
             ..spec.clone() });
         assert!(plan.head_rows(&too_many, &(100..2148)).is_err());
 
         let decode_spec = ProbeSpec { score_path: Some("decode".into()),
             verify_rows: Some(8), ..spec };
-        let decode = ScoringPlan::for_probe(&decode_spec, 2048).unwrap();
+        let decode = ScoringPlan::for_probe(&decode_spec, 2048, SCORING_ROWS).unwrap();
         assert_eq!(decode.rows, 8);
         assert_eq!(decode.head_rows(&Probe::new(decode_spec), &(100..108)).unwrap(),
             (0..8).collect::<Vec<_>>());
-        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048).unwrap().rows, 48);
+        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048, SCORING_ROWS).unwrap().rows, 48);
+
+        let wide_spec = ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(128), ..ProbeSpec::default() };
+        let wide = ScoringPlan::for_probe(&wide_spec, 2048, 128).unwrap();
+        assert_eq!(wide.rows, 128);
+        assert_eq!(wide.head_rows(&Probe::new(wide_spec), &(100..228)).unwrap().len(), 128);
+        assert!(ScoringPlan::for_probe(&ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(129), ..ProbeSpec::default() }, 2048, 128).is_err());
     }
 
     #[test]

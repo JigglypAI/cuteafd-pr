@@ -140,7 +140,7 @@ impl<'w,'a> Rank<'w,'a> {
             ensure!(!weights[..index].iter().any(|other|other.layer==w.layer),"duplicate projection layer");
         }
         ensure!(storage.stream.device.id == device.id, "projection rank storage device differs");
-        let graphs=LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        let graphs=LayerGraphs::new(device.library, super::graph_policy::max_decode_rows(), "deepseek_v41");
         Ok(Self { graphs, weights, storage })
     }
 }
@@ -283,7 +283,7 @@ impl<'w,'a> Wave<'w,'a> {
         ensure!(weights[0].len() == weights[1].len()
             && weights[0].iter().zip(weights[1]).all(|(a,b)| a.layer == b.layer),
             "projection rank layers differ");
-        let gather_graphs=LayerGraphs::new(a.device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        let gather_graphs=LayerGraphs::new(a.device.library, super::graph_policy::max_decode_rows(), "deepseek_v41");
         Ok(Self { gather_graphs,
             ranks: [Rank::on_storage(weights[0], storage.ranks[0].clone())?, Rank::on_storage(weights[1], storage.ranks[1].clone())?],
             owner: storage.owner, capacity: storage.unit, kind: storage.kind, storage, window: RowWindow::NONE })

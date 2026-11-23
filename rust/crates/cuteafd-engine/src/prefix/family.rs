@@ -74,11 +74,13 @@ pub enum Eviction {
 /// Whether a restore reproduces the state a prefill of the same tokens would have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RestoreFidelity {
-    /// The restore neither runs approximate replay nor inherits recorded approximation.
+    /// The restore neither runs approximate replay nor reuses approximate lineage. Every family
+    /// whose partial reuse replays approximately (V4.1, MiMo `--prefix-partial on`) reports its
+    /// lineage through [`PrefixFamily::approximate_from`].
     Exact,
     /// Shared pages hold exact rows through `source_end`, but positional state restarts empty
     /// at `replay_start` and the replayed rows rebuild it approximately (a partial match),
-    /// or a retained ancestor already contains that approximate state.
+    /// or the restore reuses state descended from such a replay ([`RestoreContext::approximate_from`]).
     ApproximateReplay,
 }
 
@@ -192,6 +194,10 @@ impl RestorePlan {
 pub struct RestoreContext<'t> {
     pub native_tokens: &'t [u32],
     pub media: &'t [cuteafd_core::MediaSpan],
+    /// The restored placement's approximate lineage, computed by the cache: the first row whose
+    /// state may differ from an exact prefill. A family that reports lineage records it for the
+    /// placement and returns it from [`PrefixFamily::approximate_from`] at capture.
+    pub approximate_from: Option<usize>,
 }
 
 /// A family's handle on a queued asynchronous capture ([`PrefixFamily::queue_capture`]).
@@ -325,9 +331,16 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = (placement, len);
         Ok(M::default())
     }
-    /// True when a snapshot carries state descended from an approximate restore.
-    /// Such pages cannot be deduplicated by token identity in the host tier.
-    fn approximate_snapshot(&self, _: &M) -> bool { false }
+    /// The approximate lineage of `placement`, as the last restore into it set it
+    /// ([`RestoreContext::approximate_from`]; `None` after a cold admission): the first row whose
+    /// state may differ from an exact prefill. A capture stores it with the snapshot. Pages
+    /// before it keep token-content host identities; pages from it on, and the positional mark,
+    /// are approximate. A lineage does not expire: rows computed from approximate positional
+    /// state are written into global pages that every later row reads.
+    fn approximate_from(&self, placement: &Self::Placement) -> Result<Option<usize>, BoxError> {
+        let _ = placement;
+        Ok(None)
+    }
 
     /// How to restore a selected snapshot. The default follows the layout's [`ReuseRule`]:
     /// exact frontiers restore the mark, partial matches replay. A family may resume an exact

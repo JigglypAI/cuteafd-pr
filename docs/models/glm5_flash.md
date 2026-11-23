@@ -143,7 +143,7 @@ re-run when BF16 attention lands (#2146).
   or `TARGET_HEAD=exact` keeps the pedantic FP32 GEMM as a diagnostic. With the
   FP8 or packed head the setting does not apply, and an explicit `tensor` there
   is refused.
-- 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
+- 128-row decode and verify steps: `DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
   `*_m128` programs and records 128-row replay records for their commits;
@@ -197,7 +197,7 @@ shared per-position `history` policy; it does not fit draft or verify costs.
 
 | Launcher key | Default | Resolution / old value |
 | --- | --- | --- |
-| `GLM5_FLASH_DECODE_ROWS` | `auto` | Resolves to `64`. Explicit `128` remains opt-in on one GPU with the required m128 programs. |
+| `DECODE_ROWS` | `auto` | Resolves to `64`. Explicit `128` remains opt-in on one GPU with the required m128 programs. |
 | `ATTENTION_PLAN_ROWS` | `auto` | Startup numerical recipe: loaded drafter width + 1, clamped to 64; without a drafter, 1. Explicit 1..64 overrides it. The m64/m128 execution capacities share this domain; selected scratch holds the full execution capacity. |
 | `GLM5_FLASH_INDEX_CACHE` | `auto` | `compact` on one GPU, `keys` with a head split. |
 | `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared` on one GPU with Spark experts and an automatic pool; otherwise `own`. |

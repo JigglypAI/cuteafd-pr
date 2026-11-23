@@ -21,6 +21,13 @@ impl Family for Qwen {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "Qwen 3.8 Flash Next cards are 1 RTX + 0 Sparks: no Spark round trip for a second lane to hide, and the 5090 + 1 Spark card is memory-tight for its workspace (#744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            3,
+            "Qwen4 coordinator decode programs cover 64 rows (missing qwen4_*_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // The Qwen engine's decode programs run 64 rows.
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })

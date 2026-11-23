@@ -78,11 +78,12 @@ pub(crate) struct SparseAttentionStorage<'a, const HEADS: usize> {
     metadata: DeviceAllocation<'a>,
     guard: crate::shared::memory::row_window::ScratchGuard<'a>,
     unit: usize,
+    batch_rows: usize,
 }
 impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
     fn allocation_sizes(unit: usize) -> Result<[usize; 6]> {
         ensure!((1..=4096).contains(&unit) && matches!(HEADS, 32 | 64), "invalid sparse storage unit/heads");
-        let batch = unit.min(cuteafd_core::V41_VERIFY_ROWS);
+        let batch = unit.min(super::graph_policy::max_decode_rows() as usize);
         Ok([unit * HEADS * 1024, unit * HEADS * 1024,
             V41SparseAttention::split_scratch_bytes(batch, 10)? / 64 * HEADS,
             V41SparseAttention::batch_descriptor_bytes(batch)?, unit * 8, unit * 80])
@@ -92,13 +93,14 @@ impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
     }
     pub(crate) fn new(library: &'a NativeLibrary, unit: usize, readers: &[i32]) -> Result<std::rc::Rc<Self>> {
         let [query, output, split, descriptors, replay, metadata] = Self::allocation_sizes(unit)?;
+        let batch_rows = unit.min(super::graph_policy::max_decode_rows() as usize);
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel: if HEADS == 64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
             query: DeviceAllocation::new(library, query, Tag::workspace("v41/sparse-attention"))?, output: DeviceAllocation::new(library, output, Tag::workspace("v41/sparse-attention"))?,
             split_scratch: DeviceAllocation::new(library, split, Tag::workspace("v41/sparse-attention"))?, descriptors: DeviceAllocation::new(library, descriptors, Tag::workspace("v41/sparse-attention"))?,
             replay_begins: DeviceAllocation::new(library, replay, Tag::workspace("v41/sparse-attention"))?, metadata: DeviceAllocation::new(library, metadata, Tag::workspace("v41/sparse-attention"))?,
-            guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit,
+            guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit, batch_rows,
         }))
     }
 }
@@ -184,7 +186,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     pub(crate) fn on_storage(storage: std::rc::Rc<SparseAttentionStorage<'a, HEADS>>) -> Result<Self> {
         let library = storage.stream.library;
         let capacity = storage.unit;
-        let batch = capacity.min(cuteafd_core::V41_VERIFY_ROWS);
+        let batch = storage.batch_rows;
         Ok(Self {
             descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40, "v41/sparse-descriptors")?,
             staging: LayerStaging::new(library, capacity * 80, 40, "v41/sparse-attention")?,
@@ -221,7 +223,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     /// Reserve wider decode batching before any execution and before KV sizing.
     /// Serving allocates the full verifier extent regardless of neural width.
     pub fn reserve_decode_rows(&mut self, rows: usize) -> Result<()> {
-        ensure!(rows > 0 && rows <= self.capacity && rows <= cuteafd_core::V41_VERIFY_ROWS,
+        ensure!(rows > 0 && rows <= self.capacity && rows <= cuteafd_core::V41_VOCAB_ROWS,
             "invalid sparse decode reservation");
         ensure!(self.cold.is_none() && self.graphs.len() == 0,
             "sparse decode reservation requires an unused wave");

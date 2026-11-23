@@ -165,11 +165,28 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
     cuteafd_bench::context::set_resolved("draft-context-slots", &engine_args.draft_context_slots.unwrap_or(0).to_string());
 }
 
+pub(super) fn resolve_decode_rows(engine_args: &mut super::EngineArgs, max_sequences: usize, draft_length: Option<usize>) -> Result<u32> {
+    let verify_rows = cuteafd_loader::plan::resolve_decode_rows(
+        "glm5_flash",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: engine_args.decode_rows.as_option(),
+            concurrency: max_sequences as u64,
+            decode_lanes: 1,
+            rtx_gpus: 1 + usize::from(engine_args.split_device.is_some()),
+            draft_length: if engine_args.draft.is_some() { draft_length.map(|n| n as u32) } else { Some(0) },
+        },
+    )?;
+    engine_args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(verify_rows);
+    cuteafd_bench::context::set_resolved("decode-rows", &verify_rows.to_string());
+    Ok(verify_rows)
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     args.draft_length.report_inactive(args.engine.draft.is_some());
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("glm5_flash", max_sequences as u64)?;
+    resolve_decode_rows(&mut args.engine, max_sequences, args.draft_length.draft_length)?;
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
@@ -326,9 +343,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, decode_share, &prefix,
             loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
             || {
-                // Ready once the prefix cache and the token selector exist: the ledger then lists
-                // every start-up allocation.
-                crate::shared::memory_report::log("glm5_flash ready");
+                // Ready once the prefix cache and the token selector exist; the API task logs the
+                // ready ledger (every start-up allocation) once it binds.
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
@@ -1037,14 +1053,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
             prefix_state_probe(engine, &family, &admitted.placement, &job.probe, "admitted")?;
             let _ = job.events.send(Ok(InferenceChunk::Ready {
-                system_fingerprint: None,
+                system_fingerprint: Some(opened.view.fingerprint().to_owned()),
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    verify_rows, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
                         offer()?;
                         if rows > 1 {
@@ -1457,6 +1473,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         Err(error) => {
             tracing::warn!("decode step failed: {error:#}");
             for request in active.drain(..) {
+                if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                 let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                 release(family, cache, free_kda, free_slots, &request.placement, request.slot);
             }
@@ -1821,6 +1838,17 @@ mod lane_tests {
         assert!(round.contains("lanes::commit(&mut Commit {"));
         // The KDA replay and drafter update are the commit's halves, not inline calls.
         assert!(!round.contains("engine.commit(") && !round.contains("drafter.update("));
+    }
+
+    #[test]
+    fn every_ended_request_releases_its_draft_policy_ticket_and_ready_logs_once() {
+        let source = include_str!("serve.rs");
+        let round = source.split_once("\nasync fn decode_round").unwrap().1
+            .split_once("\n/// What a prefill round's chunks share").unwrap().0;
+        let failed = round.split_once("decode step failed").unwrap().1.split_once("return Ok(None);").unwrap().0;
+        assert!(failed.contains("shared.release(request.ticket.id())"));
+        assert_eq!(source.matches(concat!("memory_report::log", "(")).count(), 1);
+        assert!(!source.contains(concat!("system_fingerprint: ", "None")));
     }
 }
 

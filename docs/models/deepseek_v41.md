@@ -50,7 +50,8 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   policy chooses verified lengths from per-position acceptance history; the
   calibrated head only skips an explore below 0.3. No draft cost model.
 - KV format: compressed MLA latent in FP8 32x32 blocks. Prefix cache: the
-  shared engine cache with exact frontiers only (`ReuseRule::EXACT`); shared
+  shared engine cache (`ReuseRule::V41`: exact ancestors, official bounded
+  replay for partial divergence, ranked by rows left to compute; see `PREFIX_PARTIAL`); shared
   FP4 source pages, a mark holding the window rings, odd compressor carry,
   Engram lookback and dSpark rings, snapshots at prompt end and turn end,
   shared `--prefix-cache-*`/`--host-cache-*` flags and pinned-host tier.

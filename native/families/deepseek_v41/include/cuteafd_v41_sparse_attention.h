@@ -60,7 +60,7 @@ int32_t cuteafd_v41_sparse_attention_bounded(
     const int32_t* selected,uint16_t* output,int32_t rows,int32_t window_width,
     const cuteafd_v41_sparse_kv_t* view,void* stream,const uint64_t* window_begins,
     float* partial,uint64_t scratch_bytes,int32_t parts);
-// Small multi-request split attention, homogeneous compressed format, rows 1..64.
+// Multi-request split attention, homogeneous compressed format, rows 1..256.
 // Each row has one device descriptor; metadata/query/selection use global row
 // indices. Width is per-row automatic. Parts must be 2 without source, 10 with
 // source. Scratch is [rows,parts,64,514] FP32 and bounds are mandatory (zeros

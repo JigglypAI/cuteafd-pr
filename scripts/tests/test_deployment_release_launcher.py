@@ -509,12 +509,10 @@ def test_effective_media_cache_quota_reaches_plan(quota: str | None, vision: str
             assert command[command.index("--media-cache-bytes") + 1] == quota
 
 
-@pytest.mark.parametrize("enabled", ["off", "on"])
-def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> None:
+def test_implicit_mimo_host_cache_matches_effective_serve_argv() -> None:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo26-flash-min"))
     entry["set"].pop("HOST_CACHE_BYTES", None)
-    entry["set"]["MIMO_HOST_CACHE"] = enabled
-    result = capture(ROOT, f"implicit-host-cache-{enabled}", release_entry=entry)
+    result = capture(ROOT, "implicit-host-cache", release_entry=entry)
     plan = result["plans"][0]
     serve = parse_run(result["containers"][0]["argv"])["command"]
     actual = serve[serve.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in serve else "0"
@@ -551,3 +549,30 @@ def test_decode_lanes_refuse_invalid_or_unsupported_before_serving(card, lanes):
     entry["set"]["DECODE_LANES"] = lanes
     with pytest.raises(RuntimeError, match="unsupported --decode-lanes|DECODE_LANES must be"):
         capture(ROOT, "decode-refuse-" + card + "-" + lanes, release_entry=entry)
+
+
+@pytest.mark.parametrize("card,decode_rows,concurrency,expected", [
+    ("v41-flash-max", "128", "16", "128"),
+    ("v41-flash-max", "256", "32", "256"),
+    ("v41-flash-max", "auto", "16", None),
+])
+def test_decode_rows_forward_planner_resolution(card, decode_rows, concurrency, expected):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"].update(DECODE_ROWS=decode_rows, CONCURRENCY=concurrency)
+    result = capture(ROOT, "decode-rows-" + card + "-" + decode_rows + "-" + concurrency, release_entry=entry)
+    plan = result["plans"][0]
+    assert plan[plan.index("--decode-rows") + 1] == decode_rows
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if expected is None:
+        assert "--decode-rows" not in command
+    else:
+        assert command[command.index("--decode-rows") + 1] == expected
+
+
+@pytest.mark.parametrize("card,decode_rows", [("v41-flash-max", "0"), ("v41-flash-max", "wide"),
+    ("v41-flash-max", "512"), ("mimo-pro-max", "128")])
+def test_decode_rows_refuse_invalid_or_unsupported_before_serving(card, decode_rows):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"]["DECODE_ROWS"] = decode_rows
+    with pytest.raises(RuntimeError, match="DECODE_ROWS|unsupported DECODE_ROWS|supports DECODE_ROWS"):
+        capture(ROOT, "decode-rows-refuse-" + card + "-" + decode_rows, release_entry=entry)

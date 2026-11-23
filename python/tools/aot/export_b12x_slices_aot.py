@@ -140,7 +140,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     if role not in ROLE_GEOMETRY and not width_role:
         raise ValueError(f"unsupported expert placement role {role!r}")
     expected_sm = (12, 1) if width_role else ROLE_SM[role]
-    from b12x._lib.aot_target import describe_target
+    from b12x._lib.aot_target import describe_target, target_for
 
     describe_target(expected_sm)
     import torch
@@ -183,7 +183,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             raise ValueError("compact live-row cutoff must fit the selected capacities")
     elif compact_live_rows is not None:
         raise ValueError("compact live-row cutoff requires compact capacity selection")
-    workspace_sms = 48 if props.minor == 1 else 188
+    # The bridge uses the live SM count for launches. Keep the capacity in
+    # this common artifact independent of any synthetic export override.
+    workspace_sms = target_for(expected_sm).multi_processor_count
     output.mkdir(parents=True, exist_ok=True)
     manifest = dict(
         schema=1,

@@ -141,6 +141,17 @@ if tool == "docker":
             if family == "deepseek_v41" and int(value("--concurrency", "16")) == 1:
                 decode_lanes = 1
             response["decode_lanes"] = decode_lanes
+            raw_decode_rows = value("--decode-rows", "auto")
+            decode_rows = 64 if raw_decode_rows in (None, "", "auto") else int(raw_decode_rows)
+            if decode_rows < 1:
+                sys.exit("DECODE_ROWS must be auto or a positive integer")
+            if family == "deepseek_v41" and decode_rows > 256:
+                sys.exit("deepseek_v41 supports DECODE_ROWS up to 256")
+            if family == "glm5_flash" and decode_rows > (128 if int(value("--rtx", "1")) == 1 else 64):
+                sys.exit("glm5_flash missing wide decode programs")
+            if family not in ("deepseek_v41", "glm5_flash") and decode_rows > 64:
+                sys.exit("unsupported DECODE_ROWS for " + family)
+            response["decode_rows"] = decode_rows
             tp = int(ranks)
             if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mimo_v2"}:
                 # Mirror the planner (prefill_waves::depth): a fixed three units

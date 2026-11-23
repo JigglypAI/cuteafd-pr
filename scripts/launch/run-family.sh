@@ -213,15 +213,16 @@ for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
 done
 }
 # DRAFT_POLICY: history (the default: keep while the calibrated product stays
-# above 0.3, with exploration), history-shared-explore (one scored-neural
-# explore unless it would grow a verify bucket beyond eight rows), clamped (online cut), or off (no drafts). DRAFT_LENGTH is the fixed-width
+# above 0.3, with exploration), clamped (history with each round's cut set from
+# the online round-cost ratio) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
 # measurement override. Sets draft_policy_args for the serve command.
 shared_draft_policy_args() {
 draft_policy_args=()
 case "$(get DRAFT_POLICY history)" in
   history) ;;
-  history-shared-explore|clamped|off) draft_policy_args=(--draft-policy "$(get DRAFT_POLICY)") ;;
-  *) echo "DRAFT_POLICY must be history, history-shared-explore, clamped or off" >&2; exit 2 ;;
+  clamped) draft_policy_args=(--draft-policy clamped) ;;
+  off) draft_policy_args=(--draft-policy off) ;;
+  *) echo "DRAFT_POLICY must be history, clamped or off" >&2; exit 2 ;;
 esac
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
@@ -793,6 +794,11 @@ count_args+=(--config /run/cuteafd-plan.config)
 v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
+v41_decode_rows="$(get DECODE_ROWS)"
+[[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || "$v41_decode_rows" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "DECODE_ROWS must be auto or a positive integer"
+[[ -z "$v41_decode_rows" ]] || count_args+=(--decode-rows "$v41_decode_rows")
+[[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
 count_args+=("${attention_precision_args[@]}")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
@@ -841,7 +847,7 @@ release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
-  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio off \
+  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio "$AUDIO" \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
@@ -853,6 +859,8 @@ release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$count_plan")" ||
   release_die "DeepSeek V4.1 deployment does not name one or two decode lanes"
+resolved_decode_rows="$(jq -er '.decode_rows | select(type == "number" and . >= 1)' <<<"$count_plan")" ||
+  release_die "DeepSeek V4.1 deployment does not name a supported verify-row budget"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   ((selected_count <= SPARK_COUNT)) || release_die "planner requested more Spark ranks than configured: $selected_count > $SPARK_COUNT"
@@ -1018,7 +1026,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "draft-policy=$(get DRAFT_POLICY history)" "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "decode-rows=${resolved_decode_rows}" "$SPECULATOR" "draft-policy=$(get DRAFT_POLICY history)" "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1164,6 +1172,7 @@ for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-co
 done
 [[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
+[[ ( -z "$v41_decode_rows" || "$v41_decode_rows" == auto ) && "$resolved_decode_rows" == 64 ]] || args+=(--decode-rows "$resolved_decode_rows")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
 # DECODE_SHARE: as for every family (the engine's default 0.2; 0 prefills whole prompts).
 [[ -z "$(get DECODE_SHARE)" ]] || args+=(--decode-share "$(get DECODE_SHARE)")
@@ -1338,7 +1347,7 @@ detected_family="$(release_config_family "$config" "$core_view")"
 core_view_args=(--core-view "$core_view")
 serve_core_view_args=()
 case "$family" in
-  glm5|glm5_flash|kimi_k3|step5|muse_spark|inkling2|hy4_flash) serve_core_view_args=("${core_view_args[@]}") ;;
+  glm5|glm5_flash|kimi_k3|step5|muse_spark|minimax_m3|inkling2|hy4_flash) serve_core_view_args=("${core_view_args[@]}") ;;
   *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
 esac
 
@@ -1716,6 +1725,11 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
+decode_rows="$(get DECODE_ROWS)"
+if [[ -n "$decode_rows" ]]; then
+  [[ "$decode_rows" == auto || "$decode_rows" =~ ^[1-9][0-9]*$ ]] ||
+    release_die "DECODE_ROWS must be auto or a positive integer"
+fi
 family_args=("${attention_precision_args[@]}" --embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${serve_core_view_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
@@ -1776,7 +1790,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
-if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 ]]; then
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 || "$family" == minimax_m3 ]]; then
   family_args+=(--vision-replicas "$vision_replicas")
 fi
 
@@ -1871,7 +1885,12 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 ) && $vision != off ]]; then
+# The shared-scheduler families plan PREFIX_CACHE_MARK_MIB below; serve the same budget.
+case $family in
+  minimax_m3|inkling2|hy4_flash)
+    [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)") ;;
+esac
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 || $checkpoint_family == mistral_large4 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -1880,9 +1899,6 @@ if [[ $family == mimo_v2 ]]; then
   [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
   [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
-  if [[ "$(get MIMO_HOST_CACHE off)" == on ]]; then
-    family_args+=(--mimo-host-cache)
-  fi
   [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
   # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
@@ -1929,7 +1945,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 prefill_packing="$(get PREFILL_PACKING)"
 if [[ -n "$prefill_packing" ]]; then
-  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == hy4_flash ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
     unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
     *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;
@@ -2337,23 +2353,6 @@ if [[ $family == glm5_flash ]]; then
   # 2048), as for MiMo; the host-off legacy arena retains its per-sequence floor.
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # Replay ownership is resolved alongside expert admission in Rust.
-  # GLM5_FLASH_DECODE_ROWS: auto keeps 64; 128 remains opt-in after the C16 cost-model gate. With
-  # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
-  # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
-  # waves (127 rows on an RTX 5090); fewer rows keep the _m64 programs. One GPU only.
-  decode_rows="$(get GLM5_FLASH_DECODE_ROWS auto)"
-  if [[ "$decode_rows" == auto ]]; then
-    decode_rows="$(release_glmf_auto GLM5_FLASH_DECODE_ROWS auto 128 64 0 \
-      "128 rows remain opt-in; C16 and post-C16 C1 draft-cost gate")"
-  fi
-  case "$decode_rows" in
-    ""|64) ;;
-    128)
-      [[ $head_split == 0 ]] ||
-        { echo "GLM5_FLASH_DECODE_ROWS=128 runs the wide decode programs on one GPU; a head split takes 64" >&2; exit 2; }
-      family_args+=(--decode-rows 128) ;;
-    *) echo "GLM5_FLASH_DECODE_ROWS must be 64 or 128" >&2; exit 2 ;;
-  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -2407,6 +2406,8 @@ audio_encoder_hash=""
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
+  [[ -z "$decode_rows" ]] || plan_draft_args+=(--decode-rows "$decode_rows")
+  [[ -z "$decode_rows" || "$decode_rows" == auto || -z "${draft_length:-}" ]] || plan_draft_args+=(--draft-length "$draft_length")
   plan_draft_args+=("${attention_precision_args[@]}")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2471,12 +2472,6 @@ audio_encoder_hash=""
   fi
   # GLM 5.3 Flash: the server's prefix-mark store, so the plan reserves an arena only when serve-glmf allocates one.
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
-  # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
-  # charge their wider decode workspace, selector, replay records and expert intake, as serving
-  # admits them, before an encoder placement is chosen.
-  if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
-    plan_draft_args+=(--decode-rows 128)
-  fi
   if [[ "$family" == kimi_k3 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2532,6 +2527,7 @@ audio_encoder_hash=""
   if [[ "$family" == glm5_flash ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
   fi
   if [[ "$family" == deepseek_v4 ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2539,6 +2535,9 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == step5 || "$family" == mimo_v2 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+  fi
+  if [[ "$family" == step5 ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
   fi
   if [[ "$family" == step5 ]]; then
     plan_mtp_depth=0
@@ -2614,7 +2613,7 @@ audio_encoder_hash=""
       *) release_die "DECODE_GRAPHS must be on or off" ;;
     esac
   fi
-  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
+  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -2695,6 +2694,13 @@ audio_encoder_hash=""
   if [[ -n "$decode_lanes" ]]; then
     case "$family" in
       deepseek_v41|mimo_v2) family_args+=(--decode-lanes "$resolved_decode_lanes") ;;
+    esac
+  fi
+  resolved_decode_rows="$(jq -er '.decode_rows | select(type == "number" and . >= 1)' <<<"$deployment_json")" ||
+    release_die "deployment does not name a supported verify-row budget"
+  if [[ ( -n "$decode_rows" && "$decode_rows" != auto ) || "$resolved_decode_rows" != 64 ]]; then
+    case "$family" in
+      glm5_flash) family_args+=(--decode-rows "$resolved_decode_rows") ;;
     esac
   fi
   case "$(family_prefill_mode "$family")" in

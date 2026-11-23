@@ -374,7 +374,7 @@ mod tests {
         let plan = RestorePlan { snapshot_end: 1, target_end: 1,
             lag: cuteafd_engine::prefix::LaggedState { source_end: 1, replay_start: 1 },
             fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
-        let context = RestoreContext { native_tokens: &[1], media: &[] };
+        let context = RestoreContext { native_tokens: &[1], media: &[], approximate_from: None };
         assert!(family.restore_with(None, None, &mut placement, &plan, &context).is_err());
         assert_eq!(retired.get(), 3);
         Ok(())
@@ -430,7 +430,7 @@ mod tests {
             lag: cuteafd_engine::prefix::LaggedState { source_end: 65, replay_start: 65 },
             fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
         let tokens: Vec<u32> = (0..66).collect();
-        let context = RestoreContext { native_tokens: &tokens, media: &[] };
+        let context = RestoreContext { native_tokens: &tokens, media: &[], approximate_from: None };
         for depth in 0..=3 {
             let shape = super::super::cache::tests::layout_for(66, 2, depth, 64);
             let ranks = (0..2).map(|rank| CacheRank::new(device, shape.clone(), rank, 1, 1, 2, usize::MAX)
@@ -569,7 +569,7 @@ mod tests {
         let plan = RestorePlan { snapshot_end: 65, target_end: 66,
             lag: cuteafd_engine::prefix::LaggedState { source_end: 65, replay_start: 65 },
             fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
-        let context = RestoreContext { native_tokens: &tokens, media: &[] };
+        let context = RestoreContext { native_tokens: &tokens, media: &[], approximate_from: None };
         let mut promoted = source.clone();
         promoted.sequence = 1;
         promoted.committed = 0;

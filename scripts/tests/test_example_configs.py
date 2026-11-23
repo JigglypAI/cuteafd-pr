@@ -214,7 +214,7 @@ print(json.dumps(dict(report, resolved_settings=fake_resolved_settings(args, fam
     spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
                       audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
-    spark_admission="coordinator_authoritative", decode_lanes=1,
+    spark_admission="coordinator_authoritative", decode_lanes=1, decode_rows=64,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=selected, prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
@@ -449,11 +449,12 @@ def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, 
         assert result.returncode == expected, entry["name"]
 
 
-def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> None:
+def test_glmf_exl3_smoke_cards_use_the_published_core_checkpoint() -> None:
+    # Historical release matrices only: the gate kit cards live checkpoints, and
+    # K3.25-Core-FP8 retired in v6 (test_gate_kit_cards_load_live_matrix_checkpoints).
     model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
     revision = "d31ebc921f1f098b4a56d37aaccb3cdef4096184"
-    for filename in ("scripts/bench/release-smoke.example.json", "scripts/bench/release-smoke-v3.json",
-                     "scripts/bench/kits/gate/matrix-gate.json"):
+    for filename in ("scripts/bench/release-smoke.example.json", "scripts/bench/release-smoke-v3.json"):
         matrix = json.loads((ROOT / filename).read_text())
         entries = [entry for entry in matrix["entries"] if entry["family"] == "glm5_flash"
                    and "exl3" in entry["name"]]
@@ -647,7 +648,10 @@ GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "muse_spark": "dflash2", "minimax_m3": "dspark"}
 # Card name -> why it intentionally differs from the family default. Empty:
 # no gate card overrides its family's shipped drafter.
-GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {}
+GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {
+    "hy4f-exl3-min": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
+    "hy4f-exl3-max": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
+}
 
 
 def _default_speculator(family: str, model: str) -> str:
@@ -1216,7 +1220,9 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
     matrix = json.loads((ROOT / filename).read_text())
     entries = {entry["name"]: entry for entry in matrix["entries"]}
     pins = keys(ROOT / "cuteafd.config")
-    for size, gpus, sparks in (("min", [1], 1), ("max", [0, 1], 0)):
+    # The gate kit keeps only the live 2x card; the 1x cell retired in v6.
+    sizes = (("max", [0, 1], 0),) if "matrix-gate" in filename else (("min", [1], 1), ("max", [0, 1], 0))
+    for size, gpus, sparks in sizes:
         entry = entries[f"glmf-exlr8-k4-{size}"]
         config = keys(ROOT / entry["config"])
         values = {**config, **matrix.get("defaults", {}).get("set", {}), **entry["set"]}

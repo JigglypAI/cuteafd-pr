@@ -211,7 +211,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub(crate) fn capture_startup(&mut self, bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
         let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), 0,
-            cuteafd_core::V41_VERIFY_ROWS).into_iter().map(|entry| entry.rows).collect();
+            crate::families::deepseek_v41::graph_policy::max_decode_rows() as usize).into_iter().map(|entry| entry.rows).collect();
         let resources = &mut self.resources;
         resources.execution.capture_startup(bank, &rows)?;
         resources.index.capture_startup(&rows, |layer, row| resources.execution.startup_source(bank, layer, row))?;
@@ -538,19 +538,11 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let id = batch.cache()?.identity();
         let rows = batch.cache()?.positions().len();
         let stage = batch.cache()?.stage();
-        let activation_trace = if tracing::enabled!(target: "cuteafd::activation_trace", tracing::Level::DEBUG) {
-            let position: u64 = std::env::var("CUTEAFD_ACTIVATION_TRACE_POSITION")?.parse()?;
-            if batch.cache()?.positions().first() == Some(&position) {
-                let directory = std::path::PathBuf::from(std::env::var("CUTEAFD_ACTIVATION_TRACE_DIR")?)
-                    .join(format!("batch{id}-{stage:?}-{rows}rows"));
-                std::fs::create_dir_all(&directory)?;
-                std::fs::write(directory.join("positions.json"), serde_json::to_vec(&batch.cache()?.positions())?)?;
-                Some(directory)
-            } else { None }
-        } else { None };
+        let activation_trace = activation_trace_directory(&batch.cache()?.positions(),
+            || format!("batch{id}-{stage:?}-{rows}rows"))?;
         ensure!(
             (stage.is_encoder() || !selected.is_empty())
-                && selected.len() <= 80
+                && selected.len() <= self.resources.head.capacity()
                 && selected.iter().all(|&i| i < rows)
                 && selected
                     .iter()
@@ -814,9 +806,33 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
 }
 
+/// The debug activation trace's batch directory, created with its positions;
+/// `None` unless the trace target is on and the trace position selects this batch.
+fn activation_trace_directory(positions: &[u64], name: impl FnOnce() -> String)
+    -> Result<Option<std::path::PathBuf>> {
+    if !tracing::enabled!(target: "cuteafd::activation_trace", tracing::Level::DEBUG) { return Ok(None) }
+    let Some(directory) = crate::shared::activation_trace::batch_directory(positions.first().copied(), name)?
+        else { return Ok(None) };
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(directory.join("positions.json"), serde_json::to_vec(positions)?)?;
+    Ok(Some(directory))
+}
+
 #[cfg(test)]
 mod tests {
     use super::State;
+
+    #[test]
+    fn debug_logging_without_trace_variables_runs_untraced() -> anyhow::Result<()> {
+        if std::env::var_os("CUTEAFD_ACTIVATION_TRACE_POSITION").is_some() { return Ok(()) }
+        let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG)
+            .with_test_writer().finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "cuteafd::activation_trace", tracing::Level::DEBUG));
+            assert!(super::activation_trace_directory(&[0, 1, 2], || unreachable!("no trace selected"))?.is_none());
+            Ok(())
+        })
+    }
     fn cpu_library() -> &'static cuteafd_ffi::NativeLibrary {
         unreachable!("CPU schedules do not enter a device chain")
     }

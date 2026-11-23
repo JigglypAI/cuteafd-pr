@@ -378,6 +378,13 @@ impl Family for Hy4Flash {
             reason: "Hy4-flash serving starts on one decode lane; a second lane waits for a measured two-lane A/B (#2478)",
         }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            7,
+            "Hy4-flash coordinator decode programs cover 64 rows (pending #2579 and hy4f_*_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }

@@ -28,7 +28,11 @@
 //! shares the pages below `aligned common - window`, restarts the positional state there and
 //! replays the window. The kernels have no per-sequence key floor, so "restarts" means the
 //! ring rows before the restart point are zeroed (zero keys and values: an extra zero-logit
-//! sink for the first replayed rows); approximate by design, not byte-exact.
+//! sink for the first replayed rows); approximate by design, not byte-exact. The shared cache
+//! labels such restores `ApproximateReplay` and scopes their lineage per ring
+//! ([`PrefixFamily::approximate_from`]): descendants captured from that ring carry the taint row
+//! (the replay's shared frontier), pages before it keep token-content host identities, and the
+//! counters and provenance report the inherited approximation.
 //!
 //! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
 //! synchronizes it. Under a head split each GPU keeps its own KV heads: its pages and ring rows
@@ -83,6 +87,9 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     slots: usize,
     partial: bool,
     draft_slots: RefCell<Vec<Option<usize>>>,
+    /// Per SWA ring: the approximate lineage of the placement on it (`--prefix-partial on`),
+    /// set by every bind and restore, read at capture.
+    lineage: RefCell<Vec<Option<usize>>>,
     draft_floors: RefCell<Vec<usize>>,
     draft_metadata: Option<Rc<Allocation<'a>>>,
     draft_offset: usize,
@@ -172,6 +179,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         };
         ensure!(!partial || window % PAGE_ROWS == 0, "partial reuse replays a whole number of pages");
         Ok(Self { engine, full, states, rank_mark_bytes: offsets, mark_bytes, arenas, slots, partial,
+            lineage: RefCell::new(vec![None; engine.rings]),
             draft_slots: RefCell::new(if draft_metadata.is_some() { vec![None; engine.rings] } else { Vec::new() }),
             draft_floors: RefCell::new(if draft_metadata.is_some() { vec![0; engine.rings] } else { Vec::new() }),
             draft_metadata, draft_offset, copies: copy_readers(engine)? })
@@ -223,9 +231,16 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         })).collect::<Result<Vec<_>>>()?;
         Ok(Self { engine, full: Vec::new(), states: Vec::new(),
             rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),
-            arenas, slots: 1, partial: false, draft_slots: RefCell::new(vec![None; engine.rings]),
+            arenas, slots: 1, partial: false, lineage: RefCell::new(vec![None; engine.rings]),
+            draft_slots: RefCell::new(vec![None; engine.rings]),
             draft_floors: RefCell::new(vec![0; engine.rings]), draft_metadata: None, draft_offset: 0,
             copies: copy_readers(engine)? })
+    }
+
+    fn set_lineage(&self, placement: &MimoPlacement, from: Option<usize>) -> Result<(), BoxError> {
+        let ring = usize::try_from(placement.ring).map_err(|_| "MiMo placement has no SWA ring")?;
+        *self.lineage.borrow_mut().get_mut(ring).ok_or("MiMo SWA ring out of range")? = from;
+        Ok(())
     }
 
     /// Zero every state's rows before `len` (a partial restore's empty window).
@@ -319,6 +334,26 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             mark_store: MarkStore::Arena,
             page_owners: Default::default(),
         }
+    }
+
+    /// Every admission binds: a cold placement on a reused ring carries no lineage.
+    fn bind(&self, placement: &mut MimoPlacement) -> Result<(), BoxError> {
+        self.set_lineage(placement, None)
+    }
+
+    fn restore_with(&self, mark: Option<&cuteafd_engine::prefix::Mark>, _: Option<&()>, placement: &mut MimoPlacement,
+        plan: &cuteafd_engine::prefix::RestorePlan, context: &cuteafd_engine::prefix::RestoreContext<'_>) -> Result<(), BoxError> {
+        match mark {
+            Some(cuteafd_engine::prefix::Mark::Slot(slot)) => self.restore(Some(*slot), placement, plan.resume())?,
+            None => self.restore(None, placement, plan.resume())?,
+            Some(cuteafd_engine::prefix::Mark::Pages(_)) => return Err("MiMo keeps its marks in an arena".into()),
+        }
+        self.set_lineage(placement, context.approximate_from)
+    }
+
+    fn approximate_from(&self, placement: &MimoPlacement) -> Result<Option<usize>, BoxError> {
+        let ring = usize::try_from(placement.ring).map_err(|_| "MiMo placement has no SWA ring")?;
+        Ok(*self.lineage.borrow().get(ring).ok_or("MiMo SWA ring out of range")?)
     }
 
     fn capture_reach(&self) -> usize {
@@ -513,6 +548,20 @@ mod rollback_tests {
         let rest = &source[source.find(needle).unwrap_or_else(|| panic!("{needle}"))..];
         let end = rest.find("\n    }\n").map_or(rest.len(), |e| e + 6);
         &rest[..end]
+    }
+
+    #[test]
+    fn partial_lineage_is_reported_per_ring_and_cleared_by_every_admission() {
+        // #2463: the shared cache scopes MiMo's opt-in partial lineage (three-turn device/host
+        // behaviour: cuteafd-engine `approximate_lineage_is_scoped_to_its_taint_row_*`). MiMo
+        // must record it per ring at restore and clear it on every cold bind.
+        let source = production();
+        let bind = body(source, "fn bind(&self, placement: &mut MimoPlacement)");
+        assert!(bind.contains("self.set_lineage(placement, None)"));
+        let restore = body(source, "fn restore_with(");
+        assert!(restore.contains("self.set_lineage(placement, context.approximate_from)"));
+        let read = body(source, "fn approximate_from(&self, placement: &MimoPlacement)");
+        assert!(read.contains("self.lineage.borrow()"));
     }
 
     #[test]

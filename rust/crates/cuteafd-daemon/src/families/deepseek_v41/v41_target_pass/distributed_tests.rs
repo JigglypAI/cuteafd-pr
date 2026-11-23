@@ -163,7 +163,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
                 &lib, &catalog, 80, 1, 32 * 1024 * 1024 * 1024, 16 * 1024 * 1024)?;
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_requests(
-                &lib, &draft_weights, &table, &vocabulary, 80, 16, 2)?;
+                &lib, &draft_weights, &table, &vocabulary, 80, cuteafd_core::V41_VERIFY_ROWS as u32, 16, 2)?;
             return decode_lanes::qualify(&lib, &runtime, &mut requests,
                 &mut pass, &mut other, &mut transport, &mut second_transport, &mut draft);
         }

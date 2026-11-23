@@ -1142,7 +1142,8 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             let experts: Value = serde_json::from_slice(&std::fs::read(dir.path().join("share/V41_EXPERT_AOT.json")).unwrap()).unwrap();
             let sms = crate::placement::ArchContext::for_device("sm_120", 96 << 30).sms;
             let programs = crate::placement::families::deepseek_v41::owners::NativePrograms::new(&manifest, sms).unwrap();
-            let expected = programs.dspark(&experts, 4096, concurrency, 2, 7, gpus,
+            let expected = programs.dspark(&experts, 4096,
+                crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, concurrency, 2, 7, gpus,
                 crate::placement::families::deepseek_v41::resident::Fp8Head::Packed).unwrap();
             for owner in expected.iter().filter(|owner| owner.group == "dSpark request lanes") {
                 let actual: u64 = memory.devices[usize::from(owner.gpu)].items.iter()
@@ -1194,6 +1195,54 @@ fn v41_one_decode_lane_charges_one_lane_and_returns_the_rest_to_kv() {
     for lanes in [None, Some(1), Some(2)] {
         assert_eq!(plan(lanes, 1).decode_lanes, 1);
     }
+}
+
+/// V4.1 `DECODE_ROWS`: `auto` resolves 64; 128 and 256 grow decode-lane and Spark
+/// decode-execution charges and shrink the admitted KV pool accordingly; values
+/// past `CONCURRENCY * (max_draft + 1)` or past 256 are refused before layout.
+#[test]
+fn v41_decode_rows_admits_wider_lanes_and_refuses_over_cap() {
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    let plan = |decode_rows: Option<u32>, lanes: Option<u8>, concurrency: u64, gpus: usize| {
+        let mut options = wave_plan_options(dir.path(), 6);
+        options.decode_lanes = lanes;
+        options.decode_rows = decode_rows;
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![96 << 30; gpus];
+        layout.concurrency = concurrency;
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = None;
+        layout.workspace_manifest = v41_workspace(dir.path());
+        layout.native_mtp_layers = 3;
+        input.plan_spark_count(&options, 6, Some(6))
+    };
+    let lane0 = |report: &PlanReport| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .flat_map(|d| &d.items).filter(|i| i.group.starts_with("lane 0 "))
+            .map(|i| i.bytes).sum()
+    };
+    let spark_exec = |report: &PlanReport| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+            .flat_map(|d| &d.items).filter(|i| i.group == "execution owners")
+            .map(|i| i.bytes).sum()
+    };
+    for gpus in [1, 2] {
+        let r64 = plan(None, Some(1), 16, gpus).unwrap();
+        let r128 = plan(Some(128), Some(1), 16, gpus).unwrap();
+        let r256 = plan(Some(256), Some(1), 32, gpus).unwrap();
+        assert!(r64.fits && r128.fits && r256.fits);
+        assert_eq!((r64.decode_rows, r128.decode_rows, r256.decode_rows), (64, 128, 256));
+        assert!(lane0(&r128) > lane0(&r64), "gpus={gpus}: 128 rows must cost more decode-lane bytes");
+        assert!(lane0(&r256) > lane0(&r128), "gpus={gpus}: 256 rows must cost more decode-lane bytes");
+        assert!(spark_exec(&r128) > spark_exec(&r64), "gpus={gpus}: 128 rows must raise Spark decode execution from 64 to 256");
+        assert!(r128.memory_layout.as_ref().unwrap().pool_tokens <= r64.memory_layout.as_ref().unwrap().pool_tokens);
+    }
+    // Demand cap: C16 * (7 + 1) = 128, so 129 is refused at C16; 257 is refused above 256 at C64.
+    assert!(plan(Some(129), Some(1), 16, 2).is_err());
+    assert!(matches!(plan(Some(257), Some(1), 64, 2), Err(PlanError::UnsupportedDecodeRows { capacity: 256, .. })));
 }
 
 fn shared_wave_snapshots() -> Vec<(&'static str, tempfile::TempDir)> {
@@ -4310,9 +4359,11 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     let (wide_path, manifest) = write("wide.json", &[base.clone(), wide.to_vec()].concat());
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
     let lookup = glmf_manifest_scratch(&manifest);
-    let options = |decode_rows: u64, path: &std::path::Path, gpus: usize| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
-        rtx_bytes: vec![32 << 30; gpus], context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()),
-        glmf_decode_rows: decode_rows, ..Default::default() }), ..sparks(4) };
+    let options = |decode_rows: u64, path: &std::path::Path, gpus: usize| PlanOptions {
+        decode_rows: Some(decode_rows as u32),
+        layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
+            rtx_bytes: vec![32 << 30; gpus], context_tokens: 131_072, workspace_manifest: Some(path.to_path_buf()),
+            concurrency: 16, state_slots: Some(8), ..Default::default() }), ..sparks(4) };
     let item = |report: &PlanReport, group: &str| {
         let items = &report.memory_layout.as_ref().unwrap().devices[0].items;
         if group == "state" { Some((Category::Kv, items.iter().filter(|i| ["KDA state and replay", "DSA index tails and replay", "commit tables"].contains(&i.group.as_str())).map(|i| i.bytes).sum(), Basis::Formula)) }
@@ -4353,12 +4404,12 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
     }
     let state = |report| item(report, "state").unwrap().1;
     assert_eq!(state(&broad) - state(&narrow), 9_453_568 + 768);
-    // A build without the wide programs, and a head split, cannot run 128 rows.
+    // A build without the wide programs cannot run 128 rows; a head split is refused at boot naming glmf2_*_m128.
     let missing = plan(dir.path(), &options(128, &narrow_path, 1)).unwrap();
     assert!(!missing.placement_supported && refused(&missing, wide_build));
     assert!(!refused(&plan(dir.path(), &options(64, &narrow_path, 1)).unwrap(), wide_build));
-    let split = plan(dir.path(), &options(128, &wide_path, 2)).unwrap();
-    assert!(!split.placement_supported && refused(&split, one_gpu));
+    let split = plan(dir.path(), &options(128, &wide_path, 2)).unwrap_err().to_string();
+    assert!(split.contains("glmf2_*_m128"), "{split}");
     assert!(!refused(&plan(dir.path(), &options(64, &wide_path, 2)).unwrap(), one_gpu));
     // Shared replay records at either row count: the state sheds the KDA layer's records of those rows
     // (18,907,136 B at 128), which the 782,236,672-byte prefill scratch holds without growing.
@@ -4428,9 +4479,9 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
             for rows in if gpus == 1 { vec![64, 128] } else { vec![64] } {
                 for pool_marks in [false, true] {
                     for shared in [false, true] {
-                        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
-                            rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072,
-                            glmf_index: index, glmf_decode_rows: rows, glmf_pool_marks: pool_marks,
+                        let options = PlanOptions { decode_rows: Some(rows as u32), layout: Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), drafter_bytes: 256 << 20,
+                            rtx_bytes: vec![24 << 30; gpus], context_tokens: 131_072, concurrency: 16,
+                            glmf_index: index, glmf_pool_marks: pool_marks,
                             glmf_shared_replay: shared, state_slots: Some(8), ..Default::default()
                         }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(2) };
                         let report = plan(dir.path(), &options).unwrap();
@@ -6561,7 +6612,7 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
         options.glmf_index = if ranks == 1 || attention == AttentionPlacement::Context { GlmfIndexCache::Compact } else { GlmfIndexCache::Keys };
         let mut geometry = if id == "glm5_flash" {
             let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
-            capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks, options.glmf_index, 4, options.glmf_decode_rows, attention, 0)?
+            capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks, options.glmf_index, 4, options.decode_rows, attention, 0)?
         } else { model.cache_geometry(options)?.context("family cache geometry")? };
         if id == "deepseek_v41" && settings.get("SPECULATOR").is_some_and(|v| v == "dspark") {
             geometry.ranks[0].retained_mark_bytes += 3 * 128 * 528;

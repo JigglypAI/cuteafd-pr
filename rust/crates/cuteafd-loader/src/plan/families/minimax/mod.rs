@@ -231,6 +231,13 @@ impl Family for MiniMaxM3 {
             reason: "decode shares the one Spark link with every prefill wave: a second lane needs its own decode link, decode \
                 workspaces and drafter scratch, and no two-lane A/B exists yet (#744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            7,
+            "MiniMax coordinator decode programs cover 64 rows (missing minimax_*_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }

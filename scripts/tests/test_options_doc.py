@@ -33,6 +33,7 @@ FAMILIES = {
     "Muse": "muse_spark",
     "Inkling": "inkling2",
     "Hy4-flash": "hy4_flash",
+    "MiniMax": "minimax_m3",
 }
 COLUMNS = list(FAMILIES)
 
@@ -218,7 +219,7 @@ def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_pat
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
-    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "hy4_flash"}
+    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "hy4_flash", "minimax_m3"}
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
@@ -412,11 +413,11 @@ def test_optional_levers_are_default_off_and_documented():
                 assert default == "2"
                 assert "`DECODE_LANES=1`" in lever["enable"]
             elif key == "DRAFT_POLICY":
+                # The lever is the opt-in `clamped` policy; `history` stays the default.
                 assert default == "history"
                 assert lever["families"] == COLUMNS
-                for policy in ("clamped", "history-shared-explore"):
-                    assert f"`DRAFT_POLICY={policy}`" in lever["enable"]
-                assert 'history-shared-explore|clamped|off) draft_policy_args=(--draft-policy "$(get DRAFT_POLICY)") ;;' in (ROOT / "scripts/launch/run-family.sh").read_text()
+                assert "`DRAFT_POLICY=clamped`" in lever["enable"]
+                assert "clamped) draft_policy_args=(--draft-policy clamped) ;;" in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
@@ -435,6 +436,10 @@ def test_optional_levers_are_default_off_and_documented():
                 assert 'selected(explicit, None, dflash,' in source
                 assert 'kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2")' in (
                     ROOT / "rust/crates/cuteafd-daemon/src/commands/plan.rs").read_text()
+            elif key == "DECODE_ROWS":
+                assert lever["families"] == ["V4.1", "GLM Flash"]
+                assert default == "auto"
+                assert "`DECODE_ROWS=128`" in lever["enable"]
             else:
                 assert default.startswith(("off", "unset")), \
                     f"lever {key} default is {default!r}, not off/unset"
@@ -473,9 +478,9 @@ def test_embedding_value_support_and_expert_usage_adapters():
     text = DOC.read_text()
     section = text.split("Token embedding placement (`EMBEDDING`", 1)[1].split("Speculator", 1)[0]
     host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
-    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 5
+    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 6
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
-        "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3"}
+        "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3", "MiniMax"}
 
 
 def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
@@ -542,7 +547,7 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
 
 def test_every_family_accepts_the_shared_draft_policy_key():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert "DRAFT_POLICY must be history, history-shared-explore, clamped or off" in launcher
+    assert "DRAFT_POLICY must be history, clamped or off" in launcher
     assert "CUTEAFD_DRAFT_POLICY" not in launcher
     for removed in ("DRAFT_SURVIVAL_LENGTHS", "DRAFT_ROW_COST"):
         assert removed not in MATRIX and removed not in launcher

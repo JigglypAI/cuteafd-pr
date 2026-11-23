@@ -115,6 +115,10 @@ pub(crate) struct DistributedTargetHead<'w, 'a> {
     greedy: Vec<(u32, f32)>,
 }
 impl<'w, 'a> DistributedTargetHead<'w, 'a> {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         let mut bytes = DistributedVocabularyWave::device_bytes(capacity, split)?;
         bytes[1] += capacity * INPUT_STRIDES.iter().sum::<usize>()

@@ -85,7 +85,7 @@ impl CoreCharges {
         draft_rows: Option<usize>, output_shard: bool, manifest: &serde_json::Value) -> Result<Self> {
         ensure!(layers > 0 && layers <= cfg.layers && matches!(ranks, 1 | 2)
             && (1..=4096).contains(&unit) && (1..=4).contains(&slots)
-            && matches!(decode_rows, 64 | 128) && (ranks == 1 || decode_rows == 64)
+            && (1..=128).contains(&decode_rows) && (ranks == 1 || decode_rows <= 64)
             && owners.is_none_or(|o| ranks == 2 && o.len() == layers), "Flash K6 admission geometry");
         let owned = owned_mla(cfg, layers, ranks, owners.is_some());
         let mut bodies = vec![Vec::new(); ranks];
@@ -107,7 +107,8 @@ impl CoreCharges {
                         continue;
                     }
                     let prefix = fp8_projection_prefix(weight);
-                    for (index, caps) in [vec![64, decode_rows], vec![4096]].into_iter().enumerate() {
+                    let decode_cap = if decode_rows > 64 { 128 } else { 64 };
+                    for (index, caps) in [vec![64, decode_cap], vec![4096]].into_iter().enumerate() {
                         for cap in caps {
                             native_names[rank][index].insert(fp8_projection_name(prefix, weight.shape, cap));
                         }

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import time
@@ -569,18 +570,77 @@ def test_nested_acquisition_inside_a_backfilled_job_is_refused(lockdir):
     assert a.wait(timeout=60) == 0 and b.wait(timeout=60) == 0
 
 
-def test_nesting_outside_a_backfill_and_the_gate_child_path_are_unchanged(lockdir):
+def test_the_gate_child_path_is_unchanged(lockdir):
     env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
-    # A bounded gate whose child queues for the same locks (as smoke does).
+    # A bounded gate whose child queues for the same locks (as smoke does); the
+    # gate's own holder record does not count as an enclosing hold.
     inner = f'{sys.executable} {SCRIPT} --locks sparks,gpu1 --wait 5 -- true'
     gated = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'sparks,gpu0,gpu1', '--gate', '--max-run', '30',
                             '--wait', '5', '--', 'sh', '-c', inner], env=env, capture_output=True, text=True, timeout=30)
     assert gated.returncode == 0, gated.stderr
-    # A plain bounded hold (granted in turn, not backfilled) may still take a disjoint lock inside.
-    inner = f'{sys.executable} {SCRIPT} --locks moa --wait 5 -- true'
-    nested = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--max-run', '30', '--wait', '5',
-                             '--', 'sh', '-c', inner], env=env, capture_output=True, text=True, timeout=30)
-    assert nested.returncode == 0, nested.stderr
+    # In-process: a gate's record is live while its child holds the flocks without a ticket.
+    with hwlock.hold(['gpu1'], wait=5, gate=True):
+        assert [data['gate'] for data in hwlock.enclosing_holders(lockdir / 'hwq')] == [True]
+        os.environ[hwlock.GATE_ENV] = str(hwlock.GATE_SEQ[0])
+        try:
+            with hwlock.hold(['gpu1'], wait=5) as handles:
+                assert len(handles) == 1
+                assert not [p for p in (lockdir / 'hwq').glob('*.ticket') if f'{hwlock.GATE_SEQ[0]:012d}' not in p.name]
+        finally:
+            del os.environ[hwlock.GATE_ENV]
+
+
+# 2026-11-23: wip-cards held ticket 13742 (sparks,gpu0,gpu1,moa) as a plain
+# holder; a nested launch under it asked hwlock for the same locks, queued a new
+# ticket behind its own parent and waited on flocks the parent held. Both GPUs
+# sat idle for 13 minutes with three tickets queued behind it.
+@pytest.mark.parametrize('bounded', [False, True])
+@pytest.mark.parametrize('inner_locks, extra, covered', [
+    ('sparks,gpu0,gpu1,moa', '', True),
+    ('gpu0', '', True),
+    ('gpu1,moa', '--max-run 5', True),
+    ('gpu0,rhea', '', False),
+    ('kakapo', '--gate', False),
+])
+def test_nested_acquisition_inside_a_plain_holder_is_refused_at_once(lockdir, bounded, inner_locks, extra, covered):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    queue = lockdir / 'hwq'
+    report = lockdir / 'inner'
+    # The inner call records its exit status, stderr and the tickets it left behind.
+    inner = (f'{sys.executable} {SCRIPT} --locks {inner_locks} --wait 30 {extra} -- true 2> {report}.err; '
+             f'echo $? > {report}.rc; ls {queue} > {report}.queue')
+    started = time.monotonic()
+    outer = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'sparks,gpu0,gpu1,moa', '--wait', '5',
+                            *(['--max-run', '60'] if bounded else []), '--', 'sh', '-c', inner],
+                           env=env, capture_output=True, text=True, timeout=60)
+    assert outer.returncode == 0, outer.stderr
+    assert time.monotonic() - started < 10, 'the inner request must fail at once, not wait'
+    assert Path(f'{report}.rc').read_text().split() == ['77']
+    # Only the outer holder's record: the refused request took no ticket.
+    left = Path(f'{report}.queue').read_text().split()
+    assert not [name for name in left if name.endswith('.ticket')], left
+    assert [name for name in left if name.endswith('.held')] and len([n for n in left if n.endswith('.held')]) == 1
+    message = Path(f'{report}.err').read_text()
+    assert 'hwlock: refusing' in message and 'ancestor ticket' in message
+    if covered:
+        assert 'already held by ancestor ticket' in message and 'CUTEAFD_HW_LOCKS_HELD' in message
+    else:
+        assert 'request every lock in the one outer hwlock call' in message
+        assert 'already held' not in message
+    assert not list(queue.glob('*.ticket')) and not list(queue.glob('*.held'))
+
+
+def test_in_process_nesting_inside_a_plain_holder_is_refused(lockdir):
+    with hwlock.hold(['gpu0', 'gpu1'], wait=5):
+        for names, text in ((['gpu1'], 'already held by ancestor ticket'),
+                            (['gpu1', 'rhea'], 'request every lock in the one outer hwlock call (--locks gpu0,gpu1,rhea)')):
+            with pytest.raises(hwlock.NestedAcquisition, match=re.escape(text)):
+                with hwlock.hold(names, wait=5):
+                    pytest.fail('a nested hold is never granted')
+        assert not list((lockdir / 'hwq').glob('*.ticket'))
+    # Released: the same request now proceeds.
+    with hwlock.hold(['gpu1'], wait=5) as handles:
+        assert len(handles) == 1
 
 
 def test_many_small_backfills_never_delay_the_older_big_job_past_the_bounds(lockdir):

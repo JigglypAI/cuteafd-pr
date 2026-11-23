@@ -845,6 +845,10 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
                 bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()
             };
             packed_check(engine, &tokens, members, args.engine.prefill_packing)?;
+            if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact {
+                engine.configure_packing(crate::shared::prefill_packing::PackingMode::Unrestricted)?;
+                packed_decode_interleave(engine, &tokens)?;
+            }
             if args.engine.prefill_packing == crate::shared::prefill_packing::PackingMode::Unrestricted {
                 let windows = windows.as_ref().context("unrestricted packed check needs the sealed official reference")?;
                 let first = args.window.as_deref().unwrap_or(&windows.first().context("empty packed reference")?.id);
@@ -898,6 +902,68 @@ fn packed_check(engine: &engine::Qwen4Engine<'_>, tokens: &[u32], members: usize
             Ok(logits)
         }, |sequences, callback| engine.prefill_packed(sequences, callback),
         |p| prefix::packed_state(engine, p))
+}
+
+/// Overwrite the captured decode tables with packed metadata twice, compare
+/// logits and durable state against the same decode steps between singleton prefills.
+fn packed_decode_interleave(engine: &engine::Qwen4Engine<'_>, tokens: &[u32]) -> Result<()> {
+    use crate::shared::qwen::scheduler::PrefillSeq;
+    use crate::shared::decode_graph::device::{snapshots, Cycle};
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &engine.cfg);
+    // Match the singleton arithmetic routes in this diagnostic separately from
+    // Exact serving's fail-closed singleton fallback. Both arms are above the
+    // 24-row PLE threshold and below the 80-row EXL3 threshold (#890).
+    const ROWS: usize = 29;
+    const TOKENS: usize = 2 * (ROWS + 1) + 1;
+    let mut admit = || Ok::<_, anyhow::Error>([allocator.admit(TOKENS)?, allocator.admit(TOKENS)?]);
+    let (mut packed, mut single) = (admit()?, admit()?);
+    let mut packed_draft = [speculate::MtpSeq::default(), speculate::MtpSeq::default()];
+    let mut single_draft = packed_draft.clone();
+    let neural = engine.weights.mtp.is_some();
+    let input: [[u32; TOKENS]; 2] = std::array::from_fn(|i| std::array::from_fn(|j| tokens[(i * 97 + j) % tokens.len()]));
+    let equal = |a: &[f32], b: &[f32]| a.iter().map(|x| x.to_bits()).eq(b.iter().map(|x| x.to_bits()));
+    engine.prepare_serving_workspaces()?;
+    let reserve = engine.configure_graph_cache()?;
+    ensure!(reserve.iter().any(|&bytes| bytes > 0), "packed/decode golden needs a nonzero graph reserve");
+    engine.warm_decode_graphs(2, false)?;
+    let graph_hits = || snapshots().iter().filter_map(|s| s.cycles.get(&Cycle::Decode)).map(|c| c.hits).sum::<u64>();
+    for start in [0, ROWS + 1] {
+        let end = start + ROWS;
+        let mut logits = [Vec::new(), Vec::new()];
+        let mut batch = packed.iter_mut().zip(&mut packed_draft).zip(&input).map(|((placement, draft), ids)|
+            PrefillSeq { placement, tokens: &ids[start..end], start, next: Some(ids[end]), draft, neural }).collect::<Vec<_>>();
+        for outcome in engine.prefill_packed(&mut batch, &mut |i, head| {
+            logits[i] = head.row_host(engine.library, 0)?;
+            Ok(Ok(()))
+        })? { outcome?; }
+        drop(batch);
+        // First decode the packed arm, without another prefill in between.
+        let decode = |placement: &mut engine::Qwen4Placement, draft: &mut speculate::MtpSeq, ids: &[u32]| -> Result<_> {
+            let head = engine.verify_device(&mut [(placement, &ids[end..end + 1])], false)?
+                .context("packed/decode golden head")?;
+            let logits = head.row_host(engine.library, 0)?;
+            if neural { speculate::prefill_chunk(engine, placement, end, &ids[end..end + 1], Some(ids[end + 1]), draft)?; }
+            Ok(logits)
+        };
+        let before = graph_hits();
+        // Table row zero still names member 0. Decode member 1 first so a
+        // missing rewrite cannot accidentally read the right table on replay.
+        let second = decode(&mut packed[1], &mut packed_draft[1], &input[1])?;
+        ensure!(graph_hits() > before, "packed/decode golden did not replay member 1 at row {end}");
+        let decoded = [decode(&mut packed[0], &mut packed_draft[0], &input[0])?, second];
+        for i in [1, 0] {
+            let ids = &input[i];
+            let head = engine.prefill_device(&mut single[i], &ids[start..end], None, None, 1)?
+                .context("packed/decode singleton head")?.row_host(engine.library, 0)?;
+            ensure!(equal(&logits[i], &head), "packed/decode prefill logits differ at {start}, member {i}");
+            if neural { speculate::prefill_chunk(engine, &single[i], start, &ids[start..end], Some(ids[end]), &mut single_draft[i])?; }
+            let control = decode(&mut single[i], &mut single_draft[i], ids)?;
+            ensure!(equal(&decoded[i], &control) && prefix::packed_state(engine, &packed[i])? == prefix::packed_state(engine, &single[i])?,
+                "packed/decode logits or state differ at {end}, member {i}");
+        }
+    }
+    println!("packed/decode/packed: target and MTP state and logits byte-identical, decode graph hits {}", graph_hits());
+    Ok(())
 }
 
 /// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.
