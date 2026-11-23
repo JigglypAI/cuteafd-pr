@@ -334,6 +334,29 @@ patterns:
 - **Duels:** give the same task as a Sol or Opus agent to Gemini or Grok in a
   separate worktree, and compare the results. Kernel design and optimization
   are the best duels.
+- **Kernel duel sandbox: CPU trace check.** Duel entrants run CPU-only in
+  `bwrap` (no `/dev/nvidia*`, `CUDA_VISIBLE_DEVICES=-1`). Give them SparkInfer's
+  `b12x.tools.cpu_trace_check` so a CuTe DSL trace-time error such as
+  `TYPE_UNSTABLE_JOIN` surfaces in the entrant's turn, not the organizer's
+  export (two routed MUL1 entries were voided that way, #2571). It needs no
+  device: it describes SM120 or SM121 to Torch and the DSL, then traces and
+  lowers each selected routed mixed-Trellis program to a cubin with the
+  exporter's options. It stops at the first error and prints the DSL's own
+  diagnostic. Before round 1, build the duel's stock packages as usual, then
+  write the scored shapes with `python -m b12x.tools.cpu_trace_check --package
+  <stock pkg-coordinator> --package <stock pkg-spark> [--match rtx-tp2/ ...]
+  --save-shapes shapes.json`. Add to the entrant wrapper `--ro-bind
+  ~/.cache/cuteafd/tools/x86_64/cute-dsl-cpu /srv/cute-dsl-cpu --ro-bind
+  shapes.json /srv/duel-shapes.json`. The recipe's `/srv` is already a tmpfs.
+  That toolchain is a relocatable CPython 3.12 with the pinned
+  nvidia-cutlass-dsl 4.8.1, CPU Torch 2.12 and Triton. The brief then tells
+  the entrant to run, from the entry checkout, `/srv/cute-dsl-cpu/bin/python3
+  -m b12x.tools.cpu_trace_check --shapes /srv/duel-shapes.json` before
+  committing, with `--arch sm120|sm121`, `--capacities 1,80` and `--match` to
+  narrow it. A pass proves only that the programs trace and lower, not
+  correctness, speed or launch limits. Runtime: about 2 s per decode program
+  and 5 s per WS prefill program on one core; the hy4f RTX set (16 programs)
+  takes about 1 min, the hy4f Spark TP1/2/4/6 set (32) about 2 min.
 - **Low-priority tasks** on their own.
 - **Reviews** of another agent's PR, compared with the code reviewer's.
 - **Research and vision** (Gemini): compare with our web search (Exa).
