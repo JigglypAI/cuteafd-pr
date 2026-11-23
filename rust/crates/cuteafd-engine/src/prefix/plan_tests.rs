@@ -9,7 +9,6 @@
 struct LagMeta {
     frontier: usize,
     tag: u64,
-    approximate: bool,
 }
 
 struct Lagged {
@@ -23,7 +22,8 @@ struct Lagged {
     /// Make `abort_capture` fail (copies that never drained).
     stuck: Cell<bool>,
     restored: RefCell<Vec<Option<LagMeta>>>,
-    approximate: RefCell<Vec<bool>>,
+    /// Per ring: the lineage the last restore set (cold admissions reset it in `bind`).
+    lineage: RefCell<Vec<Option<usize>>>,
 }
 
 impl Lagged {
@@ -31,7 +31,7 @@ impl Lagged {
         let mut fake = Fake::new(pages, rings, slots);
         fake.rule = ReuseRule { align: 2, replay: Some(WINDOW) };
         Self { fake, align: 2, replay: WINDOW, queued: RefCell::new(Vec::new()), next: Cell::new(0),
-            stuck: Cell::new(false), restored: RefCell::new(Vec::new()), approximate: RefCell::new(vec![false; rings]) }
+            stuck: Cell::new(false), restored: RefCell::new(Vec::new()), lineage: RefCell::new(vec![None; rings]) }
     }
     /// Run every queued mark copy (their stream drained).
     fn land(&self) {
@@ -48,10 +48,15 @@ impl PrefixFamily<LagMeta> for Lagged {
     fn layout(&self) -> FamilyLayout { self.fake.layout() }
     fn eviction(&self) -> Eviction { Eviction::FreesPages }
     fn capture_meta(&self, placement: &Placement, len: usize) -> Result<LagMeta, BoxError> {
-        Ok(LagMeta { frontier: len, tag: placement.ring as u64 * 1000 + len as u64,
-            approximate: self.approximate.borrow()[placement.ring] })
+        Ok(LagMeta { frontier: len, tag: placement.ring as u64 * 1000 + len as u64 })
     }
-    fn approximate_snapshot(&self, saved: &LagMeta) -> bool { saved.approximate }
+    fn bind(&self, p: &mut Placement) -> Result<(), BoxError> {
+        self.lineage.borrow_mut()[p.ring] = None;
+        Ok(())
+    }
+    fn approximate_from(&self, p: &Placement) -> Result<Option<usize>, BoxError> {
+        Ok(self.lineage.borrow()[p.ring])
+    }
     fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan {
         if hit.common == hit.snapshot_end { return RestorePlan::under(self.fake.rule, hit); }
         let source_end = hit.common / self.align * self.align;
@@ -61,9 +66,10 @@ impl PrefixFamily<LagMeta> for Lagged {
             fidelity: RestoreFidelity::ApproximateReplay }
     }
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&LagMeta>, p: &mut Placement, plan: &RestorePlan,
-        _: &RestoreContext<'_>) -> Result<(), BoxError> {
+        context: &RestoreContext<'_>) -> Result<(), BoxError> {
         self.restored.borrow_mut().push(saved.cloned());
-        self.approximate.borrow_mut()[p.ring] = !plan.exact();
+        assert_eq!(context.approximate_from.is_some(), !plan.exact(), "fidelity and lineage agree");
+        self.lineage.borrow_mut()[p.ring] = context.approximate_from;
         match mark {
             Some(Mark::Slot(slot)) => PrefixFamily::restore(&self.fake, Some(*slot), p, plan.resume()),
             None => {
@@ -163,7 +169,7 @@ fn a_lagged_partial_restore_shares_pages_through_source_end_and_replays_from_rep
     let (exact, _) = lag_serve(&mut cache, &family, 2, &prompt, 48);
     assert_eq!(exact.resume, prompt.len());
     assert_eq!(exact.source.unwrap().plan.fidelity, RestoreFidelity::Exact);
-    assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 41, tag: 41, approximate: false }));
+    assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 41, tag: 41 }));
     for p in [a, b, exact.placement] { cache.release(&family, &p.pages).unwrap(); }
     cache.clear(&family).unwrap();
     assert_eq!(cache.pool().free(), 64);
@@ -199,16 +205,20 @@ fn a_third_turn_inherits_approximation_on_device_and_host() {
         assert_eq!(source.host, host);
         assert!(!source.partial && source.plan.restores_mark());
         assert_eq!(source.plan.fidelity, RestoreFidelity::ApproximateReplay);
-        assert!(family.restored.borrow().last().unwrap().as_ref().unwrap().approximate);
+        // The second prompt's replay shared rows through 32: its snapshot is tainted from there.
+        assert_eq!(source.approximate_from, Some(32));
         assert!(third.after.is_some());
         let counts = cache.stats();
-        assert_eq!((counts.partial_hits, counts.approximate_replay_hits, counts.exact_hits), (1, 2, 0));
+        // One replay; the third turn only inherits it (counted as lineage, not a second replay).
+        assert_eq!((counts.partial_hits, counts.approximate_replay_hits, counts.approximate_lineage_hits, counts.exact_hits),
+            (1, 1, 1, 0));
         cache.release(&family, &third.placement.pages).unwrap();
     }
 }
 
+/// #2455 preferred the host ancestor; ranking by rows saved takes the deeper device partial.
 #[test]
-fn a_host_ancestor_beats_a_deeper_device_media_partial() {
+fn a_deeper_device_media_partial_beats_a_shallower_host_ancestor() {
     let mut fake = Fake::new(1024, 4, 8);
     fake.rule = ReuseRule::V41;
     let mut cache = cache(&fake, 1, 1 << 20);
@@ -229,12 +239,13 @@ fn a_host_ancestor_beats_a_deeper_device_media_partial() {
     let mut branch = original;
     branch[1001] = 4999;
     let keyed = keys(&branch);
-    assert_eq!(cache.peek_media(keyed.tokens(), keyed.spans(), false), 512);
+    // The partial diverges at 1001: sources through 1000, replay from 872 (> the 512 ancestor).
+    assert_eq!(cache.peek_media(keyed.tokens(), keyed.spans(), false), 872);
     let admitted = cache.admit_native(&fake, keyed.tokens(), &branch, keyed.spans(), branch.len(), false,
         |pages| media_place(pages, 2)).unwrap();
     let source = admitted.source.unwrap();
-    assert_eq!(admitted.resume, 512);
-    assert!(source.host && !source.partial && source.plan.exact());
+    assert_eq!(admitted.resume, 872);
+    assert!(!source.host && source.partial && !source.plan.exact());
     cache.release(&fake, &admitted.placement.pages).unwrap();
 }
 
@@ -377,7 +388,7 @@ fn snapshot_metadata_survives_the_host_tier() {
     let (back, _) = lag_serve(&mut cache, &family, 3, &first, 16);
     assert_eq!(back.resume, first.len());
     assert_eq!(cache.stats().host_promotions, promotions + 1, "the hit came from the host tier");
-    assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 13, tag: 13, approximate: false }));
+    assert_eq!(family.restored.borrow().last().cloned().flatten(), Some(LagMeta { frontier: 13, tag: 13 }));
     let mut p = back.placement;
     let mut longer = first.clone();
     longer.push(9);
@@ -536,4 +547,186 @@ fn queued_captures_publish_oldest_under_two_slot_pressure_without_losing_tickets
         cache.release(&family, &p.pages).unwrap();
     }
     assert!(cache.stats().capture_stalls > 0);
+}
+
+// ---- Ranking by rows saved and scoped approximate lineage (#2455 follow-up, #2463) ----
+
+/// Admit `prompt` cold-or-restored, prefill the rest, capture a prompt snapshot; drain the host.
+fn lag_round(cache: &mut PrefixCache<Shared, LagMeta>, family: &Lagged, ring: usize, prompt: &[u32])
+    -> (Admitted<Placement>, Placement) {
+    let served = lag_serve(cache, family, ring, prompt, prompt.len() + 8);
+    family.fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(family, &served.1.pages).unwrap();
+    served
+}
+
+#[test]
+fn the_partial_that_leaves_fewer_rows_wins_and_an_exact_ancestor_wins_ties() {
+    let (shallow, deep) = (40, 400);
+    // The fixture replays WINDOW rows: a divergence at shallow + WINDOW ties the ancestor.
+    for (divergence, partial) in [(shallow + WINDOW, false), (shallow + WINDOW + 2, true), (deep - 20, true)] {
+        let family = Lagged::new(deep, 6, 8);
+        let mut cache = lag_cache(&family, 4, 0);
+        let long = seq(100, deep);
+        lag_round(&mut cache, &family, 0, &long[..shallow]);
+        lag_round(&mut cache, &family, 1, &long);
+        let mut query = long[..divergence].to_vec();
+        query.extend(seq(90_000, 7));
+        let expected = if partial { divergence / 2 * 2 - WINDOW } else { shallow };
+        assert_eq!(cache.peek(&query, false), expected);
+        let (admitted, _) = lag_round(&mut cache, &family, 2, &query);
+        let source = admitted.source.unwrap();
+        assert_eq!((admitted.resume, source.partial), (expected, partial), "divergence {divergence}");
+        assert_eq!(source.plan.exact(), !partial, "only the replay is approximate");
+        assert_eq!(source.approximate_from, partial.then_some(divergence / 2 * 2));
+    }
+}
+
+#[test]
+fn the_host_tier_promotes_a_deeper_partial_over_a_shallow_device_ancestor() {
+    let (shallow, deep) = (40, 400);
+    let family = Lagged::new(deep * 3, 6, 8);
+    let mut cache = lag_cache(&family, 1, 1 << 22);
+    let long = seq(100, deep);
+    // The deep prompt goes to the host tier; the shallow ancestor stays on the device.
+    lag_round(&mut cache, &family, 0, &long);
+    lag_round(&mut cache, &family, 1, &long[..shallow]);
+    let mut query = long[..deep - 20].to_vec();
+    query.extend(seq(90_000, 7));
+    let promotions = cache.stats().host_promotions;
+    let expected = (deep - 20) / 2 * 2 - WINDOW;
+    assert_eq!(cache.peek(&query, false), expected);
+    let (admitted, _) = lag_round(&mut cache, &family, 2, &query);
+    let source = admitted.source.unwrap();
+    assert_eq!((admitted.resume, source.host, source.partial), (expected, true, true));
+    assert_eq!(cache.stats().host_promotions, promotions + 1);
+}
+
+/// A retained entry whose mark is gone (staging reaped an uncached mark) keeps its exact pages
+/// under a replay rule and restores by bounded replay from just short of its frontier, instead
+/// of a cold miss or a shallower ancestor.
+#[test]
+fn a_markless_entry_restores_by_bounded_replay_from_its_own_pages() {
+    let family = Lagged::new(256, 6, 8);
+    let mut cache = lag_cache(&family, 4, 0);
+    let prompt = seq(100, 41);
+    lag_round(&mut cache, &family, 0, &prompt);
+    // Drop the entry's mark as the staging ring does for an uncached write.
+    assert_eq!(cache.drop_marks_for_test(&family), 1);
+    assert_eq!(cache.stats().marks_dropped, 1);
+    let mut next = prompt.clone();
+    next.extend(seq(2000, 9));
+    assert_eq!(cache.peek(&next, false), prompt.len(), "peek is a hint; admission rechecks");
+    let (admitted, _) = lag_round(&mut cache, &family, 1, &next);
+    let source = admitted.source.unwrap();
+    // common 40 (one short of the frontier): sources through 40, replay from 40 - WINDOW.
+    assert_eq!((admitted.resume, source.partial, source.plan.exact()), (40 - WINDOW, true, false));
+    assert_eq!(source.approximate_from, Some(40));
+    let stats = cache.stats();
+    assert_eq!((stats.markless_replays, stats.approximate_replay_hits, stats.dead_marks), (1, 1, 0));
+}
+
+/// Problem 2: a replay taints only rows from its shared frontier on. Descendants keep content
+/// identities for the pages before it, so their host copies dedup with exact snapshots; a later
+/// partial restore that shares only those pages is exact; an ancestor restore still inherits.
+#[test]
+fn approximate_lineage_is_scoped_to_its_taint_row_across_device_and_host() {
+    let family = Lagged::new(256, 8, 8);
+    let mut cache = lag_cache(&family, 8, 1 << 22);
+    let base = seq(100, 64);
+    // An exact conversation over a 64-token base (16 full pages).
+    let mut first = base.clone();
+    first.extend(seq(1000, 20));
+    lag_round(&mut cache, &family, 0, &first);
+    // Diverge at 72: the replay shares rows through 72 (aligned) and taints from there.
+    let mut second = first[..72].to_vec();
+    second.extend(seq(2000, 30));
+    let (partial, _) = lag_round(&mut cache, &family, 1, &second);
+    assert_eq!(partial.source.as_ref().unwrap().approximate_from, Some(72));
+    // Its next turn is an ancestor restore: inherited lineage, labelled, counted as lineage.
+    let mut third = second.clone();
+    third.extend(seq(3000, 10));
+    let before = cache.stats().host.unwrap();
+    let (turn, _) = lag_round(&mut cache, &family, 2, &third);
+    let source = turn.source.unwrap();
+    assert!(source.plan.restores_mark() && !source.plan.exact());
+    assert_eq!(source.approximate_from, Some(72));
+    let after = cache.stats().host.unwrap();
+    // The ancestor fork shares the second snapshot's device pages: its 25 full pages are host
+    // shared, only the three pages the new suffix completed are copied.
+    assert_eq!((after.pages_shared - before.pages_shared, after.pages_copied - before.pages_copied), (25, 3));
+    // Host identities: content for the 18 pages wholly before row 72, allocation after it.
+    let pages: Vec<u32> = (0..28).collect();
+    let ids = cache.identities(&family, &third, &[], &pages, Some(72));
+    let content = super::chain::page_chain(&third, ROWS);
+    for (i, id) in ids.iter().enumerate() {
+        if i < 72 / ROWS { assert_eq!(*id, super::chain::content_id(0, content[i]), "page {i}"); }
+        else { assert!(id.compressor & super::chain::CONTENT_CLASS == 0, "page {i} is tainted"); }
+    }
+    // The exact lineage names every full page by content; 73 rounds down to 18 clean pages.
+    assert!(cache.identities(&family, &third, &[], &pages, None).iter()
+        .all(|id| id.compressor & super::chain::CONTENT_CLASS != 0));
+    assert_eq!(cache.identities(&family, &third, &[], &pages, Some(73)).iter()
+        .filter(|id| id.compressor & super::chain::CONTENT_CLASS != 0).count(), 18);
+    // A request diverging inside the clean base shares only exact pages: no inherited lineage.
+    let mut fourth = third[..60].to_vec();
+    fourth.extend(seq(4000, 30));
+    let (clean, _) = lag_round(&mut cache, &family, 3, &fourth);
+    let source = clean.source.unwrap();
+    assert!(source.partial);
+    assert_eq!(source.approximate_from, Some(60), "its own replay, not the lineage at 72");
+    let stats = cache.stats();
+    assert_eq!((stats.approximate_replay_hits, stats.approximate_lineage_hits, stats.partial_hits), (2, 1, 2));
+    // Diverging past the taint row inherits it (min of the inherited and its own taint row).
+    let mut fifth = third[..90].to_vec();
+    fifth.extend(seq(5000, 30));
+    let (tainted, _) = lag_round(&mut cache, &family, 4, &fifth);
+    assert_eq!(tainted.source.unwrap().approximate_from, Some(72));
+    // An exact restore of the untouched first conversation stays exact.
+    let (exact, _) = lag_round(&mut cache, &family, 5, &first);
+    let source = exact.source.unwrap();
+    assert!(source.plan.exact() && source.approximate_from.is_none());
+}
+
+/// Lineage survives the host tier: a promoted tainted snapshot keeps its taint row, and its
+/// clean pages are restored under content identities that dedup with exact snapshots.
+#[test]
+fn scoped_lineage_survives_host_promotion() {
+    let family = Lagged::new(256, 8, 8);
+    let mut cache = lag_cache(&family, 1, 1 << 22);
+    let first = seq(100, 84);
+    lag_round(&mut cache, &family, 0, &first);
+    let mut second = first[..72].to_vec();
+    second.extend(seq(2000, 30));
+    lag_round(&mut cache, &family, 1, &second);
+    // Push the tainted snapshot off the device.
+    lag_round(&mut cache, &family, 2, &seq(7000, 40));
+    let promotions = cache.stats().host_promotions;
+    let mut next = second.clone();
+    next.extend(seq(3000, 10));
+    let (back, _) = lag_round(&mut cache, &family, 3, &next);
+    let source = back.source.unwrap();
+    assert!(source.host && source.plan.restores_mark());
+    assert_eq!(cache.stats().host_promotions, promotions + 1);
+    assert_eq!(source.approximate_from, Some(72));
+    assert_eq!(source.plan.fidelity, RestoreFidelity::ApproximateReplay);
+}
+
+/// A cold admission on a ring that last served a tainted request starts exact.
+#[test]
+fn a_cold_admission_clears_ring_lineage() {
+    let family = Lagged::new(128, 2, 8);
+    let mut cache = lag_cache(&family, 4, 0);
+    let first = seq(100, 41);
+    lag_round(&mut cache, &family, 0, &first);
+    let mut second = first[..33].to_vec();
+    second.extend(seq(900, 6));
+    lag_round(&mut cache, &family, 1, &second);
+    assert_eq!(family.lineage.borrow()[1], Some(32));
+    let (cold, _) = lag_round(&mut cache, &family, 1, &seq(5000, 20));
+    assert!(cold.source.is_none());
+    assert_eq!(family.lineage.borrow()[1], None);
+    let (exact, _) = lag_round(&mut cache, &family, 0, &seq(5000, 20));
+    assert!(exact.source.unwrap().approximate_from.is_none());
 }

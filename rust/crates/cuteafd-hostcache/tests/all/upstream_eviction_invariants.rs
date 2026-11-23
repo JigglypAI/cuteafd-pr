@@ -264,49 +264,38 @@ fn partial_hit_replay_window_boundary() {
     assert_eq!(metrics.host_hits, 4);
 }
 
-/// V4.1 host lookups keep the ancestor even when a partial would save more work.
+/// V4.1 host lookups take the candidate that saves the most rows; an exact ancestor wins a tie.
 #[test]
-fn exact_ancestor_precedes_a_longer_partial_match() {
+fn host_lookup_ranks_by_rows_saved_with_ties_to_the_exact_ancestor() {
     let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(DEVICE_BYTES);
     let ancestor = snap(&mut device, SnapshotKind::Turn, &seq(0, 250), &[id(30, 1)]);
     write_snapshot(cache.engine_mut(), &ancestor);
     store_resident(&mut cache, &ancestor, 1);
-    // Long enough that the 381-token query diverges inside this snapshot.
     let longer = snap(&mut device, SnapshotKind::Turn, &seq(0, 500), &[id(31, 2)]);
     write_snapshot(cache.engine_mut(), &longer);
     store_resident(&mut cache, &longer, 2);
-
     let key_of_ancestor = cache.lookup(&seq(0, 250)).expect("ancestor").key;
     let key_of_longer = cache.lookup(&seq(0, 500)).expect("longer").key;
-
-    // Divergence at 377: the partial candidate saves (377/2*2)-128 = 248 < 250: ancestor wins.
+    // Divergence at 377: the partial saves (377/2*2)-128 = 248 < 250: ancestor.
     let mut query = seq(0, 377);
     query.push(999);
-    let hit = cache.lookup(&query).expect("hit");
-    assert_eq!(hit.key, key_of_ancestor);
-    assert_eq!((hit.common, hit.frontier), (250, 250));
-
-    // Divergence at 379: the partial candidate saves exactly 250 — a tie keeps the ancestor.
+    assert_eq!(cache.lookup(&query).expect("hit").key, key_of_ancestor);
+    // Divergence at 379 saves exactly 250: the tie keeps the exact ancestor.
     let mut query = seq(0, 379);
     query.push(999);
     let hit = cache.lookup(&query).expect("hit");
-    assert_eq!(hit.key, key_of_ancestor, "tie prefers the exact ancestor");
-    assert_eq!((hit.common, hit.frontier), (250, 250));
-
-    // Divergence at 381 saves 380-128 = 252 > 250, but the ancestor still wins.
+    assert_eq!((hit.key, hit.common, hit.frontier), (key_of_ancestor, 250, 250));
+    // Divergence at 381 saves 252: the partial wins.
     let mut query = seq(0, 381);
     query.push(999);
     let hit = cache.lookup(&query).expect("hit");
-    assert_eq!(hit.key, key_of_ancestor);
-    assert_eq!((hit.common, hit.frontier), (250, 250));
-
-    // Full-frontier query still resolves to the complete longer snapshot.
+    assert_eq!((hit.key, hit.common, hit.frontier), (key_of_longer, 381, 500));
+    // A full-frontier query resolves to the complete longer snapshot.
     let mut query = seq(0, 500);
     query.push(999);
     let hit = cache.lookup(&query).expect("hit");
-    assert_eq!(hit.key, key_of_longer);
-    assert_eq!((hit.common, hit.frontier), (500, 500));
+    assert_eq!((hit.key, hit.common, hit.frontier), (key_of_longer, 500, 500));
 }
 
 /// Port of the sglang radix split invariants (`test_insert_then_match_round_trips` plus edge

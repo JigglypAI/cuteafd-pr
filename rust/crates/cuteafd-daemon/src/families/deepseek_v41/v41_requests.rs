@@ -22,7 +22,8 @@ fn lease_slot(slots: &[Option<Request>], lease: CacheLease) -> Result<usize> {
 struct Request {
     lease: CacheLease,
     history: EngramHistory,
-    approximate_prefix: bool,
+    /// Approximate prefix lineage ([`cuteafd_engine::prefix::PrefixFamily::approximate_from`]).
+    approximate_from: Option<usize>,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
     /// The prompt's Engram rows being read ahead (`Requests::start_lookahead`):
@@ -270,16 +271,16 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, approximate_prefix: false, prefill: None, images: RequestImages::default(),
+        self.slots[slot] = Some(Request { lease, history, approximate_from: None, prefill: None, images: RequestImages::default(),
             lookahead: None });
         Ok(lease)
     }
-    pub fn approximate_prefix(&self, lease: CacheLease) -> Result<bool> {
-        Ok(self.request(lease)?.approximate_prefix)
+    pub fn approximate_from(&self, lease: CacheLease) -> Result<Option<usize>> {
+        Ok(self.request(lease)?.approximate_from)
     }
-    pub fn set_approximate_prefix(&mut self, lease: CacheLease, approximate: bool) -> Result<()> {
+    pub fn set_approximate_from(&mut self, lease: CacheLease, from: Option<usize>) -> Result<()> {
         let slot = lease_slot(&self.slots, lease)?;
-        self.slots[slot].as_mut().expect("validated request slot").approximate_prefix = approximate;
+        self.slots[slot].as_mut().expect("validated request slot").approximate_from = from;
         Ok(())
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
@@ -501,7 +502,7 @@ impl<'a> Requests<'a> {
         self.units.detach(slot);
         let request = self.slots[slot].as_mut().expect("validated prefix request");
         request.history = self.pipeline.new_history()?;
-        request.approximate_prefix = false;
+        request.approximate_from = None;
         request.prefill = None;
         request.lookahead = None;
         Ok(())

@@ -19,8 +19,13 @@
 //! DeepSeek's official Encoder SWA Bounded Replay: reuse global KV, restart encoder windows
 //! empty 128 tokens before the aligned common frontier, rounding before any overlapping image.
 //! The plan passes that single replay start through to the encoder and Engram restore; image
-//! features from there are re-encoded consistently. Approximation follows the request into
-//! later captures; restoring such a mark is byte-exact to the capture, not to cold prefill.
+//! features from there are re-encoded consistently. Approximation is scoped to the request's
+//! taint row (the replay's `source_end`), which follows it into later captures: pages before it
+//! keep token-content host identities, and a later partial restore that shares only those pages is
+//! exact. Restoring a tainted mark is byte-exact to the capture, not to cold prefill.
+//! Ranking minimizes rows left to prefill or replay; an exact ancestor wins a tie. With the host
+//! tier on, a retained entry's host-only mark is pinned while the entry lives; an entry without a
+//! mark replays from its own pages.
 //! An ancestor followed by a suffix of at least 128 tokens resumes as an
 //! encoder continuation (encoder rings and carry restored, decoder rings rebuilt by the suffix's
 //! final replay, which covers the whole decoder window).
@@ -56,7 +61,6 @@ pub(crate) use cuteafd_engine::prefix::SnapshotKind;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct V41Meta {
     pub request: RequestMark,
-    pub approximate: bool,
     /// The drafter rings' frontier, when the mark carries them.
     pub draft_end: Option<u64>,
 }
@@ -205,7 +209,9 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn eviction(&self) -> Eviction {
         Eviction::FreesPages
     }
-    fn approximate_snapshot(&self, meta: &V41Meta) -> bool { meta.approximate }
+    fn approximate_from(&self, placement: &V41Placement) -> Result<Option<usize>, BoxError> {
+        self.requests.borrow().approximate_from(placement.lease).map_err(boxed)
+    }
     fn plan_restore(&self, hit: RestoreCandidate<'_>) -> RestorePlan { plan(hit) }
     fn capture_meta(&self, placement: &V41Placement, len: usize) -> Result<V41Meta, BoxError> {
         let requests = self.requests.borrow();
@@ -218,8 +224,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
             (Some(id), Some(draft)) => Some(draft.committed_end(id).map_err(boxed)?),
             _ => None,
         };
-        let approximate = requests.approximate_prefix(placement.lease).map_err(boxed)?;
-        Ok(V41Meta { request: RequestMark { backbone, engram_position: position, engram_recent: recent }, draft_end, approximate })
+        Ok(V41Meta { request: RequestMark { backbone, engram_position: position, engram_recent: recent }, draft_end })
     }
     fn bind(&self, placement: &mut V41Placement) -> Result<(), BoxError> {
         self.bind_units(placement, 0).map_err(boxed)
@@ -270,9 +275,9 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
                 plan.lag.replay_start, context.native_tokens).map_err(boxed)?;
             placement.len = plan.lag.replay_start;
         }
-        requests.set_approximate_prefix(placement.lease, !plan.exact()).map_err(boxed)?;
+        requests.set_approximate_from(placement.lease, context.approximate_from).map_err(boxed)?;
         tracing::info!(fidelity = ?plan.fidelity, source_end = plan.lag.source_end,
-            replay_start = plan.lag.replay_start, "V4.1 prefix restored");
+            replay_start = plan.lag.replay_start, approximate_from = ?context.approximate_from, "V4.1 prefix restored");
         placement.plan = Some(*plan);
         Ok(())
     }
@@ -643,9 +648,14 @@ mod tests {
         let partial = selected(&[&tokens[..1500]], &branch).unwrap();
         assert_eq!(partial.fidelity, RestoreFidelity::ApproximateReplay);
         assert_eq!((partial.lag.source_end, partial.resume()), (1000, 872));
-        let ancestor = selected(&[&tokens[..512], &tokens[..1500]], &branch).unwrap();
+        // The 512 ancestor saves fewer rows than the replay (872): the replay wins.
+        let deeper = selected(&[&tokens[..512], &tokens[..1500]], &branch).unwrap();
+        assert!(!deeper.exact());
+        assert_eq!(deeper.resume(), 872);
+        // A 900 ancestor saves more than the replay: it wins and stays exact.
+        let ancestor = selected(&[&tokens[..900], &tokens[..1500]], &branch).unwrap();
         assert!(ancestor.exact());
-        assert_eq!(ancestor.resume(), 512);
+        assert_eq!(ancestor.resume(), 900);
         for (prompt, end) in [(&tokens[..777], 777), (&tokens[..1001], 1001), (&tokens[..2000], 1001)] {
             let exact = selected(&[&tokens[..end]], prompt).unwrap();
             assert!(exact.exact());
@@ -774,7 +784,6 @@ mod tests {
             request: RequestMark { backbone: BackboneMark { end: 513, windows: vec![(385, 513); 40] },
                 engram_position: 513, engram_recent: vec![Some(5), None, Some(7)] },
             draft_end: Some(513),
-            approximate: true,
         };
         let text = serde_json::to_string(&meta).unwrap();
         assert_eq!(serde_json::from_str::<V41Meta>(&text).unwrap(), meta);
