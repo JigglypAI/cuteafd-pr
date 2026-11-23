@@ -354,9 +354,11 @@ patterns:
   -m b12x.tools.cpu_trace_check --shapes /srv/duel-shapes.json` before
   committing, with `--arch sm120|sm121`, `--capacities 1,80` and `--match` to
   narrow it. A pass proves only that the programs trace and lower, not
-  correctness, speed or launch limits. Runtime: about 2 s per decode program
-  and 5 s per WS prefill program on one core; the hy4f RTX set (16 programs)
-  takes about 1 min, the hy4f Spark TP1/2/4/6 set (32) about 2 min.
+  correctness, speed or launch limits. It runs on one core, about 2 s per
+  decode program and 5 s per WS prefill program. The hy4f RTX set (16
+  programs) takes 1 min, the hy4f Spark TP1/2/4/6 set (32) 2.3 min and the
+  full routed RTX set (hy4f, GLM and Qwen4 in both codebooks, 96) 6 min.
+  `--trace-only` halves that.
 - **Low-priority tasks** on their own.
 - **Reviews** of another agent's PR, compared with the code reviewer's.
 - **Research and vision** (Gemini): compare with our web search (Exa).
