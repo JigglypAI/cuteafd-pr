@@ -446,13 +446,13 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn reset_slot(&mut self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots.len(), "dense reset outside admitted slots");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense reset requires committed healthy state");
-        self.drain()?;
         self.verification.invalidate()?;
         self.healthy = false;
         for region in self.state_regions(slot) {
             let stream = if region.device_id == self.stream.device.id { &self.stream }
                 else { &self.peer.as_ref().expect("admitted peer").stream };
-            // SAFETY: the owning stream is drained and retains this state region.
+            // SAFETY: the region stays owned; zeroing follows prior users on
+            // the same rank stream, including its prefix-copy join.
             stream.device.run(|| unsafe {
                 self.stream.device.library.cuda_zero_bytes_async(region, region.bytes, stream.raw)
             })?;

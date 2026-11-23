@@ -281,7 +281,11 @@ impl<'a> Mtp<'a> {
                     self.layout.hidden_bytes, self.stream)?;
             }
         }
-        // SAFETY: source/destination references stay retained until all copies retire.
+        Ok(())
+    }
+
+    fn drain_page_copies(&self) -> Result<()> {
+        // SAFETY: the stream and page references stay live through this wait.
         unsafe { self.library.cuda_stream_synchronize(self.stream) }
     }
 }
@@ -459,15 +463,14 @@ impl MtpCache<'_> {
         mtp.select_slot(slot)?;
         ensure!(mtp.pool.frontier(mtp.binding)?.1 == frontier && frontier > 0,
             "dense MTP snapshot requires exact pending frontier");
-        // SAFETY: producers retire before their page membership is published.
-        unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
         let binding = mtp.binding;
         let (snapshot, copies) = mtp.pool.capture_writable(binding, frontier - 1)?;
-        if let Err(error) = mtp.copy_pages(&copies) {
-            // SAFETY: failed copies keep destination ownership until they retire.
-            if unsafe { mtp.library.cuda_stream_synchronize(mtp.stream) }.is_ok() {
-                mtp.pool.release_snapshot(snapshot)?;
-            }
+        let queued = mtp.copy_pages(&copies);
+        // The copy is ordered after earlier writes. Do not publish the mark
+        // or recycle its pages (even on an error) before that work retires.
+        mtp.drain_page_copies()?;
+        if let Err(error) = queued {
+            mtp.pool.release_snapshot(snapshot)?;
             return Err(error);
         }
         Ok(mtp.pool.attachment(snapshot)?)
@@ -500,8 +503,7 @@ impl MtpCache<'_> {
         let mut mtp = self.0.borrow_mut();
         ensure!(slot < mtp.bindings.len(), "dense MTP restore outside admitted slots");
         mtp.pool.check_attachment(saved)?;
-        // SAFETY: old binding producers retire before its physical pages can be recycled.
-        unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
+        // Discard drains the old binding before recycling its physical pages.
         mtp.pool.pin_snapshot(saved.snapshot)?;
         if let Err(error) = mtp.discard_slot(slot) {
             mtp.pool.unpin_snapshot(saved.snapshot)?;
@@ -513,11 +515,11 @@ impl MtpCache<'_> {
         };
         mtp.bindings[slot] = Some(binding);
         mtp.binding = binding;
-        let result = mtp.copy_pages(&copies);
-        // SAFETY: a failed drain quarantines the source pin and destination binding.
-        unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
+        let queued = mtp.copy_pages(&copies);
+        // A failed drain keeps the source pin and destination binding owned.
+        mtp.drain_page_copies()?;
         mtp.pool.unpin_snapshot(saved.snapshot)?;
-        result
+        queued
     }
     pub(crate) fn page_bytes(&self) -> usize { self.0.borrow().layout.bytes() }
     pub(crate) fn page_segments(&self, page: DraftPageId) -> Result<Vec<DeviceRange>> {
