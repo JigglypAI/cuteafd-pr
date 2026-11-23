@@ -41,7 +41,8 @@ pub(crate) struct PrefixArgs {
     /// RAM kept outside an automatic pinned prefix pool, at least 10% of total RAM.
     #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
     pub host_cache_headroom_bytes: u64,
-    /// Shortest snapshot the host tier keeps.
+    /// Shortest snapshot the host tier keeps. Families with positional marks clamp it to
+    /// --prefix-cache-min-tokens: with the host tier on, their marks are staged and live on the host.
     #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_MIN_TOKENS)]
     pub host_cache_min_tokens: u32,
     /// Intermediate snapshot points (off by default; agentic sessions hit prompt-end and

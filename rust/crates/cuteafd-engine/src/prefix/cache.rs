@@ -269,10 +269,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
         }
         let host = match host {
-            Some((host_config, engine)) if config.entries > 0 && host_config.enabled() => Some(
+            Some((mut host_config, engine)) if config.entries > 0 && host_config.enabled() => Some({
+                // A host-enabled mark family keeps only staging slots on the device
+                // (`HOST_MARK_STAGING_SLOTS`): a retained mark lives on the host or nowhere. A
+                // snapshot the host tier refused as too short would lose its slot, and so the whole
+                // snapshot, to the next capture (#2582: a 260-token shared base gone after one
+                // warm wave). Such a family's host tier keeps everything its device keeps.
+                if layout.mark_bytes > 0 {
+                    host_config.min_tokens = host_config.min_tokens.min(u32::try_from(config.min_tokens.max(1)).unwrap_or(u32::MAX));
+                }
                 HostCache::with_rule(host_config, layout.host_layout().with_draft_pages(draft_page_bytes), engine, layout.rule, EvictionOrder::LeastRecent)
-                    .map_err(|e| PrefixError::Host(format!("{e:#}")))?,
-            ),
+                    .map_err(|e| PrefixError::Host(format!("{e:#}")))?
+            }),
             _ => None,
         };
         let arena = config.entries > 0 && layout.mark_bytes > 0 && layout.mark_store == MarkStore::Arena;

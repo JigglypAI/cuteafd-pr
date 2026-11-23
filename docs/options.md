@@ -730,7 +730,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
 | `POOL_TOKENS` | `auto` where offered | `auto` or count | Automatic pool uses memory left after target-sized placement and onboarding; a number pins it. |
-| `HOST_CACHE_BYTES` | `auto` | `auto`, `0`, byte size | Prefix-cache host tier; `0` disables it. |
+| `HOST_CACHE_BYTES` | `auto` | `auto`, `0`, byte size | Prefix-cache host tier; `0` disables it. The daemon's `--host-cache-min-tokens` (512) is the shortest snapshot it keeps, except in families with positional marks (recurrent or sliding-window state): with the host tier on they keep only two device staging marks, so a retained mark lives on the host or nowhere, and their host minimum is clamped to `--prefix-cache-min-tokens` (64). Pages-only families keep 512; their short snapshots stay on the device. Host eviction is byte-accounted least-recent (leaves before reusable ancestors), so short snapshots cost only their own pages and mark ([#2582](https://github.com/tpurtell/cuteafd/issues/2582)). |
 
 ## Attention and KV
 
