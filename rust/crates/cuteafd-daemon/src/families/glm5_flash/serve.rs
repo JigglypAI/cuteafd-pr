@@ -326,9 +326,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, lanes, policy, decode_share, &prefix,
             loop_abort, (args.prefix_marks, args.mark_arena), args.token_io.token_select, &mut media, preparer.as_deref(),
             || {
-                // Ready once the prefix cache and the token selector exist: the ledger then lists
-                // every start-up allocation.
-                crate::shared::memory_report::log("glm5_flash ready");
+                // Ready once the prefix cache and the token selector exist; the API task logs the
+                // ready ledger (every start-up allocation) once it binds.
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
@@ -1037,7 +1036,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
             prefix_state_probe(engine, &family, &admitted.placement, &job.probe, "admitted")?;
             let _ = job.events.send(Ok(InferenceChunk::Ready {
-                system_fingerprint: None,
+                system_fingerprint: Some(opened.view.fingerprint().to_owned()),
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
             if let Some(from) = probe::scoring(&job.probe) {
@@ -1457,6 +1456,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         Err(error) => {
             tracing::warn!("decode step failed: {error:#}");
             for request in active.drain(..) {
+                if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                 let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                 release(family, cache, free_kda, free_slots, &request.placement, request.slot);
             }
@@ -1821,6 +1821,17 @@ mod lane_tests {
         assert!(round.contains("lanes::commit(&mut Commit {"));
         // The KDA replay and drafter update are the commit's halves, not inline calls.
         assert!(!round.contains("engine.commit(") && !round.contains("drafter.update("));
+    }
+
+    #[test]
+    fn every_ended_request_releases_its_draft_policy_ticket_and_ready_logs_once() {
+        let source = include_str!("serve.rs");
+        let round = source.split_once("\nasync fn decode_round").unwrap().1
+            .split_once("\n/// What a prefill round's chunks share").unwrap().0;
+        let failed = round.split_once("decode step failed").unwrap().1.split_once("return Ok(None);").unwrap().0;
+        assert!(failed.contains("shared.release(request.ticket.id())"));
+        assert_eq!(source.matches(concat!("memory_report::log", "(")).count(), 1);
+        assert!(!source.contains(concat!("system_fingerprint: ", "None")));
     }
 }
 
