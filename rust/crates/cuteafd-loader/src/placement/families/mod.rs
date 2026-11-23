@@ -77,10 +77,10 @@ pub const KIMI_K3: ExecutorModes = ExecutorModes { family: "kimi_k3",
 pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE0, WHOLE1, LayerMode::HeadSplit],
     hops: true, attention: AttentionPlacement::Layers };
 
-/// Every serving family's executor set, for lookups by family name
-/// (`hy4_flash::HY4_FLASH` joins this list when `serve-hy4f` lands, #2478).
-pub const EXECUTORS: [ExecutorModes; 12] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,
-    qwen3_5::EXECUTOR, KIMI_K3, STEP5, muse_spark::MUSE_SPARK, minimax_m3::MINIMAX_M3, inkling2::INKLING2];
+/// Every serving family's executor set, for lookups by family name.
+pub const EXECUTORS: [ExecutorModes; 13] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,
+    qwen3_5::EXECUTOR, KIMI_K3, STEP5, muse_spark::MUSE_SPARK, minimax_m3::MINIMAX_M3, inkling2::INKLING2,
+    hy4_flash::HY4_FLASH];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)

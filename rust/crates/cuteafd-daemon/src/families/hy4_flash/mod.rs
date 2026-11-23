@@ -6,9 +6,11 @@
 //! layers 1..=41 LatentMoE (3072->1536, 512 EXL3 K4 MUL1 experts top-16, swiglu_limit=10,
 //! 1 shared expert), 4 host-resident Engram FP8 tables (layers 1, 11, 21, 31), FP32 LM head.
 
+pub(crate) mod backend;
 pub(crate) mod cache;
 pub(crate) mod execution;
 pub(crate) mod golden;
 pub(crate) mod native;
 pub(crate) mod programs;
+pub(crate) mod serve;
 pub(crate) mod weights;

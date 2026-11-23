@@ -21,6 +21,7 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("muse_spark", "serve-muse", Some("muse-golden")),
     ("minimax_m3", "serve-minimax", Some("minimax-golden")),
     ("inkling2", "serve-inkling2", Some("inkling2-golden")),
+    ("hy4_flash", "serve-hy4f", Some("hy4f-golden")),
 ];
 
 #[derive(Debug, clap::Args)]
@@ -151,6 +152,14 @@ mod tests {
             ["cuteafd", "inkling2-golden", "--nll"]);
         assert_eq!(argv(Kind::Serve, args(Some("inkling2"), &["--device", "1"])).unwrap().unwrap(),
             ["cuteafd", "serve-inkling2", "--device", "1"]);
+    }
+
+    #[test]
+    fn hy4_public_dispatch_preserves_family_arguments() {
+        assert_eq!(argv(Kind::Golden, args(Some("hy4_flash"), &["--nll"])).unwrap().unwrap(),
+            ["cuteafd", "hy4f-golden", "--nll"]);
+        assert_eq!(argv(Kind::Serve, args(Some("hy4_flash"), &["--device", "0", "--split-device", "1"])).unwrap().unwrap(),
+            ["cuteafd", "serve-hy4f", "--device", "0", "--split-device", "1"]);
     }
 
     #[test]
