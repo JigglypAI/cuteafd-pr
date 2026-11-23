@@ -1647,7 +1647,30 @@ def test_the_lock_turn_records_its_timeouts_as_hwlock_max_run(env, monkeypatch):
     monkeypatch.setattr(golden.hwlock, 'hold', hold)
     argv = BASE + ['--arm', 'a=i1:s1', '--arm', 'b=i1:s1', '--repeats', '2', '--timeout', '100'] + GOLDEN
     assert golden.main(argv) == 0
-    assert seen == [4 * (100 + golden.ARM_SLACK_S)]
+    assert seen == [4 * (100 + golden.LOCAL_ARM_SLACK_S)]
+
+
+def test_a_short_local_oracle_advertises_a_short_max_run(env, monkeypatch, capsys):
+    # No Spark workers, no copy-back: --timeout 90 + 120 s local slack + the
+    # 15 s at-grant preflight, so it can backfill a short free GPU window.
+    monkeypatch.setattr(golden.cards._cdi, 'cdi_names', lambda specs=(): {'0', '1', 'all'})
+    write_slot(env['home'], 'i1')
+    argv = BASE + ['--arm', 'a=i1:s1', '--timeout', '90', '--preflight', 'true', '--preflight-timeout', '15',
+                   '--dry-run'] + GOLDEN
+    assert golden.main(argv) == 0
+    assert '--max-run 225\n' in capsys.readouterr().out
+
+
+def test_a_spark_run_keeps_the_remote_slack(spark_env, capsys):
+    # Workers on four Sparks: --timeout 3600 + --worker-ready-timeout 1500 + 900 s.
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    assert '--max-run 6000\n' in capsys.readouterr().out
+
+
+def test_sm121_copy_back_keeps_the_remote_slack(sm121_env, capsys):
+    assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--timeout', '90', '--command', '--dry-run',
+                                     '--', 'true']) == 0
+    assert '--max-run 990\n' in capsys.readouterr().out
 
 
 def test_a_partial_enclosing_hold_is_refused_before_any_ticket(env, monkeypatch, capsys):

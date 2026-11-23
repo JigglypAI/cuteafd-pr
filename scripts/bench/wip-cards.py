@@ -2402,6 +2402,7 @@ def summarize_job(job, exit_code):
                                        if p.get('mapped_tables')},
                                     **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
                                        if p.get('mapped_tables')}}
+            row['graph_bands'] = sweep.get('graph_bands', [])
     row['peaks'] = peaks(dest)
     row['spark_memory'] = spark_memory_report(dest)
     row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
@@ -2726,6 +2727,16 @@ def write_summary(state, rows, arms):
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
         pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
         text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
+    if any(r.get('graph_bands') for r in rows):
+        # Steady state captures no graphs (AGENTS.md): every timed band should be capture-free.
+        text += '## Graph Captures Per Timed Band\n\n/v1/stats read just before and after each timed band.\n\n'
+        text += '| Card | Arm | Repeat | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free |\n| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |\n'
+        for r in rows:
+            for band in r.get('graph_bands', []):
+                free = {True: 'yes', False: 'NO'}.get(band.get('zero_captures'), 'unavailable: ' + str(band.get('reason')))
+                text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], band.get('band'), band.get('captures'),
+                                                   band.get('device_captures'), band.get('misses'), band.get('eager_runs'), free])) + ' |\n'
+        text += '\n'
     if any(r.get('spark_memory') for r in rows):
         text += '## Spark Host Memory\n\nHost /proc/meminfo; no Spark CUDA context. Sampled phase labels, not exact wave boundaries. Minima are bytes.\n\n'
         text += '| Card | Arm | Repeat | Rank | Host | Phase | Samples | Minimum MemAvailable bytes |\n| --- | --- | ---: | ---: | --- | --- | ---: | ---: |\n'
