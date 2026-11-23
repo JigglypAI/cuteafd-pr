@@ -43,7 +43,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const HEAD_WS_BYTES: usize = 32 << 20;
+const HEAD_WS_BYTES: usize = cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
 const ENGRAM_GATHER_WAIT: Duration = Duration::from_secs(120);
 
 pub(crate) struct Hy4EngramSlot {
@@ -812,6 +812,11 @@ impl<'a> Hy4RankWeights<'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
+
+    #[test]
+    fn head_workspace_matches_shared_vocabulary_head_contract() {
+        assert_eq!(HEAD_WS_BYTES, cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE);
+    }
 
     #[test]
     fn pack_kv_b_absorbed_from_transposed_matches_row_major_pack() -> Result<()> {
