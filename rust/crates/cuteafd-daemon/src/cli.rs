@@ -606,7 +606,7 @@ pub(crate) struct PlanArgs {
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
-    /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
+    /// Decode views: V4.1 accepts 1 or 2 (default 2), other families require 1.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub(crate) decode_lanes: Option<u8>,
     /// Rows one continuous prefill call streams for --layout (0: the family
@@ -1576,7 +1576,8 @@ pub(crate) struct NativeServeArgs {
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
-    /// V4.1 has a fixed pair of decode views; 1 is unsupported.
+    /// V4.1 decode lanes: 1 or 2 (default 2; one at concurrency 1). Serve
+    /// replaces the request with the resolved count before any allocation.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Host RAM cap for preloading mapped tables: every table (rows and scales)

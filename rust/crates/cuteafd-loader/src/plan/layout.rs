@@ -398,14 +398,15 @@ mod scoring_workspace_tests {
 }
 
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
-/// given its prefill lanes (V4.1: three fixed; V4: two fixed; GLM 5.3 and
-/// MiMo: one decode plus one prefill endpoint, including pinned one-wave
-/// layouts; Qwen and GLM Flash: one).
+/// given its prefill lanes (V4.1: one per decode lane plus one prefill; V4:
+/// two fixed; GLM 5.3 and MiMo: one decode plus one prefill endpoint,
+/// including pinned one-wave layouts; Qwen and GLM Flash: one). The V4.1
+/// count assumes two decode lanes; [`v41_spark_endpoints`] takes the resolved count.
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         // The two decode lanes' links and one prefill link (its waves share
         // that endpoint's rings).
-        "deepseek_v41" => 3,
+        "deepseek_v41" => v41_spark_endpoints(2),
         "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings);
         // Mistral Large 4 runs the GLM 5.3 engine.
@@ -418,6 +419,9 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         _ => 0,
     }
 }
+
+/// V4.1 endpoints: each resolved decode lane's link plus the one prefill link.
+pub fn v41_spark_endpoints(decode_lanes: u8) -> usize { usize::from(decode_lanes) + 1 }
 
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
 /// staging at the family's unit capacity), calibrated against the workers'
@@ -492,12 +496,13 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 }
 
 /// The planner's admission for a known backend, at the layout's resolved
-/// unit and wave count. Daemons call `admit_family` with the same inputs;
-/// parity tests compare the two per family.
+/// unit, wave count and decode lanes. Daemons call `admit_family_lanes` with
+/// the same inputs; parity tests compare the two per family.
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
+    super::spark_executions::admit_family_lanes(family, &backend.exports(), decode_rows, unit, options.prefill_waves,
+        options.decode_lanes)
 }
 
 #[cfg(test)]
@@ -1689,7 +1694,9 @@ pub(crate) fn spark_host_transport(report: &PlanReport, options: &LayoutOptions,
         path.is_file().then_some(path)
     }).and_then(|path| input.manifest(path).ok())
         .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64));
-    crate::serving_capacity::spark_host_transport(geometry, spark_endpoints(family, lanes), report.spark_ranks,
+    let endpoints = if family == "deepseek_v41" { v41_spark_endpoints(options.decode_lanes) }
+        else { spark_endpoints(family, lanes) };
+    crate::serving_capacity::spark_host_transport(geometry, endpoints, report.spark_ranks,
         native, native || family == "qwen4", !native && checkpoint.spark_input_is_bf16(), unit_rows, intake_rows,
         options.prefill_waves, v4_decode)
 }

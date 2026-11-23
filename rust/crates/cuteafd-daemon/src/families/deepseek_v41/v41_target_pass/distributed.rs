@@ -1354,7 +1354,7 @@ mod tests {
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
         crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
             std::path::Path::new(&snapshot), cuteafd_loader::plan::checkpoint::CoreView::Original)?,
-            &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2)?.start(&peers)?.wait()?;
+            &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2, 2)?.start(&peers)?.wait()?;
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;
@@ -1367,7 +1367,7 @@ mod tests {
             .build()?;
         let draft_weights = devices[1].own(|| DsparkWeights::load(&lib, &catalog, 80, 1, 32usize << 30, 16 << 20))?;
         let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-            devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
+            devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2, 2)?;
         draft.admit(91001)?;
         let lease = requests.admit(0, 91001)?;
         let mut tokens = vec![100u32, 200, 300, 400];
@@ -1579,7 +1579,7 @@ mod tests {
                 "--prefill-waves", "2", "--prefill-packing", "unrestricted"])?;
             let crate::cli::Commands::ServeNative(args) = cli.command else { unreachable!() };
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], unit_rows, 2)?;
+                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], unit_rows, 2, 2)?;
             let samples: Vec<_> = (0..20).flat_map(|sample| windows.iter().map(move |window|
                 (window, window.positions[sample].pos))).collect();
             let mut scored = std::collections::BTreeMap::<_, (Vec<_>, Vec<_>)>::new();
@@ -1651,7 +1651,7 @@ mod tests {
             let id = 93000 + chunk_rows as u64;
             let lease = requests.admit(0, id)?;
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
+                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2, 2)?;
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut requests, &mut prefill_slots, lease, &prompt, chunk_rows, 2, Some(draft.get_mut()))?;
