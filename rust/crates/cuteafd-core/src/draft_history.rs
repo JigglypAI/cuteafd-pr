@@ -334,7 +334,6 @@ struct Pending {
 #[derive(Clone, Debug, Default)]
 struct Request {
     completed_rounds: u64,
-    explored_at: u64,
     rounds: VecDeque<Round>,
     pending: Option<Pending>,
 }
@@ -357,6 +356,15 @@ impl Request {
 
 const NEURAL: usize = 0;
 const COPY: usize = 1;
+const SCORE_BINS: usize = 8;
+
+fn score_bin(kind: HeadScore, score: f32) -> usize {
+    let raw = match kind {
+        HeadScore::Probability | HeadScore::CandidateProbability => f64::from(score),
+        _ => 1. / (1. + (-f64::from(score)).exp()),
+    };
+    ((raw * SCORE_BINS as f64) as usize).min(SCORE_BINS - 1)
+}
 
 /// The neural keep cut each round uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -461,7 +469,8 @@ pub struct DraftHistory {
     /// The neural keep cut of the round being planned.
     round_cut: f64,
     shared_explore: bool,
-    explore_turn: u64,
+    calibration_round: u64,
+    last_judged: Vec<[u64; SCORE_BINS]>,
 }
 
 impl DraftHistory {
@@ -476,7 +485,7 @@ impl DraftHistory {
             platt: if spec.head.scored() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
             rule: CutRule::Fixed, cost: RoundCost::default(), round_cut: KEEP_CUT,
-            shared_explore: false, explore_turn: 0,
+            shared_explore: false, calibration_round: 0, last_judged: Vec::new(),
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
                 position_reached: vec![0; spec.block], position_accepted: vec![0; spec.block],
@@ -492,8 +501,12 @@ impl DraftHistory {
     pub fn with_cut_rule(mut self, rule: CutRule) -> Self { self.rule = rule; self }
     pub fn cut_rule(&self) -> CutRule { self.rule }
 
-    /// Share one neural stop row across a batch instead of one per request.
-    pub fn with_shared_explore(mut self, enabled: bool) -> Self { self.shared_explore = enabled; self }
+    /// Restrict shared scored explores to the verifier's existing padding.
+    pub fn with_shared_explore(mut self, enabled: bool) -> Self {
+        self.shared_explore = enabled;
+        if enabled && self.spec.head.scored() { self.last_judged = vec![[0; SCORE_BINS]; self.spec.block]; }
+        self
+    }
 
     pub fn label(&self) -> String {
         if self.control == DraftControl::History && self.shared_explore { "history-shared-explore".into() }
@@ -643,48 +656,44 @@ impl DraftHistory {
         count
     }
 
-    /// Keep the least recently selected eligible explorer. Break ties by
-    /// ticket so separate lane batches can interleave without sharing a cursor.
-    fn limit_explore(&mut self, ids: &[u64]) -> Vec<(usize, Planned)> {
-        let explorer = ids.iter().copied().filter_map(|id| {
-            let request = self.requests.get(&id)?;
-            let pending = request.pending.as_ref()?;
-            (pending.granted[NEURAL] > pending.keep).then_some((request.explored_at, id))
-        }).min();
-        let Some((_, explorer)) = explorer else { return Vec::new() };
-        self.explore_turn += 1;
-        self.requests.get_mut(&explorer).expect("selected request").explored_at = self.explore_turn;
-        let mut excluded = Vec::new();
-        for (index, &id) in ids.iter().enumerate() {
-            if id == explorer { continue; }
+    /// Settle kept drafts and add scored stop rows only within the verifier's
+    /// existing shape. Prefer the least recently judged position/score bins;
+    /// among equally stale bins, prefer stops closest to the keep cut.
+    pub fn settle_with_padding(&mut self, ids: &[u64], max_rows: usize,
+        bucket: impl Fn(usize) -> Option<usize>) -> Vec<usize> {
+        if self.control != DraftControl::History || self.last_judged.is_empty() {
+            return self.settle(ids, max_rows);
+        }
+        let mut stops = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
             let Some(pending) = self.requests.get_mut(&id).and_then(|request| request.pending.as_mut()) else { continue };
-            if pending.granted[NEURAL] <= pending.keep { continue; }
-            excluded.push((index, pending.planned[NEURAL][pending.keep]));
-            pending.granted = [pending.keep, 0];
-            pending.planned[NEURAL].truncate(pending.keep);
+            let k = pending.keep;
+            if pending.granted[NEURAL] <= k { continue; }
+            if let Some(&raw) = pending.head.get(k).filter(|score| score.is_finite()) {
+                let bin = score_bin(self.spec.head, raw);
+                let joint = pending.planned[NEURAL][..=k].iter().map(|p| p.score.unwrap_or(0.)).product::<f64>();
+                stops.push((i, pending.planned[NEURAL][k], self.last_judged[k][bin], (joint - self.round_cut).abs()));
+            }
+            pending.granted = [k, 0];
+            pending.planned[NEURAL].truncate(k);
             // A copy suffix had agreed with the original neural proposal.
             pending.planned[COPY].clear();
         }
-        excluded
-    }
-
-    /// Cap scored neural explores, settle the kept work, then put skipped stop
-    /// rows back only where the caller's actual verify shape has padding.
-    pub fn settle_with_padding(&mut self, ids: &[u64], max_rows: usize,
-        bucket: impl Fn(usize) -> usize) -> Vec<usize> {
-        if self.control != DraftControl::History || !self.shared_explore || !self.spec.head.scored() {
-            return self.settle(ids, max_rows);
-        }
-        let mut excluded = self.limit_explore(ids);
         let mut granted = self.settle(ids, max_rows);
         let mut rows = ids.len() + granted.iter().sum::<usize>();
-        // Do not turn plain decode into speculative decode just to fill padding.
-        if rows == ids.len() || excluded.is_empty() { return granted; }
-        let shape = bucket(rows);
-        excluded.sort_unstable_by(|(i, a), (j, b)| b.score.unwrap_or(0.).total_cmp(&a.score.unwrap_or(0.))
+        if stops.is_empty() { return granted; }
+        let padded = bucket(rows);
+        // Do not switch a padded path from plain decode to speculative verify.
+        let limit = match padded {
+            Some(_) if rows == ids.len() => return granted,
+            Some(shape) => shape.min(max_rows),
+            None => (rows + ids.len().div_ceil(4)).min(max_rows),
+        };
+        if rows >= limit { return granted; }
+        stops.sort_unstable_by(|(i, _, a, da), (j, _, b, db)| a.cmp(b).then_with(|| da.total_cmp(db))
             .then_with(|| ids[*i].cmp(&ids[*j])));
-        for (i, stop) in excluded {
-            if rows >= max_rows || bucket(rows + 1) != shape { break; }
+        for (i, stop, _, _) in stops {
+            if rows >= limit || padded.is_some_and(|shape| bucket(rows + 1) != Some(shape)) { break; }
             let pending = self.requests.get_mut(&ids[i]).and_then(|request| request.pending.as_mut()).expect("excluded stop");
             if pending.granted[NEURAL] != pending.keep { continue; }
             pending.planned[NEURAL].push(stop);
@@ -737,6 +746,7 @@ impl DraftHistory {
     /// Learn from one verified round. With `trace`, also return what every
     /// planned position looked like and what became of it.
     pub fn observe(&mut self, outcomes: &[DraftOutcome], trace: bool) -> Option<RoundTrace> {
+        if !self.last_judged.is_empty() { self.calibration_round += 1; }
         let mut requests = Vec::with_capacity(if trace { outcomes.len() } else { 0 });
         for outcome in outcomes {
             let mut request = self.requests.remove(&outcome.id).unwrap_or_default();
@@ -763,6 +773,9 @@ impl DraftHistory {
                     if track == NEURAL && self.spec.head.scored() {
                         if let Some(&score) = pending.head.get(position).filter(|score| score.is_finite()) {
                             self.platt[position].observe(logit(self.spec.head, score), hit);
+                            if let Some(bins) = self.last_judged.get_mut(position) {
+                                bins[score_bin(self.spec.head, score)] = self.calibration_round;
+                            }
                         }
                     }
                 }
@@ -820,7 +833,7 @@ impl DraftHistory {
             })).collect()
         };
         serde_json::json!({
-            "policy": self.control.label(), "block": self.spec.block, "head": self.spec.head,
+            "policy": self.label(), "block": self.spec.block, "head": self.spec.head,
             "copy_positions": self.spec.copy, "request_window": REQUEST_WINDOW, "server_window": SERVER_WINDOW,
             "prior_strength": PRIOR_STRENGTH, "fade_rounds": FADE_ROUNDS, "active_requests": self.requests.len(),
             "rounds": self.stats.rounds, "verified_drafts": self.stats.verified_drafts,
@@ -1338,24 +1351,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_explore_rotates_scored_stops_and_drops_the_dependent_copy_suffix() {
+    fn shared_explore_budgets_one_exact_row_per_four_requests_and_drops_dependent_copy_suffixes() {
         let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 2 };
         let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
-        let ids = [31, 11, 21];
-        let requests = ids.map(|id| (id, 5));
-        for chosen in [11, 21, 31, 11] {
-            assert_eq!(policy.plan(&requests, 64), [3; 3]);
-            for id in ids {
-                assert_eq!(policy.refine(id, 3, Some(&[8., -4., -8.])), 2);
-                assert_eq!(policy.extend_copy(id, 2), 1);
-            }
-            let granted = policy.settle_with_padding(&ids, 64, |rows| rows);
-            assert_eq!(granted, ids.map(|id| if id == chosen { 3 } else { 1 }));
-            let trace = policy.observe(&ids.into_iter().zip(granted).map(|(id, n)| outcome(id, n, 1)).collect::<Vec<_>>(), true).unwrap();
-            assert_eq!(trace.policy, "history-shared-explore");
-            assert_eq!(trace.requests.iter().filter(|q| q.positions.iter().any(|p| p.track == Track::Neural && p.explore)).count(), 1);
+        let ids = [31, 11, 21, 41, 51];
+        assert_eq!(policy.plan(&ids.map(|id| (id, 5)), 64), [3; 5]);
+        for id in ids {
+            assert_eq!(policy.refine(id, 3, Some(&[8., -4., -8.])), 2);
+            assert_eq!(policy.extend_copy(id, 2), 1);
         }
-        assert_eq!(policy.stats().position_reached, [12, 4, 0]);
+        let granted = policy.settle_with_padding(&ids, 64, |_| None);
+        assert_eq!(granted, [1, 2, 2, 1, 1]);
+        let trace = policy.observe(&ids.into_iter().zip(granted).map(|(id, n)| outcome(id, n, 1)).collect::<Vec<_>>(), true).unwrap();
+        assert_eq!(trace.policy, "history-shared-explore");
+        assert_eq!(policy.stats().position_reached, [5, 2, 0]);
     }
 
     #[test]
@@ -1366,7 +1375,7 @@ mod tests {
         for _ in 0..8 {
             let expected = baseline.plan(&requests, 64);
             assert_eq!(shared.plan(&requests, 64), expected);
-            assert_eq!(shared.settle_with_padding(&[21, 11], 64, |_| 64), expected);
+            assert_eq!(shared.settle_with_padding(&[21, 11], 64, |_| Some(64)), expected);
             let observed = [outcome(21, expected[0], 0), outcome(11, expected[1], 0)];
             shared.observe(&observed, false);
             baseline.observe(&observed, false);
@@ -1375,26 +1384,31 @@ mod tests {
     }
 
     #[test]
-    fn shared_explore_fills_only_existing_padding_in_score_order() {
+    fn shared_explore_fills_padding_by_staleness_then_cut_distance() {
         let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 0 };
         let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
         let ids = [1, 2, 3];
         let requests = ids.map(|id| (id, 3));
         let plan = |policy: &mut DraftHistory| {
             policy.plan(&requests, 64);
-            for (id, stop) in [(1, -8.), (2, -4.), (3, -1.)] {
+            for (id, stop) in [(1, -8.), (2, -1.8), (3, -1.)] {
                 assert_eq!(policy.refine(id, 3, Some(&[8., stop, -8.])), 2);
             }
         };
         plan(&mut policy);
-        assert_eq!(policy.settle_with_padding(&ids, 64, |rows| rows.next_multiple_of(4)), [2, 1, 2]);
+        assert_eq!(policy.settle_with_padding(&ids, 7, |rows| Some(rows.next_multiple_of(4))), [1, 1, 2]);
+        policy.observe(&[outcome(1, 1, 1), outcome(2, 1, 1), outcome(3, 2, 1)], false);
+        assert_eq!(policy.last_judged[1][score_bin(HeadScore::Logit, -1.)], 1);
         plan(&mut policy);
-        assert_eq!(policy.settle_with_padding(&ids, 7, |rows| rows.next_multiple_of(4)), [1, 2, 1]);
+        assert_eq!(policy.settle_with_padding(&ids, 7, |rows| Some(rows.next_multiple_of(4))), [1, 2, 1]);
+        policy.last_judged[1][score_bin(HeadScore::Logit, -1.8)] = 1;
         plan(&mut policy);
-        assert_eq!(policy.settle_with_padding(&ids, 6, |rows| rows.next_multiple_of(4)), [1; 3]);
+        assert_eq!(policy.settle_with_padding(&ids, 7, |rows| Some(rows.next_multiple_of(4))), [2, 1, 1]);
+        plan(&mut policy);
+        assert_eq!(policy.settle_with_padding(&ids, 6, |rows| Some(rows.next_multiple_of(4))), [1; 3]);
         policy.plan(&[(1, 3)], 64);
-        assert_eq!(policy.refine(1, 3, Some(&[8., -8., -8.])), 2);
-        assert_eq!(policy.settle_with_padding(&[1], 64, |rows| rows.next_multiple_of(4)), [2]);
+        assert_eq!(policy.refine(1, 3, Some(&[-8., -8., -8.])), 1);
+        assert_eq!(policy.settle_with_padding(&[1], 64, |rows| Some(rows.next_multiple_of(4))), [0]);
     }
 
     #[test]

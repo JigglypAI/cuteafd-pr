@@ -354,7 +354,7 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     trim = serve[serve.index("    let sequences: Vec<Vec<u32>>"):serve.index("    let starts: Vec<usize>")]
     assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
     assert "Drafts::Copy" not in serve
-    copy = serve.index("policy.shape(&mut shaped, geometry.decode_rows)")
+    copy = serve.index("policy.shape_with_padding(&mut shaped, geometry.decode_rows")
     assert copy < serve.index("let sequences: Vec<Vec<u32>>")
     policy = (ROOT / "rust/crates/cuteafd-daemon/src/shared/draft/history.rs").read_text()
     assert policy.index("copy::continuation(") < policy.index("self.history.settle(&ids, rows)")

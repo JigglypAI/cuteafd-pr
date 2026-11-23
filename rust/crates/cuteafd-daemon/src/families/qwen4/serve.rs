@@ -392,6 +392,9 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize {
         self.engine.verify_bucket_rows(rows, speculative, diagnostic)
     }
+    fn verify_explore_bucket(&self, rows: usize, diagnostic: bool) -> Option<usize> {
+        Some(self.engine.verify_bucket_rows(rows, true, diagnostic))
+    }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         self.engine.verify_attention_trace(contexts, rows)
     }

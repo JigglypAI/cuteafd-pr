@@ -7,7 +7,7 @@ pub(crate) enum DraftPolicyChoice {
     /// Keep the leading drafts while their calibrated product stays above 0.3, plus one explore.
     #[default]
     History,
-    /// `history` with a rotating scored-neural explore and fill in existing verify padding.
+    /// `history` with scored neural explores only in existing verify padding.
     HistorySharedExplore,
     /// `history` with each round's cut set from the online ratio of non-row time per
     /// request to per-row time (`cuteafd_core::clamped`).

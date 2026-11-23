@@ -179,6 +179,8 @@ pub(crate) trait Backend<'a> {
         kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
+    /// `None` declares an exact-row path; `Some(rows)` on a padded path may have no slack.
+    fn verify_explore_bucket(&self, _rows: usize, _diagnostic: bool) -> Option<usize> { None }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
@@ -1411,12 +1413,14 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))
         .collect::<Vec<_>>());
     // Cut each proposal to its plan, extend agreeing ones with a history copy, fit the row budget.
+    let diagnostic = active.iter().any(|a| a.job.probe.is_some());
     let neural_lengths = match shared.as_mut() {
         Some(policy) => {
             let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).map(|(a, tokens)| Proposal {
                 id: a.ticket.id(), tokens, head: engine.draft_head(&a.draft), history: &a.history,
                 greedy: a.job.sampling.is_greedy() }).collect();
-            policy.shape(&mut shaped, geometry.decode_rows)
+            policy.shape_with_padding(&mut shaped, geometry.decode_rows, |rows|
+                engine.verify_explore_bucket(rows, diagnostic))
         }
         None => vec![0; active.len()],
     };
@@ -1436,7 +1440,6 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             engine.prefetch_decode(&history, &rows[1..]);
         }
     }
-    let diagnostic = active.iter().any(|a| a.job.probe.is_some());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let spec = sequences.iter().any(|rows| rows.len() > 1);
     let draft_us = console::us(cycle);

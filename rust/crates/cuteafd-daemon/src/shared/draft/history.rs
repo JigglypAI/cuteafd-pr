@@ -72,11 +72,11 @@ impl Policy {
     /// cover every active request in verifier order. Returns how many of each
     /// request's tokens are the drafter's own; the rest are a history copy.
     pub fn shape(&mut self, proposals: &mut [Proposal<'_>], rows: usize) -> Vec<usize> {
-        self.shape_with_padding(proposals, rows, |n| n)
+        self.shape_with_padding(proposals, rows, |_| None)
     }
 
     pub fn shape_with_padding(&mut self, proposals: &mut [Proposal<'_>], rows: usize,
-        bucket: impl Fn(usize) -> usize) -> Vec<usize> {
+        bucket: impl Fn(usize) -> Option<usize>) -> Vec<usize> {
         let mut neural = Vec::with_capacity(proposals.len());
         for proposal in proposals.iter_mut() {
             let kept = self.history.refine(proposal.id, proposal.tokens.len(), proposal.head);
