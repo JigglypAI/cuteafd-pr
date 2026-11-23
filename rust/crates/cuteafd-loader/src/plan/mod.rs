@@ -1211,8 +1211,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    // The served concurrency (0 is the launcher's derived default), as serve resolves it.
     report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
-        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
+        options.layout.as_ref().map_or(2, |layout| layout.resolved_concurrency(family.id())))?;
     report.attention_precision = Some(attention_precision::resolve(family, options.attention_precision)?);
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
