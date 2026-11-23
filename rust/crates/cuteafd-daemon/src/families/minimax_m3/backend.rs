@@ -189,8 +189,18 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let drain = self.drain();
         if drain.is_err() { self.terminal.set(true); }
         // A drained step whose peer wait timed out skipped that wait: its results are void.
-        let drain = drain.and_then(|()| self.live());
+        let drain = drain.and_then(|()| self.completed_health());
         match result { Ok(value) => { drain?; Ok(value) }, Err(error) => Err(error) }
+    }
+    fn completed_health(&self) -> Result<()> {
+        self.live()?;
+        crate::shared::spark_waves::healthy().inspect_err(|_| self.terminal.set(true))
+    }
+    fn queued<T>(&self, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => self.completed(Err(error)),
+        }
     }
     fn validate(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool) -> Result<Vec<Submitted>> {
         self.idle()?;
@@ -266,11 +276,20 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let mut graphs = self.owners.graphs.borrow_mut();
         let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
             &requests, &mut graphs, captured);
-        let logits = self.completed(result)?;
+        let logits = self.queued(result)?;
+        let paired = self.owners.storage.ranks.len() > 1;
+        if paired { self.completed_health()?; } // The paired executor drained its rank tails.
         for graph in graphs.iter_mut() { graph.tick(); }
-        if graphs.iter().any(|graph| graph.needs_boundary()) {
-            // SAFETY: completed() drained every rank; captured storage pins
-            // survive the single joined device-controller observation.
+        let observe = graphs.iter().any(|graph| graph.needs_boundary());
+        let draft = self.owners.storage.draft_prefix.as_ref();
+        if !paired && (observe || draft.is_none()) {
+            // No drafter: canonical state publishes before selection. Graph
+            // maintenance likewise needs a completed sample.
+            self.completed(Ok(()))?;
+        }
+        if observe {
+            // SAFETY: paired execution or the publication/maintenance fence
+            // just drained the target queues. Pins borrow persistent storage.
             unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| {
                 for graph in graphs.iter_mut() { graph.visit(visit)?; }
                 Ok(())
@@ -278,7 +297,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             for graph in graphs.iter_mut() { graph.observed(); }
         }
         drop(graphs);
-        if let Some(draft) = &self.owners.storage.draft_prefix {
+        if let Some(draft) = draft {
             let staged = (|| {
                 let owner = self.owners.storage.ranks.last().context("MiniMax tap rank missing")?.decode.borrow();
                 let source = owner.target_taps().context("MiniMax admitted decode taps missing")?.output();
@@ -286,7 +305,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
                 retain_decode_taps(self.library(), source, target.buffer, queries.len(),
                     draft.drafter.cfg.taps.len() * self.cfg.hidden * 2, owner.stream.raw)
             })();
-            self.completed(staged)?;
+            self.queued(staged)?;
             // Keep native target writes and taps staged just like eager verify:
             // accept advances target and draft frontiers together after selection.
             *self.pending.borrow_mut() = Some(submitted);
@@ -597,7 +616,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             }
             Ok(())
         })();
-        self.completed(checked)
+        // The plain receipt only validates already-published host metadata.
+        self.queued(checked)
     }
     fn cancel(&self, placement: &Placement) -> Result<()> {
         // Drain before removing evidence or returning pages/slots to the scheduler.
@@ -1007,7 +1027,7 @@ mod tests {
         assert!(!verify.contains("draft_prefix.is_some()"));
         let decode = source.split_once("    fn decode(").unwrap().1
             .split_once("impl Drop").unwrap().0;
-        let staged = decode.split_once("if let Some(draft)").unwrap().1
+        let staged = decode.split_once("if let Some(draft) = draft").unwrap().1
             .split_once("// Non-speculative input").unwrap().0;
         assert!(staged.contains("retain_decode_taps("));
         assert!(staged.contains("Some(submitted)"));
