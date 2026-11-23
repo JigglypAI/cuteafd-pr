@@ -9,7 +9,7 @@ use crate::shared::memory::{
     weight_arena::DeviceWeightArena,
     Tag,
 };
-use crate::shared::peer_split::{slice_2d, Axis};
+use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step};
 use crate::shared::target_head::TargetHead;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 use anyhow::{bail, ensure, Context, Result};
@@ -37,9 +37,7 @@ use cuteafd_loader::shared::token_table::{AdmissionTimedOut, TablePipeline};
 use cuteafd_loader::{GatherLease, GatherTicket, TableStatsSnapshot};
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -411,51 +409,58 @@ pub(crate) struct Hy4RankWeights<'a> {
     pub(crate) local_vocab: usize,
 }
 
-fn read_tensor_bytes(checkpoint: &Checkpoint, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
-    let entry = checkpoint
-        .tensors
-        .iter()
-        .find(|t| t.meta.name == name)
-        .with_context(|| format!("Hy4-flash checkpoint missing tensor {name}"))?;
-    let file = File::open(checkpoint.snapshot.join(&entry.shard))
-        .with_context(|| format!("opening shard {} for {name}", entry.shard))?;
-    let mut bytes = vec![0u8; usize::try_from(entry.meta.byte_length)?];
-    file.read_exact_at(&mut bytes, entry.meta.byte_offset)?;
-    Ok((bytes, entry.meta.dtype.clone(), entry.meta.shape.clone()))
-}
-
-fn read_packed_engram(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, name: &str) -> Result<Option<Vec<u8>>> {
-    let pack = |prefix: &str, count: usize, suffix: &str| -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        for j in 0..count {
-            let tname = format!("{prefix}.{j}{suffix}");
-            let (raw, dtype, _) = read_tensor_bytes(checkpoint, &tname)?;
-            ensure!(dtype == DType::Bf16, "Hy4-flash Engram tensor {tname} expected BF16, got {dtype:?}");
-            out.extend_from_slice(&raw);
+fn packed_engram_rects(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, name: &str) -> Result<Option<Vec<Rect>>> {
+    for (packed, source, count, suffix) in [
+        (".lookup_per_head_norms.packed", ".lookup_per_head_norms", cfg.engram_total_heads(), ".weight"),
+        (".key_projs.packed.weight", ".key_projs", cfg.hc_mult, ".weight"),
+        (".key_projs.packed.bias", ".key_projs", cfg.hc_mult, ".bias"),
+        (".norm_key.packed", ".norm_key", cfg.hc_mult, ".weight"),
+        (".norm_query.packed", ".norm_query", cfg.hc_mult, ".weight"),
+        (".unified_per_hc_scales.packed", ".unified_per_hc_scales", cfg.hc_mult, ""),
+    ] {
+        if let Some(prefix) = name.strip_suffix(packed) {
+            return (0..count).map(|i| {
+                let tensor = format!("{prefix}{source}.{i}{suffix}");
+                ensure!(checkpoint.header(&tensor).is_some_and(|h| h.dtype == DType::Bf16),
+                    "Hy4-flash Engram tensor {tensor} must be BF16");
+                Rect::tensor(checkpoint, &tensor, None, None)
+            }).collect::<Result<Vec<_>>>().map(Some);
         }
-        Ok(out)
-    };
-    if let Some(p) = name.strip_suffix(".lookup_per_head_norms.packed") {
-        return Ok(Some(pack(&format!("{p}.lookup_per_head_norms"), cfg.engram_total_heads(), ".weight")?));
-    }
-    if let Some(p) = name.strip_suffix(".key_projs.packed.weight") {
-        return Ok(Some(pack(&format!("{p}.key_projs"), cfg.hc_mult, ".weight")?));
-    }
-    if let Some(p) = name.strip_suffix(".key_projs.packed.bias") {
-        return Ok(Some(pack(&format!("{p}.key_projs"), cfg.hc_mult, ".bias")?));
-    }
-    if let Some(p) = name.strip_suffix(".norm_key.packed") {
-        return Ok(Some(pack(&format!("{p}.norm_key"), cfg.hc_mult, ".weight")?));
-    }
-    if let Some(p) = name.strip_suffix(".norm_query.packed") {
-        return Ok(Some(pack(&format!("{p}.norm_query"), cfg.hc_mult, ".weight")?));
-    }
-    if let Some(p) = name.strip_suffix(".unified_per_hc_scales.packed") {
-        return Ok(Some(pack(&format!("{p}.unified_per_hc_scales"), cfg.hc_mult, "")?));
     }
     Ok(None)
 }
 
+fn dense_rect(checkpoint: &Checkpoint, name: &str, rank: usize, gpus: usize) -> Result<Rect> {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    let tensor = if checkpoint.contains_tensor(name) { name.to_owned() } else { format!("{name}.weight") };
+    let header = checkpoint.header(&tensor).with_context(|| format!("Hy4-flash checkpoint missing {tensor}"))?;
+    let element = match header.dtype {
+        DType::Bf16 | DType::F16 => 2,
+        DType::F32 => 4,
+        ref other => bail!("Hy4-flash unsupported target tensor dtype {other:?} for {tensor}"),
+    };
+    let share = |n: usize| -> Result<Range<usize>> {
+        ensure!(n % gpus == 0, "Hy4-flash {tensor} cannot split extent {n} across {gpus} ranks");
+        let width = n / gpus;
+        Ok(rank * width..(rank + 1) * width)
+    };
+    let (rows, cols) = if stem.ends_with(".self_attn.learnable_sink_param") {
+        ensure!(header.dtype == DType::F32 && header.shape.len() == 1, "bad sink shape for {tensor}");
+        (None, Some(share(header.shape[0] * element)?))
+    } else if gpus == 2 && header.shape.len() == 2 {
+        let split = if stem == "lm_head" { CoreSplit::Output } else { core_split(stem) };
+        match split {
+            CoreSplit::Output => (Some(share(header.shape[0])?), None),
+            CoreSplit::Input => (None, Some(share(header.shape[1] * element)?)),
+            CoreSplit::Whole => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    Rect::tensor(checkpoint, &tensor, rows, cols)
+}
+
+#[cfg(test)]
 fn pack_kv_b_absorbed(
     raw: &[u8],
     local_heads: usize,
@@ -566,194 +571,186 @@ impl<'a> Hy4RankWeights<'a> {
         let layouts = target_arenas(checkpoint, cfg, &model.core, &modes, gpus)?;
         ensure!(layouts.len() == gpus, "target_arenas rank count mismatch");
 
-        let mut ranks = Vec::with_capacity(gpus);
-        for (rank, layout) in layouts.into_iter().enumerate() {
-            let device = devices[rank];
-            let arena = DeviceWeightArena::new(
-                device,
-                layout.arena.clone(),
-                ArenaTag::weights("hy4_flash/target"),
-            )?;
+        let library = devices[0].library;
+        let dense = DenseLoad::mount(library);
+        let mount = cuteafd_loader::families::hy4_flash::weight_layout::target_mount_load(checkpoint, gpus)?;
+        // At most a serial native conversion reader and the shared dense
+        // reader can coexist on a mounted snapshot.
+        let mount_owners = [("hy4_flash/dense-mount-source", 2 * mount.pinned_source),
+            ("hy4_flash/dense-mount-rows", 2 * mount.full_row_cache),
+            ("hy4_flash/dense-mount-tables", 2 * mount.pinned_tables)];
+        admit_host_memory(0, &mount_owners, 0, 0)?;
+        dense.admit_mount(mount)?;
+        let ranks = crate::shared::experts::rtx::push::load_alone(&checkpoint.snapshot, devices, || {
+            let mut ranks = Vec::with_capacity(gpus);
+            for (rank, layout) in layouts.into_iter().enumerate() {
+                let device = devices[rank];
+                let arena = DeviceWeightArena::new(
+                    device,
+                    layout.arena.clone(),
+                    ArenaTag::weights("hy4_flash/target"),
+                )?;
 
-            // Load compact-core EXL3/FP8 projections directly into their preplanned arena views.
-            let native = Hy4NativeCore::load(device, programs, checkpoint, &layout, max_rows, &arena)?;
-            let claimed_by_native = |name: &str| -> bool {
-                for suffix in [".trellis", ".suh", ".svh"] {
-                    if let Some(stem) = name.strip_suffix(suffix) {
-                        if layout.core.contains_key(stem) {
-                            return true;
-                        }
-                    }
-                }
-                for suffix in [".payload", ".scales"] {
-                    if let Some(stem) = name.strip_suffix(suffix) {
-                        if layout.fp8.contains_key(stem) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            };
-
-            let mut views = BTreeMap::new();
-            let mut embedding = None;
-            let mut inv_freq_dsa = None;
-            let mut inv_freq_swa = None;
-
-            for (name, view_meta) in layout.arena.views() {
-                if claimed_by_native(name) {
-                    continue;
-                }
-                if name == ROPE_INV_FREQ_DSA {
-                    let bytes = inv_freq_bytes(cfg.qk_rope_dim, cfg.sparse_rope_theta);
-                    ensure!(bytes.len() == view_meta.bytes(), "{name}: inv_freq bytes mismatch");
-                    let alloc = arena.view(name, view_meta.bytes())?;
-                    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
-                    inv_freq_dsa = Some(alloc);
-                    continue;
-                }
-                if name == ROPE_INV_FREQ_SWA {
-                    let bytes = inv_freq_bytes(cfg.swa_qk_rope_dim, cfg.swa_rope_theta);
-                    ensure!(bytes.len() == view_meta.bytes(), "{name}: inv_freq bytes mismatch");
-                    let alloc = arena.view(name, view_meta.bytes())?;
-                    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
-                    inv_freq_swa = Some(alloc);
-                    continue;
-                }
-                if name == "model.embed_tokens.weight" {
-                    let entry = checkpoint
-                        .tensors
-                        .iter()
-                        .find(|t| t.meta.name == *name)
-                        .context("Hy4-flash missing model.embed_tokens.weight")?;
-                    let source = EmbedSource::new(
-                        &checkpoint.snapshot,
-                        &entry.shard,
-                        &entry.meta,
-                        cfg.hidden,
-                    )?;
-                    let (emb, ()) = device.run(|| {
-                        TokenEmbedding::load_with(
-                            device.library,
-                            source,
-                            EmbedPlacement::Gpu,
-                            || Ok(()),
-                            |_, bytes| arena.view("model.embed_tokens.weight", bytes),
-                        )
-                    })?;
-                    embedding = Some(emb);
-                    continue;
-                }
-
-                let alloc = arena.view(name, view_meta.bytes())?;
-                let stem = name.strip_suffix(".weight").unwrap_or(name);
-                if let Some(proj) = model.core.get(stem).filter(|_| stem.ends_with(".self_attn.kv_b_proj")) {
-                    let local_heads = (proj.shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
-                    dequant_kv_b_trellis_absorbed(device, programs, checkpoint, proj, rank, gpus, local_heads,
-                        cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, alloc.buffer)?;
-                    views.insert(name.clone(), alloc);
-                    continue;
-                }
-                let upload_bytes: Vec<u8> = if let Some(packed) = read_packed_engram(checkpoint, cfg, name)? {
-                    packed
-                } else {
-                    if stem.ends_with(".self_attn.kv_b_proj") {
-                        let (raw, dtype, shape) = read_tensor_bytes(checkpoint, name)?;
-                        ensure!(dtype == DType::Bf16 && shape.len() == 2, "bad kv_b_proj shape for {name}");
-                        let sliced = if gpus == 2 {
-                            slice_2d(&raw, shape[0], shape[1], 2, Axis::Rows, rank, gpus)
-                        } else {
-                            raw
-                        };
-                        let local_heads = (shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
-                        pack_kv_b_absorbed(&sliced, local_heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank)?
-                    } else {
-                        let ckpt_name = if checkpoint.contains_tensor(name) {
-                            name.clone()
-                        } else {
-                            format!("{name}.weight")
-                        };
-                        let (raw, dtype, shape) = read_tensor_bytes(checkpoint, &ckpt_name)?;
-                        let elem = match dtype {
-                            DType::Bf16 | DType::F16 => 2usize,
-                            DType::F32 => 4usize,
-                            other => bail!("Hy4-flash unsupported target tensor dtype {other:?} for {ckpt_name}"),
-                        };
-
-                        if stem.ends_with(".self_attn.learnable_sink_param") {
-                            ensure!(dtype == DType::F32 && shape.len() == 1, "bad sink shape for {name}");
-                            let local_heads = shape[0] / gpus;
-                            let start = rank * local_heads * 4;
-                            raw[start..start + local_heads * 4].to_vec()
-                        } else if stem == "lm_head" || (gpus == 2 && shape.len() == 2) {
-                            let split = if stem == "lm_head" {
-                                CoreSplit::Output
-                            } else {
-                                core_split(stem)
-                            };
-                            match split {
-                                CoreSplit::Output if gpus == 2 => {
-                                    slice_2d(&raw, shape[0], shape[1], elem, Axis::Rows, rank, gpus)
-                                }
-                                CoreSplit::Input if gpus == 2 => {
-                                    slice_2d(&raw, shape[0], shape[1], elem, Axis::Cols, rank, gpus)
-                                }
-                                _ => raw,
+                // Load compact-core EXL3/FP8 projections directly into their preplanned arena views.
+                let native = Hy4NativeCore::load(device, programs, checkpoint, &layout, max_rows, &arena)?;
+                let claimed_by_native = |name: &str| -> bool {
+                    for suffix in [".trellis", ".suh", ".svh"] {
+                        if let Some(stem) = name.strip_suffix(suffix) {
+                            if layout.core.contains_key(stem) {
+                                return true;
                             }
-                        } else {
-                            raw
                         }
                     }
+                    for suffix in [".payload", ".scales"] {
+                        if let Some(stem) = name.strip_suffix(suffix) {
+                            if layout.fp8.contains_key(stem) {
+                                return true;
+                            }
+                        }
+                    }
+                    false
                 };
 
-                ensure!(
-                    upload_bytes.len() == view_meta.bytes(),
-                    "Hy4-flash {name}: upload bytes {} != arena view {}",
-                    upload_bytes.len(),
-                    view_meta.bytes()
-                );
-                device.run(|| device.library.copy_h2d(alloc.buffer, &upload_bytes))?;
-                views.insert(name.clone(), alloc);
-            }
+                let mut views = BTreeMap::new();
+                let mut embedding = None;
+                let mut inv_freq_dsa = None;
+                let mut inv_freq_swa = None;
 
-            let inv_freq_dsa = inv_freq_dsa.context("Hy4-flash target arena missing inv_freq_dsa view")?;
-            let inv_freq_swa = inv_freq_swa.context("Hy4-flash target arena missing inv_freq_swa view")?;
-
-            let local_vocab = cfg.vocab_size / gpus;
-            let (head_ws, head) = if views.contains_key("lm_head.weight") {
-                let ws = Allocation::new(device, HEAD_WS_BYTES, Tag::workspace("hy4_flash/head-cublas-ws"))?;
-                let h = device.run(|| {
-                    // SAFETY: `ws` stays alive in `Hy4RankWeights` for the full lifetime of `head`.
-                    unsafe {
-                        device.library.vocabulary_head_rows(
-                            ws.buffer.ptr,
-                            cfg.hidden as u32,
-                            max_head_rows.min(64) as u32,
-                            local_vocab as u32,
-                            TargetHead::configured().native_mode(),
-                        )
+                for (name, view_meta) in layout.arena.views() {
+                    if claimed_by_native(name) {
+                        continue;
                     }
-                })?;
-                (Some(ws), Some(h))
-            } else {
-                (None, None)
-            };
+                    if name == ROPE_INV_FREQ_DSA || name == ROPE_INV_FREQ_SWA {
+                        let (dim, theta, view) = if name == ROPE_INV_FREQ_DSA {
+                            (cfg.qk_rope_dim, cfg.sparse_rope_theta, &mut inv_freq_dsa)
+                        } else {
+                            (cfg.swa_qk_rope_dim, cfg.swa_rope_theta, &mut inv_freq_swa)
+                        };
+                        let bytes = inv_freq_bytes(dim, theta);
+                        let alloc = arena.view(name, bytes.len())?;
+                        device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
+                        *view = Some(alloc);
+                        continue;
+                    }
+                    if name == "model.embed_tokens.weight" {
+                        let entry = checkpoint
+                            .tensors
+                            .iter()
+                            .find(|t| t.meta.name == *name)
+                            .context("Hy4-flash missing model.embed_tokens.weight")?;
+                        let source = EmbedSource::new(
+                            &checkpoint.snapshot,
+                            &entry.shard,
+                            &entry.meta,
+                            cfg.hidden,
+                        )?;
+                        let (emb, ()) = device.run(|| {
+                            TokenEmbedding::load_with(
+                                device.library,
+                                source,
+                                EmbedPlacement::Gpu,
+                                || Ok(()),
+                                |_, bytes| arena.view("model.embed_tokens.weight", bytes),
+                            )
+                        })?;
+                        embedding = Some(emb);
+                        continue;
+                    }
 
-            ranks.push(Self {
-                device,
-                rank,
-                gpus,
-                layout,
-                arena,
-                views,
-                native,
-                embedding,
-                inv_freq_dsa,
-                inv_freq_swa,
-                head_ws,
-                head,
-                local_vocab,
-            });
+                    let alloc = arena.view(name, view_meta.bytes())?;
+                    let stem = name.strip_suffix(".weight").unwrap_or(name);
+                    if stem.ends_with(".self_attn.kv_b_proj") {
+                        if !model.core.contains_key(stem) {
+                            let header = checkpoint.header(name).context("Hy4 BF16 KV-B header missing")?;
+                            ensure!(header.dtype == DType::Bf16 && header.shape.len() == 2,
+                                "bad BF16 KV-B shape for {name}");
+                            let nope = cfg.qk_nope_dim;
+                            let v = cfg.v_head_dim;
+                            let lat = cfg.kv_lora_rank;
+                            let rect = dense_rect(checkpoint, name, rank, gpus)?;
+                            let heads = rect.rows.len() / (nope + v);
+                            let uk_bytes = heads * lat * nope * 2;
+                            let uv_bytes = heads * v * lat * 2;
+                            ensure!(rect.rows.len() == heads * (nope + v) && rect.width() == lat * 2
+                                && rect.bytes() == uk_bytes + uv_bytes && alloc.buffer.bytes == uk_bytes + uv_bytes,
+                                "Hy4 KV-B source or destination extent differs for {name}");
+                            dense.step(Step { device: device.id, rects: vec![rect], jobs: vec![Job::Absorb {
+                                heads, nope, v, lat,
+                                uk: CuteafdDeviceBuffer { bytes: uk_bytes, ..alloc.buffer },
+                                uv: CuteafdDeviceBuffer { ptr: alloc.buffer.ptr.wrapping_byte_add(uk_bytes), bytes: uv_bytes, ..alloc.buffer },
+                            }] }, std::ptr::null_mut())?;
+                        }
+                    } else {
+                        let rects = match packed_engram_rects(checkpoint, cfg, name)? {
+                            Some(rects) => rects,
+                            None => vec![dense_rect(checkpoint, name, rank, gpus)?],
+                        };
+                        let mut bytes = 0;
+                        let lands = rects.into_iter().map(|rect| {
+                            let start = bytes;
+                            bytes += rect.bytes();
+                            (rect, start)
+                        }).collect();
+                        ensure!(bytes == alloc.buffer.bytes, "Hy4-flash {name}: source and arena sizes differ");
+                        dense.operand(Operand { device: device.id, buffer: alloc.buffer, lands, bytes })?;
+                    }
+                    views.insert(name.clone(), alloc);
+                }
+
+                let inv_freq_dsa = inv_freq_dsa.context("Hy4-flash target arena missing inv_freq_dsa view")?;
+                let inv_freq_swa = inv_freq_swa.context("Hy4-flash target arena missing inv_freq_swa view")?;
+
+                let local_vocab = cfg.vocab_size / gpus;
+                let (head_ws, head) = if views.contains_key("lm_head.weight") {
+                    let ws = Allocation::new(device, HEAD_WS_BYTES, Tag::workspace("hy4_flash/head-cublas-ws"))?;
+                    let h = device.run(|| {
+                        // SAFETY: `ws` stays alive in `Hy4RankWeights` for the full lifetime of `head`.
+                        unsafe {
+                            device.library.vocabulary_head_rows(
+                                ws.buffer.ptr,
+                                cfg.hidden as u32,
+                                max_head_rows.min(64) as u32,
+                                local_vocab as u32,
+                                TargetHead::configured().native_mode(),
+                            )
+                        }
+                    })?;
+                    (Some(ws), Some(h))
+                } else {
+                    (None, None)
+                };
+
+                ranks.push(Self {
+                    device,
+                    rank,
+                    gpus,
+                    layout,
+                    arena,
+                    views,
+                    native,
+                    embedding,
+                    inv_freq_dsa,
+                    inv_freq_swa,
+                    head_ws,
+                    head,
+                    local_vocab,
+                });
+            }
+            Ok(ranks)
+        })?;
+        dense.release();
+        // Keep at most one quantized KV-B conversion live. The push group
+        // publishes regular weights first; a failed conversion never exposes
+        // the uninitialized absorbed view to execution.
+        for r in &ranks {
+            for (stem, proj) in &model.core {
+                if !stem.ends_with(".self_attn.kv_b_proj") {
+                    continue;
+                }
+                let local_heads = proj.shape[0] / gpus / (cfg.qk_nope_dim + cfg.v_head_dim);
+                dequant_kv_b_trellis_absorbed(r.device, programs, checkpoint, proj, r.rank, gpus, local_heads,
+                    cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, r.weight(stem)?)?;
+            }
         }
         Ok(ranks)
     }
@@ -881,9 +878,9 @@ mod tests {
                             continue;
                         }
                         if name.ends_with(".packed") || name.ends_with(".packed.weight") || name.ends_with(".packed.bias") {
-                            let packed = read_packed_engram(&checkpoint, &cfg, name)?
+                            let packed = packed_engram_rects(&checkpoint, &cfg, name)?
                                 .with_context(|| format!("missing packed handler for {name}"))?;
-                            assert_eq!(packed.len(), view_meta.bytes(), "view={view} rank {rank}/{gpus} {name}");
+                            assert_eq!(packed.iter().map(Rect::bytes).sum::<usize>(), view_meta.bytes(), "view={view} rank {rank}/{gpus} {name}");
                             continue;
                         }
                         let stem = name.strip_suffix(".weight").unwrap_or(name);

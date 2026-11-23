@@ -137,6 +137,17 @@ pub fn fp8_role(name: &str) -> Fp8Role {
     Fp8Role::exact("non-core projection", false)
 }
 
+/// Both the original and compact target recipes use the shared windowed
+/// mount reader. Expert and lookup-table shards have separate owners.
+pub fn target_mount_load(checkpoint: &Checkpoint, gpus: usize) -> Result<crate::shared::dense_read::MountLoad> {
+    crate::shared::dense_read::MountLoad::from_headers(
+        checkpoint.tensors.iter().map(|t| &t.meta).filter(|h| {
+            !h.name.contains(".mlp.experts.") && !h.name.contains(".multi_head_embedding.embedding.")
+        }),
+        gpus,
+    )
+}
+
 /// One coordinator rank's immutable packed target arena.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorWeights {
