@@ -221,3 +221,81 @@ def test_bench_ab_agentic_battery_rows_and_summary(tmp_path, monkeypatch, task_n
     table = ab.summarize(rows, ["off", "on"])
     line = next(l for l in table.splitlines() if l.startswith("c1_ttft_later_s"))
     assert line.split()[-1] == "0.250"
+
+
+def chain_server(bench, monkeypatch, replies, prompt_step=1000):
+    """A fake API whose prompt grows by `prompt_step` tokens per request."""
+    bodies = []
+
+    def fake(base, body, api_key=None, clock=None):
+        bodies.append(json.loads(json.dumps(body)))
+        reply = replies[(len(bodies) - 1) % len(replies)]
+        return dict(reasoning=reply.get("reasoning", "thinking"), content=reply.get("content", ""),
+                    calls=reply.get("calls", []), finish_reason="tool_calls" if reply.get("calls") else "stop",
+                    first_output_seconds=0.5, first_content_seconds=None, finish_seconds=1.5, done=True,
+                    usage={"prompt_tokens": prompt_step * len(bodies), "prompt_cache_hit_tokens": 0,
+                           "completion_tokens": 20})
+
+    monkeypatch.setattr(bench, "stream_turn", fake)
+    return bodies
+
+
+def test_chain_tasks_appends_the_next_task_and_stops_at_the_target(tmp_path, monkeypatch):
+    bench = load()
+    replies = [{"calls": [{"id": "a", "name": "list_dir", "arguments": '{"path": "."}'}]}, {"content": "done"}]
+    bodies = chain_server(bench, monkeypatch, replies)
+    out = tmp_path / "chain.json"
+    assert bench.main(["record", "--output", str(out), "--seeds", "1", "--chain-tasks", "--target-context", "9500",
+                       "--max-turns", "50", "--label", "c"]) == 0
+    session = json.loads(out.read_text())["sessions"][0]
+    # Ten requests: the tenth prompt (10000) reaches the target before its completion is added.
+    assert len(bodies) == len(session["turns"]) == 10 and session["stop"] == "target_context"
+    names = [t["task"] for t in session["chain"]]
+    # Seed 1 starts at the second task and cycles; five tasks were opened in ten turns.
+    assert names == ["parser", "rates", "dates", "money", "parser"]
+    assert session["chain"][4]["cycle"] == 1 and session["chain"][0]["first_turn"] == 0
+    users = [m["content"] for m in session["messages"] if m["role"] == "user"]
+    assert len(users) == 5 and users[1].startswith("Thanks, that one is done.") and bench.TASKS[2]["prompt"] in users[1]
+    assert "reset to its original state" in users[4] and "reset" not in users[3]
+    # One history: every request extends the previous one, reasoning echoed back.
+    for before, after in zip(bodies, bodies[1:]):
+        assert after["messages"][:len(before["messages"])][1:] == before["messages"][1:]
+    assert bodies[-1]["messages"][2]["reasoning_content"] == "thinking"
+    assert [t["task_index"] for t in session["turns"]] == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    assert all(t["success"] is False for t in session["chain"][:4])
+
+
+def test_chain_tasks_respects_max_turns_and_fresh_seeds(tmp_path, monkeypatch):
+    bench = load()
+    bodies = chain_server(bench, monkeypatch, [{"calls": [{"id": "a", "name": "list_dir", "arguments": '{"path": "."}'}]}])
+    out = tmp_path / "chain.json"
+    assert bench.main(["record", "--output", str(out), "--seeds", "0", "2", "--chain-tasks",
+                       "--target-context", "1000000", "--max-turns", "3", "--label", "c"]) == 0
+    sessions = json.loads(out.read_text())["sessions"]
+    assert [s["stop"] for s in sessions] == ["max_turns", "max_turns"] and len(bodies) == 6
+    assert [s["chain"][0]["task"] for s in sessions] == ["money", "rates"]
+    nonces = {b["messages"][0]["content"].splitlines()[0] for b in bodies}
+    assert len(nonces) == 2, "each seed's session has its own nonce"
+
+
+def test_chain_tasks_argument_pairing_and_key_file(tmp_path, monkeypatch):
+    bench = load()
+    chain_server(bench, monkeypatch, [{"content": "done"}])
+    with pytest.raises(SystemExit):
+        bench.main(["record", "--output", str(tmp_path / "a.json"), "--chain-tasks"])
+    with pytest.raises(SystemExit):
+        bench.main(["record", "--output", str(tmp_path / "a.json"), "--target-context", "4096"])
+    with pytest.raises(SystemExit):
+        bench.main(["record", "--output", str(tmp_path / "a.json"), "--chain-tasks", "--target-context", "10"])
+    key = tmp_path / "key"
+    key.write_text("secret\n")
+    seen = []
+    monkeypatch.setattr(bench, "stream_turn", lambda base, body, api_key=None, clock=None: seen.append((base, api_key))
+                        or dict(reasoning="", content="ok", calls=[], finish_reason="stop", first_output_seconds=0.1,
+                                first_content_seconds=0.1, finish_seconds=0.2, done=True,
+                                usage={"prompt_tokens": 2000, "prompt_cache_hit_tokens": 0, "completion_tokens": 1}))
+    monkeypatch.setenv("CUTEAFD_SMOKE_URL", "http://card:9")
+    monkeypatch.setenv("CUTEAFD_API_KEY_FILE", str(key))
+    assert bench.main(["record", "--output", str(tmp_path / "b.json"), "--seeds", "0", "--chain-tasks",
+                       "--target-context", "2000"]) == 0
+    assert seen == [("http://card:9", "secret")]

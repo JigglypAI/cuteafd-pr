@@ -3044,6 +3044,9 @@ impl Opened {
         })?;
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         probe("packing")?;
+        if let Some(dump) = crate::shared::selection_dump::shared("glm5_flash")? {
+            engine.attach_selection_dump(dump)?;
+        }
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
                 engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves,

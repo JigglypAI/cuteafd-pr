@@ -633,6 +633,9 @@ pub(crate) struct GlmEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): eager decode reads back each
+    /// full indexer layer's top-k as logical tokens. None: no drain or copy.
+    pub(super) selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
     /// Token-split attention (K3): the build's programs, set at construction (each GPU's
@@ -790,7 +793,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true, selection_dump: None })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -2331,6 +2334,8 @@ impl<'a> GlmEngine<'a> {
             return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
+        ensure!(self.selection_dump.is_none(), "{} refuses CUDA graph capture",
+            crate::shared::selection_dump::ENV_DIR);
         let pinned = self.prewarm_pins(&key);
         let Some(mut ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
         // No synchronization here: peer segments may not yet have been queued.
@@ -3094,6 +3099,9 @@ impl<'a> GlmEngine<'a> {
                 ("scratch", w.topk_scratch.buffer.ptr)],
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
+        if rank == 0 && index_cache.is_some() && tables.decode && self.context.is_none() {
+            self.dump_selection(rank, w, index, tables)?;
+        }
         // Shared-indexer layers read the previous full layer's `indices`.
         // Neither quality tier has a faster native prefill route than BF16 here.
         if !tables.decode {
@@ -3124,6 +3132,52 @@ impl<'a> GlmEngine<'a> {
                 scalars)?;
         }
         self.o_proj(rank, w, layer, cap, rows)
+    }
+
+    /// Diagnostic: drains `rank`'s stream after the top-k and records the real
+    /// decode rows' selection as logical token ids (inverted through each row's
+    /// page table; context placement keeps its merged selection elsewhere and is
+    /// refused at attach). Shared-indexer layers reuse their source's selection,
+    /// so only full layers are recorded.
+    fn dump_selection(&self, rank: usize, w: &Workspace<'_>, index: usize, tables: &StepTables) -> Result<()> {
+        use crate::shared::selection_dump::{self as dump, Layout, Row};
+        let rows = tables.exchange_rows;
+        let positions: Vec<u64> = tables.positions[..rows].iter().map(|&p| p as u64).collect();
+        let layout = Layout { width: self.cfg.index_topk, unit_tokens: 1, source: index, heads: 1 };
+        dump::record(self.selection_dump.as_deref(), index, layout, &positions, || {
+            let width = self.cfg.index_topk;
+            let bytes = rows * width * 4;
+            let raw = self.on(rank, || {
+                // SAFETY: the rank's own stream; draining it completes the top-k.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank))? };
+                let mut out = vec![0u8; bytes];
+                self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..w.indices.buffer })?;
+                Ok(out)
+            })?;
+            let slots = dump::i32s(&raw);
+            (0..rows).map(|row| {
+                // The row's real pages only (the decode table pads with page 0).
+                let pages = (tables.cache_lengths[row] as usize).div_ceil(PAGE_ROWS).min(tables.table_width);
+                let table = &tables.page_table[row * tables.table_stride..row * tables.table_stride + pages];
+                let length = tables.lengths[row] as usize;
+                Ok(Row { position: positions[row], frontier: tables.cache_lengths[row],
+                    ids: dump::logical_tokens(&slots[row * width..row * width + length], table, PAGE_ROWS)? })
+            }).collect()
+        })
+    }
+
+    /// Attaches the selection dump: eager decode only (no attached graphs),
+    /// heads or whole placement (rank 0 sees every full layer).
+    pub(super) fn attach_selection_dump(&mut self, dump: std::sync::Arc<crate::shared::selection_dump::SelectionDump>) -> Result<()> {
+        ensure!(self.context.is_none(), "{} needs heads or whole attention placement on GLM 5.3",
+            crate::shared::selection_dump::ENV_DIR);
+        ensure!(!self.weights.layers.iter().any(|l| l.attention_owner.is_some_and(|gpu| gpu != 0)),
+            "{} refuses layers placement on GLM 5.3", crate::shared::selection_dump::ENV_DIR);
+        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0,
+            "{} refuses attached CUDA graphs: set CUTEAFD_GLM_WARM_GRAPHS=0 and GPU_GRAPH_RESERVE=0",
+            crate::shared::selection_dump::ENV_DIR);
+        self.selection_dump = Some(dump);
+        Ok(())
     }
 
     /// Mistral Large 4's attention (`GlmVariant::MistralLarge4`) on the shared

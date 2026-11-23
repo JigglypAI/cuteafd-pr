@@ -469,6 +469,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
         engine.attach_dsa_dump(dump)?;
     }
+    if let Some(dump) = crate::shared::selection_dump::shared("kimi_k3")? {
+        engine.attach_selection_dump(dump)?;
+    }
     if let Some(dump) = super::score_dump::ScoreDump::from_env()? {
         engine.attach_dsa_scores(dump)?;
     }

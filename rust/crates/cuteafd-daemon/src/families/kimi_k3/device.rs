@@ -683,6 +683,9 @@ pub(crate) struct LocalLane<'a> {
     pub(super) dsa_dump: Option<Rc<super::dsa_dump::DsaDump>>,
     pub(super) dsa_scores: Option<Rc<super::score_dump::ScoreDump>>,
     pub(super) dsa_keys: Option<Rc<super::key_dump::KeyDump>>,
+    /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): the shared append-only
+    /// selection dump, decode rows only, logical token ids.
+    pub(super) selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
 }
 
 #[derive(Clone, Copy)]
@@ -740,7 +743,7 @@ impl<'a> LocalLane<'a> {
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
             replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks],
-            capture: None, dsa_dump: None, dsa_scores: None, dsa_keys: None })
+            capture: None, dsa_dump: None, dsa_scores: None, dsa_keys: None, selection_dump: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -1127,7 +1130,7 @@ impl<'a> LocalLane<'a> {
     /// A diagnostic readback adds host-visible host copies inside the step,
     /// so it excludes every recorded stream.
     fn diagnostics_active(&self) -> bool {
-        self.dsa_dump.is_some() || self.dsa_scores.is_some() || self.dsa_keys.is_some()
+        self.dsa_dump.is_some() || self.dsa_scores.is_some() || self.dsa_keys.is_some() || self.selection_dump.is_some()
     }
 
     /// Run one step body through the bounded graph cache: replay a resident
@@ -1357,6 +1360,36 @@ impl<'a> LocalLane<'a> {
             context.exchange.wait_query(self.rank, slot)?;
             Ok(())
         })
+    }
+
+    /// Diagnostic: a decode step's selected physical token slots, read back
+    /// with the row positions, causal lengths and page table the selector
+    /// used, as logical token ids (shared `CUTEAFD_DIAG_SELECTION_DUMP`).
+    fn dump_selection(&self, layer: usize, rows: usize, indices: CuteafdDeviceBuffer, table_width: usize) -> Result<()> {
+        use crate::shared::selection_dump::{self as dump, Layout, Row};
+        let Some(selection) = self.selection_dump.as_deref() else { return Ok(()) };
+        let stream = self.stream();
+        stream.drain()?;
+        let read = |buffer: CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
+            let mut out = vec![0u8; bytes];
+            stream.device.run(|| stream.device.library.copy_d2h(&mut out, view(buffer, 0, bytes)?))?;
+            Ok(out)
+        };
+        let positions: Vec<u64> = read(self.lane.buffer("DSA positions")?, rows * 8)?.chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()).max(0) as u64).collect();
+        if !selection.wants(positions.iter().copied()) { return Ok(()) }
+        let lengths = dump::i32s(&read(self.lane.buffer("DSA selected lengths")?, rows * 4)?);
+        let frontiers = dump::i32s(&read(self.lane.buffer("DSA lengths")?, rows * 4)?);
+        let table = dump::i32s(&read(self.lane.buffer("DSA page table")?, rows * table_width * 4)?);
+        let slots = dump::i32s(&read(indices, rows * 2048 * 4)?);
+        let rows = (0..rows).map(|row| {
+            let pages = (frontiers[row].max(0) as usize).div_ceil(64).min(table_width);
+            let length = (lengths[row].max(0) as usize).min(2048);
+            Ok(Row { position: positions[row], frontier: frontiers[row],
+                ids: dump::logical_tokens(&slots[row * 2048..row * 2048 + length],
+                    &table[row * table_width..row * table_width + pages], 64)? })
+        }).collect::<Result<Vec<_>>>()?;
+        selection.write(layer, Layout { width: 2048, unit_tokens: 1, source: layer, heads: 1 }, rows)
     }
 
     pub(crate) fn context_dsa_dump(&self, layer: usize, rows: usize) -> Result<()> {
@@ -1744,6 +1777,9 @@ impl<'a> LocalLane<'a> {
         super::dsa_dump::record_selected(self.dsa_dump.as_deref(), self.rank, stream, layer, batch.rows, || {
             Ok((self.lane.buffer("DSA positions")?, self.lane.buffer("DSA selected lengths")?, indices))
         })?;
+        if self.rank == 0 && batch.rows <= 64 {
+            self.dump_selection(layer, batch.rows, indices, table_width)?;
+        }
         if let Some(dump) = scores_dump {
             super::score_dump::record_scores(dump, self.rank, stream, layer, batch.rows, table_width,
                 batch.rows <= 64, || Ok(super::score_dump::ScoreBuffers {

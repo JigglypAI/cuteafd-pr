@@ -224,6 +224,38 @@ impl Workspace<'_> {
         unsafe { self.enqueue_impl(kernels, p, decode.request, decode.batch, true, stream) }
     }
 
+    /// Diagnostic (`CUTEAFD_DIAG_SELECTION_DUMP`): after a decode enqueue,
+    /// drains `stream` and records each row's selected logical 128-token
+    /// blocks per KV head (head-major plane, stride the compiled rows), folded
+    /// as `block * heads + head`. Attention never runs inside a MiniMax graph.
+    pub fn dump_decode(&self, kernels: &Kernels<'_>, layer: usize, r: Request, stream: &Stream<'_>,
+        dump: Option<&crate::shared::selection_dump::SelectionDump>) -> Result<()> {
+        use crate::shared::selection_dump::{self as selection, Layout, Row};
+        let Some(dump) = dump else { return Ok(()) };
+        let layout = kernels.decode_select.layout;
+        let heads = layout.kv_heads() as usize;
+        ensure!(heads == 4, "{} needs whole MiniMax attention (all four KV heads on one GPU)", selection::ENV_DIR);
+        stream.drain()?;
+        let read = |buffer: Buffer, bytes: usize| -> Result<Vec<u8>> {
+            let mut out = vec![0u8; bytes];
+            self.device.run(|| self.device.library.copy_d2h(&mut out, Buffer { bytes, ..buffer }))?;
+            Ok(out)
+        };
+        let positions: Vec<u64> = read(r.positions, r.rows * 8)?.chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()).max(0) as u64).collect();
+        let plane = selection::i32s(&read(self.plane("selections")?, heads * layout.rows as usize * 64)?);
+        let rows = (0..r.rows).map(|row| {
+            let mut ids = Vec::with_capacity(heads * 16);
+            for head in 0..heads {
+                let at = (head * layout.rows as usize + row) * 16;
+                ids.extend(plane[at..at + 16].iter().filter(|&&b| b >= 0).map(|&b| b * heads as i32 + head as i32));
+            }
+            Row { position: positions[row], frontier: ((positions[row] + 1).div_ceil(128)) as i32, ids }
+        }).collect();
+        selection::record(Some(dump), layer, Layout { width: heads * 16, unit_tokens: 128, source: layer, heads: heads as u32 },
+            &positions, || Ok(rows))
+    }
+
     unsafe fn enqueue_impl(&self, kernels: &Kernels<'_>, p: Projections, r: Request,
         batch: usize, decode: bool, stream: &Stream<'_>) -> Result<Buffer> {
         ensure!(self.device.id == kernels.device.id && self.device.id == stream.device.id
