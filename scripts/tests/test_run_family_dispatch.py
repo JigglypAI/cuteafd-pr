@@ -1915,9 +1915,9 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
 
 @pytest.mark.parametrize("family_config,model,row_key,rtx,ranks", [
     ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
-      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_BATCH_TOKENS", 1, 4),
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_ROWS", 1, 4),
     ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
-      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_BATCH_TOKENS", 2, 6),
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_ROWS", 2, 6),
     ({"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
       "first_k_dense_replace": 1, "moe_layer_freq": 1}}, "test/Kimi-K3", "PREFILL_ROWS", 2, 6),
     ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
@@ -5778,7 +5778,7 @@ def test_nondefault_config_handoff_matches_composed_serving_values(tmp_path, fam
     if local:
         keys += "EXPERT_BACKEND=local\n"
     else:
-        prefill = "PREFILL_BATCH_TOKENS" if family in ("deepseek_v41", "step5") else "PREFILL_ROWS"
+        prefill = "PREFILL_BATCH_TOKENS" if family == "deepseek_v41" else "PREFILL_ROWS"
         keys += f"{prefill}=1024\nRTX_EXPERT_LAYERS=0\n"
     has_kv = family in ("mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark")
     if has_kv:

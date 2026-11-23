@@ -484,7 +484,7 @@ impl<'a> Step5Recipe<'a> {
             if rank == usize::from(ownership.execution().spec().entry_gpu) {
                 let count = inputs.inventory.spark_ranks;
                 let bytes = crate::serving_capacity::prefill_return_bytes_with_format(1, inputs.rows as u64,
-                    count as u64, 4096, inputs.spark_reply_format)?.max(256 * count as u64);
+                    count as u64, 4096, inputs.spark_reply_formats.prefill(false))?.max(256 * count as u64);
                 physical(&mut fixed, &mut backings, rank, Category::Transport, "Step-5 Spark intake planes",
                     if count == 0 { vec![] } else { vec![bytes / count as u64; count] })?;
                 physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 routed reply",
@@ -564,7 +564,7 @@ impl<'a> Step5Recipe<'a> {
             prefill: Pin::Exact(self.prefill),
             operation: Operation::Serving,
             resident_weight_limit: self.inputs.resident_weight_limit,
-            spark_reply_formats: Default::default(),
+            spark_reply_formats: self.inputs.spark_reply_formats,
         }
     }
 
@@ -693,7 +693,10 @@ impl Recipe for Step5Recipe<'_> {
         let mut contract = Contract {
             floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
-            spark_reply_formats: None,
+            spark_reply_formats: (self.inputs.inventory.spark_ranks > 0).then(|| cuteafd_core::spark_reply::SparkReplyFormats {
+                prefill: Some(request.spark_reply_formats.prefill(false)),
+                decode: Some(request.spark_reply_formats.decode()),
+            }),
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
             pool_page_multiple: 1,

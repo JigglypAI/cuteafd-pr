@@ -360,7 +360,7 @@ mod tests {
         let inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
             bf16_target_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
             host: HostInputs::default(), resident_weight_limit: None,
-            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            spark_reply_formats: Default::default(),
             kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
             inventory: PlacementInventory { gpus: vec![GpuBudget { capacity_bytes: 96 << 30,
                 reserve_bytes: 0, baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],

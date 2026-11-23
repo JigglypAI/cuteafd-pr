@@ -185,7 +185,8 @@ pub struct RuntimeInputs {
     pub host: HostInputs,
     pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     pub resident_weight_limit: Option<ResidentWeights>,
-    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
+    /// Requested Spark reply formats; admission resolves and records both phases.
+    pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
     /// Span rows: every per-call plane's rows (`waves` units).
@@ -672,7 +673,7 @@ mod tests {
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
         RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: crate::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
-            host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            host: Default::default(), resident_weight_limit: None, spark_reply_formats: Default::default(),
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             waves: 1, unit: 0,
             inventory: Inventory {
@@ -999,7 +1000,7 @@ mod tests {
             for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
                     cuteafd_core::SparkReplyFormat::Nvfp4] {
                 let mut input = inputs(ranks);
-                input.spark_reply_format = format;
+                input.spark_reply_formats.prefill = Some(format);
                 input.rows = 3 * 2752;
                 input.waves = 3;
                 input.unit = 2752;
@@ -1011,6 +1012,19 @@ mod tests {
                 assert_eq!(intake[0].bytes, 4
                     * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(input.rows as u64 * 4096 * 2)?);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_decode_reply_format_reaches_the_resolved_decisions() -> Result<()> {
+        use cuteafd_core::{spark_reply::SparkReplyFormats, SparkReplyFormat::{Bf16, Fp8, Nvfp4}};
+        for decode in [None, Some(Fp8), Some(Nvfp4)] {
+            let mut input = inputs(1);
+            input.spark_reply_formats = SparkReplyFormats { prefill: None, decode };
+            let admission = run(&input).with_context(|| format!("decode {decode:?}"))?;
+            assert_eq!(admission.solved.decisions.spark_reply_formats,
+                Some(SparkReplyFormats { prefill: Some(Bf16), decode: Some(decode.unwrap_or(Bf16)) }));
         }
         Ok(())
     }
