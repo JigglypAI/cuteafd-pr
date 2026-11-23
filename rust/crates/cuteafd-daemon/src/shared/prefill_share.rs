@@ -716,6 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn packed_tables_split_before_submission_and_the_next_wave_runs() {
+        let budget = crate::shared::prefill_packing::TableBudget([10, 2]);
+        let mut queue = PrefillQueue::new(0.0).one_wave_rounds();
+        let entries = [[4, 1], [4, 1], [5, 2], [4, 1], [1, 1]];
+        for id in 0..entries.len() { queue.push(Prompt { id, left: 1 }); }
+        let mut waves = Vec::new();
+        while !queue.is_empty() {
+            let finished = queue.round_packed(32, 8, |p| Some(p.left), |group, next|
+                budget.fits(group.iter().chain([next]).map(|p| entries[p.id])), |group| {
+                    // A backend given an oversized group would fail before its submission.
+                    assert!(budget.offsets(group.iter().map(|p| entries[p.id])).is_ok());
+                    waves.push(group.iter().map(|p| p.id).collect::<Vec<_>>());
+                    group.iter().map(|_| Ok(Chunk::Done)).collect()
+                });
+            assert!(!finished.is_empty() && finished.iter().all(|(_, result)| result.is_ok()));
+        }
+        assert_eq!(waves, [vec![0, 1], vec![2], vec![3, 4]]);
+        assert!(budget.offsets([[usize::MAX, 0], [1, 0]]).is_err());
+    }
+
+    #[test]
     fn packed_round_is_queued_only_bounded_and_never_skips_an_ineligible_member() {
         let mut queue = PrefillQueue::new(0.2).one_wave_rounds();
         let mut groups = Vec::new();

@@ -16,7 +16,7 @@
 //! step's one table row, and each sequence's drafter taps (its last rows, as a pass of its own
 //! takes them) to their own tap rows, so a pass needs no buffer a one-sequence pass does not.
 use super::engine::{KPOOL, PAGE_ROWS};
-use anyhow::{ensure, Result};
+use anyhow::Result;
 
 /// Tokens of one pool-cache page (64 pools of [`KPOOL`] tokens).
 const POOL_PAGE_TOKENS: usize = KPOOL * PAGE_ROWS;
@@ -76,21 +76,18 @@ pub(crate) fn plan(chunks: &[(usize, usize)], limits: &Limits) -> Result<Vec<Seg
     let layout = crate::shared::prefill_packing::plan(chunks, &crate::shared::prefill_packing::Limits {
         rows: limits.rows, chunk_rows: limits.chunk_rows, max_context: limits.max_context, taps: limits.taps,
     })?;
-    let mut out = Vec::with_capacity(chunks.len());
-    let (mut pages, mut pools) = (0, 0);
-    for segment in layout {
+    let columns = |segment: &crate::shared::prefill_packing::Segment| {
+        let end = segment.start + segment.rows;
+        [end.div_ceil(PAGE_ROWS), end.div_ceil(POOL_PAGE_TOKENS)]
+    };
+    let offsets = crate::shared::prefill_packing::TableBudget([limits.table_pages, limits.table_pool_pages])
+        .offsets(layout.iter().map(columns))?;
+    Ok(layout.into_iter().zip(offsets).map(|(segment, [page_offset, pool_offset])| {
+        let [page_columns, pool_columns] = columns(&segment);
         let crate::shared::prefill_packing::Segment { first, rows, start, tap_offset, tap_rows } = segment;
-        let end = start + rows;
-        let (page_columns, pool_columns) = (end.div_ceil(PAGE_ROWS), end.div_ceil(POOL_PAGE_TOKENS));
-        out.push(Segment { first, rows, start, page_offset: pages, page_columns, pool_offset: pools, pool_columns,
-            long: end > limits.dense_context, tap_offset, tap_rows });
-        pages += page_columns;
-        pools += pool_columns;
-    }
-    ensure!(pages <= limits.table_pages && pools <= limits.table_pool_pages,
-        "a packed prefill's page tables ({pages} record and {pools} pool pages) exceed one table row ({} and {})",
-        limits.table_pages, limits.table_pool_pages);
-    Ok(out)
+        Segment { first, rows, start, page_offset, page_columns, pool_offset, pool_columns,
+            long: start + rows > limits.dense_context, tap_offset, tap_rows }
+    }).collect())
 }
 
 /// Whether `chunks` fit one packed pass.

@@ -156,6 +156,8 @@ pub(crate) trait Backend<'a> {
         Ok(self.prefill_device(placement, tokens, logit_rows, pool)?.map(probe::ScoreLogits::Device))
     }
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> { None }
+    fn packed_table_budget(&self) -> Option<crate::shared::prefill_packing::TableBudget> { None }
+    fn packed_table_entries(&self, _placement: &Self::Placement) -> [usize; 2] { [0; 2] }
     fn coordinator_packed_cap(&self) -> Result<Option<usize>> { Ok(None) }
     fn checked_packed_limits(&self) -> Result<Option<crate::shared::prefill_packing::Limits>> {
         let mut limits = self.packed_limits();
@@ -1087,10 +1089,13 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let caching = cache.enabled();
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
             let limits = engine.checked_packed_limits()?;
+            let table_budget = engine.packed_table_budget();
             let finished = prefills.round_packed_excluding(limits.map_or(0, |l| l.rows), max_sequences, turn.prefill_excluded(),
                 |p| packed_chunk(p).map(|(_, rows)| rows),
                 |group, next| limits.is_some_and(|limits| crate::shared::prefill_packing::plan(
-                    &group.iter().chain([next]).filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok()),
+                    &group.iter().chain([next]).filter_map(packed_chunk).collect::<Vec<_>>(), &limits).is_ok())
+                    && table_budget.is_none_or(|budget| budget.fits(group.iter().chain([next])
+                        .map(|p| engine.packed_table_entries(&p.placement)))),
                 |group| {
                     if group.len() > 1 {
                         if let Err(error) = offer() {

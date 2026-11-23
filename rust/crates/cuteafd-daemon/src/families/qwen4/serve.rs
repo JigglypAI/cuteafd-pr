@@ -373,6 +373,12 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
         self.engine.packed_limits()
     }
+    fn packed_table_budget(&self) -> Option<crate::shared::prefill_packing::TableBudget> {
+        Some(self.engine.packed_table_budget())
+    }
+    fn packed_table_entries(&self, placement: &Self::Placement) -> [usize; 2] {
+        placement.packed_table_entries()
+    }
     fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Self::Placement, Self::Draft>],
         _pool: &cuteafd_engine::prefix::RefPagePool,
         on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
