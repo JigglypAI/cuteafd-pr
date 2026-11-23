@@ -391,6 +391,44 @@ def session_only(dump, min_position: int):
     return out
 
 
+def _run_forked(jobs: dict, layers: list, workers: int):
+    """Analyze layers in forked children (they inherit the decoded dumps, so no
+    function is pickled); each child pickles only its result to a temp file."""
+    import os
+    import pickle
+    import tempfile
+    if workers == 1:
+        for layer in layers:
+            yield analyze_layer(*jobs[layer])
+        return
+    with tempfile.TemporaryDirectory(prefix="sparse-study-") as tmp:
+        pending, running = list(layers), {}
+        done = {}
+        while pending or running:
+            while pending and len(running) < workers:
+                layer = pending.pop(0)
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        out = {k: list(v) for k, v in analyze_layer(*jobs[layer]).items()}
+                        with open(os.path.join(tmp, f"{layer}.pkl"), "wb") as f:
+                            pickle.dump(out, f)
+                        os._exit(0)
+                    except BaseException:
+                        import traceback
+                        traceback.print_exc()
+                        os._exit(1)
+                running[pid] = layer
+            pid, status = os.wait()
+            layer = running.pop(pid)
+            if status != 0:
+                raise RuntimeError(f"layer {layer} analysis failed (status {status})")
+            with open(os.path.join(tmp, f"{layer}.pkl"), "rb") as f:
+                done[layer] = pickle.load(f)
+        for layer in layers:
+            yield done[layer]
+
+
 def tidy(args) -> int:
     files = sorted(args.dump.glob("layer-*.bin"))
     if not files:
@@ -404,12 +442,11 @@ def tidy(args) -> int:
     for layer, d in sorted(dumps.items()):
         earlier = [l for l in dumps if l < layer and dumps[l]["unit_tokens"] == d["unit_tokens"] and dumps[l]["heads"] == d["heads"]]
         jobs[layer] = (d, by_pos[max(earlier)] if earlier else None)
-    import concurrent.futures
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max(1, min(args.jobs, len(jobs)))) as pool:
-        futures = {layer: pool.submit(analyze_layer, d, source) for layer, (d, source) in jobs.items()}
-        for layer, future in futures.items():
-            per_layer[layer] = future.result()
-            print(f"{args.family} layer {layer}: {len(dumps[layer]['position'])} records", file=sys.stderr, flush=True)
+    layers = list(jobs)
+    workers = max(1, min(args.jobs, len(layers)))
+    for layer, out in zip(layers, _run_forked(jobs, layers, workers)):
+        per_layer[layer] = out
+        print(f"{args.family} layer {layer}: {len(dumps[layer]['position'])} records", file=sys.stderr, flush=True)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     for kind in ("working", "churn", "cluster", "cache"):
