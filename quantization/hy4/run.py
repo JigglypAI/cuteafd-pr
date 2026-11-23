@@ -1,8 +1,9 @@
 """Full Hy4 direct MC on the single K8-causal production stream."""
+from __future__ import annotations
+
 import sys
 
 import torch
-from __future__ import annotations
 
 from hy4_flash import run as shared
 from . import forward, host_input_recovery, recipe
