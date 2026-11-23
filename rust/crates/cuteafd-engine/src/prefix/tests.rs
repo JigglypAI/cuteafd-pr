@@ -1985,6 +1985,7 @@ fn a_short_shared_base_survives_the_warm_wave_on_two_staging_slots() {
                     prompt
                 };
                 for (phase, name) in [(1u32, "warm"), (2, "timed")] {
+                    let promoted = cache.stats().mark_promotions;
                     for i in 0..wave {
                         let prompt = suffixed(phase, i);
                         let (resume, _, mut p) = serve(&mut cache, &fake, 1 + i, &prompt, &seq(20_000 + i as u32 * 10, 4), 64);
@@ -1995,8 +1996,26 @@ fn a_short_shared_base_survives_the_warm_wave_on_two_staging_slots() {
                         fake.forward(&mut p, &longer).unwrap();
                         cache.release(&fake, &p.pages).unwrap();
                     }
+                    // Settled marks went to the host: the base's mark came back through the
+                    // host round trip, and the forwards above found every row exact.
+                    assert!(cache.stats().mark_promotions > promoted, "{name}: no host mark restore");
                     settle(&mut cache);
                 }
+                // An exact repeat of the base restores from the host with the first token's logits
+                // of a fresh prefill and no forward.
+                let admitted = cache.admit(&fake, &base, 64, true,
+                    |pages| Placement { pages, ring: 7, len: 0, ring_from: 0 }).unwrap();
+                assert_eq!(admitted.resume, base_len);
+                assert!(admitted.source.as_ref().unwrap().host);
+                // The fake's logits are a pure function of the tokens a fresh prefill reads.
+                let v = u64::from_le_bytes(value(3, &base));
+                let fresh: Vec<f32> = (0..8).map(|i| ((v >> (i * 8)) & 0xff) as f32).collect();
+                assert_eq!(admitted.after.unwrap().logits.unwrap().to_vec(), fresh);
+                let mut p = admitted.placement;
+                let mut longer = base.clone();
+                longer.push(3);
+                fake.forward(&mut p, &longer).unwrap();
+                cache.release(&fake, &p.pages).unwrap();
                 // The base and every turn short of the host minimum went to the host tier.
                 assert_eq!(cache.host_config().unwrap().min_tokens, 1);
                 assert_eq!(cache.stats().host.unwrap().stores_skipped, 0);
