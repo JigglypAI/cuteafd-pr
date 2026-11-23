@@ -592,7 +592,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         );
         ensure!(
             (stage.is_encoder() || !selected.is_empty())
-                && selected.len() <= 80
+                && selected.len() <= self.resources.head.capacity()
                 && selected.iter().all(|&i| i < rows)
                 && selected
                     .iter()

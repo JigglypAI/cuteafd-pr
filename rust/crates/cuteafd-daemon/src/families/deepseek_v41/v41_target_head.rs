@@ -165,6 +165,10 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     sampling: TargetSamplingWave<'a>,
 }
 impl<'a> TargetHeadWave<'a, '_> {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Target verification rows are bounded by the V4.1 vocabulary-row ceiling.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
