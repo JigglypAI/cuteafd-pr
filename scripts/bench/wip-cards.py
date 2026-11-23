@@ -2909,7 +2909,7 @@ def resolved_card(card, overrides, unsets=()):
 
 def build_scopes(cards):
     env = family_scopes(cards, config)
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
     return env
 
 
@@ -3008,8 +3008,10 @@ BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_E
 def build_lock_mode(revision):
     text = run(['git', '-C', str(REPO), 'show', revision + ':wip.sh']).stdout
     native = run(['git', '-C', str(REPO), 'show', revision + ':scripts/build/build-wip-artifacts.sh']).stdout
-    # Native-phase sources lock only their export: on the host under a held fair
-    # turn (CUTEAFD_WIP_HOST_EXPORT_TURN) or, older, through a mounted lock file.
+    # CPU-export sources run all AOT exports on CPU without GPU export locks.
+    if 'CUTEAFD_WIP_EXPORT_LOCKS' not in text and 'CUDA_VISIBLE_DEVICES=' in text:
+        return 'cpu-export'
+    # Historical native-phase sources lock only their GPU export phase.
     if 'CUTEAFD_WIP_EXPORT_LOCKS' in text and ('wip_capped_export()' in text or 'CUTEAFD_WIP_HOST_EXPORT_TURN' in text or 'CUTEAFD_WIP_EXPORT_LOCK_FILES' in native):
         return 'native-phase'
     return 'legacy-full-build'
@@ -3263,9 +3265,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             print(shlex.join(cmd))
             if not dry:
                 if cmd is commands[-1]:
-                    # A native-phase wip.sh takes the seed's fair turn itself, around the export only:
-                    # Cargo, slot reuse and native-cache hits need no Spark lock, so they never queue.
-                    if build_role == 'both' and arm['build_lock_mode'] != 'native-phase':
+                    # CPU-export and native-phase checkouts manage seed leases inside wip.sh;
+                    # only legacy full-build checkouts need a pre-build fair wait.
+                    if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build':
                         # Wait (not fail) while another job's export holds the seed Spark; wip.sh
                         # takes the lock itself for the native phase, so release it at once.
                         seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
@@ -3281,7 +3283,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                     env.update(seed_env(arm, seed, dry))
                     if arm['build_slot']:
                         env['CUTEAFD_WIP_BUILD_SLOT'] = 'on'
-                    if arm['build_lock_mode'] == 'legacy-full-build':
+                    if arm['build_lock_mode'] == 'native-phase':
+                        env['CUTEAFD_WIP_EXPORT_LOCKS'] = 'on'
+                    else:
                         env.pop('CUTEAFD_WIP_EXPORT_LOCKS', None)
                     save(state / ('build-' + name + '.json'), dict(revision=revision, lock_mode=arm['build_lock_mode'], scopes=scopes, command=cmd))
                     if run_build(cmd, env=env, cwd=source, timeout=14400):

@@ -1831,6 +1831,8 @@ def main() -> None:
     parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
                         help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
                              "every other program (existing stems unchanged); only exports nothing else")
+    parser.add_argument("--capability", type=int, choices=(120, 121),
+                        help="target CUDA compute capability (default: 121 for --exlr8-role spark, else 120)")
     args = parser.parse_args()
     if args.context_split_only:
         args.context_split = "only"
@@ -1841,6 +1843,12 @@ def main() -> None:
     if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
             or len(set(exlr8_families)) != len(exlr8_families)):
         raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
+    from b12x._lib.aot_target import describe_target
+
+    target_capability = args.capability if args.capability is not None else (
+        121 if args.exlr8_role == "spark" else 120
+    )
+    describe_target(target_capability)
     import torch
     from b12x.integration.cuteafd import (
         FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
@@ -2364,6 +2372,8 @@ def main() -> None:
         "",
     ]))
     (output / "dsv4_programs.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline dsv4 AOT export initialized CUDA")
 
 
 if __name__ == "__main__":

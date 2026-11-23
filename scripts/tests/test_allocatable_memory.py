@@ -128,16 +128,6 @@ def test_missing_usage_under_finite_limit_fails_closed(host_paths):
         memory.host_allocatable_memory(**host_paths)
 
 
-def test_release_probe_uses_same_helper_and_reports_measure():
-    text = (ROOT / 'build.sh').read_text()
-    probe = text[text.index('    spark_memory_probe='):text.index('    spark_wait_reason="allocatable memory')]
-    assert 'python/tools/lib/allocatable_memory.py:/allocatable_memory.py:ro' in probe
-    assert '"$dev_image" /allocatable_memory.py' in probe
-    assert 'mem_get_info' not in probe
-    assert '($spark_memory_measure)' in probe
-    assert 'spark_allocatable_free >= spark_export_min_free_bytes' in probe
-
-
 @pytest.mark.parametrize('integrated', [False, True])
 def test_torch_without_integrated_property_queries_runtime_attribute(monkeypatch, integrated):
     import ctypes

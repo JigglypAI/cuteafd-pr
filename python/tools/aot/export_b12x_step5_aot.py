@@ -129,6 +129,10 @@ def main():
     args = parser.parse_args()
     if min(args.summary_capacity, args.max_staged_regions) <= 0:
         parser.error("summary and staged-region capacities must be positive")
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target("sm120")
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
 
     destination = args.output_dir
@@ -149,6 +153,8 @@ def main():
         print(f"exported {label}", flush=True)
     manifest.write_text(json.dumps(dict(schema=1, sparkinfer=_pinned_sparkinfer.LOCK_DATA,
                                         programs=records), indent=2) + "\n")
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline Step-5 export initialized CUDA")
 
 
 if __name__ == "__main__":

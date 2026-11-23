@@ -220,7 +220,7 @@ impl Family for MiMo {
                         even element low nibble, UE8M0 U8 [N, K/32]): H {h}, I {i}, {e} experts"),
                     how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127); \
                         packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
-                        python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
+                        python/tools/aot/package_fp8_moe_aot.py --geometry mimop). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows), widest stored width {stored}, \
                         {:.1} GiB per rank. The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
                         above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \

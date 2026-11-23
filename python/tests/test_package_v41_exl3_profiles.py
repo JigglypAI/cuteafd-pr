@@ -166,12 +166,10 @@ class PackageProfileTests(unittest.TestCase):
                 major=compute[0], minor=compute[1], multi_processor_count=48)),
             get_device_capability=Mock(return_value=tuple(compute)),
             current_device=Mock(return_value=0),
-            empty_cache=Mock())
+            is_initialized=Mock(return_value=False))
         jobs = ModuleType('_export_jobs')
         jobs.export_jobs = lambda: 1
-        jobs.gpu_workers = lambda requested: requested
         jobs.export_slot = nullcontext
-        jobs.park_context_lease = lambda: None
         image = bytearray(64)
         image[:6] = b'\x7fELF\x02\x01'
         struct.pack_into('<H', image, 18, 190)
@@ -270,15 +268,17 @@ class PackageProfileTests(unittest.TestCase):
 
         # Most tests isolate ordinary recipes; segment coverage opts in explicitly.
         segment_policy = package.segment_export_options if segments else lambda *a, **k: None
+        aot_target = ModuleType('b12x._lib.aot_target')
+        aot_target.describe_target = Mock(return_value=SimpleNamespace(capability=tuple(compute)))
         with patch.object(package, 'segment_export_options', side_effect=segment_policy), \
                 patch.dict(sys.modules, {'_pinned_sparkinfer': pinned, '_export_jobs': jobs,
-                                     'export_b12x_exl3_aot': exporter, 'torch': torch}), \
+                                     'export_b12x_exl3_aot': exporter, 'torch': torch,
+                                     'b12x._lib.aot_target': aot_target}), \
                 patch.object(package, 'compile_variants', side_effect=compile_inline), \
                 patch.object(package.os, 'setsid'), \
                 patch.object(package.subprocess, 'run', side_effect=link):
             package.build(args)
         manifest = package.verify(args.output, pinned.REVISION, args.runtime, role)
-        self.assertEqual(torch.cuda.empty_cache.call_count, exporter.export.call_count)
         return args.output, manifest, exporter.export.call_args_list, capacities
 
     def test_compile_cache_identity_tracks_options_without_invalidating_unchanged_cells(self):

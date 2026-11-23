@@ -34,9 +34,8 @@ seed, kakapo or cassowary, is never one), and the config's SPARK_*_HOST list
 stays the serving Sparks that receive the slot. An automatic seed
 (WIP_SEED_HOST, else WIP_BUILD_SEED, default kakapo) that is a LAN-only seed
 becomes the less-loaded of the LAN-only seeds, else rhea or moa when they are
-all unreachable or full. Builds on one LAN-only seed share its CPU slots but
-take its GPU export one at a time (hwlock SEED-export); native-cache hits take
-no turn. WIP_SEED_ADDR optionally gives a seed without RDMA its bulk-transfer
+all unreachable or full. Builds on one LAN-only seed share its CPU slots for
+both Cargo and CPU-only AOT exports (no GPU export lock). WIP_SEED_ADDR optionally gives a seed without RDMA its bulk-transfer
 address (default: its LANE_A when it is a configured Spark, else its directly
 attached LAN address).
 The default builds the shared release Spark role set alongside historical TP4,
@@ -139,11 +138,7 @@ case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coord
 wip_spark_leg=1
 [[ "$role" != coordinator || -n "$from_slot" ]] || wip_spark_leg=0
 
-wip_export_host_env="${CUTEAFD_EXPORT_HOST-}"
-wip_export_host_set="${CUTEAFD_EXPORT_HOST+x}"
 release_load_config "$config"
-[[ -z "$wip_export_host_set" ]] || CUTEAFD_EXPORT_HOST="$wip_export_host_env"
-export CUTEAFD_EXPORT_HOST
 # Resolve once for direct builds too; explicit card/environment scopes win,
 # including an empty expert list or Spark role override.
 wip_scopes="$(python3 "$repo_root/scripts/lib/wip_aot_scopes.py" --config "$config" \
@@ -185,13 +180,6 @@ release_need sha256sum
 release_need install
 release_need nvidia-smi
 
-case "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" in on|off) ;; *) release_die "CUTEAFD_WIP_EXPORT_LOCKS must be on or off" ;; esac
-wip_export_locks=off
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" == on ]]; then
-  wip_export_locks=on
-  # Rust takes no hardware mutex. Native misses queue only after the seed
-  # lease and Cargo build slot have been released.
-fi
 mapfile -t wip_hosts < <(release_spark_values HOST)
 # A coordinator-only clone of a config with no active Sparks (0-Spark cards)
 # also skips the Spark leg: nothing to clone, rebuild or reach.
@@ -332,7 +320,6 @@ wip_build_resource_release() {
   unset wip_build_resource_pid
 }
 wip_build_resource_acquire() {
-  [[ "$wip_export_locks" == on ]] || return 0
   # Multiple instances have disjoint containers, source trees and Cargo targets.
   # The unsuffixed legacy container can use slot zero but not multiple leases.
   [[ -n "${WIP_INSTANCE:-}" ]] || CUTEAFD_SEED_BUILD_SLOTS=1
@@ -384,10 +371,9 @@ wip_build_resource_acquire() {
 }
 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
-# The WIP container binds the primary coordinator GPU (the shared resolution).
+# The persistent WIP container binds the primary coordinator GPU for serving
+# (run.sh --wip); builds and AOT exports themselves run on CPU.
 release_resolve_coordinator_gpus "$COORDINATOR_GPUS" auto
-[[ "$wip_export_locks" == off || "$RELEASE_COORDINATOR_GPU_HOST_INDEX" =~ ^[01]$ ]] ||
-  release_die "export locking needs the primary coordinator GPU to be host GPU 0 or 1 (COORDINATOR_GPUS)"
 
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
@@ -1287,25 +1273,6 @@ read -r scope key <"$1/output/$2/.native-cache-key" &&
 wip_seed_lock() {
   case "$1" in rhea|moa) printf '%s\n' "$1" ;; *) release_is_lan_seed "$1" && printf '%s\n' "$1" || printf 'sparks\n' ;; esac
 }
-# Try a configured remote exporter first, then queue one capped local turn.
-# Dispatch runs only after the Spark lease and Cargo build slot are released.
-wip_serving_export_priority() {
-  [[ "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" == auto ]] &&
-    python3 "$repo_root/scripts/build/export-placement.py" waiting-serving
-}
-
-wip_coordinator_export_modes() {
-  if wip_serving_export_priority; then
-    printf 'maxq wait-maxq\n'
-    return
-  fi
-  case "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" in
-    auto) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
-    capped) [[ -z "${CUTEAFD_EXPORT_HOST:-}" ]] || printf 'remote ' ; printf 'capped\n' ;;
-    remote) printf 'remote wait-remote\n' ;;
-    *) release_die "CUTEAFD_WIP_COORDINATOR_EXPORT must be auto, remote or capped" ;;
-  esac
-}
 
 # Docker exec and SSH do not forward client's signals to the actual build.
 # Leave stdin open until cancellation, then wait for the remote supervisor to
@@ -1318,139 +1285,6 @@ wip_exec() {
   shift 2
   wip_pipe -- "$docker_cli" "$verb" -i "$@"
 }
-
-# wip_cached_exports BUILD...: the native phase with every AOT export required
-# to come from the export cache (scripts/build/export-cache.py exits 3 before an
-# exporter would start). CMake and host C++ run; no export touches a GPU. On a
-# miss Ninja keeps the restored outputs and the caller takes the export turn.
-wip_cached_exports() {
-  [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" == on ]] || return 1
-  local started=$SECONDS status=0 log
-  log="$(mktemp "${TMPDIR:-/tmp}/wip-cached-exports.XXXXXXXX")"
-  "$@" >"$log" 2>&1 || status=$?
-  echo "WIP cached exports: $(grep -oE '^export cache [a-z-]+' "$log" | sort | uniq -c | awk '{printf "%s %s, ", $4, $1}')"
-  if ((status == 0)); then
-    rm -f "$log"
-    echo "WIP phase cached-exports: $((SECONDS - started))s"
-    return 0
-  fi
-  grep -h 'export cache required-hit-missed' "$log" | head -3 >&2 || true
-  echo "WIP cached exports: not every export is cached (exit $status, log $log); taking the export turn" >&2
-  return 1
-}
-
-# wip_remote_export SOURCE: the native key's entry from CUTEAFD_EXPORT_HOST, through
-# sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
-wip_remote_export() {
-  local export_source="${1:?wip_remote_export requires frozen source directory}"
-  local host="${CUTEAFD_EXPORT_HOST:-maxq}" key env_file started=$SECONDS
-  if wip_serving_export_priority; then host=maxq; fi
-  [[ -n "$host" ]] || return 75
-  read -r _ key <"$state_dir/output/coordinator/.native-cache-key" || return 75
-  env_file="$(mktemp "${TMPDIR:-/tmp}/wip-export-env.XXXXXXXX")"
-  printf '%s\n' "${coordinator_build[@]}" | grep -E '^CUTEAFD_[A-Z0-9_]+=' >"$env_file"
-  printf 'CUTEAFD_WIP_EXPORT_LOCKS=off\n' >>"$env_file"
-  echo "WIP coordinator export: remote on $host"
-  local layers status=0
-  layers="$(docker image inspect -f '{{json .RootFS.Layers}}' "$COORDINATOR_DOCKER_DEV" | sha256sum | awk '{print $1}')"
-  "$repo_root/scripts/build/export-remote.sh" "$host" "$export_source" "$key" "$env_file" \
-    "$COORDINATOR_DOCKER_DEV" "$layers" || status=$?
-  if ((status != 0)); then
-    rm -f "$env_file"
-    echo "WIP coordinator export: $host unavailable (export-remote exited $status); next mode" >&2
-    return 75
-  fi
-  rm -f "$env_file"
-  native_store_nest raptor x86_64 "$(realpath "$state_dir")" coordinator import
-  native_store_sync "" "$state_dir" "$(uname -m)" coordinator import
-  wip_exec docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native || return 75
-  echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
-}
-
-# wip_capped_export SOURCE BUILD...: the native phase on a raptor GPU we hold: one
-# whose lock the caller already holds, else a fair-queued GPU turn (the first
-# configured GPU, held only for the export). A one-off container on
-# that GPU (the WIP container is bound to the primary COORDINATOR_GPUS), admitted by the
-# host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
-wip_capped_export() {
-  local export_source="${1:?wip_capped_export requires frozen source directory}"
-  shift
-  local status=0
-  local -a priority=()
-  [[ "${CUTEAFD_WIP_COORDINATOR_EXPORT:-auto}" != auto ]] || priority=(--yield-serving)
-  CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
-    python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" "${priority[@]}" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
-    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); source \"\$repo_root/scripts/lib/cdi-gpus.sh\"; wip_capped_export_on" ||
-    status=$?
-  if ((status == 76)); then
-    echo "WIP coordinator export: yielding raptor to serving; remote on maxq"
-    local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
-    while ((SECONDS < remote_deadline)); do
-      if CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source"; then return 0; fi
-      sleep 60
-    done
-    return 75
-  fi
-  ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
-}
-
-# wip_capped_export_on: runs under export-placement.py hold, CUTEAFD_EXPORT_GPU set.
-wip_capped_export_on() (
-  local placement="$repo_root/scripts/build/export-placement.py" gpu cap jobs used started=$SECONDS
-  gpu="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v i="$CUTEAFD_EXPORT_GPU" '$1 == i {print $2}')"
-  [[ -n "$gpu" ]] || return 75
-  read -r cap jobs used < <(python3 "$placement" admit --gpu "$gpu" --headroom-mib "${CUTEAFD_WIP_EXPORT_HEADROOM_MIB:-4096}") ||
-    { echo "WIP coordinator export: gpu$CUTEAFD_EXPORT_GPU has no room for a capped export" >&2; return 75; }
-  echo "WIP coordinator export: capped on gpu$CUTEAFD_EXPORT_GPU (${cap} MiB, ${jobs} jobs; ${used} MiB in use)"
-  # The coordinator build's environment (its -e pairs), in a one-off container
-  # on that GPU sharing the WIP container's /wip and cache mounts.
-  local -a build env_args=()
-  eval "build=($CUTEAFD_CAPPED_BUILD)"
-  local i line
-  # The WIP container's own cache plan (export cache, Triton/XDG/torch caches,
-  # compiler caches): --volumes-from brings its mounts, not its environment.
-  local image_env
-  image_env="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$COORDINATOR_DOCKER_DEV")"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && ! grep -qxF -- "$line" <<<"$image_env" && env_args+=(-e "$line")
-  done < <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$coordinator_container")
-  for ((i = 2; i < ${#build[@]}; i++)); do
-    [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
-  done
-  local id status=0 gpu_args name="${coordinator_container}-export-$$"
-  cleanup_capped() {
-    trap '' TERM HUP INT QUIT
-    local names
-    # A failed daemon query is never proof that CUDA has stopped.
-    while true; do
-      if names="$(timeout 30 docker ps -a --filter "name=^/$name$" --format '{{.Names}}')"; then
-        if [[ -z "$names" ]]; then return 0; fi
-        if timeout 30 docker rm -f "$name" >/dev/null; then
-          if names="$(timeout 30 docker ps -a --filter "name=^/$name$" --format '{{.Names}}')" && [[ -z "$names" ]]; then return 0; fi
-        fi
-      fi
-      echo "Capped export cleanup unconfirmed; retaining GPU lock" >&2
-      sleep 60
-    done
-  }
-  trap cleanup_capped EXIT
-  trap 'exit 143' TERM INT HUP QUIT
-  mapfile -t gpu_args < <(release_gpu_device_args "$gpu")
-  id="$(docker run -d --name "$name" --user "$(id -u):$(id -g)" "${gpu_args[@]}" \
-    -e HOME=/wip/home -e "USER=$(id -un)" -e "LOGNAME=$(id -un)" "${env_args[@]}" \
-    -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-${CARGO_BUILD_JOBS:-$(nproc)}}" -e "CUTEAFD_EXPORT_JOBS=$((cap / 2688))" \
-    -e CUTEAFD_EXPORT_HOST_SLOT_DIR=/export-slots -e "CUTEAFD_EXPORT_HOST_WORKERS=$(nproc)" \
-    -e "CUTEAFD_EXPORT_GPU_SLOT_DIR=/export-slots/gpu$CUTEAFD_EXPORT_GPU" -e "CUTEAFD_EXPORT_GPU_BUDGET_MIB=$cap" -e "CUDA_VISIBLE_DEVICES=$gpu" -e "NVIDIA_VISIBLE_DEVICES=$gpu" \
-    --volumes-from "$coordinator_container" --entrypoint sleep "$COORDINATOR_DOCKER_DEV" infinity)" || return 75
-  # The watchdog counts only this container's processes (its cgroup carries the ID).
-  python3 "$placement" watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id" -- \
-    docker exec "$id" timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh \
-    /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator native || status=$?
-  cleanup_capped
-  trap - EXIT TERM INT HUP QUIT
-  ((status == 0)) || return "$status"
-  echo "WIP phase coordinator export-capped: $((SECONDS - started))s (gpu$CUTEAFD_EXPORT_GPU)"
-)
 
 build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
@@ -1477,10 +1311,11 @@ build_coordinator() {
   fi
   local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
+    -e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void \
     -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}" \
     -e "CUTEAFD_WIP_HOST_ISA=${wip_coordinator_host_isa:-${CUTEAFD_WIP_HOST_ISA:-}}" \
     -e "CUTEAFD_WIP_CARGO_FEATURES=${wip_cargo_features:-}" \
-    -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
+    -e "CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}" \
     -e "CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}" \
@@ -1511,11 +1346,9 @@ build_coordinator() {
     python3 /wip/source/scripts/build/build-process.py --channel --timeout 7200 -- \
     /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator)
-  # Cargo first, holding no hardware; then the bounded native/AOT export.
-  # A native-cache hit restores verified outputs without touching a GPU.
-  # The raptor compile holds a build slot (scripts/build/build-slot.sh; slot 0 is
-  # build.lock) only while Cargo runs, when the caller asks (wip-cards does);
-  # the GPU export, reuse and staging hold none.
+  # Cargo and CPU-only AOT exports both run without hardware GPU locks.
+  # When CUTEAFD_WIP_BUILD_SLOT=on (e.g. wip-cards), each phase runs niced
+  # inside a counting CPU build slot (scripts/build/build-slot.sh).
   local rust_status=0 attempt
   # One retry: a coordinator Rust exec has twice reported 127 although the phase
   # inside the container completed (open issue). The phase is idempotent and a
@@ -1537,38 +1370,18 @@ build_coordinator() {
   fi
   [[ "$phase" != rust ]] || return 0
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator import
-  if [[ "${wip_export_locks:-off}" != on ]]; then
-    wip_exec "${coordinator_build[@]}" native
-  elif native_store_has "" "${state_dir:-/nonexistent}" coordinator; then
-    echo "WIP coordinator export: native cache hit, no GPU turn"
-    # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
+  if native_store_has "" "${state_dir:-/nonexistent}" coordinator; then
+    echo "WIP coordinator export: native cache hit"
     wip_exec docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
-  elif wip_cached_exports wip_exec docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
-    echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
+  elif [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
+    echo "WIP coordinator export: CPU export inside a build slot"
+    CUTEAFD_BUILD_STOP_GRACE=25 "$repo_root/scripts/build/build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" native ||
+      release_die "coordinator WIP CPU export failed"
   else
-    # Remote first when configured; otherwise take one bounded fair GPU turn.
-    # The seed lease and Cargo slot are already released before this phase.
-    local mode exported=0
-    for mode in $(wip_coordinator_export_modes); do
-      case "$mode" in
-        remote) wip_remote_export "$export_source" && exported=1 ;;
-        maxq) CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source" && exported=1 ;;
-        capped) wip_capped_export "$export_source" "${coordinator_build[@]}" && exported=1 ;;
-        wait-remote|wait-maxq)
-          local remote_deadline=$((SECONDS + ${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}))
-          while ((SECONDS < remote_deadline)); do
-            sleep 60
-            if [[ "$mode" == wait-maxq ]]; then
-              if CUTEAFD_EXPORT_HOST=maxq wip_remote_export "$export_source"; then exported=1; break; fi
-            elif wip_remote_export "$export_source"; then exported=1; break; fi
-          done
-          ;;
-
-      esac
-      ((exported == 0)) || { echo "WIP coordinator export: done by $mode"; break; }
-    done
-    ((exported)) || release_die "no coordinator export mode succeeded"
+    echo "WIP coordinator export: CPU export"
+    wip_exec "${coordinator_build[@]}" native ||
+      release_die "coordinator WIP CPU export failed"
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
   wip_exec docker exec -e "CUTEAFD_WIP_SLOT_GENERATION=${wip_generation:-}" -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
@@ -1577,22 +1390,6 @@ build_coordinator() {
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
     "$COORDINATOR_DOCKER_DEV" "$image_id" "$image_layers"
-}
-
-# wip_seed_export_turn: this build's exclusive GPU-export turn on the seed, held
-# by the lease process (scripts/build/build-resource.py) so its teardown stops
-# the build container before releasing it. A LAN-only seed queues fairly on
-# hwlock SEED-export; rhea and moa leases are exclusive already.
-wip_seed_export_turn() {
-  local dir="$wip_build_resource_dir" started=$SECONDS
-  : >"$dir/export-request"
-  echo "WIP Spark export: waiting for the GPU export turn on $seed_host"
-  until [[ -e "$dir/export-granted" ]]; do
-    [[ ! -e "$dir/export-failed" ]] || release_die "no GPU export turn on $seed_host: $(<"$dir/export-failed")"
-    kill -0 "$wip_build_resource_pid" 2>/dev/null || release_die "the $seed_host build lease ended before the export turn"
-    sleep 1
-  done
-  echo "WIP Spark export: GPU export turn on $seed_host after $((SECONDS - started))s"
 }
 
 build_expert() (
@@ -1619,7 +1416,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -i -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' python3 /wip/source/scripts/build/build-process.py --channel --timeout 7200 -- /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -i -e 'CUDA_VISIBLE_DEVICES=' -e 'NVIDIA_VISIBLE_DEVICES=void' -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' python3 /wip/source/scripts/build/build-process.py --channel --timeout 7200 -- /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
@@ -1627,32 +1424,15 @@ build_expert() (
   native_store_nest "$seed_host" aarch64 "$seed_root" expert import
   native_store_sync "$seed_host" "$seed_root" aarch64 expert import
   local restore_command="${build_command/docker exec /docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 } native"
-  if [[ "${wip_export_locks:-off}" != on ]]; then
-    wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command native"
-  elif native_store_has "$seed_host" "$seed_root" expert; then
-    echo "WIP Spark export: native cache hit, no export turn"
+  if native_store_has "$seed_host" "$seed_root" expert; then
+    echo "WIP Spark export: native cache hit"
     wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
-  elif wip_cached_exports wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" \
-      "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
-    echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
-    # The seed's CPU lease admits other builds; its GPU export is one at a time.
-    wip_seed_export_turn
-    # A build that held a turn before us may have published this very key.
-    native_store_nest "$seed_host" aarch64 "$seed_root" expert import
-    native_store_sync "$seed_host" "$seed_root" aarch64 expert import
-    if native_store_has "$seed_host" "$seed_root" expert; then
-      echo "WIP Spark export: native cache hit after the export turn"
-      wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$restore_command" ||
-        release_die "Spark WIP native restore on $seed_host failed"
-    else
-      wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command native" ||
-        release_die "Spark WIP export on $seed_host failed"
-    fi
-    # Publish to the host store (hardlinks) before the next export on this seed.
-    native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
-    : >"$wip_build_resource_dir/export-done"
+    # Both Cargo and CPU-only AOT exports share the seed's counting build lease.
+    echo "WIP Spark export: CPU export on $seed_host"
+    wip_pipe --timeout 7260 -- ssh -T -o BatchMode=yes "$seed_host" "$build_command native" ||
+      release_die "Spark WIP export on $seed_host failed"
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish

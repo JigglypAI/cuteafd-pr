@@ -9,9 +9,9 @@ dead process and is removed. A request takes its locks only when no older live
 ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
-order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, kakapo-export,
-cassowary-export, maxq), so callers that still use plain flock stay excluded (they are
-just not queued fairly). Exit 75 when the wait expires.
+order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, maxq), so callers
+that still use plain flock stay excluded (they are just not queued fairly).
+Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
 them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
@@ -48,13 +48,11 @@ from pathlib import Path
 
 # kakapo and cassowary are the LAN-only build seeds (10 GbE, never serve): after
 # every serving lock, so a serving job's locks are always taken before a seed
-# lease's. Each seed's GPU-export turn (SEED-export) comes last: a build takes it
-# while its counting lease on that seed is live (scripts/build/build-resource.py).
+# lease's. Kernel AOT exports run on CPU and need no GPU export lock.
 LAN_SEEDS = ('kakapo', 'cassowary')
-# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles builds, AOT exports, quants,
-# CPU gates and single-GPU correctness, never perf A/B, cards or serving.
-ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS),
-         'maxq')
+# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles quants, CPU gates and
+# single-GPU correctness, never perf A/B, cards or serving.
+ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, 'maxq')
 _DEFAULT_LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 # An explicit assignment (a driver pinning a private directory, a test) wins;
 # otherwise CUTEAFD_LOCK_DIR is read when the lock is taken, so a process that

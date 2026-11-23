@@ -294,7 +294,7 @@ def test_segments_package_records_row_address_variant(tmp_path, monkeypatch):
 def test_worker_target_is_explicit_and_failures_are_observed_unordered():
     source = TOOL.read_text()
     assert 'args, target_compute, raw' in source
-    assert 'describe_gb10()' in source
+    assert 'describe_target(tuple(target_compute))' in source
     assert "meta['compute'] != list(target_compute)" in source
     assert 'as_completed(futures)' in source and 'pool.map(' not in source
     assert 'process.kill()' in source and 'process.join()' in source

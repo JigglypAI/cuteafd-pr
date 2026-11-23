@@ -24,6 +24,9 @@ def main():
     # Runtime cached modules omit the retained IR needed by export_to_c.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
+    from b12x._lib.aot_target import describe_target
+
+    describe_target("sm120")
     import torch
     from b12x.attention._shared.mla.native_v41_aot import compile_native_v41_attention_aot
 
@@ -55,6 +58,8 @@ def main():
                     format="FP8 window / FP4 indexed; separate value and scale planes",
                     abi=dict(pointers=pointers, i32=["rows"], stream="stream"), artifacts=artifacts)
     manifest_path.write_text(json.dumps(manifest, indent=2)+"\n")
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline V4.1 attention export initialized CUDA")
     print(manifest_path)
 
 

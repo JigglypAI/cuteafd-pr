@@ -1000,30 +1000,28 @@ def tile_overrides(values: list[str], capacities: list[int], role: str,
     return result
 
 
-def init_variant_worker(reservations=None):
+def _pinned_sparkinfer_module():
+    import _pinned_sparkinfer
+    return _pinned_sparkinfer
+
+
+def init_variant_worker():
     """Once per long-lived worker: its own session (so a failure can kill the
-    compilers it started) and the reservation its one CUDA context takes."""
+    compilers it started) and CPU-only visibility."""
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
     os.setsid()
-    if reservations is not None:
-        from _export_jobs import claim_context_reservation
-        claim_context_reservation(reservations.get(timeout=30))
-    os.environ['CUTEAFD_EXPORT_WORKER_RAM_MIB'] = '4096'
-    os.environ['CUTEAFD_EXPORT_WORKER_GPU_MIB'] = '2688'
 
 
 def compile_variant(payload):
     args, target_compute, raw, width, experts, capacity, topk, dtype, run_options = payload
-    import _pinned_sparkinfer
+    _pinned_sparkinfer_module()
+    from b12x._lib.aot_target import describe_target
     from export_b12x_exl3_aot import export
     from _export_jobs import export_slot
     import torch
-    # Admission may wait for another package; never occupy its export slot.
-    torch.cuda.current_device()
+
+    describe_target(tuple(target_compute))
     with export_slot():
-        real = torch.cuda.get_device_capability(0)
-        if tuple(target_compute) == (12, 1) and real == (12, 0):
-            from exl3_cross_sm121 import describe_gb10
-            describe_gb10()
         if torch.cuda.get_device_capability(0) != tuple(target_compute):
             raise ValueError(f'EXL3 worker cannot target {target_compute}')
         meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **run_options)
@@ -1050,32 +1048,20 @@ def compile_variant(payload):
             if name.endswith('.so'):
                 verify_object_target(raw / name, target_compute)
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_initialized():
+            raise RuntimeError('EXL3 worker initialized CUDA during CPU export')
     return meta, runtime_files
 
 
 def compile_variants(payloads, jobs):
     """Observe failures in completion order, assemble successes in input order."""
-    from _export_jobs import reserve_context_pool
     context = multiprocessing.get_context('spawn')
-    with reserve_context_pool(min(jobs, len(payloads))) as paths:
-        reservations = context.Queue()
-        try:
-            for path in paths:
-                reservations.put(path)
-            return _compile_variants(payloads, len(paths), context, reservations)
-        finally:
-            reservations.close()
-            reservations.join_thread()
+    return _compile_variants(payloads, min(jobs, len(payloads)), context)
 
 
-def _compile_variants(payloads, jobs, context, reservations):
-    # Workers live for the whole package and reuse one CUDA context across
-    # variants: a context per variant meant 24-30 create/destroy cycles per
-    # package, and GB10 context creation fails (NV_ERR_NO_MEMORY) under the
-    # build's own load. Each variant still frees its tensors and cache.
+def _compile_variants(payloads, jobs, context):
     pool = ProcessPoolExecutor(max_workers=jobs, mp_context=context,
-                               initializer=init_variant_worker, initargs=(reservations,))
+                               initializer=init_variant_worker)
     try:
         futures = {pool.submit(compile_variant, payload): index for index, payload in enumerate(payloads)}
         results = [None] * len(payloads)
@@ -1190,19 +1176,12 @@ def build(args: argparse.Namespace) -> None:
     profiles += companions
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
-    import _pinned_sparkinfer
-    if codebook == 'mul1' and hasattr(_pinned_sparkinfer, 'require_routed_mul1'):
-        _pinned_sparkinfer.require_routed_mul1()
-    import torch
-
-    # The planner needs only a context, not a worker's sizing arena.
-    os.environ['CUTEAFD_EXPORT_WORKER_RAM_MIB'] = '1024'
-    props = torch.cuda.get_device_properties(0)
-    # --loopback: Spark layouts compiled for this coordinator GPU, for worker
-    # tests on raptor; the manifest records compute 12.0, so no Spark takes it.
+    pinned_sparkinfer = _pinned_sparkinfer_module()
+    if codebook == 'mul1' and hasattr(pinned_sparkinfer, 'require_routed_mul1'):
+        pinned_sparkinfer.require_routed_mul1()
+    # --loopback: Spark layouts compiled for SM120, for worker tests on raptor;
+    # the manifest records compute 12.0, so no Spark takes it.
     expected_compute = (12, 1) if args.role == 'spark' and not getattr(args, 'loopback', False) else (12, 0)
-    if (props.major, props.minor) != expected_compute:
-        raise ValueError(f'{args.role} package requires GPU {expected_compute}')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.build_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.exl3-package-', dir=args.output.parent) as temporary:
@@ -1275,10 +1254,8 @@ def build(args: argparse.Namespace) -> None:
             if segment_options is not None:
                 pending.append((width, experts, SEGMENT_MAX_ROWS, topk, 'bf16', segment_options,
                                 destinations, 'segments', None))
-        from _export_jobs import export_jobs, gpu_workers, park_context_lease
-        jobs = min(gpu_workers(export_jobs()), len(pending))
-        # The planner's context idles while its workers run; free its host lease.
-        park_context_lease()
+        from _export_jobs import export_jobs
+        jobs = min(export_jobs(), len(pending))
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
         # World and rank destinations do not determine generated code. Keep all
         # arithmetic/schedule options in the key, including compact descriptor ABI.
@@ -1346,8 +1323,8 @@ def build(args: argparse.Namespace) -> None:
                  for p in sorted(stage.rglob('*')) if p.is_file()}
         manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,
                     'decode_capacities': [n for n in capacities if n <= 80],
-                    'sparkinfer_revision': _pinned_sparkinfer.REVISION,
-                    'compute': [props.major, props.minor], 'sms': props.multi_processor_count,
+                    'sparkinfer_revision': pinned_sparkinfer.REVISION,
+                    'compute': list(expected_compute), 'sms': 48 if expected_compute == (12, 1) else 188,
                     'variants': variants, 'files': files,
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
@@ -1366,7 +1343,7 @@ def build(args: argparse.Namespace) -> None:
         # B12x policy legitimately picks a wider tile only at m16, so a package may
         # mix tile values across capacities and that is not an error.
         (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-        verify(stage, _pinned_sparkinfer.REVISION)
+        verify(stage, pinned_sparkinfer.REVISION)
         install_package(stage, args.output)
     print(json.dumps({'package': str(args.output), 'role': args.role, 'variants': len(variants)}), flush=True)
 

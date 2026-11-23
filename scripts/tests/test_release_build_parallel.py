@@ -205,7 +205,6 @@ def test_split_state_and_tail_wiring():
     assert 'setsid --wait bash -s --' in text
     assert 'trap cleanup_spark_phase EXIT' in text
     assert 'kill -TERM -- "-$$"' in text
-    assert '$export_container-probe' in text
     # Manifest generation stays entirely in preparation; workers only verify it.
     assert text.index('--write "$source_manifest"') < text.index('build_coordinator_release() (')
     assert '"${native_build_jobs:-__legacy__}"' in text

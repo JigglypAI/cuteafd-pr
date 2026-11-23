@@ -39,10 +39,9 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
   (`kernel.perf_event_paranoid=1`): add `--sample=process-tree
   --cpuctxsw=process-tree` to nsys to find host-side stalls.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
-  `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
-  `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
-  while holding a later one. Coordinator exports skip all GPU probes while
-  a seed lease is live. Every lock wait and run has a timeout.
+  `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock`. Never
+  acquire an earlier lock while holding a later one. Every lock wait and run
+  has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
   command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
   and let its completion wake you. Don't poll status or tail logs in between;
@@ -158,21 +157,18 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: CPU builds
-  use five counting slots; LAN-only seeds use counting leases plus one
-  GPU export at a time, serving-host seeds remain exclusive. Serialize performance runs, one model per GPU.
+  and AOT exports use five counting slots (`build-slot.sh`); LAN-only seeds
+  use counting leases, serving-host seeds remain exclusive. Serialize performance runs, one model per GPU.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
-- Coordinator export placement: `auto` probes a free capped raptor GPU
-  without waiting, then maxq (config `CUTEAFD_EXPORT_HOST`, environment
-  override wins), with bounded remote retry and no queued GPU-turn fallback.
-  Independent EXL3 variants use bounded spawned workers; all exporters share
-  host-wide CPU/context admission. Raptor Ninja CPU jobs are independent of
-  a shared weighted GPU budget (640 MiB/context plus 2048 MiB per EXL3
-  sizing worker), with the same 12 GiB watchdog cap. GB10 RAM admission uses `MemAvailable`:
-  CUDA allocations reclaim clean file cache; `MemFree` and cudaMemGetInfo
-  under-report usable unified memory. Remote exports reserve aggregate GPU
-  and host RAM before container creation and release only after it stops.
+- Build-time AOT exports (CuTe DSL and Triton AOT, SM120 and SM121) run
+  CPU-only (`CUDA_VISIBLE_DEVICES=""`) using `b12x._lib.aot_target.describe_target`
+  and never initialize CUDA or require a GPU or hardware lock. Independent
+  variants use bounded spawned workers; all exporters share host-wide CPU
+  worker admission (`_export_jobs.py`). GB10 serving RAM admission uses
+  `MemAvailable`: CUDA allocations reclaim clean file cache; `MemFree` and
+  `cudaMemGetInfo` under-report usable unified memory.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
@@ -477,12 +473,11 @@ Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
   RoCE fabric. Their sealed slots reach the Sparks through sparknest. Each has
   three counting build leases (20 threads / ~120 GiB): shared `SEED.lock`
   umbrella plus exclusive `SEED.build.N.lock`, excluding legacy exclusive
-  users. The leases cover Cargo and CPU phases; the GPU export takes the
-  seed's fair `SEED-export` turn (hwlock), one at a time; native-cache hits
-  skip it. An automatic seed is the less-loaded LAN seed (fewest held
-  slots), then idle rhea/moa under their exclusive hardware locks; `--seed`
-  is a placement request. Independent instances share host-wide exporter
-  worker slots. `build-dev-images.sh` gives both seeds the Spark dev image.
+  users. The leases cover Cargo, C++ and CPU-only AOT export phases. An
+  automatic seed is the less-loaded LAN seed (fewest held slots), then idle
+  rhea/moa under their exclusive hardware locks; `--seed` is a placement
+  request. Independent instances share host-wide exporter worker slots.
+  `build-dev-images.sh` gives both seeds the Spark dev image.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

@@ -287,10 +287,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             "parameters": [p.strip() for p in wrapper[2].split(',')],
             "object_sha256": hashlib.sha256((output / (label + '.o')).read_bytes()).hexdigest(),
             "header_sha256": hashlib.sha256(header.encode()).hexdigest()})
-    # Compile-only qualification needs the same shapes/aliasing, not CUDA storage.
-    buffers = None if row_addresses else make_mixed_trellis_buffers(launch,
-        device=torch.device("meta") if compile_only else torch.device("cuda", 0),
-        sms=workspace_sms)
+    # Buffer shapes and storage aliasing are pure metadata; meta tensors avoid
+    # allocating multi-GiB sizing arenas while producing identical buffer specs.
+    buffers = None if row_addresses else make_mixed_trellis_buffers(
+        launch, device=torch.device("meta"), sms=workspace_sms)
     lut_bytes = launch.trellis_lut.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     (output / 'trellis_lut.bin').write_bytes(lut_bytes)
     layouts = {}
@@ -302,7 +302,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         layouts, segment_regions, segment_bytes = segment_buffer_layouts(segment_geometry)
     for field in (() if row_addresses else fields(buffers)):
         value = getattr(buffers, field.name)
-        address = id(value) if compile_only else value.untyped_storage().data_ptr()
+        address = id(value)
         owner = owners.setdefault(address, field.name)
         layouts[field.name] = {"shape": list(value.shape), "dtype": str(value.dtype),
             "bytes": value.numel() * value.element_size(), "allocation": owner,
@@ -421,7 +421,13 @@ def main() -> None:
                                        "B12x per-capacity policy")
     parser.add_argument("--codebook", choices=("mcg", "mul1"), default="mcg",
                         help="EXL3 routed-expert codebook (default: mcg)")
+    parser.add_argument("--capability", type=int, choices=(120, 121), default=120,
+                        help="Target CUDA compute capability (default: 120)")
     args = parser.parse_args()
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target(args.capability)
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
            route_block=args.route_block, token_major_rotation=args.token_major_rotation,
@@ -431,6 +437,8 @@ def main() -> None:
            activation=args.activation,
            decode_schedule=args.decode_schedule, compact_weights=args.compact_weights,
            row_addresses=args.row_addresses, codebook=args.codebook)
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline EXL3 export initialized CUDA")
 
 
 if __name__ == "__main__":

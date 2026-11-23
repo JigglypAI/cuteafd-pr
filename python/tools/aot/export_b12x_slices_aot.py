@@ -136,6 +136,13 @@ def write_manifest(output, manifest, artifacts):
 
 
 def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
+    width_role = role.startswith("spark_w")
+    if role not in ROLE_GEOMETRY and not width_role:
+        raise ValueError(f"unsupported expert placement role {role!r}")
+    expected_sm = (12, 1) if width_role else ROLE_SM[role]
+    from b12x._lib.aot_target import describe_target
+
+    describe_target(expected_sm)
     import torch
     import cutlass
     import cutlass.cute as cute
@@ -146,14 +153,10 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
 
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
-        raise ValueError("native Blackwell device required")
-    width_role = role.startswith("spark_w")
-    if role not in ROLE_GEOMETRY and not width_role:
-        raise ValueError(f"unsupported expert placement role {role!r}")
+        raise ValueError("native Blackwell target required")
     coordinator = role == "coordinator"
     tp2 = role == "rtx_tp2"
     draft_tp2 = role == "dspark_tp2"
-    expected_sm = (12, 1) if width_role else ROLE_SM[role]
     if (props.major, props.minor) != expected_sm:
         raise ValueError(
             f"{role} expert slices require SM{expected_sm[0]}{expected_sm[1]}, "
@@ -504,6 +507,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         artifacts.extend(("v41_expert_input_quant.h", "v41_expert_input_quant.o",
                           "v41_input_quant_dispatch.h"))
     write_manifest(output, manifest, artifacts)
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline slice AOT export initialized CUDA")
 
 
 if __name__ == "__main__":

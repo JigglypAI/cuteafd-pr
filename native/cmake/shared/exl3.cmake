@@ -36,13 +36,9 @@ set(CUTEAFD_EXL3_REQUIRE_ARGS --require-layout "${CUTEAFD_EXL3_REQUIRE_LAYOUTS}"
 list(JOIN CUTEAFD_EXL3_CAPACITIES "," CUTEAFD_EXL3_CAPACITIES_ARG)
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_EXL3_CUDA_INCLUDE)
 set(CUTEAFD_EXL3_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_exl3_aot.py")
-# Large prefill export arenas must not overlap other GPU compiler jobs.
-get_property(CUTEAFD_EXL3_PREDECESSORS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-list(FILTER CUTEAFD_EXL3_PREDECESSORS INCLUDE REGEX "_export$")
-# Family exports must also serialize against each other: chain each family
-# on the previous family's package manifest.
+# EXL3 exports run on CPU with meta buffers and host-wide CPU worker admission
+# (python/tools/lib/_export_jobs.py), so families do not need GPU-arena chaining.
 set(CUTEAFD_EXL3_FAMILY_MANIFESTS)
-set(CUTEAFD_EXL3_FAMILY_CHAIN ${CUTEAFD_EXL3_PREDECESSORS})
 # Other expert geometries: CUTEAFD_EXPERT_FAMILIES entries FAMILY:exl3-kTIERS
 # (for example dsv4p:exl3-k23 for DeepSeek V4 Pro EXL3 K2) each build one
 # exl3-FAMILY-kTIERS package with the same layouts, sliced from the family's own
@@ -181,12 +177,10 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_routes_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
-      ${CUTEAFD_EXL3_FAMILY_CHAIN}
     COMMENT "Building ${CUTEAFD_EXL3_GEOMETRY} EXL3 modules and verified runtime package (tiers ${CUTEAFD_EXL3_FAMILY_TIERS})"
     VERBATIM
   )
   list(APPEND CUTEAFD_EXL3_FAMILY_MANIFESTS "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
-  set(CUTEAFD_EXL3_FAMILY_CHAIN "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
 endforeach()
 add_custom_target(cuteafd_exl3_export DEPENDS ${CUTEAFD_EXL3_FAMILY_MANIFESTS})
 add_dependencies(cuteafd_exl3_export cuteafd_verify_sparkinfer_source)

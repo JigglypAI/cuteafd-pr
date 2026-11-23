@@ -134,9 +134,3 @@ def require_routed_mul1(source: Path = SOURCE, revision: str = REVISION) -> None
         raise ValueError(
             f"EXL3 routed-expert MUL1 requires a newer SparkInfer pin (current revision {revision})"
         )
-
-
-# Every exporter imports this module before first CUDA use. Admission holds a
-# host RAM/context reservation until exit, including sequential FP8 packages.
-from _export_jobs import install_context_admission
-install_context_admission()
