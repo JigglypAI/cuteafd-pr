@@ -149,6 +149,9 @@ pub struct Sweep {
     /// sustained heat each phase built up, next to the timed points' own windows.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub thermal: serde_json::Map<String, Value>,
+    /// The verify-shape sweep (smoke `sweep_verify`), instead of decode points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::sweep_verify::VerifySweep>,
 }
 
 impl Sweep {
@@ -380,6 +383,24 @@ pub fn run_concurrency_windowed(url: &str, api_key: Option<&str>, levels: &[usiz
     on_timed: OnTimed, options: &crate::sustained::Options) -> Result<Sweep> {
     run_configured(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths,
         prefill_options, fabric, tokens, on_timed, None, options)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_verify_windowed(url: &str, api_key: Option<&str>, options: &crate::sweep_verify::VerifyOptions,
+    fabric: bool, on_timed: OnTimed) -> Result<Sweep> {
+    options.validate()?;
+    let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
+    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
+    client.discover().context("verify sweep: /v1/models")?;
+    let prelude = client.warm_prelude(TOKENS)?;
+    let verify = crate::sweep_verify::run(&client, options, on_timed)?;
+    let mut sweep = Sweep { prelude: Some(prelude), ..Sweep::default() };
+    if let Some(window) = verify.thermal.clone() {
+        eprintln!("sweep verify GPU throttle: {}", cuteafd_core::thermal::describe(&window));
+        sweep.thermal.insert("verify".into(), window);
+    }
+    sweep.verify = Some(verify);
+    Ok(sweep)
 }
 
 #[allow(clippy::too_many_arguments)]

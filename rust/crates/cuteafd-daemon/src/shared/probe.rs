@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub(crate) mod features;
 pub(crate) mod still;
+pub(crate) mod verify_timing;
 
 pub(crate) type ProbeRef = Option<Arc<Probe>>;
 

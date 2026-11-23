@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod rows;
+pub mod verify_timing;
 
 /// The request header naming a registered probe.
 pub const HEADER: &str = "x-cuteafd-probe";
@@ -96,6 +97,10 @@ pub struct ProbeSpec {
     /// (a reference's top-k, so KL can be estimated against it).
     #[serde(default)]
     pub want: HashMap<usize, Vec<u32>>,
+    /// Warmed verify-only exact-shape timing through the serving decode path
+    /// (see [`verify_timing`]); the request then ends without generating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_timing: Option<verify_timing::VerifyTiming>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -362,6 +367,9 @@ pub struct ProbeRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scored_prefill_chunks: Vec<[usize; 2]>,
     pub error: Option<String>,
+    /// The samples of a `verify_timing` probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_timing: Option<verify_timing::VerifyTimingRecord>,
 }
 
 /// A probe shared by the benchmark and the engine serving its request.
@@ -509,6 +517,10 @@ impl Probe {
 
     pub fn scored_prefill_chunk(&self, first_position: usize, rows: usize) {
         self.with(|r| r.scored_prefill_chunks.push([first_position, rows]));
+    }
+
+    pub fn verify_timing(&self, record: verify_timing::VerifyTimingRecord) {
+        self.with(|r| r.verify_timing = Some(record));
     }
 
     /// The scoring request's rows: positions `from..len` of the prompt.
