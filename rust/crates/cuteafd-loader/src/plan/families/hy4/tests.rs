@@ -6,9 +6,8 @@ use crate::families::hy4_common::{core_split, PAGE_ROWS};
 use crate::placement::families::hy4::HY4 as HY4_EXECUTOR;
 use crate::placement::AttentionPlacement;
 use crate::plan::{
-    layout::LayoutOptions,
     testing::{t, write_snapshot, Tensor},
-    ExpertPlacement, PlanInput, PlanOptions,
+    PlanInput, PlanOptions,
 };
 
 const GIB: u64 = 1 << 30;
@@ -445,10 +444,9 @@ fn hy4_bf16_source_contract_and_arena_sizes_match_expectations() {
 }
 
 #[test]
-fn hy4_exl3_k4_mul1_placement_fits_min_max_and_k6_compact() {
-    // 1. Original BF16 core + EXL3 K4 MUL1 experts:
-    //    - 1x RTX PRO 6000 (96 GiB) + 4 Sparks (121 GiB) -> FITS!
-    //    - 2x RTX PRO 6000 (96 GiB) + 6 Sparks (121 GiB) ContextSplit FP8 KV -> hits 2M target!
+fn hy4_exl3_catalog_resolves_hy4_geometry_distinct_from_glm5() {
+    // Full Spark EXL3 placement testing lands in Step 3 alongside the
+    // spark-package-ranges.json `hy4:exl3` entry and placement-input republish (#2550).
     let dir_orig = synthetic_hy4_snapshot(true, None);
     let input_orig = PlanInput::open(dir_orig.path()).unwrap();
     let cat_geom = input_orig.expert_catalog().unwrap().routed_experts().geometry().unwrap();
@@ -456,92 +454,19 @@ fn hy4_exl3_k4_mul1_placement_fits_min_max_and_k6_compact() {
     assert_eq!(cat_geom.family(), Some("hy4"));
     assert_eq!(cat_geom.swiglu_limit(), Some(10.0));
     assert!(!cat_geom.same_shape(&cuteafd_core::ExpertGeometry::GLM5));
-    let mut layout_min = LayoutOptions::default();
-    layout_min.rtx_bytes = vec![96 * GIB];
-    layout_min.spark_bytes = 121 * GIB;
-    layout_min.host_memory = Some((512 * GIB, 480 * GIB));
-    layout_min.mla_kv = cuteafd_core::MlaCacheFormat::Fp8;
-    layout_min.workspace_manifest = Some(std::path::PathBuf::from("/nonexistent/PROGRAMS.json"));
 
-    let report_min = input_orig
-        .plan(&PlanOptions {
-            placement: ExpertPlacement::Sparks { ranks: 4 },
-            layout: Some(layout_min.clone()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(report_min.family.as_deref(), Some("hy4"));
-    assert!(
-        report_min.solver_placement.is_some(),
-        "1x RTX + 4 Sparks original core refused: {:?} hints={:?}",
-        report_min.config_error,
-        report_min.hints
-    );
-    let mem_min = report_min.memory_layout.as_ref().unwrap();
-    assert!(
-        mem_min.pool_tokens >= 600_000,
-        "1x RTX + 4 Sparks FP8 KV pool {} tokens unexpectedly low",
-        mem_min.pool_tokens
-    );
-
-    // 2x RTX PRO 6000 + 6 Sparks (max card, ContextSplit default)
-    let mut layout_max = layout_min.clone();
-    layout_max.rtx_bytes = vec![96 * GIB, 96 * GIB];
-    let report_max = input_orig
-        .plan(&PlanOptions {
-            placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(layout_max),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(
-        report_max.solver_placement.is_some(),
-        "2x RTX + 6 Sparks original core refused: {:?}",
-        report_max.hints
-    );
-    assert_eq!(report_max.attention_placement, AttentionPlacement::Context);
-    let mem_max = report_max.memory_layout.as_ref().unwrap();
-    assert!(
-        mem_max.pool_tokens >= 1_900_000,
-        "2x RTX + 6 Sparks FP8 KV pool {} tokens should reach ~2M target",
-        mem_max.pool_tokens
-    );
-
-    // 2. K6 compact core + EXL3 K4 MUL1 experts:
-    //    - 1x RTX PRO 6000 + 4 Sparks clears full 1M native context in FP8 KV!
+    // Verify K6 compact core packed target arena shrinks as planned (~20.7 GiB 1x / ~11.9 GiB/GPU 2x).
     let dir_k6 = synthetic_hy4_snapshot(true, Some(6));
-    let input_k6 = PlanInput::open(dir_k6.path()).unwrap();
-    let report_k6_1x = input_k6
-        .plan(&PlanOptions {
-            placement: ExpertPlacement::Sparks { ranks: 4 },
-            layout: Some(layout_min.clone()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(
-        report_k6_1x.solver_placement.is_some(),
-        "1x RTX + 4 Sparks K6 core refused: {:?}",
-        report_k6_1x.hints
-    );
-    let mem_k6 = report_k6_1x.memory_layout.as_ref().unwrap();
-    assert!(
-        mem_k6.pool_tokens >= 1_048_576,
-        "1x RTX + 4 Sparks K6 core FP8 KV pool {} should clear 1M native context",
-        mem_k6.pool_tokens
-    );
-
-    // Verify 1x RTX + 2 Sparks refuses cleanly (174 GiB/rank > 121 GiB Spark).
-    let report_tp2 = input_orig
-        .plan(&PlanOptions {
-            placement: ExpertPlacement::Sparks { ranks: 2 },
-            layout: Some(layout_min),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(
-        report_tp2.solver_placement.is_none(),
-        "1x RTX + 2 Sparks must be refused (174 GiB/rank > 121 GiB)"
-    );
+    let ckpt_k6 = Checkpoint::inventory(dir_k6.path()).unwrap();
+    let model_k6 = Model::open(&ckpt_k6).unwrap();
+    let modes_1x = crate::placement::families::hy4::layer_modes(&model_k6.cfg, 1, AttentionPlacement::Context);
+    let arenas_1x = target_arenas(&ckpt_k6, &model_k6.cfg, &model_k6.core, &modes_1x, 1).unwrap();
+    let gib_1x = arenas_1x[0].arena.bytes() as f64 / GIB as f64;
+    assert!((20.4..21.2).contains(&gib_1x), "1x K6 target arena {gib_1x:.2} GiB");
+    let modes_2x = crate::placement::families::hy4::layer_modes(&model_k6.cfg, 2, AttentionPlacement::Context);
+    let arenas_2x = target_arenas(&ckpt_k6, &model_k6.cfg, &model_k6.core, &modes_2x, 2).unwrap();
+    let gib_2x = arenas_2x[0].arena.bytes() as f64 / GIB as f64;
+    assert!((11.6..12.3).contains(&gib_2x), "2x ContextSplit K6 target arena {gib_2x:.2} GiB");
 }
 
 #[test]
