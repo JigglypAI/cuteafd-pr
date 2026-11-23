@@ -464,6 +464,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             if let Some(link) = spark_link {
                 engine.attach_spark(link, onboarded_layers.clone());
             }
+            let graph_layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(
+                gpus,
+                worker_args.peers.len(),
+            );
+            engine.configure_graphs(graph_layout)?;
 
             let family = engine.prefix()?;
             let host_total = cuteafd_loader::formats::mapped_preload::host_memory_before_process()
@@ -497,6 +502,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .publish();
 
             let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
+            backend.warm_decode_graphs(graph_layout)?;
             let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
                 cuteafd_engine::media::EmbeddingCache::new(0),
                 crate::shared::qwen::Encoder::Off,

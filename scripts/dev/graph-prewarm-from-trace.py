@@ -1840,6 +1840,115 @@ STEP5_LAYOUTS = {"fp8-2rtx-6spark": 2, "nvfp4-1rtx-4spark": 1,
 STEP5_GEOMETRY = re.compile(r"Key \{ layer: (\d+), rows: (\d+), section: "
                             r"(Projection|Attention|Dense|Frontend|Shared|Finish) \}")
 
+HY4_LAYOUTS = {
+    "exl3-k4-mc-1rtx-0spark": 1,
+    "exl3-k4-mc-2rtx-0spark": 2,
+    "exl3-k4-mc-1rtx-spark": 1,
+    "exl3-k4-mc-2rtx-spark": 2,
+}
+HY4_GEOMETRY = re.compile(
+    r"Key \{ layer: (\d+), rows: (\d+), section: "
+    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish|Head) \}"
+)
+
+
+def generate_hy4_flash(traces, layout):
+    """Whole replayed row geometries, per rank; never borrow another layout."""
+    if layout not in HY4_LAYOUTS:
+        raise ValueError(f"unknown Hy4-flash layout {layout!r}")
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") != 2:
+            raise ValueError("Hy4-flash requires GRAPH_TRACE schema_version=2")
+        device = int(trace["cache"]["device"])
+        sampled = int(trace["cache"]["sampled_at_ms"])
+        if device not in latest or sampled >= latest[device][0]:
+            latest[device] = (sampled, trace)
+    if len(latest) != HY4_LAYOUTS[layout]:
+        raise ValueError(f"{layout} requires {HY4_LAYOUTS[layout]} device traces")
+    rank_identities = []
+    for rank, device in enumerate(sorted(latest)):
+        _, trace = latest[device]
+        identities = {}
+        for graph in trace["graphs"]:
+            if graph["site"] != "hy4_flash.section":
+                continue
+            match = HY4_GEOMETRY.fullmatch(graph["shape"])
+            if match is None:
+                raise ValueError(f"cannot parse Hy4-flash identity: {graph['shape']!r}")
+            layer, rows, section = match.groups()
+            key = (int(layer), int(rows), section)
+            if key[0] > 42 or key[1] <= 0:
+                raise ValueError(f"unsupported Hy4-flash geometry {key}")
+            if int(graph.get("nodes") or 0) < 2 or graph.get("spans_devices", False):
+                raise ValueError(f"invalid local Hy4-flash section topology {key}")
+            capture = graph.get("capture_bytes")
+            if capture is None or int(capture) < 0:
+                raise ValueError(f"Hy4-flash section {key} lacks measured capture bytes")
+            if key in identities:
+                raise ValueError(f"duplicate Hy4-flash exact geometry {key} on device {device}")
+            identities[key] = graph
+        rank_identities.append(identities)
+    all_graphs = [(key, graph) for identities in rank_identities for key, graph in identities.items()]
+    rows = {key[1] for key, graph in all_graphs if qwen_replay(graph) >= 1}
+    if not rows:
+        raise ValueError("Hy4-flash layout has no replayed row geometries")
+    heat = {row: sum(qwen_replay(graph) for key, graph in all_graphs if key[1] == row) for row in rows}
+    hot = {
+        row: any(
+            sustained(graph)
+            or (int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2)
+            for key, graph in all_graphs
+            if key[1] == row and qwen_replay(graph) >= 1
+        )
+        for row in rows
+    }
+    ordered_rows = sorted(rows, key=lambda row: (not hot[row], -heat[row], row))
+    ranks = []
+    for rank, inventory in enumerate(rank_identities):
+        identities = {key: graph for key, graph in inventory.items() if key[1] in rows}
+        if {key[1] for key in identities} != rows:
+            raise ValueError(f"Hy4-flash rank {rank} lacks a selected row geometry")
+        positive = [int(g["capture_bytes"]) for g in identities.values() if int(g["capture_bytes"]) > 0]
+        if not positive:
+            raise ValueError(f"Hy4-flash rank {rank} has no positive measured capture shares")
+        mean = math.ceil(sum(positive) / len(positive))
+        costs = {key: int(graph["capture_bytes"]) or mean for key, graph in identities.items()}
+        entries = [
+            {
+                "rows": row,
+                "pin": hot[row],
+                "replay_hits": heat[row],
+                "capture_bytes": sum(cost for key, cost in costs.items() if key[1] == row),
+                "sections": [
+                    {
+                        "layer": key[0],
+                        "section": key[2],
+                        "capture_bytes": costs[key],
+                        "replay_hits": qwen_replay(identities[key]),
+                    }
+                    for key in sorted(identities)
+                    if key[1] == row
+                ],
+            }
+            for row in ordered_rows
+        ]
+        ranks.append(
+            {
+                "rank": rank,
+                "reserve_base_bytes": packed(sum(costs.values())),
+                "reserve_extra_bytes": CHUNK,
+                "entries": entries,
+                "zero_replay_sibling_bytes": sum(
+                    costs[key] for key, graph in identities.items() if qwen_replay(graph) == 0
+                ),
+                "lazy_zero_replay_bytes": sum(
+                    int(graph["capture_bytes"]) for key, graph in inventory.items() if key[1] not in rows
+                ),
+            }
+        )
+    return {"schema_version": 1, "family": "hy4_flash", "layout": layout, "ranks": ranks}
+
 
 def generate_step5(traces, layout):
     """Whole replayed row geometries, per rank; never borrow another layout."""
@@ -1917,7 +2026,7 @@ def generate_step5(traces, layout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark", "step5")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark", "step5", "hy4_flash")))
     parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1963,8 +2072,11 @@ def main():
     elif args.family == "step5":
         if layout not in STEP5_LAYOUTS:
             parser.error("Step-5 requires its exact --layout")
+    elif args.family == "hy4_flash":
+        if layout not in HY4_LAYOUTS:
+            parser.error("Hy4-flash requires its exact --layout")
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41, kimi_k3 and step5 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41, kimi_k3, step5 and hy4_flash only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
@@ -1975,6 +2087,8 @@ def main():
                                    args.ranks, args.onboard_layers)
         elif args.family == "step5":
             result = generate_step5([json.loads(Path(path).read_text()) for path in args.trace], layout)
+        elif args.family == "hy4_flash":
+            result = generate_hy4_flash([json.loads(Path(path).read_text()) for path in args.trace], layout)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,

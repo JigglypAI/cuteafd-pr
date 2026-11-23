@@ -56,6 +56,9 @@ pub(crate) struct GoldenArgs {
     /// Serving-shaped N=1 decode parity: prefill `0..score_from-1` in chunks, then step 1 token at a time.
     #[arg(long)]
     pub(crate) decode: bool,
+    /// Enable bounded decode CUDA graphs during `--decode` or `--resume-at` verification.
+    #[arg(long)]
+    pub(crate) decode_graphs: bool,
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
@@ -360,6 +363,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?
     };
     engine.dump_dir = args.dump_dir.clone();
+    if args.decode_graphs {
+        let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
+        engine.configure_graphs(layout)?;
+    }
 
     if !args.resume_at.is_empty() {
         let mut tokens = if let Some(ws) = &selected_windows {
@@ -401,7 +408,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 for pos in prefix..(win.tokens.len() - 1) {
                     let next_pos = pos + 1;
                     let need = wanted_set.contains(&next_pos);
-                    let row = engine.forward_chunk_opts(&win.tokens[pos..pos + 1], args.last_layer, need)?;
+                    let row = if args.decode_graphs {
+                        engine.forward_decode_step(win.tokens[pos], args.last_layer, need)?
+                    } else {
+                        engine.forward_chunk_opts(&win.tokens[pos..pos + 1], args.last_layer, need)?
+                    };
                     if need {
                         scored_slices.push((next_pos, row));
                     }
@@ -567,6 +578,17 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 ctx_agg.confident_top1.unwrap_or(0.0) * 100.0,
                 ctx_agg.top3_contained * 100.0,
             );
+        }
+        if args.decode_graphs {
+            for snap in crate::shared::decode_graph::device::snapshots() {
+                let hits: u64 = snap.cycles.values().map(|c| c.hits).sum();
+                let captures: u64 = snap.cycles.values().map(|c| c.captures).sum();
+                let eager: u64 = snap.cycles.values().map(|c| c.eager_runs).sum();
+                println!(
+                    "hy4f-golden decode-graphs device={}: reserve={} charged={} captures={} hits={} eager_runs={}",
+                    snap.device, snap.reserve, snap.charged, captures, hits, eager,
+                );
+            }
         }
         return Ok(());
     }
