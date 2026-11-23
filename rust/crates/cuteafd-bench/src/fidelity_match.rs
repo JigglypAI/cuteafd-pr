@@ -28,6 +28,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     // Official native NVFP4/MXFP8 release; MiniMax publishes no BF16 master.
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
     Publication { root: "tencent/Hy4-flash", siblings: &["tencent/Hy4-flash"], revision: dataset::HY4_REVISION, config: dataset::HY4_CONFIG },
+    Publication { root: "tencent/Hy4", siblings: &["tencent/Hy4", "tencent/Hy4-FP8"], revision: dataset::HY4_FULL_REVISION, config: dataset::HY4_FULL_CONFIG },
     Publication { root: "thinkingmachines/Inkling-2-Small-MXFP8", siblings: &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"], revision: dataset::INKLING2_REVISION, config: dataset::INKLING2_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
     Publication { root: "mistralai/Mistral-Large-4-1T-A52B", siblings: &["mistralai/Mistral-Large-4-1T-A52B"], revision: dataset::MISTRAL_LARGE4_REVISION, config: dataset::MISTRAL_LARGE4_CONFIG },
@@ -52,6 +53,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
     ("tencent/Hy4-flash", &["tencent/Hy4-flash"]),
+    ("tencent/Hy4", &["tencent/Hy4", "tencent/Hy4-FP8"]),
     ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
 
@@ -418,6 +420,32 @@ mod tests {
                 (root, dataset::HY4_REVISION, dataset::HY4_CONFIG));
         }
         assert!(resolve_in("someone/Hy4-flash-unverified", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn hy4_full_official_root_maps_fp8_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "tencent/Hy4";
+        let sibling = "tencent/Hy4-FP8";
+        for model in [root, sibling] {
+            assert_eq!(official_root(model), Some(root));
+            let reference = resolve_in(model, None, tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, "name");
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::HY4_FULL_REVISION, dataset::HY4_FULL_CONFIG));
+        }
+        for (model, parent) in [("test/hy4-bf16-quant", root), ("test/hy4-fp8-quant", sibling)] {
+            let quant = add(tmp.path(), model, &format!("base_model: {parent}\nbase_model_relation: quantized"));
+            let reference = resolve_in(model, Some(&quant), tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, "base_model");
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::HY4_FULL_REVISION, dataset::HY4_FULL_CONFIG));
+            let mut chain = vec![model.to_string(), parent.to_string()];
+            if parent != root { chain.push(root.to_string()); }
+            assert_eq!(reference.resolved_chain, vec![chain]);
+        }
+        assert!(official_root("tencent/Hy4-unverified").is_none());
+        assert!(resolve_in("someone/Hy4-unverified", None, tmp.path()).is_err());
     }
 
     #[test]
