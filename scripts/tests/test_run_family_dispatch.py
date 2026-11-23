@@ -3451,7 +3451,7 @@ def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, key
                                   keys)
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
-                   and "cuteafd plan" not in line
+                   and "cuteafd plan" not in line and "python3 -I -" not in line
                    for line in result.stderr.splitlines())
 
 

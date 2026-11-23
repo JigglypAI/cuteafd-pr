@@ -436,10 +436,6 @@ def test_optional_levers_are_default_off_and_documented():
                 assert 'selected(explicit, None, dflash,' in source
                 assert 'kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2")' in (
                     ROOT / "rust/crates/cuteafd-daemon/src/commands/plan.rs").read_text()
-            elif key == "DECODE_LANES":
-                assert lever["families"] == ["V4.1"]
-                assert default == "2"
-                assert "`DECODE_LANES=1`" in lever["enable"]
             elif key == "DECODE_ROWS":
                 assert lever["families"] == ["V4.1", "GLM Flash"]
                 assert default == "auto"

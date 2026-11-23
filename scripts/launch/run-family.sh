@@ -798,7 +798,7 @@ v41_decode_rows="$(get DECODE_ROWS)"
 [[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || "$v41_decode_rows" =~ ^[1-9][0-9]*$ ]] ||
   release_die "DECODE_ROWS must be auto or a positive integer"
 [[ -z "$v41_decode_rows" ]] || count_args+=(--decode-rows "$v41_decode_rows")
-[[ -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
+[[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
 count_args+=("${attention_precision_args[@]}")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
@@ -2407,7 +2407,7 @@ audio_encoder_hash=""
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
   [[ -z "$decode_rows" ]] || plan_draft_args+=(--decode-rows "$decode_rows")
-  [[ -z "${draft_length:-}" ]] || plan_draft_args+=(--draft-length "$draft_length")
+  [[ -z "$decode_rows" || "$decode_rows" == auto || -z "${draft_length:-}" ]] || plan_draft_args+=(--draft-length "$draft_length")
   plan_draft_args+=("${attention_precision_args[@]}")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")

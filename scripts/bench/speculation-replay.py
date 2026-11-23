@@ -506,7 +506,7 @@ def replay(rows, fit, rule, batch_rule=None, max_rows=64):
     rounds = collections.defaultdict(list)
     for r in rows:
         rounds[(r['card'], r['round'], r['lane'])].append(r)
-    tokens = seconds = decode_rows = 0.
+    tokens = seconds = verify_rows = 0.
     for members in rounds.values():
         lengths = batch_rule(members, fit) if batch_rule else settle([rule(m) for m in members], members, max_rows)
         committed = sum(1 + min(L, accepted_run(m)) for L, m in zip(lengths, members))
