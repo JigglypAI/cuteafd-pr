@@ -185,8 +185,6 @@ impl Family for MistralLarge4 {
     }
     fn id(&self) -> &'static str { "mistral_large4" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
-    /// serve-glm's Pixtral path keeps the shared host media cache (`ml4_media`).
-    fn media_cache_headroom(&self) -> bool { true }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA
     }
