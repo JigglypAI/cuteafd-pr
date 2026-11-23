@@ -17,7 +17,7 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8', 'MINIMAX', 'INKLING2')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8', 'MINIMAX', 'INKLING2', 'HY4F')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
          'FP8_MOE_BF16_FAMILIES', 'EXLR8_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
@@ -117,14 +117,42 @@ def entries_for(repo, matrix, scope):
     return selected
 
 
-def entry_scopes(repo, entry):
+from contextlib import contextmanager
+
+
+@contextmanager
+def _scoped_hf_environ(environ):
+    if environ is None or environ is os.environ:
+        yield
+        return
+    overrides = {
+        key: str(val) for key, val in environ.items()
+        if key.startswith('HF_') or key == 'CUTEAFD_NAMESPACE_ROOT'
+    }
+    if not overrides:
+        yield
+        return
+    saved = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, previous in saved.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
+def entry_scopes(repo, entry, environ=None):
     wip = scopes_module(repo)
     values = wip.read_config(repo / entry.get('config', 'cuteafd.config'))
     values.update({key: str(value) for key, value in entry['set'].items()})
     # Resource reservations do not override smoke's config/set topology.
     if entry.get('family'):
         values['FAMILY'] = entry['family']
-    family, scopes = wip.config_scopes(values)
+    with _scoped_hf_environ(environ):
+        family, scopes = wip.config_scopes(values)
     return family, values, scopes
 
 
@@ -138,7 +166,7 @@ def derive(repo, matrix, scope='all', environ=None):
     result = {PREFIX + key + '_AOT': 'OFF' for key in SWITCHES}
     result.update({PREFIX + key: '' for key in LISTS})
     for entry in entries:
-        _, _, scopes = entry_scopes(repo, entry)
+        _, _, scopes = entry_scopes(repo, entry, environ)
         for key, value in scopes.items():
             suffix = key.removeprefix('CUTEAFD_WIP_')
             if suffix == 'COORDINATOR_EXPERT_FAMILIES':
@@ -246,6 +274,8 @@ def requirements(repo, matrix, scope):
             programs = {'minimax'}
         elif family == 'inkling2':
             programs = {'inkling2', 'dense_trellis_k6', 'native_attention'}
+        elif family == 'hy4_flash':
+            programs = {'hy4f', 'dense_trellis_k6'} | ({'hy4f2'} if dual else set())
         elif family == 'muse_spark':
             programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
         spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))

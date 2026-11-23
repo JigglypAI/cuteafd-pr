@@ -55,7 +55,7 @@ elif args[:2] == ['image', 'inspect']:
 
 def command(tmp_path, arch='amd64', mode='registry'):
     return ['python3', str(SELECTOR), 'select', '--source', str(ROOT), '--arch', arch,
-            '--local-tag', 'local-dev', '--engine-commit', 'fixture', '--mode', mode,
+            '--engine-commit', 'fixture', '--mode', mode,
             '--output', str(tmp_path/'manifest.json')]
 
 
@@ -117,7 +117,7 @@ def test_remote_leg_selects_and_reuses_exact_image_across_ssh_phases(tmp_path):
     ssh.write_text('#!/bin/bash\nshift\nexec bash -s -- "$@"\n')
     ssh.chmod(0o755)
     args = [str(staging), 'local-dev', 'release-image', 'fixture', 'pin', 'version'] + ['__legacy__'] * 5
-    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON', 'on', '90', '123', '7', base64.b64encode(b'export CUTEAFD_RELEASE_SCOPE=all; export CUTEAFD_RELEASE_MATRIX_SHA256=fixture').decode()]
+    args += ['dev', 'fixture-export', '__legacy__', '__legacy__', '__legacy__', '__legacy__', '0', 'registry', 'ON', 'on', base64.b64encode(b'export CUTEAFD_RELEASE_SCOPE=all; export CUTEAFD_RELEASE_MATRIX_SHA256=fixture').decode()]
     result = subprocess.run(['ssh', 'seed', *args], input=remote, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     manifest_path = staging/'.cuteafd-release/fixture-export.dev-image.json'
@@ -224,13 +224,18 @@ def test_wip_missing_default_images_select_on_both_hosts(tmp_path, mode):
     assert not list((home/'.cache/cuteafd/builds/wip-dev-image').glob('source.*'))
 
 
-def test_digest_config_uses_safe_local_fallback_tag(tmp_path):
-    argv = command(tmp_path, mode='build')
-    argv[argv.index('--local-tag') + 1] = MOD.REGISTRY + '@' + DIGEST
-    result = subprocess.run(argv, env=fixture(tmp_path), capture_output=True, text=True)
+@pytest.mark.parametrize('arch', ['amd64', 'arm64'])
+@pytest.mark.parametrize('mode,failure', [('build', ''), ('registry', 'missing')])
+def test_fallback_build_never_retags_shared_default(tmp_path, arch, mode, failure):
+    # 2026-11-20: a release fallback built as cuteafd-coordinator-dev moved the
+    # shared default; WIP exports then pinned it and maxq refused the unknown image.
+    result = subprocess.run(command(tmp_path, arch, mode), env=fixture(tmp_path, arch, failure),
+                            capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == IMAGE
     build = next(call for call in calls(tmp_path) if call[0] == 'build')
-    assert build[build.index('-t') + 1] == f'cuteafd-dev-local:tc-{MOD._toolchain.identity(ROOT)}-amd64'
+    assert build[build.index('-t') + 1] == f'cuteafd-dev-local:tc-{MOD._toolchain.identity(ROOT)}-{arch}'
+    assert not any(call[0] == 'tag' for call in calls(tmp_path))
 
 
 def test_wip_cancel_stops_remote_session_that_survives_ssh_client(tmp_path):

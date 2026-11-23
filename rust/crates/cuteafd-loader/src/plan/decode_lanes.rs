@@ -22,14 +22,16 @@ pub enum LaneSupport {
     One { reason: &'static str },
     /// One or two; `default` until a hardware A/B qualifies another default.
     OneOrTwo { default: u8 },
-    /// A fixed pair (the executor has no one-lane path).
-    FixedTwo,
 }
 
 impl LaneSupport {
     /// Most lanes the executor can run (each owns a Spark decode execution).
     pub fn max_lanes(self) -> u8 {
-        match self { Self::One { .. } => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
+        match self { Self::One { .. } => 1, Self::OneOrTwo { .. } => MAX_DECODE_LANES }
+    }
+    /// Lanes a launch without `--decode-lanes` requests.
+    pub fn default_lanes(self) -> u8 {
+        match self { Self::One { .. } => 1, Self::OneOrTwo { default } => default }
     }
 }
 
@@ -39,16 +41,11 @@ impl LaneSupport {
 /// concurrency one: an idle second lane would cost memory for nothing.
 pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
     let support = family.decode_lanes();
-    let lanes = requested.unwrap_or(match support {
-        LaneSupport::One { .. } => 1,
-        LaneSupport::OneOrTwo { default } => default,
-        LaneSupport::FixedTwo => 2,
-    });
+    let lanes = requested.unwrap_or(support.default_lanes());
     if !(1..=MAX_DECODE_LANES).contains(&lanes) {
         return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
     }
     let refusal = match (support, lanes) {
-        (LaneSupport::FixedTwo, 1) => Some("the executor has a fixed pair of decode lanes"),
         (LaneSupport::One { reason }, 2) => Some(reason),
         _ => None,
     };
@@ -61,10 +58,11 @@ pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u
     })
 }
 
-/// The lane a newly admitted request joins: the lighter one, lane zero on a
-/// tie. A drained cohort is then rebalanced to within one request.
-pub fn assign(loads: [usize; MAX_DECODE_LANES as usize]) -> usize {
-    usize::from(loads[1] < loads[0])
+/// The lane a newly admitted request joins among `lanes`: the lighter one,
+/// lane zero on a tie (always lane zero with one lane). A drained cohort is
+/// then rebalanced to within one request.
+pub fn assign(loads: [usize; MAX_DECODE_LANES as usize], lanes: u8) -> usize {
+    usize::from(lanes > 1 && loads[1] < loads[0])
 }
 
 #[cfg(test)]
@@ -74,14 +72,12 @@ mod tests {
     #[test]
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
         for family in super::super::family::registry() {
-            let default = match family.decode_lanes() {
-                LaneSupport::One { .. } => 1, LaneSupport::OneOrTwo { default } => default, LaneSupport::FixedTwo => 2 };
+            let default = family.decode_lanes().default_lanes();
             assert_eq!(resolve(*family, None, 16).unwrap(), default, "{}", family.id());
             for lanes in [1, 2] {
                 let supported = match family.decode_lanes() {
                     LaneSupport::One { .. } => lanes == 1,
                     LaneSupport::OneOrTwo { .. } => true,
-                    LaneSupport::FixedTwo => lanes == 2,
                 };
                 let result = resolve(*family, Some(lanes), 16);
                 if supported { assert_eq!(result.unwrap(), lanes); } else {
@@ -93,10 +89,15 @@ mod tests {
                 assert!(matches!(resolve(*family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
             }
         }
-        // The fixed pair holds at concurrency one.
+        // V4.1 runs one or two lanes, two by default, and one at concurrency one
+        // (an idle second lane would hold workspaces, graphs and a Spark
+        // decode execution for nothing).
         let v41 = &crate::plan::families::deepseek::DEEPSEEK_V41;
-        assert_eq!(resolve(v41, Some(2), 1).unwrap(), 2);
-        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::FixedTwo);
+        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::OneOrTwo { default: 2 });
+        for (requested, concurrency, expected) in [(None, 16, 2), (Some(2), 16, 2), (Some(1), 16, 1),
+            (None, 1, 1), (Some(2), 1, 1), (Some(1), 1, 1), (Some(1), 32, 1)] {
+            assert_eq!(resolve(v41, requested, concurrency).unwrap(), expected, "{requested:?} C{concurrency}");
+        }
     }
 
     #[test]
@@ -123,11 +124,15 @@ mod tests {
 
     #[test]
     fn assignment_fills_the_lighter_lane_and_ties_go_to_lane_zero() {
-        assert_eq!([assign([0, 0]), assign([1, 0]), assign([1, 1]), assign([3, 5])], [0, 1, 0, 0]);
+        assert_eq!([assign([0, 0], 2), assign([1, 0], 2), assign([1, 1], 2), assign([3, 5], 2)], [0, 1, 0, 0]);
         let mut loads = [0usize; 2];
         for _ in 0..17 {
-            loads[assign(loads)] += 1;
+            loads[assign(loads, 2)] += 1;
             assert!(loads[0].abs_diff(loads[1]) <= 1);
         }
+        // One lane admits every request to lane zero.
+        let mut loads = [0usize; 2];
+        for _ in 0..16 { loads[assign(loads, 1)] += 1; }
+        assert_eq!(loads, [16, 0]);
     }
 }

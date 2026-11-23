@@ -164,11 +164,13 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     let package_family = match family {
         "glm5" => "glm", "glm5_flash" => "glmf", "kimi_k3" | "kimi_k31" => "kimik3",
         "muse_spark" => "muse", "mistral_large4" => "ml4", "deepseek_v4" => "dsv4p",
+        "hy4_flash" => "hy4f",
         other => other,
     };
-    let tiers = catalog.exl3().context("EXL3 worker needs its catalog")?.decoder_tiers()
-        .iter().map(usize::to_string).collect::<String>();
-    let recipe = super::super::experts::spark_recipe(&format!("{package_family}:exl3-k{tiers}"),
+    let exl3 = catalog.exl3().context("EXL3 worker needs its catalog")?;
+    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+    let recipe = super::super::experts::spark_recipe(
+        &format!("{package_family}:exl3-k{tiers}{}", exl3.codebook().package_suffix()),
         geometry.intermediate as usize, working.spark_ranks)?;
     let width = *recipe.stored_widths.get(rank).context("EXL3 worker rank outside recipe")?;
     let compact = recipe.rule == cuteafd_core::tp_units::UnitRule::Rotated;

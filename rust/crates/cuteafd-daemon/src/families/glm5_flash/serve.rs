@@ -869,7 +869,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     // DFlash2 selector features land only for the open trace's round records.
     if let Some(drafter) = drafter {
-        drafter.set_selector_readback(trace.is_some(), policy.length.control() == cuteafd_core::DraftControl::History);
+        { let (traced, scored) = crate::shared::draft::history::score_readback(policy.length.control());
+            drafter.set_selector_readback(traced && trace.is_some(), scored); }
     }
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
     let first_prefill_seen = std::cell::Cell::new([false; 2]);
@@ -1529,7 +1530,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted.max(1), censored)).collect();
-        policy.observe(&outcomes);
+        policy.observe_timed(&outcomes, trace.is_some().then(|| history::RoundTiming::since(tally.lane(),
+            tally.started(), lane.draft_s - draft0, step_ms / 1e3, starts.clone())));
     }
     if let Some(trace) = trace.as_mut() {
         lane.trace_round += 1;

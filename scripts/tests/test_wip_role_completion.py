@@ -573,7 +573,7 @@ def _distribution_script(tmp_path, held, targets):
     text = (ROOT / 'wip.sh').read_text()
     start = text.index('wip_distribute_locks() {')
     helpers = text[start:text.index('\nwip_build_selected_roles() {')]
-    seed_lock = text[text.index('wip_seed_lock() {'):text.index('# Try a configured remote exporter first')]
+    seed_lock = text[text.index('wip_seed_lock() {'):text.index('\n# Docker exec and SSH')]
     trace = tmp_path / 'trace'
     hw = tmp_path / 'scripts/hw'
     hw.mkdir(parents=True)

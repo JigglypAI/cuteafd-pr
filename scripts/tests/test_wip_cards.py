@@ -423,7 +423,7 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'build.lock' in output and 'gpu1.lock' not in output
     scopes = cards.build_scopes([entry])
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
-    assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
+    assert 'CUTEAFD_WIP_EXPORT_LOCKS' not in scopes
     # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
     qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [],
             'set': {'MODEL_ID': 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'SPARK_COUNT': '0'}}
@@ -493,8 +493,9 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
 
 
 def test_source_lock_capability_detection(monkeypatch):
-    texts = iter(['CUTEAFD_WIP_EXPORT_LOCKS', 'CUTEAFD_WIP_EXPORT_LOCK_FILES', 'old', 'old'])
+    texts = iter(['CUDA_VISIBLE_DEVICES=', 'CUDA_VISIBLE_DEVICES=', 'CUTEAFD_WIP_EXPORT_LOCKS', 'CUTEAFD_WIP_EXPORT_LOCK_FILES', 'old', 'old'])
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=next(texts)))
+    assert cards.build_lock_mode('cpu') == 'cpu-export'
     assert cards.build_lock_mode('new') == 'native-phase'
     assert cards.build_lock_mode('old') == 'legacy-full-build'
 
@@ -822,15 +823,10 @@ def _trace_tools(tmp_path, extra=None):
 def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
     function = _wip_function('build_expert() (', '\n# Role builders end here.') + '\nnative_store_has() { return 1; }\n'
     text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    # The lease process (build-resource.py) grants the export turn; rhea's is its exclusive lease.
-    (lease / 'export-granted').write_text('{}')
     setup = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
@@ -838,9 +834,7 @@ release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([rhea]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn
+'''
     subprocess.run(['bash', '-c', setup + function + '\nbuild_expert'], check=True,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
@@ -850,11 +844,10 @@ wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
     assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
-    # The export ran inside the granted turn, and the turn was handed back.
-    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
+    assert 'CUDA_VISIBLE_DEVICES=' in lines[native]
 
 
-def test_coordinator_export_follows_rust_with_memory_caps(tmp_path):
+def test_coordinator_export_follows_rust_on_cpu(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -864,22 +857,15 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export SOURCE:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { shift; printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator all /frozen/source'], check=True,
+    subprocess.run(['bash', '-c', setup + function + '\nbuild_coordinator all /frozen/source'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
-    capped = lines.index('capped')
-    # First every export is requested from the export cache (cold here), then the GPU turn.
-    cached = next(i for i, line in enumerate(lines) if 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' in line)
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native')
-                  and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line)
-    assert rust < cached < capped < native
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
+    assert rust < native
+    assert 'CUDA_VISIBLE_DEVICES=' in lines[native]
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
-    assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
     assert '/wip-export-gpu.lock' not in wip
 
@@ -1526,7 +1512,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
 @pytest.mark.parametrize('audio,enabled', [(None, True), ('auto', True), ('on', True), ('off', False)])
 def test_muse_audio_scope_matches_card_request(tmp_path, audio, enabled):
     cfg = tmp_path / 'muse.config'
-    cfg.write_text('FAMILY=muse_spark\nSPARK_COUNT=4\n')
+    cfg.write_text('FAMILY=muse_spark\nMODEL_ID=wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6\nSPARK_COUNT=4\n')
     card = dict(family='muse_spark', config=str(cfg), gpus=[0], sparks=['ostrich', 'dodo', 'emu', 'kiwi'],
                 set={} if audio is None else dict(AUDIO=audio))
     scopes = cards.build_scopes([card])
@@ -2000,7 +1986,9 @@ def test_v41_tp_role_matches_the_launcher_derivation(tmp_path, keys, role):
     config.write_text('MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n')
     card = dict(name='v', family='deepseek_v41', config=str(config), set=keys, sparks=[])
     assert cards.slot_needs(card)['tp_role'] == role
-    assert cards.slot_needs({**card, 'family': 'glm5_flash'})['tp_role'] is None
+    glmf_keys = ({**keys, 'MODEL_ID': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC'}
+                 if keys.get('EXPERT_FORMAT') == 'exl3' else keys)
+    assert cards.slot_needs({**card, 'family': 'glm5_flash', 'set': glmf_keys})['tp_role'] is None
 
 
 def test_seal_check_reports_attested_roles_from_the_slot(tmp_path, monkeypatch):
@@ -2246,6 +2234,69 @@ def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp
     with pytest.raises(ValueError, match='--exact-state uses the measurement window'):
         cards.generate({**entry, 'levels': [1]}, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key',
                        {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
+
+
+def test_client_runs_against_the_live_server_after_readiness(entry, tmp_path):
+    client = ['/opt/x/agentic', 'record', '--output', 'session.json']
+    with pytest.raises(ValueError, match='--client needs --panels none'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       client=client)
+    none = {**entry, 'profile': 'panels:', 'baseline': False}
+    with pytest.raises(ValueError, match='--client needs --panels none and no sweep'):
+        cards.generate({**none, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                       {}, set(), None, 1, client=client)
+    for kwargs in (dict(exact_state=['/x', 'g']), dict(cold_hosts=['raptor'])):
+        with pytest.raises(ValueError, match='excludes --exact-state and --cold-window'):
+            cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                           client=client, **kwargs)
+    with pytest.raises(ValueError, match='--client-timeout must be'):
+        cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       client=client, client_timeout=0)
+    job = cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                         client=client)
+    hook = job['entry']['precheck']
+    out = Path(job['state']) / 'client'
+    assert out.is_dir() and hook['required'] and hook['timeout_s'] == cards.CLIENT_TIMEOUT_S == 3600
+    assert hook['argv'][:3] == ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={tmp_path / "key"}']
+    assert hook['argv'][-len(client):] == client and job['client'] == hook['argv']
+    assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['precheck'] == hook
+    # A card that already has a precheck (an expected pool) runs it first, then the client.
+    job = cards.generate(none, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key', {}, set(), 4096, 1,
+                         client=client, client_timeout=600)
+    hook = job['entry']['precheck']
+    assert hook['argv'][:2] == ['sh', '-c'] and hook['timeout_s'] == 600 + 180
+    assert hook['argv'][2].index('--precheck') < hook['argv'][2].index('/opt/x/agentic')
+    with pytest.raises(ValueError, match='7200 s hook limit'):
+        cards.generate(none, 'c', dict(instance='r', slot='s'), tmp_path, tmp_path / 'key', {}, set(), 4096, 1,
+                       client=client, client_timeout=7200)
+
+
+def test_client_hook_runs_in_its_output_directory(entry, tmp_path):
+    none = {**entry, 'profile': 'panels:', 'baseline': False}
+    job = cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                         client=['sh', '-c', 'pwd > where; printf %s "$CUTEAFD_SMOKE_URL" > url; exit 3'])
+    result = subprocess.run(job['entry']['precheck']['argv'], env={**os.environ, 'CUTEAFD_SMOKE_URL': 'http://h:1'})
+    out = Path(job['state']) / 'client'
+    assert result.returncode == 3
+    assert (out / 'where').read_text().strip() == str(out) and (out / 'url').read_text() == 'http://h:1'
+
+
+def test_client_dry_run_shows_the_hook_and_requires_panels_none(entry, tmp_path, monkeypatch, capsys):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    base = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s',
+            '--state', str(state), '--dry-run', '--client', '/opt/x/agentic record --output s.json']
+    monkeypatch.setattr(sys, 'argv', base)
+    with pytest.raises(SystemExit):
+        cards.main()
+    assert '--client needs --panels none' in capsys.readouterr().err
+    monkeypatch.setattr(sys, 'argv', base + ['--panels', 'none', '--client-timeout', '5400'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert job['entry']['baseline'] is False and job['entry']['profile'] == 'panels:'
+    assert job['entry']['precheck']['timeout_s'] == 5400
+    output = capsys.readouterr().out
+    assert '# smoke client (after readiness' in output and '/opt/x/agentic record --output s.json' in output
 
 
 def test_fabric_probe_card_selector(entry, tmp_path):
@@ -2583,17 +2634,12 @@ def test_owner_marker_adopts_only_matching_sealed_retry_root(tmp_path, damage):
 
 
 def _expert_leg(tmp_path, has):
-    """build_expert with native_store_has answering from `has` in order; returns (trace lines, lease dir)."""
+    """build_expert with native_store_has answering from `has` in order; returns trace lines."""
     function = _wip_function('build_expert() (', '\n# Role builders end here.')
-    text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    (lease / 'export-granted').write_text('{}')
     answers = tmp_path / 'answers'
     answers.write_text(''.join(f'{int(not a)}\n' for a in has))
     setup = f'''set -euo pipefail
@@ -2603,44 +2649,19 @@ release_die() {{ exit 2; }}
 slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([kakapo]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn
+'''
     stub = f'''
 native_store_has() {{ local rc; rc="$(head -1 {str(answers)!r})"; sed -i 1d {str(answers)!r}; printf 'has %s\\n' "$rc" >> "$TRACE"; return "$rc"; }}
 '''
     subprocess.run(['bash', '-c', setup + function + stub + '\nbuild_expert'], check=True, timeout=30,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
-    return trace.read_text().splitlines(), lease
+    return trace.read_text().splitlines()
 
 
-def test_native_cache_hit_on_a_lan_seed_takes_no_export_turn(tmp_path):
-    lines, lease = _expert_leg(tmp_path, [True])
-    assert not (lease / 'export-request').exists() and not (lease / 'export-done').exists()
+def test_native_cache_hit_on_a_lan_seed_restores_without_rebuilding(tmp_path):
+    lines = _expert_leg(tmp_path, [True])
     native = [line for line in lines if line.endswith('/wip/output/expert native')]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
-
-
-def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
-    # A build ahead of us in the seed's export queue exported this very key.
-    lines, lease = _expert_leg(tmp_path, [False, True])
-    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
-    native = [line for line in lines if line.endswith('/wip/output/expert native')
-              and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line]
-    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
-
-
-def test_export_turn_failure_stops_the_build(tmp_path):
-    text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    (lease / 'export-failed').write_text('no turn for kakapo-export after 14400 s')
-    script = f'''release_die() {{ echo "die: $*"; exit 3; }}
-seed_host=kakapo wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn + '\nwip_seed_export_turn\necho unreachable'
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 3 and 'die: no GPU export turn on kakapo' in result.stdout
 
 
 @pytest.mark.parametrize('stop', [None, 'TERM', 'INT', 'HUP'])
@@ -3454,7 +3475,7 @@ def test_ml4_min_max_scope_union_includes_both_counts():
 
 def test_scope_and_package_needs_share_global_arm_settings(entry, tmp_path):
     entry.update(family='mistral_large4')
-    Path(entry['config']).write_text('SPARK_COUNT=4\nSPARK_TP=4\n')
+    Path(entry['config']).write_text('MODEL_ID=wrldsuksgo2mars/Mistral-Large-4-EXL3-K4\nSPARK_COUNT=4\nSPARK_TP=4\n')
     variant = cards.resolved_card(entry, {'SPARK_COUNT': '5'}, {'SPARK_TP'})
     assert variant['resolved_values']['SPARK_COUNT'] == '5'
     assert 'SPARK_TP' not in variant['resolved_values']
@@ -3517,6 +3538,7 @@ def test_seal_inventory_reads_libraries_not_registered_directories(tmp_path):
 
 def test_global_count_override_builds_and_launches_same_topology(entry, tmp_path, monkeypatch):
     entry['family'] = 'mistral_large4'
+    Path(entry['config']).write_text('MODEL_ID=wrldsuksgo2mars/Mistral-Large-4-EXL3-K4\nBENCH_SIMULATED=on\n')
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
     seen = []
@@ -4418,3 +4440,27 @@ def test_detached_termination_cannot_publish_child_success(tmp_path):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
+
+
+def test_serving_turn_is_bounded_by_its_jobs_budgets(entry, tmp_path, monkeypatch):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    # The card's own timeouts become the turn's hwlock --max-run (no new knob):
+    # launch + run budget, hooks, smoke teardown and driver slack, per job.
+    import contextlib
+    seen = []
+    @contextlib.contextmanager
+    def hold(names, wait, *args, **kwargs):
+        seen.append(kwargs['max_run'])
+        yield []
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    short = make({**entry, 'timeout_s': 100, 'run_timeout_s': 200}, tmp_path / 'a')
+    long = make({**entry, 'timeout_s': 100, 'run_timeout_s': 5000}, tmp_path / 'b')
+    with cards.serving_turn([short], {}, 5):
+        pass
+    with cards.serving_turn([short, long], {}, 5):
+        pass
+    expected = 100 + 200 + 120 + short['entry']['prelaunch']['timeout_s'] + cards.SMOKE_STOP_GRACE_S + cards.JOB_DRIVER_SLACK_S
+    assert seen[0] == expected == cards.job_max_run(short)
+    assert seen[1] == cards.job_max_run(short) + cards.job_max_run(long)
+    assert cards.job_max_run(long) - cards.job_max_run(short) == 4800

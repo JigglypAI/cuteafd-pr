@@ -49,6 +49,7 @@ pub mod load_timing;
 mod observer_context;
 pub mod synchronized_load;
 pub mod push_ring;
+pub mod attic;
 pub mod event_waiters;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1221,6 +1222,10 @@ fn native_tag(tag: memory_ledger::Tag) -> Result<(u32, CString)> {
     Ok((tag.kind.as_raw(), CString::new(tag.owner).context("allocation owner contains NUL")?))
 }
 type FreeDeviceBufferFn = unsafe extern "C" fn(buf: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
+type AllocCarveoutDeviceBufferFn = unsafe extern "C" fn(bytes: usize, fds: *const c_int, fd_bytes: *const usize,
+    fd_count: usize, out: *mut CuteafdDeviceBuffer, out_tail_bytes: *mut usize, kind: u32, owner: *const c_char) -> CuteafdStatus;
+/// `cuteafd_device_buffer_flags_t::CUTEAFD_DEVICE_BUFFER_FLAG_CARVEOUT`.
+pub const DEVICE_BUFFER_FLAG_CARVEOUT: u64 = 8;
 type CudaStreamCreateFn = unsafe extern "C" fn(out: *mut *mut c_void) -> CuteafdStatus;
 type CudaStreamDestroyFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaStreamSynchronizeFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
@@ -1717,6 +1722,10 @@ macro_rules! native_symbols {
     };
 }
 
+/// Carveout range base -> its tail's ledger address (rows are keyed by pointer).
+static CARVEOUT_TAILS: Mutex<std::collections::BTreeMap<usize, Option<usize>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
 native_symbols! {
     cuteafd_xgrammar_compile: XGrammarCompileFn,
     cuteafd_xgrammar_matcher_create: XGrammarMatcherCreateFn,
@@ -1739,6 +1748,7 @@ native_symbols! {
     cuteafd_alloc_device_buffer: AllocDeviceBufferFn,
     cuteafd_alloc_managed_device_buffer: AllocManagedDeviceBufferFn,
     cuteafd_free_device_buffer: FreeDeviceBufferFn,
+    cuteafd_alloc_carveout_device_buffer: AllocCarveoutDeviceBufferFn,
     cuteafd_cuda_stream_create: CudaStreamCreateFn,
     cuteafd_cuda_stream_destroy: CudaStreamDestroyFn,
     cuteafd_cuda_stream_synchronize: CudaStreamSynchronizeFn,
@@ -1835,6 +1845,7 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_poll_with_timeout: RdmaRcEndpointPollWithTimeoutFn,
     cuteafd_xgrammar_compiler_create: XGrammarCompilerCreateFn,
     cuteafd_xgrammar_compiler_create_json: XGrammarCompilerCreateFn,
+    cuteafd_peer_wait_timeout: unsafe extern "C" fn(*mut u32, *mut u32, *mut u64) -> i32,
 }
 
 /// Lifetime-pinned physical memory reader for cache policy owners without a library borrow.
@@ -2300,6 +2311,13 @@ fn record_rdma_rings(handle: *mut c_void, views: [CuteafdRdmaRcEndpointBufferVie
 
 /// Per-destination pinned source and copy-completion fence. Raw owners are
 /// released by NativeLibrary only after every pending upload has completed.
+/// A reservation-only ordered upload found no startup staging for its
+/// destination (#2544): creating the event and pinned staging now would run
+/// driver work inside a serving step, possibly while a peer GPU spins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("ordered H2D destination {ptr:#x} on device {device} stream {stream:#x} has no startup reservation")]
+pub struct UnreservedOrderedH2D { pub device: i32, pub stream: usize, pub ptr: usize }
+
 struct OrderedH2DStaging {
     staging: SyncH2DStagingBuffer,
     event: *mut c_void,
@@ -2571,7 +2589,9 @@ impl NativeLibrary {
         let (free, total) = device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-            Ok(available)
+            // A borrowed, not yet mapped display carveout is outside MemAvailable;
+            // only the expert weight arena consumes it (attic::take_for).
+            Ok(available.saturating_add(usize::try_from(attic::pending_bytes())?))
         })?;
         observer_context::exclude(free, total, observer)
     }
@@ -2788,15 +2808,53 @@ impl NativeLibrary {
         Ok(buffer)
     }
 
+    /// One `[carveout | cuMemCreate tail]` range of `bytes` holding `tag`: the
+    /// lease's slices first, ordinary device memory after. Two ledger owners:
+    /// `<owner>` for the tail (charged like any device allocation) and
+    /// `experts/spark-carveout` for the lent bytes (outside `MemAvailable`).
+    /// Freed by [`Self::free_device_buffer`]; the lease's connection is retained.
+    #[track_caller]
+    pub fn alloc_carveout_device_buffer(&self, bytes: usize, lease: &attic::Lease,
+        tag: memory_ledger::Tag) -> Result<(CuteafdDeviceBuffer, usize)> {
+        use std::os::fd::AsRawFd;
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let alloc_fn: AllocCarveoutDeviceBufferFn = self.cuteafd_alloc_carveout_device_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
+        let fds = lease.parts.iter().map(|(fd, _)| fd.as_raw_fd()).collect::<Vec<_>>();
+        let sizes = lease.parts.iter().map(|(_, bytes)| usize::try_from(*bytes)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let carveout: usize = sizes.iter().sum();
+        anyhow::ensure!(carveout <= bytes, "carveout lease exceeds the arena");
+        let mut buffer = CuteafdDeviceBuffer::default();
+        let mut tail = 0usize;
+        // SAFETY: the fds stay open in `lease` and the outputs are live locals
+        // through this synchronous call; native imports, never closes, the fds.
+        let status = unsafe { alloc_fn(bytes, fds.as_ptr(), sizes.as_ptr(), fds.len(), &mut buffer, &mut tail,
+            kind, owner.as_ptr()) };
+        self.status_to_result("cuteafd_alloc_carveout_device_buffer", status)?;
+        anyhow::ensure!(tail + carveout == bytes && buffer.flags & DEVICE_BUFFER_FLAG_CARVEOUT != 0,
+            "carveout range differs from its lease");
+        let base = buffer.ptr as usize;
+        memory_ledger::record_alloc(memory_ledger::Space::Carveout, buffer.device_id, base, carveout,
+            memory_ledger::tag(memory_ledger::MemoryKind::Experts, "experts/spark-carveout"));
+        if tail > 0 {
+            memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, base + carveout, tail, tag);
+        }
+        CARVEOUT_TAILS.lock().unwrap_or_else(|e| e.into_inner()).insert(base, (tail > 0).then_some(base + carveout));
+        Ok((buffer, tail))
+    }
+
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
         let address = buffer.ptr as usize;
+        let carveout_tail = (buffer.flags & DEVICE_BUFFER_FLAG_CARVEOUT != 0).then(||
+            CARVEOUT_TAILS.lock().unwrap_or_else(|e| e.into_inner()).remove(&address).flatten());
         self.retire_ordered_h2d_destinations(*buffer)?;
         // SAFETY: ordered uploads to this allocation (including interior views)
         // completed and released their sources before the native free.
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)?;
         memory_ledger::record_free(address);
+        if let Some(Some(tail)) = carveout_tail { memory_ledger::record_free(tail); }
         Ok(())
     }
 
@@ -3242,6 +3300,24 @@ impl NativeLibrary {
     /// queued work. Every reader/writer of dst is ordered on this stream (or
     /// joined onto it by an event); this call is outside graph capture.
     pub unsafe fn copy_h2d_ordered(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.copy_h2d_ordered_with(dst, src, stream, false) }
+    }
+
+    /// As [`Self::copy_h2d_ordered`], for a destination [`Self::reserve_h2d_ordered`]
+    /// reserved at startup on this stream: an unreserved destination is refused
+    /// with [`UnreservedOrderedH2D`] instead of creating an event and pinned
+    /// staging inside a serving step (#2544).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::copy_h2d_ordered`].
+    pub unsafe fn copy_h2d_reserved(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.copy_h2d_ordered_with(dst, src, stream, true) }
+    }
+
+    unsafe fn copy_h2d_ordered_with(&self, dst: CuteafdDeviceBuffer, src: &[u8], stream: *mut c_void,
+        reserved: bool) -> Result<()> {
         if src.is_empty() { return Ok(()); }
         anyhow::ensure!(!dst.ptr.is_null() && src.len() <= dst.bytes, "ordered H2D destination is too small or null");
         anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
@@ -3249,6 +3325,9 @@ impl NativeLibrary {
         let mut entries = self.ordered_h2d_staging.lock()
             .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
         let key = (device, stream as usize, dst.ptr as usize);
+        if reserved && !entries.contains_key(&key) {
+            return Err(UnreservedOrderedH2D { device, stream: key.1, ptr: key.2 }.into());
+        }
         let capacity = if entries.contains_key(&key) { src.len() } else { dst.bytes };
         let entry = self.ordered_h2d_entry(&mut entries, key, capacity)?;
         if entry.pending {

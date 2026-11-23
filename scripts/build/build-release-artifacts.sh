@@ -200,6 +200,9 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$build_root/cache/triton}"
 mkdir -p "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$B12X_ROCE_CACHE_DIR" "$TRITON_CACHE_DIR"
 export PYTHONPATH="$build_root/source/third_party/sparkinfer:$build_root/source/python/reference/cuteafd_reference:$build_root/source/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export PYO3_PYTHON=python3
+export CUDA_VISIBLE_DEVICES=""
+export NVIDIA_VISIBLE_DEVICES=void
+renice -n 19 -p "$$" >/dev/null 2>&1 || true
 compiler_cache_cmake_args=()
 source "$(dirname "${BASH_SOURCE[0]}")/compiler-cache.sh"
 cuteafd_compiler_cache_setup "$build_root"
@@ -276,6 +279,7 @@ cmake \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MINIMAX_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_INKLING2_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_HY4F_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_HY4F_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \

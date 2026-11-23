@@ -3,27 +3,44 @@ use super::*;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::cell::RefCell;
 
+/// Run the decode lanes to a completed boundary. With `second` (two resolved
+/// lanes) both lane loops are polled together; without it lane 0 runs alone
+/// (`LaneSet::run_one`) on the same loop, lease and boundary control.
 pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &tokio::runtime::Runtime,
-    first: &mut P, second: &mut P, requests: &mut Requests<'a>,
-    first_transport: &mut P::Transport, second_transport: &mut P::Transport,
+    first: &mut P, second: Option<&mut P>, requests: &mut Requests<'a>,
+    first_transport: &mut P::Transport, second_transport: Option<&mut P::Transport>,
     active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
+    let second = match (second, second_transport) {
+        (Some(pass), Some(transport)) => Some((pass, transport)),
+        (None, None) => None,
+        _ => anyhow::bail!("V4.1 second decode lane is missing its pass or transport"),
+    };
+    let lanes = 1 + usize::from(second.is_some());
     first.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(0); Ok(()) })?;
-    second.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(1); Ok(()) })?;
+    let mut second = second;
+    if let Some((pass, _)) = second.as_mut() {
+        pass.visit_lane_graphs(&mut |_, _, _, bank| { bank.lane_owner(1); Ok(()) })?;
+    }
     let mut draft = draft;
     if let Some(draft) = draft.as_deref_mut() {
-        for lane in 0..2 { draft.visit_lane_graphs(lane, &mut |_, _, _, bank| { bank.lane_owner(lane); Ok(()) })?; }
+        for lane in 0..lanes { draft.visit_lane_graphs(lane, &mut |_, _, _, bank| { bank.lane_owner(lane); Ok(()) })?; }
     }
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
     let set = LaneSet::default();
-    runtime.block_on(drive_lanes(&set, || requests.borrow().release_epoch(),
-        |lease, control| lane(lease, control, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
-        |lease, control| lane(lease, control, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
-    ))
+    match second {
+        Some((second, second_transport)) => runtime.block_on(drive_lanes(&set, || requests.borrow().release_epoch(),
+            |lease, control| lane(lease, control, lanes, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
+            |lease, control| lane(lease, control, lanes, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        )),
+        None => runtime.block_on(drive_lane(&set, || requests.borrow().release_epoch(),
+            |lease, control| lane(lease, control, lanes, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        )),
+    }
 }
 
 /// Run both lanes of one call. Units released since both lanes started (a retirement on
@@ -36,6 +53,15 @@ pub(super) async fn drive_lanes<'s, F, G>(set: &'s LaneSet, epoch: impl Fn() -> 
 where F: std::future::Future<Output = Result<()>>, G: std::future::Future<Output = Result<()>> {
     let control = LaneControl::start(epoch());
     set.run(|lease| first(lease, control), |lease| second(lease, control)).await
+}
+
+/// Run the only lane (`LaneSupport::OneOrTwo` resolved to one): lane 0 under
+/// the same epoch sample and [`LaneControl`] as a pair.
+pub(super) async fn drive_lane<'s, F>(set: &'s LaneSet, epoch: impl Fn() -> u64,
+    first: impl FnOnce(LaneLease<'s>, LaneControl) -> F) -> Result<()>
+where F: std::future::Future<Output = Result<()>> {
+    let control = LaneControl::start(epoch());
+    set.run_one(|lease| first(lease, control)).await
 }
 
 /// One lane's boundary bookkeeping: the call's start epoch, rounds issued and whether it retired
@@ -121,7 +147,7 @@ async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<
 
 #[allow(clippy::too_many_arguments)]
 async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease<'_>, mut control: LaneControl,
-    pass: &mut P, transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
+    lanes: usize, pass: &mut P, transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
     active: &RefCell<&mut [Option<Active<'a>>]>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
@@ -165,7 +191,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             };
             // Guard at a drained boundary too: a stale or overfull lane must
             // shed only its excess owners, never fail its peers or reset links.
-            let capacity = active.borrow().len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS);
+            let capacity = super::lane_capacity(active.borrow().len(), lanes);
             if members.len() > capacity {
                 for &slot in &members[capacity..] {
                     let id = active.borrow()[slot].as_ref().unwrap().id();
@@ -393,7 +419,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
                 let layer_us = pass.captured_layer_us();
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), &active.borrow(), &members, &inputs,
-                    &accepted_inputs, &emissions);
+                    &accepted_inputs, &emissions, || lane_timing(lane, started, draft_us, verify_us, &drafting));
                 if let Some(live) = live {
                     let active = active.borrow();
                     live.push(console_round(tally, lane, shared, started, draft_us,

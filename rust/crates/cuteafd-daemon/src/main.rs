@@ -85,6 +85,8 @@ fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut c
         Commands::KimiGolden(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::MinimaxGolden(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::Inkling2Golden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::Hy4fGolden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeHy4f(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::ServeInkling2(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::ServeMinimax(args) => Some((&args.snapshot, &mut args.attention)),
         Commands::ServeStep5(args) => Some((&args.snapshot, &mut args.attention)),
@@ -131,6 +133,8 @@ fn resolve_command_attention_precision(command: &mut Commands) -> Result<()> {
         Commands::MuseGolden(args) => ("muse_spark", &mut args.engine.attention.attention_precision),
         Commands::ServeInkling2(args) => ("inkling2", &mut args.attention.attention_precision),
         Commands::Inkling2Golden(args) => ("inkling2", &mut args.attention.attention_precision),
+        Commands::Hy4fGolden(args) => ("hy4_flash", &mut args.attention.attention_precision),
+        Commands::ServeHy4f(args) => ("hy4_flash", &mut args.attention.attention_precision),
         _ => return Ok(()),
     };
     let family = cuteafd_loader::plan::family::registry().iter().copied()
@@ -509,14 +513,17 @@ async fn run() -> Result<()> {
         args.memory = memory;
     } else if let Some(cap) = policy.gpu_cap {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
-            | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeMinimax(_) | Commands::ServeInkling2(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
+            | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeMinimax(_) | Commands::ServeInkling2(_) | Commands::ServeHy4f(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MinimaxGolden(_) | Commands::Inkling2Golden(_) | Commands::MuseGolden(_)),
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MinimaxGolden(_) | Commands::Inkling2Golden(_) | Commands::Hy4fGolden(_) | Commands::MuseGolden(_)),
             "--gpu-memory-cap applies only to coordinator serve/golden and plan commands");
         cuteafd_ffi::set_coordinator_gpu_budget(cap)?;
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
     policy.install().map_err(anyhow::Error::msg)?;
+    let carveout = memory.spark_carveout != Some(cli::SparkCarveout::Off);
+    cuteafd_ffi::attic::set_enabled(carveout);
+    cuteafd_loader::serving_capacity::spark_memory::set_carveout_enabled(carveout);
     // Resolve the environment only after generic serve/golden's family reparse:
     // an environment fallback must not overwrite an explicit outer CLI value.
     let graph_floor = family_graph_floor.or(initial_graph_floor).or(
@@ -534,7 +541,7 @@ async fn run() -> Result<()> {
             shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10));
             shared::thermal::monitor("expertd");
         }
-        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeMinimax(_) | Commands::ServeInkling2(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_)
+        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeMinimax(_) | Commands::ServeInkling2(_) | Commands::ServeHy4f(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
             shared::host_heap::start();
             tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
@@ -562,6 +569,8 @@ async fn run() -> Result<()> {
         Commands::KimiGolden(args) => families::kimi_k3::golden::run_golden(args).await,
         Commands::MinimaxGolden(args) => families::minimax_m3::golden::run_golden(args).await,
         Commands::Inkling2Golden(args) => families::inkling2::golden::run_golden(args).await,
+        Commands::Hy4fGolden(args) => families::hy4_flash::golden::run_golden(args).await,
+        Commands::ServeHy4f(args) => families::hy4_flash::serve::run(args).await,
         Commands::ServeInkling2(args) => families::inkling2::serve::run(args).await,
         Commands::ServeMinimax(args) => families::minimax_m3::serve::run(args).await,
         Commands::ServeKimi(args) => families::kimi_k3::serve::run(args).await,

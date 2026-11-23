@@ -87,7 +87,15 @@ pub(crate) struct MemoryArgs {
     /// Cap pool growth after the layout is fixed (default: all remaining memory).
     #[arg(long, global = true)]
     pub(crate) kv_max_tokens: Option<u64>,
+    /// Spark routed-expert weights in the GB10 display carveout lent by a
+    /// validated spark-attic atticd (`SPARK_CARVEOUT`, default auto: used where
+    /// present, fail-open); `off` never connects and plans without it.
+    #[arg(long, global = true, value_enum)]
+    pub(crate) spark_carveout: Option<SparkCarveout>,
 }
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparkCarveout { Auto, Off }
 
 impl MemoryArgs {
     /// The family argv wins key by key over the outer `serve`/`golden` argv.
@@ -103,6 +111,7 @@ impl MemoryArgs {
             kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
             kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
             kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
+            spark_carveout: self.spark_carveout.or(outer.spark_carveout),
         }
     }
 
@@ -245,6 +254,12 @@ pub(crate) enum Commands {
     /// Qualify a native coordinator-only Inkling target prefix.
     #[command(hide = true)]
     Inkling2Golden(crate::families::inkling2::golden::GoldenArgs),
+    /// Qualify Hy4-flash coordinator text forward, NLL/logits, Engram FP8/BF16, and unit exactness.
+    #[command(hide = true)]
+    Hy4fGolden(crate::families::hy4_flash::golden::GoldenArgs),
+    /// Serve Hy4-flash through the shared scheduler on 1x or 2x RTX (and Spark experts).
+    #[command(hide = true)]
+    ServeHy4f(crate::families::hy4_flash::serve::ServeArgs),
     /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
     #[command(hide = true)]
     ServeInkling2(crate::families::inkling2::serve::ServeArgs),
@@ -597,7 +612,7 @@ pub(crate) struct PlanArgs {
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
-    /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
+    /// Decode views: V4.1 accepts 1 or 2 (default 2), other families require 1.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub(crate) decode_lanes: Option<u8>,
     /// Rows one continuous prefill call streams for --layout (0: the family
@@ -1567,7 +1582,8 @@ pub(crate) struct NativeServeArgs {
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
-    /// V4.1 has a fixed pair of decode views; 1 is unsupported.
+    /// V4.1 decode lanes: 1 or 2 (default 2; one at concurrency 1). Serve
+    /// replaces the request with the resolved count before any allocation.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Host RAM cap for preloading mapped tables: every table (rows and scales)

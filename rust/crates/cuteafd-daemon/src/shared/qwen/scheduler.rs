@@ -187,7 +187,9 @@ pub(crate) trait Backend<'a> {
     /// The drafter's per-token score format; `None` for a token-only drafter.
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
     /// Enable readback for selector-backed drafters; trained heads already provide it.
-    fn configure_draft_scores(&self, _enabled: bool) {}
+    /// Turn on the drafter readbacks `score_readback` asks for: `scored` per-token
+    /// scores for the policy and the trace, `traced` the selector feature vector.
+    fn configure_draft_scores(&self, _traced: bool, _scored: bool) {}
     /// Scores of the request's current proposal.
     fn draft_head<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
     /// Whether verification and acceptance take history-copy rows past the drafter's block.
@@ -823,7 +825,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let mut selector = TokenSelector::new(engine.library(), select, geometry.vocab_size, geometry.decode_rows)?;
         engine.selector_ready(&mut selector)?;
         let shared = if width > 0 {
-            engine.configure_draft_scores(length.control() == cuteafd_core::DraftControl::History);
+            let (traced, scored) = crate::shared::draft::history::score_readback(length.control());
+            engine.configure_draft_scores(traced, scored);
             Some(Policy::new(length, width, engine.draft_head_kind(), engine.draft_copies()))
         } else { None };
         let trace = Trace::open()?;
@@ -847,6 +850,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     crate::shared::api::run_scheduler(|| {
     loop {
         engine.require_live()?;
+        // A timed-out peer wait skipped itself: every paired engine of this
+        // process is terminal, whether or not its backend checks the record.
+        engine.library().check_peer_wait_timeout()?;
         offer()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");

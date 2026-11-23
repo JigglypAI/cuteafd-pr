@@ -514,6 +514,23 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Attaches the shared selection dump: eager lanes only (no attached
+    /// graphs) and non-context DSA (whole or heads MLA placement).
+    pub(crate) fn attach_selection_dump(&self, dump: std::sync::Arc<crate::shared::selection_dump::SelectionDump>) -> Result<()> {
+        use crate::shared::selection_dump::ENV_DIR;
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(self.provisional.borrow().is_none(), "{ENV_DIR} requires idle Kimi lanes at startup");
+        for lane in &mut lanes.local {
+            for local in lane {
+                ensure!(local.graph_device().is_none(), "{ENV_DIR} refuses attached CUDA graphs (GPU_GRAPH_RESERVE=0)");
+                ensure!(!local.context_dsa_diagnostic(), "{ENV_DIR} needs heads or whole MLA placement on Kimi K3.1 (ATTENTION_PLACEMENT=heads)");
+                local.selection_dump = Some(dump.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn attach_dsa_scores(&self, dump: Rc<super::score_dump::ScoreDump>) -> Result<()> {
         self.require_live()?;
         let mut lanes = self.lanes.try_borrow_mut()?;
@@ -800,12 +817,17 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_state(&self) -> TerminalState { self.terminal.get() }
+
     fn shutdown(&self) -> Result<()> {
         if self.terminal.get() == TerminalState::Drained { return Ok(()); }
         let lanes = self.lanes.try_borrow_mut()?;
         let lanes = RefCell::new(lanes);
         if let Some(draft) = &self.draft { draft.abort()?; }
         let result = teardown(&mut Teardown {
+            // An error path (an RTX expert enqueue) may already have published:
+            // publication is idempotent, so the drains below still run (#2543).
             abort: || {
                 self.terminal.set(TerminalState::Aborting);
                 self.peer.as_deref().map_or(Ok(()), PeerExchange::publish_abort)

@@ -7,6 +7,10 @@ _sys.path[:0] = [str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib"
 import argparse, hashlib, json, re
 from pathlib import Path
 import _pinned_sparkinfer  # noqa: F401
+from b12x._lib.aot_target import describe_target
+
+describe_target('sm120')
+import torch
 import cutlass.cute as cute
 from cutlass import Uint8, Uint32, Int32, Int64, BFloat16, Float32
 from b12x._lib.compiler import compile as compile_kernel, KernelCompileSpec
@@ -36,3 +40,5 @@ if not args or normalize(args[1])!=','.join('&'+x for x in pointers+i32+i64+['st
     raise ValueError('unexpected V4.1 index generated dispatch order')
 manifest=dict(pointers=pointers,i32=i32,i64=i64,artifacts={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in [a.output_dir/'v41_index_score.h',a.output_dir/'v41_index_score.o']})
 (a.output_dir/'v41_index_score.json').write_text(json.dumps(manifest,indent=2)+'\n')
+if torch.cuda.is_initialized():
+    raise RuntimeError('offline V4.1 index export initialized CUDA')

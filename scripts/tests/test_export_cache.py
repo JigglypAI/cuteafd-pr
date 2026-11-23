@@ -401,13 +401,16 @@ def test_every_cmake_export_runs_through_the_launcher():
     assert '"TRITON_DISABLE_LINE_INFO=1"' in cmake and "option(CUTEAFD_EXPORT_LINEINFO" in cmake
 
 
-def test_wip_tries_cached_exports_before_any_export_turn():
+def test_wip_runs_cpu_export_with_export_cache_enabled():
     wip = (ROOT / "wip.sh").read_text()
-    coordinator = wip[wip.index("build_coordinator() {"):]
-    assert coordinator.index("wip_cached_exports wip_exec docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1") < \
-        coordinator.index("wip_coordinator_export_modes")
+    coordinator = wip[wip.index("build_coordinator() {"):wip.index("build_expert() (")]
+    assert "CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}" in coordinator
+    assert "-e CUDA_VISIBLE_DEVICES= -e NVIDIA_VISIBLE_DEVICES=void" in coordinator
+    assert "wip_coordinator_export_modes" not in coordinator
     expert = wip[wip.index("build_expert() ("):]
-    assert expert.index("CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1") < expert.index("wip_seed_export_turn\n")
+    assert "CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}" in expert
+    assert "-e 'CUDA_VISIBLE_DEVICES=' -e 'NVIDIA_VISIBLE_DEVICES=void'" in expert
+    assert "wip_seed_export_turn" not in expert
 
 
 def test_build_containers_mount_one_host_store_per_architecture():

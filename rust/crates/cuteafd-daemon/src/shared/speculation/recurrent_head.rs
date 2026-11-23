@@ -194,11 +194,16 @@ impl Rank<'_> {
                 lib.load_widen_bf16_f32(self.buffer("head.logits_bf16")?.ptr,self.buffer("head.logits")?.ptr,
                     sequences*self.config.valid_vocab,stream)?;
                 stamp(step, HeadStage::Widen)?;
+                // The argmax's log-softmax (one f32 per sequence) is the drafter's
+                // candidate probability, written beside its token every step.
                 lib.cuda_logits_greedy_f32_async(self.buffer("head.logits")?.ptr,sequences,self.config.valid_vocab,
-                    self.config.valid_vocab,ids.ptr,std::ptr::null_mut(),self.buffer("head.status")?.ptr,stream)?;
+                    self.config.valid_vocab,ids.ptr,self.buffer("head.step_logprob")?.ptr,self.buffer("head.status")?.ptr,stream)?;
                 stamp(step, HeadStage::Argmax)?;
                 lib.copy_d2d_2d_async(part(self.buffer("head.tokens")?,step*4,
                     self.buffer("head.tokens")?.bytes-step*4)?,self.config.predictions()*4,ids,4,4,sequences,stream)?;
+                lib.copy_d2d_2d_async(part(self.buffer("head.logprob")?,step*4,
+                    self.buffer("head.logprob")?.bytes-step*4)?,self.config.predictions()*4,
+                    self.buffer("head.step_logprob")?,4,4,sequences,stream)?;
                 lib.copy_d2d_async(state,next_state,sequences*c.markov_rank*2,stream)?;
             }
             stamp(step, HeadStage::Copies)?;

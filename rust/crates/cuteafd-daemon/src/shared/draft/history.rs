@@ -86,11 +86,16 @@ impl Policy {
     }
 
     /// Learn from one verified round and record it.
-    pub fn observe(&mut self, outcomes: &[DraftOutcome]) {
+    pub fn observe(&mut self, outcomes: &[DraftOutcome]) { self.observe_timed(outcomes, None); }
+
+    /// [`Self::observe`] with the round's measured host timing, which the
+    /// trace record carries alongside the policy's view (no extra timers).
+    pub fn observe_timed(&mut self, outcomes: &[DraftOutcome], timing: Option<RoundTiming>) {
         let record = self.history.observe(outcomes, self.trace.is_some());
         if let (Some(trace), Some(mut record)) = (self.trace, record) {
             attach_request_ids(&mut record);
-            if let Err(error) = trace.write(RoundRecord { r#type: "draft_round", round: self.rounds, draft: record }) {
+            if let Err(error) = trace.write(RoundRecord { r#type: "draft_round", round: self.rounds, timing,
+                draft: record }) {
                 tracing::warn!(%error, "draft round trace failed");
             }
         }
@@ -103,6 +108,18 @@ impl Policy {
     fn publish(&self) {
         if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(Arc::new(self.history.snapshot())); }
     }
+}
+
+/// Which drafter score readbacks a serve loop turns on: per-token scores whenever
+/// the policy keys on them (`history`) or a speculation trace records them (a
+/// fixed `DRAFT_LENGTH` trace carries the same scores), and the selector feature
+/// vector only for the trace. Returns `(traced, scored)` for `set_selector_readback`.
+pub(crate) fn score_readback(control: DraftControl) -> (bool, bool) {
+    readback_for(control, replay_trace().is_some())
+}
+
+fn readback_for(control: DraftControl, traced: bool) -> (bool, bool) {
+    (traced, control == DraftControl::History || traced)
 }
 
 static SPECULATION_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -144,7 +161,33 @@ struct RoundRecord {
     r#type: &'static str,
     round: u64,
     #[serde(flatten)]
+    timing: Option<RoundTiming>,
+    #[serde(flatten)]
     draft: cuteafd_core::RoundTrace,
+}
+
+/// A verify round's host-clock times, as the serve loop already measures
+/// them for its console round: `round_us` from the round's start to the
+/// policy observe, `draft_us` the draft pass and `verify_us` the verify step.
+/// `context` is each request's committed length before the round, in the
+/// same order as the observed outcomes.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub(crate) struct RoundTiming {
+    pub lane: usize,
+    pub round_us: u64,
+    pub draft_us: u64,
+    pub verify_us: u64,
+    pub context: Vec<usize>,
+}
+
+impl RoundTiming {
+    /// Times from seconds and a round start, as the serve loops hold them.
+    pub fn since(lane: usize, started: std::time::Instant, draft_s: f64, verify_s: f64,
+        context: Vec<usize>) -> Self {
+        let us = |s: f64| (s.max(0.) * 1e6) as u64;
+        Self { lane, round_us: started.elapsed().as_micros() as u64, draft_us: us(draft_s), verify_us: us(verify_s),
+            context }
+    }
 }
 
 /// The stats view may lag the policy by this many rounds.
@@ -246,7 +289,7 @@ mod tests {
         core.plan(&[(7, 3)], 64);
         core.refine(7, 3, Some(&[0.9, 0.8, 0.1]));
         let draft = core.observe(&[outcome(7, 4, 2, false)], true).unwrap();
-        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0, draft }).unwrap();
+        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0, timing: None, draft }).unwrap();
         assert_eq!((value["type"].as_str(), value["policy"].as_str(), value["block"].as_u64()),
             (Some("draft_round"), Some("history"), Some(3)));
         assert_eq!((value["rounds"].as_u64(), value["short_rounds"].as_u64(), value["short_share"].as_f64()),
@@ -271,13 +314,50 @@ mod tests {
         core.plan(&[(id, 3)], 64);
         let mut record = core.observe(&[outcome(id, 4, 2, false)], true).unwrap();
         attach_request_ids(&mut record);
-        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0,
+        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 0, timing: None,
             draft: record.clone() }).unwrap();
         assert_eq!(value["requests"][0]["id"], id);
         assert_eq!(value["requests"][0]["request_id"], "http-history-request");
         unregister_request(id);
         attach_request_ids(&mut record);
         assert!(record.requests[0].request_id.is_none());
+    }
+
+    #[test]
+    fn a_timed_round_record_carries_lane_times_and_context_and_an_untimed_one_none() {
+        let mut core = DraftHistory::new(DrafterSpec { block: 3, head: HeadScore::None, copy: 0 },
+            cuteafd_core::DraftControl::Fixed(3));
+        core.plan(&[(7, 3), (8, 3)], 64);
+        let draft = core.observe(&[outcome(7, 4, 2, false), outcome(8, 4, 4, false)], true).unwrap();
+        let timing = RoundTiming { lane: 1, round_us: 9000, draft_us: 1500, verify_us: 7000, context: vec![4096, 131072] };
+        let value = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 3, timing: Some(timing),
+            draft: draft.clone() }).unwrap();
+        assert_eq!((value["lane"].as_u64(), value["round_us"].as_u64(), value["draft_us"].as_u64(),
+            value["verify_us"].as_u64()), (Some(1), Some(9000), Some(1500), Some(7000)));
+        assert_eq!(value["context"], serde_json::json!([4096, 131072]));
+        assert_eq!(value["requests"].as_array().map(Vec::len), Some(2));
+        let untimed = serde_json::to_value(RoundRecord { r#type: "draft_round", round: 3, timing: None, draft }).unwrap();
+        for field in ["lane", "round_us", "draft_us", "verify_us", "context"] { assert!(untimed.get(field).is_none(), "{field}"); }
+        let since = RoundTiming::since(0, std::time::Instant::now(), 0.0015, -1., vec![7]);
+        assert_eq!((since.draft_us, since.verify_us, since.context), (1500, 0, vec![7]));
+    }
+
+    #[test]
+    fn scores_are_read_back_for_the_history_policy_or_any_trace() {
+        // Untraced: exactly as before, scores only when `history` keys on them.
+        assert_eq!(readback_for(DraftControl::History, false), (false, true));
+        assert_eq!(readback_for(DraftControl::Fixed(7), false), (false, false));
+        assert_eq!(readback_for(DraftControl::Off, false), (false, false));
+        // A trace records the scores under every control, fixed-length runs included.
+        assert_eq!(readback_for(DraftControl::History, true), (true, true));
+        assert_eq!(readback_for(DraftControl::Fixed(7), true), (true, true));
+        // Every family configures readback through this one helper.
+        for source in [include_str!("../qwen/scheduler.rs"), include_str!("../../families/glm5/serve.rs"),
+            include_str!("../../families/glm5_flash/serve.rs"), include_str!("../../families/mimo_v2/serve.rs")] {
+            assert!(source.contains("history::score_readback("));
+            assert!(!source.contains("set_selector_readback(trace.is_some(), policy.length.control() == "));
+        }
+        assert!(!include_str!("../qwen/scheduler.rs").contains("configure_draft_scores(length.control() =="));
     }
 
     #[test]

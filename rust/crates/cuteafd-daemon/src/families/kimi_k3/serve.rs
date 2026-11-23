@@ -127,7 +127,9 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context.filter(|&tokens| tokens > 0).unwrap_or(cfg.max_position),
         context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context.map(|n| n as u64)),
-        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
+        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0),
+        // A selection dump reads back inside the step: serve without startup graphs.
+        graphs: crate::shared::selection_dump::shared("kimi_k3")?.is_none(),
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
         #[cfg(test)] prove_serve_admission: false,
     })
@@ -176,7 +178,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let mark_bytes = super::state::KdaLayout::for_ranks(&cfg, slots, 1, 1, physical_ranks)?.mark_bytes()
                 .checked_mul(physical_ranks).context("Kimi prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(concurrency).slots(mark_bytes);
-            startup::preflight(&worker_args.manifest, &worker_args.native_lib)?;
+            startup::preflight(&checkpoint, &worker_args.manifest, &worker_args.native_lib)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;

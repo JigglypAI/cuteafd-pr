@@ -47,7 +47,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     type Pass<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
     Pass::begin_request(first_transport)?;
     Pass::begin_request(second_transport)?;
-    Pass::decode_round(lib, runtime, first, second, requests, first_transport, second_transport,
+    Pass::decode_round(lib, runtime, first, Some(&mut *second), requests, first_transport, Some(&mut *second_transport),
         &mut active, &[vec![0], vec![]], Some(draft), &mut prefixes, &receive, admission::Wake::default())?;
     ensure!(active.iter().all(Option::is_none), "distributed serving round did not retire its request");
     ensure!(requests.cache().request_id(lease).is_err(), "retired target lease remains live");
@@ -644,7 +644,8 @@ struct Round<'r, 'w, 'a, P: ServingTarget<'w, 'a>> {
     runtime: &'r tokio::runtime::Runtime,
     first: &'r mut P,
     first_transport: &'r mut P::Transport,
-    second_transport: &'r mut P::Transport,
+    /// The second decode lane's link, absent with one resolved lane.
+    second_transport: Option<&'r mut P::Transport>,
     requests: &'r mut Requests<'a>,
     prefill: &'r mut super::prefill_target::PrefillSlots<'a, P>,
     draft: Option<&'r mut DraftRuntime<'w, 'a, P::Chain>>,
@@ -773,7 +774,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
     fn reset_links(&mut self) -> Result<()> {
         round_failure::count_reset();
         P::reset_connections(self.first_transport)?;
-        P::reset_connections(self.second_transport)?;
+        if let Some(second) = self.second_transport.as_deref_mut() { P::reset_connections(second)?; }
         for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
         Ok(())
     }
@@ -846,9 +847,9 @@ fn finish_startup<P>(decode_share: &crate::shared::prefill_share::DecodeShareArg
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     runtime: &tokio::runtime::Runtime, receive: &mut mpsc::Receiver<NativeRequest>,
-    first: &mut P, second: &mut P,
+    first: &mut P, mut second: Option<&mut P>,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
-    second_transport: &mut P::Transport, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
+    mut second_transport: Option<&mut P::Transport>, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
     mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
     vision: &mut crate::families::deepseek_v41::v41_vision_encoder::Encoder,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
@@ -861,6 +862,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
+    let lanes = args.decode_lanes;
+    ensure!(second.is_some() == (lanes > 1) && second_transport.is_some() == (lanes > 1),
+        "V4.1 serve owners differ from the {lanes} resolved decode lane(s)");
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
@@ -895,7 +899,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(lib, |f| {
             first.visit_graph_banks(f)?;
-            second.visit_graph_banks(f)?;
+            if let Some(second) = second.as_deref_mut() { second.visit_graph_banks(f)?; }
             for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
             if let Some(draft) = draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
             Ok(())
@@ -935,7 +939,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
-        let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+        let mut loads = crate::shared::serve::lanes::rebalance(&mut active, lanes,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
         // Queued prompts keep the lane they were announced on and decode there.
@@ -1163,7 +1167,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         prefix_waiters.extend(next_wave);
         stall::mark(stall::Phase::Admission, active.iter().flatten().count() + admitted.len());
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
-            let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
+            let lane = cuteafd_loader::plan::decode_lanes::assign(loads, lanes);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
@@ -1172,7 +1176,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             drop(images);
             let ready = (|| -> Result<_> {
                 crate::shared::serve::RequestFailure::check_lane(id, loads[lane],
-                    active.len().div_ceil(2).min(cuteafd_core::V41_MAX_LANE_MEMBERS))?;
+                    lane_capacity(active.len(), usize::from(lanes)))?;
                 let constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
                     .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
                 // Nothing dispatched yet: the failure branch below only releases.
@@ -1210,7 +1214,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if prefills.due(active.iter().any(Option::is_some)) {
             stall::mark(stall::Phase::Admission, active.iter().flatten().count() + prefills.len());
             let mut round = Round { lib, args, runtime, first: &mut *first, first_transport: &mut *first_transport,
-                second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
+                second_transport: second_transport.as_deref_mut(), requests: &mut *requests, prefill: &mut *prefill_slots,
                 draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active, whole };
             // The packed pass runs inside the round's timed window: its time is owed too.
             let finished = prefills.round_with(&mut round, prepare_round::<P>,
@@ -1273,8 +1277,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // boundary past it (share 0 never gets here with prompts waiting).
         let cycle = (!whole && !prefills.is_empty()).then(Instant::now);
         stall::mark(stall::Phase::Decode, active.iter().flatten().count() + prefills.len());
-        let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
-            requests, first_transport, second_transport, &mut active, &members,
+        let result = room.and_then(|_| P::decode_round(lib, runtime, first, second.as_deref_mut(),
+            requests, first_transport, second_transport.as_deref_mut(), &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + prefills.len(),
@@ -1292,7 +1296,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             // RV3-4: answer and mark the members before a reset `?` can leave `serve`.
             round_failure::handle(&mut active, &error, || {
                 round_failure::count_reset();
-                P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+                P::reset_connections(first_transport)?;
+                if let Some(second) = second_transport.as_deref_mut() { P::reset_connections(second)?; }
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
                 Ok(())
             })?;
@@ -2057,6 +2062,12 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
     result
 }
 
+/// Members one decode lane holds: the request slots split across `lanes`
+/// lanes, capped by the per-lane member limit (`V41_MAX_LANE_MEMBERS`).
+pub(super) fn lane_capacity(slots: usize, lanes: usize) -> usize {
+    slots.div_ceil(lanes.max(1)).min(cuteafd_core::V41_MAX_LANE_MEMBERS)
+}
+
 fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<'a>>],
     members: &[usize], inputs: &[Vec<u32>], speculative: bool) -> Result<RequestBatch> {
     validate_proposals(active, members, inputs)?;
@@ -2217,7 +2228,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions,
+            || lane_timing(lane, started, draft_us, verified_us, &seeds));
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, verified_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, Some(&round)));
@@ -2265,7 +2277,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
         tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
-        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions);
+        observe_lane_round(draft.as_deref_mut(), active, members, &inputs, &accepted_inputs, &emissions,
+            || lane_timing(lane, started, draft_us, executed_us - prepared_us, &seeds));
         if let Some(live) = live {
             live.push(console_round(tally, lane, false, started, draft_us, prepare_us, executed_us - prepared_us,
                 &layer_us, pass.captured_ffn_split(), active, members, &inputs, None));
@@ -2730,11 +2743,20 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
     console::Event::Gauges(gauges)
 }
 
+/// A lane round's trace times from the values its console round already
+/// carries; `seeds` are (id, anchor, committed end, remaining) in lane order.
+pub(super) fn lane_timing(lane: usize, started: Instant, draft_us: u64, verify_us: u64,
+    seeds: &[(u64, u32, u64, usize)]) -> crate::shared::draft::history::RoundTiming {
+    crate::shared::draft::history::RoundTiming { lane, round_us: started.elapsed().as_micros() as u64, draft_us,
+        verify_us, context: seeds.iter().map(|seed| seed.2 as usize).collect() }
+}
+
 /// Feed a completed lane round's acceptance to the draft policy. A request
 /// that finished on a token its next draft also proposed (or on its last
 /// verified row) was not judged there: its round is censored, not a miss.
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     active: &[Option<Active<'a>>], members: &[usize], inputs: &[Vec<u32>], accepted: &[u32], emissions: &[Vec<u32>],
+    timing: impl FnOnce() -> crate::shared::draft::history::RoundTiming,
 ) {
     let Some(draft) = draft else { return };
     let requests: Vec<_> = members.iter().zip(inputs).zip(accepted).zip(emissions)
@@ -2743,7 +2765,8 @@ fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_,
                 accepted: count, censored: crate::shared::draft::history::finish_censored(r.finished, count as usize,
                     input, emitted.last().copied()) })).collect();
     if requests.len() != members.len() { return; }
-    draft.observe_round(&requests);
+    let timing = crate::shared::draft::history::replay_trace().is_some().then(timing);
+    draft.observe_round(&requests, timing);
 }
 /// Resolve one finishing row's retained frontier from its downloaded bytes.
 ///
@@ -2934,6 +2957,21 @@ mod sampling_tests {
         let idle = &code[start..start + code[start..].find("receive.blocking_recv()").expect("the idle wait")];
         assert!(idle.contains("stats.lock()") && idle.contains("serving_stats("),
             "going idle must publish the serving stats (prefill_queue.prefilling stays stale otherwise): {idle}");
+    }
+
+    /// Every V4.1 lane round hands the draft trace the same times its console
+    /// round carries, and the committed ends of its seeds as context.
+    #[test]
+    fn lane_rounds_trace_their_console_times_and_context() {
+        let source = include_str!("scheduler.rs");
+        let code = source.split("#[cfg(test)]\nmod sampling_tests").next().unwrap();
+        assert_eq!(code.matches("|| lane_timing(lane, started, draft_us, ").count(), 2);
+        assert!(code.contains("|| lane_timing(lane, started, draft_us, verified_us, &seeds)"));
+        assert!(code.contains("|| lane_timing(lane, started, draft_us, executed_us - prepared_us, &seeds)"));
+        let lanes = include_str!("scheduler/independent.rs");
+        assert!(lanes.contains("|| lane_timing(lane, started, draft_us, verify_us, &drafting)"));
+        let timing = lane_timing(1, Instant::now(), 1500, 7000, &[(4, 11, 8192, 64), (5, 12, 131072, 64)]);
+        assert_eq!((timing.lane, timing.draft_us, timing.verify_us, timing.context), (1, 1500, 7000, vec![8192, 131072]));
     }
 
     /// The lanes stop at their first completed boundary past the debt: an independent

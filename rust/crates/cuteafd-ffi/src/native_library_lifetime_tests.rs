@@ -147,6 +147,42 @@ fn staging_census_getters_preserve_absence_backing_and_native_history() -> Resul
     Ok(())
 }
 
+/// #2544: a reservation-only upload into an unreserved destination is refused
+/// with the typed error before any event, staging or copy; after the startup
+/// reservation it uploads into exactly the reserved staging, never a new one.
+#[test]
+fn reserved_upload_refuses_unreserved_destinations_without_allocating() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    let mut dst = library.alloc_device_buffer(16, crate::memory_ledger::TEST)?;
+    let stream = 1usize as *mut c_void;
+    let audit = memory_ledger::AllocationAudit::begin();
+    let before = fixture.events()?;
+    // SAFETY: the CPU fixture owns the destination and accepts a synthetic stream.
+    let error = unsafe { library.copy_h2d_reserved(dst, &[1, 2, 3, 4], stream) }.unwrap_err();
+    let refused = error.downcast_ref::<crate::UnreservedOrderedH2D>().copied().expect("typed refusal");
+    assert_eq!((refused.device, refused.stream, refused.ptr), (0, 1, dst.ptr as usize));
+    assert!(library.ordered_h2d_staging_buffer(dst, stream)?.is_none());
+    assert_eq!(audit.checkpoint(), 0, "a refusal allocates nothing");
+    assert_eq!(fixture.events()?, before, "a refusal creates no event and queues no copy");
+    fixture.reserve_ordered_upload(&library, dst, stream as usize)?;
+    let reserved = library.ordered_h2d_staging_buffer(dst, stream)?.unwrap();
+    let position = audit.checkpoint();
+    // SAFETY: as above, after the startup reservation on this stream.
+    unsafe { library.copy_h2d_reserved(dst, &[1, 2, 3, 4], stream)?; }
+    assert_eq!(library.ordered_h2d_staging_buffer(dst, stream)?.unwrap().ptr, reserved.ptr);
+    assert_eq!(audit.checkpoint(), position, "a reserved upload allocates nothing");
+    // A different stream is a different destination key.
+    assert!(unsafe { library.copy_h2d_reserved(dst, &[1], 2usize as *mut c_void) }.unwrap_err()
+        .downcast_ref::<crate::UnreservedOrderedH2D>().is_some());
+    library.release_ordered_h2d_staging()?;
+    // SAFETY: the completed fixture upload initialized these live bytes.
+    unsafe { assert_eq!(std::slice::from_raw_parts(dst.ptr.cast::<u8>(), 4), &[1, 2, 3, 4]); }
+    library.free_device_buffer(&mut dst)?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {

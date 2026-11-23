@@ -67,3 +67,37 @@ release_spark_memory_samples rhea ostrich rhea
     assert result.returncode == 0, result.stderr
     assert calls.read_text().splitlines() == ['rhea', 'ostrich']
     assert [row['host'] for row in json.loads(result.stdout)] == ['rhea', 'ostrich', 'rhea']
+
+
+def attic(tmp_path, *, state='ready', version='0.1.6', lent=0, mode=0o660, key_mode=0o640, updated=1000, gid=None):
+    import os
+    run = tmp_path / 'run/spark-attic'
+    run.mkdir(parents=True, exist_ok=True)
+    (run / 'status.json').write_text(json.dumps({
+        'name': 'spark-attic', 'version': version, 'state': state, 'why': 'x', 'validated': state == 'ready',
+        'size_mib': 2044, 'free_mib': 2044, 'largest_mib': 2044, 'lent_mib': lent, 'draining_mib': 0,
+        'every_s': 10, 'updated': updated}))
+    sock = run / 'attic.sock'
+    sock.write_text('')
+    sock.chmod(mode)
+    key = tmp_path / 'etc/spark-attic/key'
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_text('attic_0123\n')
+    key.chmod(key_mode)
+    return tmp_path
+
+
+def test_carveout_credit_needs_ready_fresh_unlent_and_access(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setattr(os, 'getuid', lambda: 4242)  # not the files' owner, not root
+    root = attic(tmp_path)
+    own_gid = (root / 'run/spark-attic/attic.sock').stat().st_gid
+    # The launcher adds the socket's gid, so a group-readable key suffices.
+    assert probe.carveout(root, now=1005, groups=[], env={}) == (2044 << 20, 'spark-attic 0.1.6 ready')
+    assert probe.carveout(attic(tmp_path, key_mode=0o600), now=1005, groups=[], env={})[0] == 0
+    _, reason = probe.carveout(attic(tmp_path, key_mode=0o600), now=1005, groups=[], env={})
+    assert '--socket-group' in reason and 'INSTALL.md' in reason
+    for case in [dict(state='refusing'), dict(version='0.2.0'), dict(lent=2), dict(updated=900)]:
+        assert probe.carveout(attic(tmp_path, **case), now=1005, groups=[], env={})[0] == 0, case
+    assert probe.carveout(tmp_path / 'absent', now=1005, env={}) == (0, 'not installed')
+    del own_gid

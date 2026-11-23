@@ -243,6 +243,8 @@ pub(crate) struct UnitOwner<'a> {
     planes: BTreeMap<String, Rc<Allocation<'a>>>,
     routed_boundary: Rc<super::experts::Boundary<'a>>,
     target_taps: Option<TargetTapWriter<'a>>,
+    /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic, decode owners only).
+    selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
 }
 impl Drop for UnitOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("MiniMax unit arithmetic owners"); }
@@ -270,7 +272,8 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: None, stream, rows: layout.rows, planes, target_taps: None })
+            split: None, stream, rows: layout.rows, planes, target_taps: None,
+            selection_dump: if prefill { None } else { crate::shared::selection_dump::shared("minimax_m3")? } })
     }
     pub fn new_split(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32, wire: WirePrecision, prefill: bool,
@@ -302,7 +305,7 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: Some(split), stream, rows, planes, target_taps: None })
+            split: Some(split), stream, rows, planes, target_taps: None, selection_dump: None })
     }
     pub fn new_heads(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32, prefill: bool) -> Result<Self> {
@@ -317,7 +320,7 @@ impl<'a> UnitOwner<'a> {
             routed_boundary: Rc::new(super::experts::Boundary::new(kernels.device)?),
             attention: kernels.attention.as_ref().map(|attention| if prefill { attention::Workspace::new(attention) }
                 else { attention::Workspace::new_decode(attention) }).transpose()?,
-            split: None, stream, rows, planes, target_taps: None })
+            split: None, stream, rows, planes, target_taps: None, selection_dump: None })
     }
     fn heads(&self) -> bool { self.planes.contains_key("reduction") }
     pub fn is_split(&self) -> bool { self.split.is_some() }
@@ -469,8 +472,10 @@ impl<'a> UnitOwner<'a> {
         let rows = request.request.rows;
         let p = self.projections(weights, layer, 0, rows)?;
         // SAFETY: caller supplies batched metadata; producer planes are retained.
-        let output = unsafe { self.attention.as_mut().context("MiniMax rank has no attention role")?.decode(
-            kernels.attention.as_ref().context("MiniMax missing attention kernels")?, p, request, &self.stream)? };
+        let attention_kernels = kernels.attention.as_ref().context("MiniMax missing attention kernels")?;
+        let workspace = self.attention.as_mut().context("MiniMax rank has no attention role")?;
+        let output = unsafe { workspace.decode(attention_kernels, p, request, &self.stream)? };
+        workspace.dump_decode(attention_kernels, layer, request.request, &self.stream, self.selection_dump.as_deref())?;
         self.copy_attention(output, 0, rows)
     }
     fn project_attention(&mut self, kernels: &Kernels<'a>, weights: &TargetWeights<'_>,

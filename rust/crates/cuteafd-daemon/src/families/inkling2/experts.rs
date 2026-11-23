@@ -11,6 +11,9 @@ use std::{path::Path, rc::Rc};
 /// The forward knows only normalized inputs/routes and the stream-ordered
 /// output. EXL3 K4 can supply the same boundary without editing layer math.
 pub(crate) trait Dispatcher {
+    /// A dispatcher whose launches queue peer waits; the engine's terminal path
+    /// publishes, drains and finishes it with every other wait owner (#2543).
+    fn terminal(&self) -> Option<&dyn crate::shared::peer_split::TerminalOwner> { None }
     fn wire_input(&self) -> bool { true }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()>;
@@ -54,8 +57,9 @@ impl<'a> Resident<'a> {
                 Box::new(Whole::from_pushed(device, &tensors, &package, backing.layers.clone(), rows, budget, layers)?)
             }
             crate::shared::experts::rtx::push::PushedExperts::Exl3(layers) => {
+                let stem = catalog.exl3().context("Inkling EXL3 pushed catalog absent")?.package_name("inkling2");
                 let package = native_lib.parent().context("Inkling native lib directory absent")?
-                    .join("exl3/exl3-inkling2-k45/rtx-tp1");
+                    .join("exl3").join(stem).join("rtx-tp1");
                 Box::new(Exl3Tp2::pushed_whole_weights(device, catalog, &package, backing.layers.clone(), rows,
                     budget, RtxSelectionPolicy::CanonicalDecode, layers)?.execution()?)
             }
@@ -86,7 +90,21 @@ struct SplitResident<'a> {
     // The shared owner holds raw stream handles through its terminal drain.
     _streams: [Rc<Stream<'a>>; 2],
 }
+/// Every layer of a TP2 group shares one owner; repeated terminal calls are idempotent.
+impl crate::shared::peer_split::TerminalOwner for SplitResident<'_> {
+    fn publish_abort(&self) -> Result<()> {
+        crate::shared::peer_split::TerminalOwner::publish_abort(&*self.owner.try_borrow()?.exchange)
+    }
+    fn drain_terminal(&self) -> Result<()> { self.owner.try_borrow()?.exchange.drain_terminal() }
+    fn finish_terminal(&self, drained: bool) {
+        match self.owner.try_borrow() {
+            Ok(owner) => crate::shared::peer_split::TerminalOwner::finish_terminal(&*owner.exchange, drained),
+            Err(error) => tracing::error!(%error, "Inkling TP2 owner borrowed during terminal finish"),
+        }
+    }
+}
 impl Dispatcher for SplitResident<'_> {
+    fn terminal(&self) -> Option<&dyn crate::shared::peer_split::TerminalOwner> { Some(self) }
     fn wire_input(&self) -> bool { self.owner.borrow().wire }
     fn enqueue(&self, input: Buffer, ids: Buffer, weights: Buffer, output: Buffer,
         rows: usize, stream: &Stream<'_>) -> Result<()> {
@@ -136,7 +154,9 @@ pub(crate) fn serving_dispatchers<'a>(stream: Rc<Stream<'a>>, peer: Option<Rc<St
                         .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
                 }
                 (PushedExperts::Exl3(left), PushedExperts::Exl3(right)) => {
-                    let dir = native.parent().context("Inkling native directory missing")?.join("exl3/exl3-inkling2-k45/rtx-tp2");
+                    let stem = catalog.exl3().context("Inkling EXL3 pushed catalog missing")?.package_name("inkling2");
+                    let dir = native.parent().context("Inkling native directory missing")?
+                        .join("exl3").join(stem).join("rtx-tp2");
                     let [left, right] = Exl3Tp2::pushed_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::INKLING2,
                         [&dir, &dir], layers.clone(), rows, budgets, RtxSelectionPolicy::CanonicalDecode, [left, right])?;
                     [Box::new(left.execution()?), Box::new(right.execution()?)]

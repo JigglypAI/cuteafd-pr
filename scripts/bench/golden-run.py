@@ -37,9 +37,8 @@ Spark's GB10 GPU instead of raptor, from each arm's sealed Spark leg (the spark-
 slot `./wip.sh --role both|expert` seals) in HOST's own WIP root, where wip.sh seals a
 seed's leg and copies it to the serving Sparks. HOST is a build seed, kakapo or cassowary
 (approved for single-Spark kernel work; off the fabric), or a pool Spark when its lock is
-free. Locks: a seed's build umbrella and GPU-export turn (SEED, SEED-export: no build
-lease, seed encode or export shares the GPU), a pool Spark's serving lock (sparks for
-ostrich/dodo/emu/kiwi, rhea, moa). The container runs the slot's sealed dev image and
+free. Locks: a seed's build umbrella (SEED: no build lease or seed encode shares the host),
+a pool Spark's serving lock (sparks for ostrich/dodo/emu/kiwi, rhea, moa). The container runs the slot's sealed dev image and
 aarch64 artifacts with the same source tree, mounts, environment and working directory
 as raptor, plus `--device nvidia.com/gpu=all`, the serving identity and a memory cap
 (--memory-bytes, else CUTEAFD_DEV_MEMORY, else 16g, swap equally), bounded by an
@@ -123,7 +122,7 @@ REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
                'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden',
-               'minimax': 'minimax-golden', 'inkling2': 'inkling2-golden'}
+               'minimax': 'minimax-golden', 'inkling2': 'inkling2-golden', 'hy4f': 'hy4f-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
@@ -608,9 +607,8 @@ def worker_command(state, arm, rank, record):
 
 # --sm121-host: the build seeds (off the fabric, approved for single-Spark kernel
 # work) and the pool Sparks. A seed's GPU is guarded by its counting build lease
-# umbrella (SEED.lock, shared by Cargo leases and seed-hosted GPU encodes) and its
-# GPU-export turn (SEED-export): both are taken, so no build, encode or export
-# shares the GPU. A pool Spark takes its serving lock, so no card runs beside it.
+# umbrella (SEED.lock, shared by build leases and exclusive for seed-hosted GPU
+# runs). A pool Spark takes its serving lock, so no card runs beside it.
 SM121_HOSTS = ('kakapo', 'cassowary', *HOST_LOCKS)
 DEFAULT_SM121_MEMORY = '16g'
 SM121_SCRATCH = 'golden-sm121'  # under ~/.cache/cuteafd/builds/TASK/ on the Spark; removed after the turn
@@ -619,7 +617,7 @@ SM121_SCRATCH = 'golden-sm121'  # under ~/.cache/cuteafd/builds/TASK/ on the Spa
 def sm121_locks(host):
     if host not in SM121_HOSTS:
         raise ValueError(f'--sm121-host {host} is not a GB10 Spark ({", ".join(SM121_HOSTS)})')
-    return hwlock.canonical([host, f'{host}-export'] if host in hwlock.LAN_SEEDS else [HOST_LOCKS[host]])
+    return hwlock.canonical([host] if host in hwlock.LAN_SEEDS else [HOST_LOCKS[host]])
 
 
 def sm121_memory(memory_bytes):
@@ -1446,6 +1444,18 @@ class PowerSampler:
 
 # --------------------------------------------------------------------------- running
 
+# Per run beyond --timeout (and the Spark workers' ready timeout): starting and
+# removing the container, worker teardown, copying a Spark run's output back.
+ARM_SLACK_S = 900
+
+
+def turn_max_run(state, runs, args):
+    """The lock turn's hwlock --max-run: every run's --timeout, its workers'
+    ready timeout and ARM_SLACK_S, plus the at-grant --preflight."""
+    ready = state['sparks']['ready_timeout'] if state.get('sparks') else 0
+    return runs * (state['timeout'] + ready + ARM_SLACK_S) + (args.preflight_timeout if args.preflight else 0)
+
+
 def run_args(state, arm=None):
     """The golden argv, plus ARM's own --arm-arg tokens appended."""
     return substitute(state['golden'] + (arm or {}).get('args', []), state['snapshot_container'],
@@ -1970,7 +1980,8 @@ def main(argv=None):
     order = list(schedule(arms, args.repeats, not args.no_interleave))
     if args.preflight_only or args.dry_run:
         if args.dry_run:
-            print(f"# locks (fair queue, in order): {','.join(state['locks'])}")
+            print(f"# locks (fair queue, in order): {','.join(state['locks'])}; "
+                  f"--max-run {turn_max_run(state, len(order), args):.0f}")
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])
@@ -1985,7 +1996,14 @@ def main(argv=None):
         Path(state['fixtures']).mkdir(parents=True, exist_ok=True)  # ours, before Docker would create it as root
     (root / 'plan.json').write_text(json.dumps(dict(state, order=order, arms=arms), indent=2, default=str) + '\n')
 
-    held = set(filter(None, os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+    held = set(hwlock.canonical(filter(None, os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(','))))
+    if held & set(state['locks']) and not set(state['locks']) <= held:
+        # As wip-cards and smoke (#2364): an inner ticket for the rest would wait
+        # on flocks the enclosing hold itself has, so it could never be granted.
+        print(f"golden-run: needs {','.join(state['locks'])}, but the enclosing hwlock holds "
+              f"{','.join(hwlock.canonical(held))}; rerun under hwlock.py --locks "
+              f"{','.join(hwlock.canonical(held | set(state['locks'])))}", file=sys.stderr)
+        return 2
     records = []
     previous = {signum: signal.signal(signum, _interrupt) for signum in (signal.SIGTERM, signal.SIGHUP)}
 
@@ -2007,7 +2025,8 @@ def main(argv=None):
         else:
             with hwlock.hold(state['locks'], args.wait, f'golden-run {args.task}', preflight=args.preflight,
                              preflight_timeout=args.preflight_timeout,
-                             preflight_at_grant_only=args.preflight_at_grant):
+                             preflight_at_grant_only=args.preflight_at_grant,
+                             max_run=turn_max_run(state, len(order), args)):
                 body()
     except hwlock.PreflightFailed as error:
         print(f'golden-run: {error}', file=sys.stderr)
@@ -2016,8 +2035,13 @@ def main(argv=None):
         print(f'golden-run: {error}', file=sys.stderr)
         code = 75
     except (Interrupted, KeyboardInterrupt) as error:
-        print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
-        code = 130
+        if hwlock.OVERRAN[0]:
+            print(f"golden-run: the turn's --max-run bound ({turn_max_run(state, len(order), args):.0f} s) "
+                  'was reached; containers removed, locks released', file=sys.stderr)
+            code = 124
+        else:
+            print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
+            code = 130
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
         print(f'golden-run: {message}', file=sys.stderr)

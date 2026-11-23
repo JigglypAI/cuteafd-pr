@@ -146,12 +146,13 @@ class PackageProfileTests(unittest.TestCase):
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
     def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='dsv4p',
-                      capacities=(1, 80), compact=False, profiles=(), segments=False):
+                      capacities=(1, 80), compact=False, profiles=(), segments=False,
+                      codebook='mcg'):
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)),
             require_layout=list(require), tile=list(tiles),
-            compact_companions=compact, profile=list(profiles),
+            compact_companions=compact, profile=list(profiles), codebook=codebook,
             cxx='unused-cxx', cuda_include=root, cuda_libdir=root,
             cuda_driver=root / 'libcuda.so', runtime=root / 'libcute_dsl_runtime.so')
         args.runtime.write_bytes(b'runtime fixture')
@@ -165,12 +166,10 @@ class PackageProfileTests(unittest.TestCase):
                 major=compute[0], minor=compute[1], multi_processor_count=48)),
             get_device_capability=Mock(return_value=tuple(compute)),
             current_device=Mock(return_value=0),
-            empty_cache=Mock())
+            is_initialized=Mock(return_value=False))
         jobs = ModuleType('_export_jobs')
         jobs.export_jobs = lambda: 1
-        jobs.gpu_workers = lambda requested: requested
         jobs.export_slot = nullcontext
-        jobs.park_context_lease = lambda: None
         image = bytearray(64)
         image[:6] = b'\x7fELF\x02\x01'
         struct.pack_into('<H', image, 18, 190)
@@ -194,8 +193,11 @@ class PackageProfileTests(unittest.TestCase):
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
                                                 'compact_weights', 'token_major_rotation', 'warp_specialized',
                                                 'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation',
-                                                'row_addresses'},
+                                                'row_addresses', 'codebook'},
                                  'unexpected option consumed by the fake export')
+            if 'codebook' in options:
+                self.assertEqual(options['codebook'], 'mul1')
+                meta['codebook'] = options['codebook']
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
                 meta.update(descriptor_rows=7, native_info_version=3)
@@ -266,15 +268,17 @@ class PackageProfileTests(unittest.TestCase):
 
         # Most tests isolate ordinary recipes; segment coverage opts in explicitly.
         segment_policy = package.segment_export_options if segments else lambda *a, **k: None
+        aot_target = ModuleType('b12x._lib.aot_target')
+        aot_target.describe_target = Mock(return_value=SimpleNamespace(capability=tuple(compute)))
         with patch.object(package, 'segment_export_options', side_effect=segment_policy), \
                 patch.dict(sys.modules, {'_pinned_sparkinfer': pinned, '_export_jobs': jobs,
-                                     'export_b12x_exl3_aot': exporter, 'torch': torch}), \
+                                     'export_b12x_exl3_aot': exporter, 'torch': torch,
+                                     'b12x._lib.aot_target': aot_target}), \
                 patch.object(package, 'compile_variants', side_effect=compile_inline), \
                 patch.object(package.os, 'setsid'), \
                 patch.object(package.subprocess, 'run', side_effect=link):
             package.build(args)
         manifest = package.verify(args.output, pinned.REVISION, args.runtime, role)
-        self.assertEqual(torch.cuda.empty_cache.call_count, exporter.export.call_count)
         return args.output, manifest, exporter.export.call_args_list, capacities
 
     def test_compile_cache_identity_tracks_options_without_invalidating_unchanged_cells(self):
@@ -1154,7 +1158,8 @@ class PackageProfileTests(unittest.TestCase):
                 with self.subTest(geometry=geometry, bits=bits), tempfile.TemporaryDirectory() as temporary:
                     _, _, calls, _ = self.build_fixture(
                         Path(temporary), 'coordinator', bits, geometry=geometry,
-                        capacities=(80, 256, 2752))
+                        capacities=(80, 256, 2752),
+                        codebook='mul1' if geometry in package.MUL1_ONLY_GEOMETRIES else 'mcg')
                     for call in calls:
                         ws = call.args[3] > 80 and (geometry, call.args[1], call.args[3]) not in package.COOPERATIVE_PREFILL_CELLS
                         self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
@@ -1561,6 +1566,55 @@ class PackageProfileTests(unittest.TestCase):
                 _, manifest, calls, capacities = self.build_fixture(Path(temporary), 'coordinator', bits)
                 self.assert_layouts(manifest, capacities, expected, bits)
                 self.assertEqual(len(calls), 2 * len(capacities))
+
+    def test_mul1_codebook_tracks_distinct_cache_and_manifest_while_mcg_stays_omitted(self):
+        with tempfile.TemporaryDirectory() as mcg_dir, tempfile.TemporaryDirectory() as mul1_dir:
+            mcg_out, mcg_manifest, mcg_calls, _ = self.build_fixture(
+                Path(mcg_dir), 'spark', (4, 5), geometry='glm',
+                capacities=(1, 1024), profiles=('tp4-width512',), segments=True, codebook='mcg')
+            mul1_out, mul1_manifest, mul1_calls, _ = self.build_fixture(
+                Path(mul1_dir), 'spark', (4, 5), geometry='glm',
+                capacities=(1, 1024), profiles=('tp4-width512',), segments=True, codebook='mul1')
+            self.assertNotIn('codebook', mcg_manifest)
+            self.assertEqual(mul1_manifest['codebook'], 'mul1')
+            self.assertTrue(all('codebook' not in v for v in mcg_manifest['variants']))
+            self.assertTrue(all(v.get('codebook') == 'mul1' for v in mul1_manifest['variants']))
+            self.assertTrue(all('codebook' not in c.kwargs for c in mcg_calls))
+            self.assertTrue(all(c.kwargs.get('codebook') == 'mul1' for c in mul1_calls))
+            mcg_caches = {c.args[0].parent.name for c in mcg_calls}
+            mul1_caches = {c.args[0].parent.name for c in mul1_calls}
+            self.assertFalse(mcg_caches & mul1_caches)
+            # Re-sign a variant with mismatched codebook to verify semantic rejection.
+            variant = mul1_manifest['variants'][0]
+            path = mul1_out / variant['directory'] / 'v41_exl3.json'
+            meta = json.loads(path.read_text())
+            meta.pop('codebook', None)
+            path.write_text(json.dumps(meta))
+            name = str(path.relative_to(mul1_out))
+            mul1_manifest['files'][name] = {'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+            (mul1_out / 'manifest.json').write_text(json.dumps(mul1_manifest))
+            with self.assertRaisesRegex(ValueError, 'variant codebook mismatch'):
+                package.verify(mul1_out)
+
+    def test_hy4f_geometry_profiles_and_mul1_only_contract(self):
+        self.assertEqual(package.GEOMETRIES['hy4f'], (1536, 1536, 512, 16))
+        self.assertEqual(package.activation('hy4f'), 'silu')
+        self.assertEqual(package.swiglu_limit('hy4f'), 10.0)
+        coord = [(p, w) for p, w, *_ in package.profiles_for_role('coordinator', 'hy4f')]
+        self.assertEqual(coord, [('rtx-tp1', 1536), ('rtx-tp2', 768)])
+        with tempfile.TemporaryDirectory() as mcg_dir, tempfile.TemporaryDirectory() as mul1_dir:
+            with self.assertRaisesRegex(ValueError, 'requires --codebook mul1'):
+                self.build_fixture(
+                    Path(mcg_dir), 'coordinator', (4, 5), geometry='hy4f',
+                    capacities=(1, 80), profiles=('rtx-tp1',), codebook='mcg')
+            _, manifest, calls, _ = self.build_fixture(
+                Path(mul1_dir), 'coordinator', (4, 5), geometry='hy4f',
+                capacities=(1, 80, 1024), profiles=('rtx-tp1', 'rtx-tp2'), codebook='mul1')
+            self.assertEqual(manifest['geometry'], 'hy4f')
+            self.assertEqual(manifest['codebook'], 'mul1')
+            self.assertTrue(all(c.kwargs.get('codebook') == 'mul1' for c in calls))
+            self.assertTrue(all(c.kwargs.get('hidden') == 1536 for c in calls))
+            self.assertTrue(all('swiglu_limit' not in c.kwargs for c in calls))
 
 
 if __name__ == '__main__':

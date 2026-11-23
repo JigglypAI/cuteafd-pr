@@ -121,6 +121,26 @@ def test_glmf_package_witness_is_the_live_mc_checkpoint():
         assert entries[key]['checkpoints'][1] == expected
 
 
+def test_hy4f_exl3_spark_range_and_profiles_cover_tp1_to_tp6():
+    packages = module('hy4f_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    assert pack.GEOMETRIES['hy4f'] == (1536, 1536, 512, 16)
+    assert pack.activation('hy4f') == 'silu'
+    assert pack.swiglu_limit('hy4f') == 10.0
+    assert packages.package_worlds('hy4f', 'exl3') == [1, 2, 3, 4, 5, 6]
+    entry = packages.package_entry('hy4f', 'exl3')
+    assert entry['basis'] == 'lower_bound'
+    assert entry['checkpoints'][0] == {
+        'model': 'wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC',
+        'revision': 'cc72179113573d751ed3245e3e58d3640694378d',
+        'routed_expert_bytes': 41 * 512 * 3 * (96 * 96 * 64 * 2 + 1536 * 2 * 2 + 4),
+    }
+    profiles = pack.build_profiles('spark', 'hy4f')
+    for world in range(1, 7):
+        widths = {destination: width for _, width, _, _, _, destinations in profiles
+                  for destination in destinations if destination.startswith(f'tp{world}-rank')}
+        assert len(widths) == world and sum(widths.values()) == 1536
+
+
 def count_objects(geometry, worlds, intermediate, unit=128):
     """Today's tp-keyed jobs versus proposed compact width-class jobs.
 

@@ -159,7 +159,7 @@ mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"
 export CUTEAFD_WIP_HOST_ISA_RESOLVED="${host_isas[*]}"
 [[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
+if [[ "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
   # AOT outputs remain reusable; only the stale configure identity is discarded.
   rm -f "$build_dir/native/CMakeCache.txt"
@@ -197,9 +197,8 @@ if [[ -z "$wip_previous_fingerprint" || "$wip_previous_native" != "$wip_native_f
 fi
 wip_current_fingerprint="$wip_rust_fingerprint $wip_native_fingerprint"
 
-if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
-  renice -n 19 -p "$$" >/dev/null
-else
+renice -n 19 -p "$$" >/dev/null 2>&1 || true
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
   unset CARGO_BUILD_JOBS
 fi
 [[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
@@ -233,7 +232,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
-      grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4|INKLING2)_AOT=OFF$' |
+      grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4|INKLING2|HY4F)_AOT=OFF$' |
       grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|EXPORT_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s v41 %s %s %s vision %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" \
@@ -340,6 +339,7 @@ cmake \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_INKLING2_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_HY4F_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_HY4F_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_WIP_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$v41_coordinator_aot" \
@@ -367,9 +367,10 @@ if [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" 
 else
   export CUTEAFD_EXPORT_CACHE=off
 fi
-# One process budget shared by variant workers across all Ninja package jobs.
+# One process budget shared by CPU variant workers across all Ninja package jobs.
+export CUDA_VISIBLE_DEVICES=""
+export NVIDIA_VISIBLE_DEVICES=void
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
-export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
 mapfile -t native_build_args < <(cuteafd_native_build_args)
 cmake --build "$build_dir/native" -- "${native_build_args[@]}"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
@@ -503,7 +504,7 @@ fi
 # optional package flags use that same codec table.
 if ((${native_hit:-0})); then
   :
-elif [[ "${v41_expert_aot:-OFF}" == ON || ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF};${CUTEAFD_WIP_MINIMAX_AOT:-OFF};${CUTEAFD_WIP_INKLING2_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
+elif [[ "${v41_expert_aot:-OFF}" == ON || ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF};${CUTEAFD_WIP_MINIMAX_AOT:-OFF};${CUTEAFD_WIP_INKLING2_AOT:-OFF};${CUTEAFD_WIP_HY4F_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
     || ( "$role" == expert && ( -n "${expert_families:-}${bf16_families:-}" || "${exl3_aot:-OFF}" == ON || "${v41_nvfp4_aot:-OFF}" == ON || "${v41_expert_aot:-OFF}" == ON ) ) ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else

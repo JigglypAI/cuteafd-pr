@@ -208,6 +208,7 @@ pub(crate) struct IndexSelectionWave<'a> {
     warmed: bool,
     audit: bool,
     async_audit: Option<AsyncAudit<'a>>,
+    selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
 }
 fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
@@ -287,6 +288,7 @@ impl<'a> IndexSelectionWave<'a> {
             ready: None, pending: None, in_flight: false, warmed: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
             async_audit: AsyncAudit::new(library, capacity)?,
+            selection_dump: crate::shared::selection_dump::shared("deepseek_v41")?,
         })
     }
     pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
@@ -776,6 +778,10 @@ impl<'a> IndexSelectionWave<'a> {
             // SAFETY: snapshots are retained until the completed-step hook.
             unsafe { self.enqueue_async_audit(query, requests, &metadata, rows, width)?; }
         }
+        if launched.is_ok() && self.selection_dump.is_some() && !self.window.is_windowed()
+            && requests.iter().all(|r| r.positions.len() == 1) {
+            self.dump_selection(query.layer, rows, &metadata, &bindings)?;
+        }
         if launched.is_ok() { self.warmed = true; }
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
@@ -787,6 +793,27 @@ impl<'a> IndexSelectionWave<'a> {
             self.ready = Some(ready);
         }
         Ok(())
+    }
+    /// Diagnostic (`CUTEAFD_DIAG_SELECTION_DUMP`): drains the selection stream
+    /// and records a decode step's logical compressed-row ids (row `r` covers
+    /// tokens `[r*step, (r+1)*step)`; step 2 at layers 2/8/14, 1 from 20).
+    /// Graph-replayed selections are refused so the readback never sits
+    /// inside a capture.
+    fn dump_selection(&self, layer: usize, rows: usize, metadata: &[[u64; 6]], bindings: &[(IndexBinding, u64)]) -> Result<()> {
+        use crate::shared::selection_dump::{self as dump, Layout, Row, ENV_DIR};
+        ensure!(self.graph.is_none() && self.graphs.len() == 0, "{ENV_DIR} refuses V4.1 index selection graphs (GPU_GRAPH_RESERVE=0)");
+        let step = metadata.first().map_or(1, |m| m[5]);
+        ensure!(metadata.iter().all(|m| m[5] == step), "V4.1 selection mixes compression steps");
+        let positions: Vec<u64> = bindings.iter().map(|(_, position)| *position).collect();
+        let layout = Layout { width: 512, unit_tokens: u32::try_from(step)?, source: layer, heads: 1 };
+        dump::record(self.selection_dump.as_deref(), layer, layout, &positions, || {
+            self.synchronize()?;
+            let mut raw = vec![0u8; rows * 2048];
+            self.storage.stream.library.copy_d2h(&mut raw, slice(self.b(9), 0, rows * 2048))?;
+            let ids = dump::i32s(&raw);
+            Ok((0..rows).map(|row| Row { position: positions[row], frontier: i32::try_from(metadata[row][1]).unwrap_or(i32::MAX),
+                ids: ids[row * 512..(row + 1) * 512].to_vec() }).collect())
+        })
     }
     /// Inspect retained snapshots only after the target step has completed.
     pub fn finish_audit(&mut self) -> Result<()> {

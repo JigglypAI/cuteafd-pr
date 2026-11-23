@@ -257,8 +257,8 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
         self.engine.native_draft().map_or(cuteafd_core::HeadScore::None, |d| d.common().score_source())
     }
-    fn configure_draft_scores(&self, enabled: bool) {
-        if let Some(d) = self.engine.native_draft() { d.common().configure_scores(enabled); }
+    fn configure_draft_scores(&self, traced: bool, scored: bool) {
+        if let Some(d) = self.engine.native_draft() { d.common().configure_scores(traced, scored); }
     }
     fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)
@@ -676,14 +676,14 @@ mod tests {
         ensure!(!source.is_empty(), "Kimi packing gate token panel empty");
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("native packing gate requires isolated process"))?;
-        super::super::startup::preflight(&args.manifest, &args.native_lib)?;
-        // SAFETY: explicit installed native library; every borrower drops before it.
-        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-        let programs = library.programs()?.with_manifest(&args.manifest)?;
         let view = args.attention.selected_view.clone().map(Ok)
             .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
         args.attention.validate_view(&view)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
+        super::super::startup::preflight(&checkpoint, &args.manifest, &args.native_lib)?;
+        // SAFETY: explicit installed native library; every borrower drops before it.
+        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         let prefill = args.prefill()?;
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;

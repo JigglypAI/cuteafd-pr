@@ -87,23 +87,26 @@ def export_jobs():
     experts.add("qwen4:exl3-k45")
     # Inkling 2 has no live example config yet; its MXFP8 W8A8, native dynamic-amax
     # NVFP4 W4A4 and K4 MC EXL3 expert packages are registered here.
-    experts.update(("inkling2:mxfp8", "inkling2:nvfp4a4", "inkling2:exl3-k45"))
-    geometries = [*compare.GEOMETRIES, "kimik3", "kimik31", "muse", "muse2", "ml4",
+    experts.update(("inkling2:mxfp8", "inkling2:nvfp4a4", "inkling2:exl3-k45", "hy4f:exl3-k45-mul1"))
+    geometries = [*compare.GEOMETRIES, "kimik3", "kimik31", "muse", "muse2", "ml4", "hy4f", "hy4f2",
                   "dense_trellis_k6", "kimi_split", "expert_partial", "expert_reply",
                   "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense", "minimax", "inkling2", "native_experts"]
     jobs = [("programs", "export_b12x_dsv4_aot.py", [
         "--geometry", ",".join(geometries), "--max-context", "1048576",
         "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on",
-        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4,inkling2",
+        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4,inkling2,hy4f",
         "--exlr8-family", "glm,glmf", "--exlr8-role", "coordinator"])]
     for expert in sorted(experts):
         family, kind = expert.split(":")
         if kind.startswith("exl3-k"):
-            bits = kind.removeprefix("exl3-k")
-            jobs.append((f"exl3/exl3-{family}-k{bits}", "package_exl3_aot.py", [
+            mul1 = kind.endswith("-mul1")
+            bits = kind.removesuffix("-mul1").removeprefix("exl3-k")
+            suffix = "-mul1" if mul1 else ""
+            codebook_args = ["--codebook", "mul1"] if mul1 else []
+            jobs.append((f"exl3/exl3-{family}-k{bits}{suffix}", "package_exl3_aot.py", [
                 "--geometry", family, "--bits", ",".join(bits), "--capacities",
                 compare.EXL3_CAPACITIES_KIMIK3 if family == "kimik3" else compare.EXL3_CAPACITIES,
-                "--role", "coordinator"]))
+                "--role", "coordinator", *codebook_args]))
         elif kind in ("fp8", "bf16"):
             geometry = family + ("_bf16" if kind == "bf16" else "")
             suffix = "-bf16-weights" if kind == "bf16" else ""
@@ -141,8 +144,8 @@ def worker_command(payload, staging):
 
 def default_workers():
     sys.path.insert(0, str(ROOT / "python/tools/lib"))
-    from _export_jobs import export_jobs as admitted_jobs, host_context_cap
-    return max(1, min(admitted_jobs(), host_context_cap()))
+    from _export_jobs import export_jobs as admitted_jobs, host_worker_cap
+    return max(1, min(admitted_jobs(), host_worker_cap()))
 
 
 def program_shards(catalog, workers):

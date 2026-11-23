@@ -1,5 +1,5 @@
 //! One immutable dense-core view, selected before inventory or payload reads.
-use super::{mc::{Manifest, MC_MANIFEST}, CoreView};
+use super::{mc::{EngramFp8, Exl3CodebookDeclaration, Manifest, MC_MANIFEST}, CoreView};
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,6 +23,8 @@ pub struct CheckpointView {
     quantize_config: Option<Arc<Value>>,
     weight_map: Option<Arc<BTreeMap<String, String>>>,
     fp8_tensors: Arc<Vec<String>>,
+    engram_fp8: Option<Arc<EngramFp8>>,
+    exl3_codebook: Option<Exl3CodebookDeclaration>,
     pub(super) classification_headers: Arc<Vec<super::CheckpointTensor>>,
 }
 
@@ -130,10 +132,16 @@ impl CheckpointView {
             ensure!(mc.is_none(), "MC view requires selected index {index_name}");
             None
         };
+        let engram_fp8 = mc.as_ref().and_then(|(m, _)| m.engram_fp8.clone()).map(Arc::new);
+        let exl3_codebook = mc.as_ref().and_then(|(m, _)| m.exl3_codebook.clone());
         Ok(Self { snapshot: snapshot.into(), mode, original_core_dtype: mc.as_ref().map(|(m, _)| m.original_core_dtype.clone()), config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
-            quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), metadata_digests, classification_headers: Arc::default() })
+            quantize_config, weight_map, fp8_tensors: Arc::new(fp8_tensors), engram_fp8, exl3_codebook,
+            metadata_digests, classification_headers: Arc::default() })
     }
+
+    pub fn engram_fp8(&self) -> Option<&EngramFp8> { self.engram_fp8.as_deref() }
+    pub fn exl3_codebook(&self) -> Option<&Exl3CodebookDeclaration> { self.exl3_codebook.as_ref() }
 
     /// Original core IDs, excluding only family-declared unqualified native MTP.
     pub fn fp8_tensors(&self) -> &[String] { &self.fp8_tensors }

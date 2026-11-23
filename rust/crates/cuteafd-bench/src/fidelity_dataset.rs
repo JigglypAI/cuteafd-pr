@@ -63,6 +63,9 @@ pub const INKLING2_MANIFEST_SHA256: &str = "68449d10abf27137a7ab805f74cf9f618303
 pub const HY4_REVISION: &str = "0b1a914773c77072e768ee20ea2899806f554476";
 pub const HY4_CONFIG: &str = "hy4-flash-v1_20261118_own-text-bf16-f32";
 pub const HY4_MANIFEST_SHA256: &str = "9ffaf7dac6afa70d5360b1bc9c54c3ade21c3a26d1d234531fc53b9f44bbef87";
+pub const HY4_FULL_REVISION: &str = "ac045b800155a747ac4292a48ea9155728f5863a";
+pub const HY4_FULL_CONFIG: &str = "hy4-v1_20261122_own-text-bf16-f32";
+pub const HY4_FULL_MANIFEST_SHA256: &str = "5b7a2ab20bb152393566ea23a5a4734c374f4db7ceb356d1527f375883e3ad7c";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -367,6 +370,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
             (INKLING2_REVISION, INKLING2_CONFIG) => Some(INKLING2_MANIFEST_SHA256),
             (HY4_REVISION, HY4_CONFIG) => Some(HY4_MANIFEST_SHA256),
+            (HY4_FULL_REVISION, HY4_FULL_CONFIG) => Some(HY4_FULL_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -574,6 +578,43 @@ fn hy4_reference_sources(provenance: &Value, manifest: &Value) -> bool {
             && numeric_check(&layers[0]["active_indexer_relative_l2"]))
 }
 
+const HY4_FULL_ROOT: &str = "tencent/Hy4";
+const HY4_FULL_ROOT_REVISION: &str = "c10c0de5b6f850703fb0a90e65d1c32b558b9167";
+const HY4_FULL_UPSTREAM: &str = "2f1bc5e321b9a736200a590d6e7743ccdeb60772";
+const HY4_FULL_SOURCE_FILES: [(&str, &str); 3] = [
+    ("models/hy_v4/modeling_hy_v4.py", "29673975dbea3d41e64904019926dd3a71d0acfa1e17232423096515247a1fd3"),
+    ("models/hy_v4/configuration_hy_v4.py", "d55ed3d35a4faf0c1f7a3f8334a4a97729463f48b0365d2751f8aba767e3cad0"),
+    ("conversion_mapping.py", "6e4085f1c941c55b4d12cdddcbb6134a683fe3639af853988bcb1c026ac2d88c"),
+];
+
+fn hy4_full_reference_sources(provenance: &Value, manifest: &Value) -> bool {
+    let source = &provenance["source_pin"];
+    let evidence = &provenance["gates"]["upstream_preflight"];
+    let numeric_check = |value: &Value| value.as_f64().is_some_and(|x| (0.0..=1e-4).contains(&x));
+    let three_prompts = |value: &Value| value.as_array().is_some_and(|values|
+        values.len() == 3 && values.iter().all(numeric_check));
+    let sha256 = |value: &Value| value.as_str().is_some_and(|s| s.len() == 64 &&
+        s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    manifest["root_checkpoint"]["id"] == HY4_FULL_ROOT
+        && manifest["root_checkpoint"]["revision"] == HY4_FULL_ROOT_REVISION
+        && manifest["vocab"] == 120832
+        && provenance["source_identity_provider"] == "families.hy4.golden"
+        && source["checkpoint"] == HY4_FULL_ROOT && source["revision"] == HY4_FULL_ROOT_REVISION
+        && source["transformers_revision"] == HY4_FULL_UPSTREAM
+        && source["config_sha256"] == provenance["snapshot_identity"]["config_sha256"]
+        && ["config_sha256", "index_sha256", "common_sha256", "model_sha256", "golden_sha256",
+            "sources_sha256", "layer_major_sha256"].iter().all(|key| sha256(&source[*key]))
+        && HY4_FULL_SOURCE_FILES.iter().all(|(path, digest)| source["transformers_files"][*path] == *digest)
+        && evidence["passed"] == true && evidence["source_pin"] == *source
+        && three_prompts(&evidence["truncated_logit_relative_l2"])
+        && three_prompts(&evidence["full_logit_relative_l2"])
+        && evidence["layers"].as_array().is_some_and(|layers| layers.len() == 78
+            && layers.iter().enumerate().all(|(i, layer)| layer["layer"] == i
+                && three_prompts(&layer["same_input_relative_l2"]))
+            && numeric_check(&layers[1]["active_indexer_relative_l2"])
+            && numeric_check(&layers[2]["active_indexer_relative_l2"]))
+}
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -605,6 +646,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                 && manifest["reference_execution"]["sparse_attention_launch"] == *launch
         } else if manifest["family"] == "hy4_flash" {
             hy4_reference_sources(provenance, manifest)
+        } else if manifest["family"] == "hy4" {
+            hy4_full_reference_sources(provenance, manifest)
         } else if manifest["family"] == "inkling2" {
             inkling_reference_sources(provenance, manifest)
         } else if manifest["family"] == "deepseek_v41" {
@@ -842,6 +885,39 @@ mod tests {
             "layers": layers}});
         assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
         qualification["reference_provenance"]["gates"]["upstream_preflight"]["layers"][41]["same_input_relative_l2"][2] = json!(0.001);
+        assert!(qualification_label(&qualification, &manifest).is_err());
+    }
+
+    #[test]
+    fn hy4_full_requires_bound_upstream_evidence_through_all_layers() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["family"] = json!("hy4");
+        manifest["vocab"] = json!(120832);
+        manifest["root_checkpoint"] = json!({"id": HY4_FULL_ROOT, "revision": HY4_FULL_ROOT_REVISION});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(HY4_FULL_ROOT);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(HY4_FULL_ROOT_REVISION);
+        }
+        qualification["prefix_qualification"]["vocab"] = json!(120832);
+        let provenance = &mut qualification["reference_provenance"];
+        provenance["source_identity_provider"] = json!("families.hy4.golden");
+        let mut source = json!({"checkpoint": HY4_FULL_ROOT, "revision": HY4_FULL_ROOT_REVISION,
+            "transformers_revision": HY4_FULL_UPSTREAM});
+        for key in ["index_sha256", "common_sha256", "model_sha256", "golden_sha256",
+            "sources_sha256", "layer_major_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        source["config_sha256"] = provenance["snapshot_identity"]["config_sha256"].clone();
+        source["transformers_files"] = json!(HY4_FULL_SOURCE_FILES.into_iter().collect::<std::collections::BTreeMap<_, _>>());
+        let mut layers: Vec<_> = (0..78).map(|i| json!({"layer": i, "same_input_relative_l2": [0.0, 0.0, 0.0]})).collect();
+        layers[1]["active_indexer_relative_l2"] = json!(1e-6);
+        layers[2]["active_indexer_relative_l2"] = json!(1e-6);
+        provenance["source_pin"] = source.clone();
+        provenance["gates"] = json!({"upstream_preflight": {"passed": true, "source_pin": source,
+            "truncated_logit_relative_l2": [1e-6, 1e-6, 1e-6], "full_logit_relative_l2": [3e-6, 3e-6, 3e-6],
+            "layers": layers}});
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        qualification["reference_provenance"]["gates"]["upstream_preflight"]["layers"][77]["same_input_relative_l2"][2] = json!(0.001);
         assert!(qualification_label(&qualification, &manifest).is_err());
     }
 
@@ -1282,7 +1358,7 @@ mod tests {
             (KIMI_K31_REVISION, KIMI_K31_CONFIG),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG),
-            (HY4_REVISION, HY4_CONFIG)] {
+            (HY4_REVISION, HY4_CONFIG), (HY4_FULL_REVISION, HY4_FULL_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1363,6 +1439,15 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 12645);
             assert_eq!(balance["prefill"]["generated_positions"], 11731);
+        }
+        if commit == HY4_FULL_REVISION && config == HY4_FULL_CONFIG {
+            assert_eq!(reference.checkpoint, HY4_FULL_ROOT);
+            assert_eq!(reference.windows.len(), 70);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], HY4_FULL_ROOT);
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 13557);
+            assert_eq!(balance["prefill"]["generated_positions"], 12634);
         }
         if commit == INKLING2_REVISION && config == INKLING2_CONFIG {
             assert_eq!(reference.checkpoint, "thinkingmachines/Inkling-2-Small-MXFP8");

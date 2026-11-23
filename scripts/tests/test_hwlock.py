@@ -167,28 +167,26 @@ def test_maxq_lock_uses_the_standard_flock_path(lockdir):
             handle.close()
 
 
-def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
-    # The LAN-only seeds' leases sort after every serving lock, and each seed's
-    # GPU-export turn after every lease: a build holds its lease when it queues
-    # for the export, so the turn must come later in the one canonical order.
+def test_lan_seed_locks_are_known_and_ordered_after_serving():
+    # The LAN-only seeds' leases sort after every serving lock.
     assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
-    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'maxq')
-    assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
-        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
+    assert hwlock.ORDER[-3:] == ('kakapo', 'cassowary', 'maxq')
+    assert hwlock.canonical(['kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
+        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary']
     assert hwlock.canonical(['maxq', 'gpu0']) == ['gpu0', 'maxq']
 
 
 def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):
     monkeypatch.setattr(hwlock, 'LOCK_DIR', lockdir)
-    busy = spawn(lockdir, 'kakapo-export', 5.0, lockdir / 'busy')
+    busy = spawn(lockdir, 'kakapo', 5.0, lockdir / 'busy')
     try:
         wait_for(lockdir / 'busy')
         calls = []
         with pytest.raises(hwlock.Cancelled):
-            with hwlock.hold(['kakapo-export'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
+            with hwlock.hold(['kakapo'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
                 pytest.fail('a cancelled waiter never holds the lock')
         assert not list((lockdir / 'hwq').glob('*.ticket')) or all(
-            'kakapo-export' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
+            'kakapo' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
     finally:
         busy.wait(timeout=10)
 
@@ -416,3 +414,202 @@ def test_the_guard_refuses_the_real_lock_directory():
         open(REAL_LOCK_DIR / 'gpu1.lock')
     with pytest.raises(pytest.fail.Exception):
         os.open(REAL_LOCK_DIR / 'hwq', os.O_RDONLY)
+
+
+# --------------------------------------------------------------------------- bounded backfill
+
+WHOLE = 'sparks,gpu0,gpu1,rhea,moa'
+
+
+def spawn_bounded(lockdir, locks, seconds, marker, max_run=None, inner=None):
+    """hwlock running a command that stamps `marker` with its start time, sleeps,
+    then stamps `marker.end`; `inner` (a shell line) runs first instead of sleeping."""
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    body = (f'import pathlib,subprocess,time; m=pathlib.Path({str(marker)!r}); m.write_text(str(time.time())); '
+            + (f'subprocess.run({inner!r}, shell=True); ' if inner else f'time.sleep({seconds}); ')
+            + 'pathlib.Path(str(m)+".end").write_text(str(time.time()))')
+    cmd = [sys.executable, str(SCRIPT), '--locks', locks, '--wait', '60',
+           *(['--max-run', str(max_run)] if max_run is not None else []), '--', sys.executable, '-c', body]
+    return subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, text=True)
+
+
+def end_of(marker):
+    return wait_for(Path(str(marker) + '.end'), timeout=60)
+
+
+def queued(lockdir, count, timeout=10):
+    """Wait until `count` live tickets are queued (the spawned waiters are in line)."""
+    end = time.time() + timeout
+    while len(list((lockdir / 'hwq').glob('*.ticket'))) < count:
+        assert time.time() < end, 'waiters never queued'
+        time.sleep(0.02)
+
+
+def test_backfill_rule_matrix(lockdir):
+    """backfill_check on hand-made queue entries: the holder's recorded bound,
+    the candidate's own bound, unbounded and out-of-queue holders."""
+    queue = hwlock._queue()
+    now = time.time()
+    keep = []
+    ticket = lambda seq, locks: keep.append(hwlock._publish(queue, seq, 'ticket', dict(locks=locks))[1])
+    ticket(5, ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa'])  # B, waiting
+    flocks = hwlock._try_flocks(['sparks', 'gpu1'])  # A's locks
+    path, handle = hwlock._publish(queue, 1, 'held', dict(seq=1, locks=['sparks', 'gpu1'],
+                                                          release_by=now + 100 + hwlock.HARD_STOP_S))
+    try:
+        assert hwlock.backfill_check(queue, ['gpu0'], 9, 50, now)[0]
+        assert hwlock.backfill_check(queue, ['gpu0'], 9, 100, now)[0]
+        allowed, reason = hwlock.backfill_check(queue, ['gpu0'], 9, 101, now)
+        assert not allowed and 'after ticket 5' in reason
+        # Two recorded blockers: the earlier deadline decides.
+        other, other_handle = hwlock._publish(queue, 2, 'held', dict(seq=2, locks=['rhea'],
+                                                                     release_by=now + 40 + hwlock.HARD_STOP_S))
+        rhea = hwlock._try_flocks(['rhea'])
+        assert hwlock.backfill_check(queue, ['gpu0'], 9, 40, now)[0]
+        assert not hwlock.backfill_check(queue, ['gpu0'], 9, 41, now)[0]
+        for item in [other_handle, *rhea]:
+            item.close()
+        other.unlink()
+        assert not hwlock.backfill_check(queue, ['gpu1'], 9, 10, now)[0]  # its own lock is held
+        # A ticket older than B that wants only free locks could start now: no jump.
+        path3, handle3 = hwlock._publish(queue, 3, 'ticket', dict(locks=['gpu0']))
+        allowed, reason = hwlock.backfill_check(queue, ['gpu0'], 9, 10, now)
+        assert not allowed and 'ticket 3 could start now' in reason
+        handle3.close()
+        path3.unlink()
+    finally:
+        handle.close()
+        path.unlink()
+    # A granted gate's ticket holds its turn: never jumped.
+    path, handle = hwlock._publish(queue, 5, 'held', dict(seq=5, locks=['sparks', 'gpu0', 'gpu1', 'rhea', 'moa'],
+                                                          gate=True, release_by=now + 1000))
+    try:
+        allowed, reason = hwlock.backfill_check(queue, ['kakapo'], 9, 10, now)
+        assert allowed  # disjoint from every older ticket
+        allowed, reason = hwlock.backfill_check(queue, ['gpu0'], 9, 10, now)
+        assert not allowed and 'gpu0 is held' in reason
+    finally:
+        handle.close()
+        path.unlink()
+    # A holder without a bound may release any moment.
+    path, handle = hwlock._publish(queue, 1, 'held', dict(seq=1, locks=['sparks', 'gpu1'], release_by=None))
+    try:
+        allowed, reason = hwlock.backfill_check(queue, ['gpu0', 'moa'], 9, 10, now)
+        assert not allowed and 'held without a bound' in reason
+    finally:
+        handle.close()
+        path.unlink()
+    # No record at all: the flocks are held outside the queue (plain flock, smoke).
+    allowed, reason = hwlock.backfill_check(queue, ['moa'], 9, 10, now)
+    assert not allowed and 'outside the queue' in reason
+    for item in [*flocks, *keep]:
+        item.close()
+
+
+def test_bounded_small_job_backfills_ahead_of_a_waiting_whole_cluster_ticket(lockdir):
+    # 2026-11-23: A held sparks,gpu1; B (older) wanted the whole cluster; C wanted gpu0 and GPU0 idled.
+    a = spawn_bounded(lockdir, 'sparks,gpu1', 4.0, lockdir / 'a', max_run=60)
+    wait_for(lockdir / 'a')
+    b = spawn_bounded(lockdir, WHOLE, 0.1, lockdir / 'b')
+    queued(lockdir, 1)
+    c = spawn_bounded(lockdir, 'gpu0', 0.3, lockdir / 'c', max_run=20)
+    for proc in (a, b, c):
+        assert proc.wait(timeout=60) == 0, proc.stderr.read()
+    assert wait_for(lockdir / 'c') < end_of(lockdir / 'a')  # C ran while A held its locks
+    assert wait_for(lockdir / 'b') >= max(end_of(lockdir / 'a'), end_of(lockdir / 'c'))
+    assert 'backfilled' in c.stderr.read()
+
+
+@pytest.mark.parametrize('holder_bound,candidate_bound', [(5, 30), (None, 2), (60, None)],
+                         ids=['candidate-bound-exceeds-holder', 'holder-unbounded', 'candidate-unbounded'])
+def test_no_backfill_unless_both_bounds_allow_it(lockdir, holder_bound, candidate_bound):
+    a = spawn_bounded(lockdir, 'sparks,gpu1', 2.0, lockdir / 'a', max_run=holder_bound)
+    wait_for(lockdir / 'a')
+    b = spawn_bounded(lockdir, WHOLE, 0.5, lockdir / 'b')
+    queued(lockdir, 1)
+    c = spawn_bounded(lockdir, 'gpu0', 0.1, lockdir / 'c', max_run=candidate_bound)
+    for proc in (a, b, c):
+        assert proc.wait(timeout=60) == 0, proc.stderr.read()
+    # Today's strict order: C waits behind B.
+    assert wait_for(lockdir / 'c') >= end_of(lockdir / 'b')
+    assert 'backfilled' not in c.stderr.read()
+
+
+def test_an_overrunning_backfill_is_killed_at_its_bound_and_the_older_ticket_follows(lockdir):
+    a = spawn_bounded(lockdir, 'sparks,gpu1', 0.5, lockdir / 'a', max_run=60)
+    wait_for(lockdir / 'a')
+    b = spawn_bounded(lockdir, WHOLE, 0.1, lockdir / 'b')
+    queued(lockdir, 1)
+    c = spawn_bounded(lockdir, 'gpu0', 60, lockdir / 'c', max_run=3)
+    started = wait_for(lockdir / 'c')
+    assert c.wait(timeout=30) == 124
+    assert time.time() - started < 3 + 2
+    assert '--max-run 3 s reached' in c.stderr.read()
+    assert not Path(str(lockdir / 'c') + '.end').exists()
+    assert a.wait(timeout=30) == 0 and b.wait(timeout=30) == 0
+    # B waited on C's gpu0 past A's release, but no longer than C's bound (+ one 2 s poll).
+    began = wait_for(lockdir / 'b')
+    assert started + 3 - 0.5 <= began <= started + 3 + hwlock.POLL_S + 2.5
+    assert not list((lockdir / 'hwq').glob('*.held'))
+
+
+def test_nested_acquisition_inside_a_backfilled_job_is_refused(lockdir):
+    a = spawn_bounded(lockdir, 'sparks,gpu1', 5.0, lockdir / 'a', max_run=60)
+    wait_for(lockdir / 'a')
+    b = spawn_bounded(lockdir, WHOLE, 0.1, lockdir / 'b')
+    queued(lockdir, 1)
+    rcs = lockdir / 'inner-rcs'
+    inner = '; '.join(f'{sys.executable} {SCRIPT} --locks {locks} --wait 5 {extra} -- true; echo $? >> {rcs}'
+                      for locks, extra in (('gpu0', ''), ('kakapo', ''), ('cassowary', '--gate'),
+                                           ('maxq', '--max-run 5')))
+    c = spawn_bounded(lockdir, 'gpu0', 0, lockdir / 'c', max_run=20, inner=inner)
+    assert c.wait(timeout=60) == 0, c.stderr.read()
+    assert wait_for(lockdir / 'c') < end_of(lockdir / 'a')
+    assert rcs.read_text().split() == ['77'] * 4
+    assert a.wait(timeout=60) == 0 and b.wait(timeout=60) == 0
+
+
+def test_nesting_outside_a_backfill_and_the_gate_child_path_are_unchanged(lockdir):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    # A bounded gate whose child queues for the same locks (as smoke does).
+    inner = f'{sys.executable} {SCRIPT} --locks sparks,gpu1 --wait 5 -- true'
+    gated = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'sparks,gpu0,gpu1', '--gate', '--max-run', '30',
+                            '--wait', '5', '--', 'sh', '-c', inner], env=env, capture_output=True, text=True, timeout=30)
+    assert gated.returncode == 0, gated.stderr
+    # A plain bounded hold (granted in turn, not backfilled) may still take a disjoint lock inside.
+    inner = f'{sys.executable} {SCRIPT} --locks moa --wait 5 -- true'
+    nested = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--max-run', '30', '--wait', '5',
+                             '--', 'sh', '-c', inner], env=env, capture_output=True, text=True, timeout=30)
+    assert nested.returncode == 0, nested.stderr
+
+
+def test_many_small_backfills_never_delay_the_older_big_job_past_the_bounds(lockdir):
+    a = spawn_bounded(lockdir, 'sparks,gpu1', 3.0, lockdir / 'a', max_run=6)
+    granted = wait_for(lockdir / 'a')
+    b = spawn_bounded(lockdir, WHOLE, 0.1, lockdir / 'b')
+    queued(lockdir, 1)
+    smalls = []
+    for n in range(12):
+        smalls.append(spawn_bounded(lockdir, 'gpu0', 0.2, lockdir / f'c{n}', max_run=1.5))
+        time.sleep(0.25)
+    for proc in (a, b, *smalls):
+        assert proc.wait(timeout=90) == 0, proc.stderr.read()
+    began = wait_for(lockdir / 'b')
+    # No backfill outlives A's own bound, so B starts by then (plus one poll).
+    assert began <= granted + 6 + hwlock.POLL_S + 1.0
+    backfilled = [n for n in range(12) if wait_for(lockdir / f'c{n}') < began]
+    assert backfilled, 'some small job should have used the idle GPU'
+    assert all(end_of(lockdir / f'c{n}') <= began for n in backfilled)
+    # The rest waited their turn behind B.
+    assert all(wait_for(lockdir / f'c{n}') >= end_of(lockdir / 'b') for n in range(12) if n not in backfilled)
+
+
+def test_max_run_must_be_finite_and_positive(lockdir):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    for value in ('0', '-1', 'inf', 'nan'):
+        result = subprocess.run([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--max-run', value, '--', 'true'],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 2 and '--max-run' in result.stderr
+    with pytest.raises(ValueError):
+        with hwlock.hold(['gpu1'], 5, max_run=0):
+            pass

@@ -183,7 +183,23 @@ impl<'a> Execution<'a> {
         }
         Ok(())
     }
-    pub fn require_live(&self) -> Result<()> { ensure!(!self.terminal, "Inkling execution is terminal"); Ok(()) }
+    pub fn require_live(&self) -> Result<()> {
+        ensure!(!self.terminal, "Inkling execution is terminal");
+        if let Some(peer) = &self.peer { peer.exchange.require_live()?; }
+        Ok(())
+    }
+    /// Both ranks drained and the peer exchange still live: only then may a
+    /// step's logits or graph observations be used (a timed-out peer wait
+    /// skipped itself, so its drained step is void).
+    fn completed(&mut self) -> Result<()> {
+        self.requests.decode.stream.drain()?;
+        if let Some(peer) = &self.peer {
+            peer.requests.decode.stream.drain()?;
+            peer.exchange.require_live()?;
+        }
+        crate::shared::spark_waves::healthy()?;
+        self.observe_completed()
+    }
     pub fn new(link: SparkLink<'a>, requests: RequestOwners<'a>, head: Head<'a>,
         target: TargetWeights<'a>, kernels: Kernels<'a>, local: Vec<Box<dyn Dispatcher + 'a>>,
         cfg: Inkling2Config, graph_reserve: u64, ingress: Vec<cuteafd_core::SparkIngress>) -> Result<Self> {
@@ -211,9 +227,7 @@ impl<'a> Execution<'a> {
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Prefill, io: &mut io }.run(units)?;
-            self.requests.decode.stream.drain()?;
-            crate::shared::spark_waves::healthy()?;
-            self.observe_completed()
+            self.completed()
         })();
         if result.is_err() { self.terminate(); }
         result
@@ -238,9 +252,7 @@ impl<'a> Execution<'a> {
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
-            self.requests.decode.stream.drain()?;
-            crate::shared::spark_waves::healthy()?;
-            self.observe_completed()?;
+            self.completed()?;
             Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
                 vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                 stream: self.requests.decode.stream.raw, greedy: None })
@@ -266,21 +278,23 @@ impl<'a> Execution<'a> {
     pub fn terminate(&mut self) {
         if self.terminal { return; }
         self.terminal = true;
-        let drained = (|| {
-            if let Some(peer) = &self.peer { peer.exchange.publish_abort()?; }
-            self.link.terminal_quiesce()?;
-            if let Some(peer) = &self.peer {
-                peer.exchange.drain_compute()?;
-                peer.requests.cache.drain()?;
-            }
+        // Every owner that queues peer waits on either rank's streams: the head
+        // split, each TP2 expert owner and the TP2 drafter (#2543).
+        use crate::shared::peer_split::TerminalOwner;
+        let mut owners: Vec<&dyn TerminalOwner> = Vec::new();
+        if let Some(peer) = &self.peer { owners.push(&peer.exchange); }
+        owners.extend(self.local.iter().filter_map(|local| local.terminal()));
+        if let Some(draft) = &self.draft { owners.push(&*draft.drafter); }
+        let link = std::cell::RefCell::new(&mut self.link);
+        let drained = crate::shared::peer_split::terminal_sequence(&owners, || link.borrow_mut().terminal_quiesce(), || {
+            if let Some(peer) = &self.peer { peer.requests.cache.drain()?; }
             self.requests.decode.stream.drain()?;
             for owner in &self.requests.prefill { owner.stream.drain()?; }
             self.requests.cache.drain()?;
-            self.link.terminal_drain_copies()?;
-            self.link.terminal_release()?;
-            if let Some(peer) = &self.peer { peer.exchange.finish_terminal(true); }
-            Ok(())
-        })();
+            let mut link = link.borrow_mut();
+            link.terminal_drain_copies()?;
+            link.terminal_release()
+        });
         crate::shared::decode_graph::fatal_drain(drained, "Inkling request executor retirement");
         if let Some(graphs) = &mut self.graphs { graphs.bank.cache_clear_drained(); }
         if let Some(peer) = &mut self.peer { peer.graphs.bank.cache_clear_drained(); }
@@ -306,6 +320,11 @@ mod tests {
         assert!(source.contains("device::observe_completed("));
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("begin_capture("));
         let terminal = source.split("pub fn terminate(").nth(1).unwrap();
+        // #2543: the head split, every TP2 expert owner and the drafter are aborted together.
+        for owner in ["owners.push(&peer.exchange)", "self.local.iter().filter_map(|local| local.terminal())",
+            "owners.push(&*draft.drafter)", "terminal_sequence(&owners"] {
+            assert!(terminal.contains(owner), "{owner}");
+        }
         assert!(terminal.find("terminal_quiesce").unwrap() < terminal.find("decode.stream.drain").unwrap());
         assert!(terminal.find("cache.drain").unwrap() < terminal.find("terminal_release").unwrap());
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("for layer in"));

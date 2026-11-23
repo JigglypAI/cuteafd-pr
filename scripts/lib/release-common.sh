@@ -109,13 +109,14 @@ PYPROFILE
 # The one device memory policy (rust/crates/cuteafd-core/src/memory_policy.rs):
 # launch keys and the global cuteafd flags they become, in one order.
 RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE MEMORY_PADDING GRAPH_DISABLE_LOW_MEM GRAPH_NODE_PADDING
-  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS)
+  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS SPARK_CARVEOUT)
 release_memory_flag() {
   case "$1" in
     GPU_MEMORY_CAP) printf -- --gpu-memory-cap ;; SPARK_MEMORY_CAP) printf -- --spark-memory-cap ;;
     GPU_RESERVE) printf -- --gpu-reserve ;; SPARK_RESERVE) printf -- --spark-reserve ;;
     FAMILY_RESERVE) printf -- --family-reserve ;; MEMORY_PADDING) printf -- --memory-padding ;; GRAPH_DISABLE_LOW_MEM) printf -- --graph-disable-low-mem ;; GRAPH_NODE_PADDING) printf -- --graph-node-padding ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
     KV_MIN_TOKENS) printf -- --kv-min-tokens ;; KV_MAX_TOKENS) printf -- --kv-max-tokens ;;
+    SPARK_CARVEOUT) printf -- --spark-carveout ;;
     *) return 1 ;;
   esac
 }
@@ -140,6 +141,8 @@ release_validate_memory_value() {
     GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING)
       [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
         release_die "$key must be a size in B, MB, GB, MiB or GiB" ;;
+    SPARK_CARVEOUT)
+      [[ "$value" == auto || "$value" == off ]] || release_die "SPARK_CARVEOUT must be auto or off" ;;
     *) release_die "unknown memory policy key: $key" ;;
   esac
 }
@@ -643,6 +646,24 @@ release_serving_docker_args() {
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")
   done
+  # spark-attic (GB10 display carveout, #2546), the project's stock interface:
+  # its socket directory and key read-only at their own paths (or the documented
+  # SPARK_ATTIC_SOCK / SPARK_ATTIC_KEY_FILE overrides), plus the socket's own
+  # group, so a non-root container connects where the operator applied the
+  # documented --socket-group step. A root-only install still mounts; the
+  # worker then refuses with one line naming that step and runs without it.
+  local attic_sock="${SPARK_ATTIC_SOCK:-/run/spark-attic/attic.sock}"
+  local attic_key="${SPARK_ATTIC_KEY_FILE:-/etc/spark-attic/key}" attic_gid
+  if [[ "${SPARK_CARVEOUT:-auto}" != off && -S "$attic_sock" && -f "$attic_key" ]]; then
+    RELEASE_SERVING_ARGS+=(--mount "type=bind,src=$(dirname "$attic_sock"),dst=$(dirname "$attic_sock"),readonly"
+      --mount "type=bind,src=$attic_key,dst=$attic_key,readonly"
+      -e "SPARK_ATTIC_SOCK=$attic_sock" -e "SPARK_ATTIC_KEY_FILE=$attic_key")
+    attic_gid="$(stat -c %g "$attic_sock" 2>/dev/null || true)"
+    if [[ "$attic_gid" =~ ^[0-9]+$ && "$attic_gid" != 0 && "$attic_gid" != "$primary_group" ]] &&
+        [[ " ${groups[*]} " != *" $attic_gid "* ]]; then
+      RELEASE_SERVING_ARGS+=(--group-add "$attic_gid")
+    fi
+  fi
 }
 
 # Shared host stores mounted into the coordinator must be ours: a missing bind
@@ -1083,7 +1104,7 @@ release_known_key() {
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_WINDOW|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     GPU_GRAPH_RESERVE|GPU_GRAPH_RESERVE_EXTRA|GPU_GRAPH_RESERVE_EXTRA_CAP|SPARK_GRAPH_RESERVE|GRAPH_TRACE|GRAPH_PREWARM|GRAPH_DONOR_ALWAYS|GRAPH_DONOR_COLD_LAG) return 0 ;; # Bounded graph cache.
-    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS|SPARK_CARVEOUT) return 0 ;; # One device memory policy (docs/options.md).
     EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_PREFILL_REPLY_FORMAT|SPARK_DECODE_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS|TP2_DFLASH) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
@@ -1101,7 +1122,7 @@ release_known_key() {
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_NSYS_ROOT|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -1162,10 +1183,42 @@ release_spark_host_rows() {
 # can therefore clean every host it names.
 # The family of the checkpoint a config names (scripts/lib/checkpoint-family.py
 # on its config.json). A config without MODEL_ID, or a snapshot not present
+release_hf_home() {
+  local helper
+  helper="$(dirname "${BASH_SOURCE[0]}")/wip_aot_scopes.py"
+  if [[ -f "$helper" ]]; then
+    python3 "$helper" --print-hf-home
+    return
+  fi
+  printf '%s\n' "${HF_HOME:-$HOME/.cache/huggingface}"
+}
+
+release_resolve_model_revision() {
+  local model="$1" explicit="${2:-}" hf_home="${3:-}" helper
+  helper="$(dirname "${BASH_SOURCE[0]}")/wip_aot_scopes.py"
+  if [[ -f "$helper" ]]; then
+    local -a cmd=(python3 "$helper" --resolve-revision --model "$model")
+    [[ -z "$explicit" ]] || cmd+=(--revision "$explicit")
+    [[ -z "$hf_home" ]] || cmd+=(--hf-home "$hf_home")
+    "${cmd[@]}"
+    return
+  fi
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return
+  fi
+  local root="${hf_home:-${HF_HOME:-$HOME/.cache/huggingface}}/hub/models--${model//\//--}"
+  [[ -s "$root/refs/main" ]] || return 1
+  local rev
+  rev="$(release_trim "$(<"$root/refs/main")")"
+  [[ -n "$rev" ]] || return 1
+  printf '%s\n' "$rev"
+}
+
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" attention="original" line key value hub dir
+  local config="$1" model="" revision="" attention="original" line key value hf_home hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -1178,9 +1231,10 @@ release_config_family() {
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
-  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+  hf_home="$(release_hf_home)"
+  hub="$hf_home/hub"
   dir="$hub/models--${model//\//--}"
-  [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  [[ -n "$revision" ]] || revision="$(release_resolve_model_revision "$model" "" "$hf_home" 2>/dev/null)" || revision=""
   [[ -z "${2:-}" ]] || attention="$2"
   local selected_config=config.json
   case "$attention" in
@@ -1256,9 +1310,10 @@ PY
 
 # Resolve fixed onboarding from the checkpoint's sparse layers.
 release_onboard() {
-  local value="$1" model="$2" revision="${3:-}" hub snapshot
-  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${model//\//--}"
-  [[ -n "$revision" || ! -f "$hub/refs/main" ]] || revision="$(<"$hub/refs/main")"
+  local value="$1" model="$2" revision="${3:-}" hf_home hub snapshot
+  hf_home="$(release_hf_home)"
+  hub="$hf_home/hub/models--${model//\//--}"
+  [[ -n "$revision" ]] || revision="$(release_resolve_model_revision "$model" "" "$hf_home" 2>/dev/null)" || revision=""
   snapshot="$hub/snapshots/$revision/config.json"
   local -a args=(--onboard "$value")
   [[ ! -f "$snapshot" ]] || args+=("$snapshot")
@@ -1345,7 +1400,6 @@ release_load_config() {
   PROFILE_EXPERT_ROUTE_WEIGHTS=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
-  CUTEAFD_EXPORT_HOST=
   WIP_BUILD_SEED=kakapo
   COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
   COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator
@@ -1642,9 +1696,8 @@ release_resolve_local_model_revision() {
   local hf_home="$1"
   local model_root="$hf_home/hub/models--${RELEASE_MODEL_ID//\//--}"
   if [[ -z "$RELEASE_MODEL_REVISION" ]]; then
-    [[ -s "$model_root/refs/main" ]] ||
+    RELEASE_MODEL_REVISION="$(release_resolve_model_revision "$RELEASE_MODEL_ID" "" "$hf_home" 2>/dev/null)" ||
       release_die "MODEL_REVISION is empty and $RELEASE_MODEL_ID has no local refs/main"
-    RELEASE_MODEL_REVISION="$(<"$model_root/refs/main")"
   fi
   [[ "$RELEASE_MODEL_REVISION" =~ ^[0-9a-f]{40,64}$ ]] ||
     release_die "resolved model revision is not 40..64 lowercase hex: $RELEASE_MODEL_REVISION"

@@ -33,7 +33,8 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
   - `original` restores the native drafter **byte for byte**. **Why:** published original views once carried a K4 MTP and needed repair (`c5b1e4aeab`).
 - **Write the MC package directly into one output directory.** No intermediate plain packages, staging copies or server-side parent copies.
 - **FP8-origin sources aren't MC** and never get a quantized core. Start from the BF16 original whenever one exists.
-- **Keep native, byte for byte, in every view:** embeddings, router weights and biases, all norms, sinks, the DSA/compressed indexer, absorbed `kv_b_proj`, recurrent/KDA pieces, vision towers, the drafter's special heads, and any lookup tables (see the addendum).
+- **MLA attention: which projections are core.** In every core view (K8 and K6), quantize **`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa` and `o_proj`** (plus any gate projection the architecture has, such as `linear_gate`). **`q_b_proj` is a core module: quantize it.** The only MLA projection kept native is the absorbed **`kv_b_proj`**. **Why:** the two `_b` projections sit side by side, and a past run read "absorbed `kv_b_proj`" as covering `q_b_proj` too and left it native. The DSA indexer's own `wq_b` is a different tensor: it belongs to the indexer and stays native with it.
+- **Keep native, byte for byte, in every view:** embeddings, router weights and biases, all norms, sinks, the DSA/compressed indexer (including its `wq_b`, `wk`, `weights_proj` and `k_norm`), the absorbed MLA `kv_b_proj` (**only `kv_b_proj`; `q_b_proj` is quantized as above**), recurrent/KDA pieces, vision towers, the drafter's special heads, and any lookup tables (see the addendum).
 
 ## 2. EXL3 contract: MUL1 codebook
 - **Codebook (TJ 2026-11-19):** **MUL1** (multiplier `0x83DCD12D`) for every EXL3 tensor, experts and core K8/K6 alike.
@@ -42,7 +43,7 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
   - A padded head records logical vs stored N, padded to 128, with zero padding scales.
 - **Quantizer support:** GPTQModel already handles MUL1 (`gptqmodel/exllamav3/modules/quant/exl3_lib/quantize.py`, `codebook_mul1_mult`, `mul1` in `quant_args`).
 - **Record the codebook** in `quantize_config*.json`, `cuteafd-mc.json` and the model card's recipe table.
-- **Engine status:** the core path loads MUL1. **The routed-expert kernels require MCG today**: `deepseek_v41/v41_exl3.rs:489` ("routed expert kernels require MCG"), and the fork's `w4a16/prepare.py` refuses the MUL1 runtime marker. Expert MUL1 support is separate engine work, so a MUL1-expert checkpoint won't serve until it lands. Produce the correct MUL1 checkpoint anyway.
+- **Engine status:** the engine serves MUL1 for both the core and the routed experts (routed-expert MUL1 since #2538, with the SM120/SM121 decode duel winners from fork #420/#421 pinned in #2581). The loader reads the codebook from the per-tensor `mcg`/`mul1` marker (`cuteafd-loader/src/plan/format.rs`).
 - **Don't use an E4M3-rounded codebook at K6.** **Why:** it failed all 20 pilot tensors at 2.28–2.39× NMSE.
 
 ## 3. Calibration data
@@ -219,4 +220,4 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 ---
 
 ## 14. Model addendum
-*(Append: source and pinned revision; reference code in authority order and the pinned Transformers version; architecture; size estimate; top-k and routing function (for §4); thinking mode (for §3); core module list; keep-native list; special tensors and their formats; model-specific calibration traffic; pilot layers; extra bars; the published name; and the engine follow-ups this checkpoint needs.)*
+*(Append: source and pinned revision; reference code in authority order and the pinned Transformers version; architecture; size estimate; top-k and routing function (for §4); thinking mode (for §3); core module list (for MLA, state explicitly that `q_b_proj` is quantized); keep-native list; special tensors and their formats; model-specific calibration traffic; pilot layers; extra bars; the published name; and the engine follow-ups this checkpoint needs.)*

@@ -5,16 +5,13 @@ source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/build-supervision.sh"
 usage() {
   printf '%s\n' 'Usage: build-dev-images.sh [--config FILE] [--spark-hosts HOST,...]' \
-    '  [--seed-hosts HOST,...] [--export-hosts HOST,...] [--role coordinator|expert|both]' \
+    '  [--seed-hosts HOST,...] [--role coordinator|expert|both]' \
     '  [--distribute-only] [--publish] [--dry-run]' \
     'Build toolchain-only dev images natively, independent of SparkInfer pins.' \
     '--publish uses only ghcr.io/tpurtell/cuteafd-dev:tc-HASH{-amd64,-arm64} and latest.' \
     'Publishing never retags local development defaults. Use rhea or a LAN-only seed as the Spark seed.' \
     '--seed-hosts: build-only Spark seeds that also receive the Spark image' \
     '  (default: the LAN-only seeds, kakapo,cassowary; empty for none).' \
-    '--export-hosts: remote coordinator export hosts that receive the coordinator image' \
-    '  (default: the config'"'"'s CUTEAFD_EXPORT_HOST, reached by ssh hostname; empty for none).' \
-    '  Its previous image stays under :prev-ID; a running container keeps its image.' \
     '--distribute-only: build nothing and retag nothing here or on the seed; copy this toolchain'"'"'s' \
     '  existing images to receivers whose copy differs (layer list). A host that already matches is skipped.' \
     'A copy to or from a host without RoCE goes zstd-compressed over AES-GCM ssh on its LAN address.' \
@@ -22,13 +19,12 @@ usage() {
     'Hold build.lock and the Spark seed host lock around actual builds.'
 }
 config="$repo_root/cuteafd.config"; hosts_csv=; role=both; dry_run=0; publish=0; distribute_only=0
-seed_hosts_csv="$(IFS=,; echo "${release_lan_seed_hosts[*]}")"; export_hosts_csv=__config__
+seed_hosts_csv="$(IFS=,; echo "${release_lan_seed_hosts[*]}")"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?}"; shift 2 ;;
     --spark-hosts) hosts_csv="${2:?}"; shift 2 ;;
     --seed-hosts) seed_hosts_csv="${2-}"; shift 2 ;;
-    --export-hosts) export_hosts_csv="${2-}"; shift 2 ;;
     --distribute-only) distribute_only=1; shift ;;
     --role) role="${2:?}"; shift 2 ;;
     --publish) publish=1; shift ;;
@@ -66,17 +62,6 @@ else
 fi
 seed_only_hosts=()
 [[ -z "$seed_hosts_csv" ]] || IFS=, read -ra seed_only_hosts <<<"$seed_hosts_csv"
-# Remote coordinator export hosts (scripts/build/export-remote.sh) need the exact
-# coordinator dev image: they admit an export only when its layer list matches.
-[[ "$export_hosts_csv" != __config__ ]] || export_hosts_csv="${CUTEAFD_EXPORT_HOST:-}"
-export_hosts=()
-[[ -z "$export_hosts_csv" ]] || IFS=, read -ra export_hosts <<<"$export_hosts_csv"
-# export_ssh HOST ARGS...: connect by name, as scripts/build/export-remote.sh does.
-export_ssh() {
-  local host="$1"
-  shift
-  release_ssh -o ConnectTimeout=10 "$host" "$@"
-}
 if [[ "$role" != coordinator ]]; then
   ((${#spark_hosts[@]})) || release_die 'no Spark build host'
   seed_host="${spark_hosts[0]}"
@@ -86,8 +71,6 @@ if [[ "$role" != coordinator ]]; then
   done
 fi
 printf 'Toolchain: tc-%s\n  amd64: %s\n  arm64: %s\n' "$hash" "$coordinator_tag" "$spark_tag"
-((publish)) || [[ "$role" == expert ]] || ((${#export_hosts[@]} == 0)) ||
-  printf 'Export hosts receive the coordinator image: %s\n' "${export_hosts[*]}"
 ((!distribute_only)) || printf 'Distribute only: no build, no retag on this host or the seed.\n'
 ((!publish)) || printf '  index: %s:tc-%s\n  latest: %s:latest\n' "$package" "$hash" "$package"
 case "$distribute_only:$role:$sequential" in
@@ -100,27 +83,8 @@ esac
 if ((dry_run)); then printf 'Dry run: nothing built or pushed.\n'; exit 0; fi
 # layers_of RUNNER IMAGE: the image's content identity (its RootFS layer list). An
 # image ID is not portable: docker save | load can give the same layers another ID.
-# Empty when the image is missing; otherwise the digest export-remote.sh compares.
 layers_of() {
   "${@:1:$#-1}" "l=\$(docker image inspect -f '{{json .RootFS.Layers}}' '${!#}' 2>/dev/null) && printf '%s\\n' \"\$l\" | sha256sum | cut -c1-64" 2>/dev/null || true
-}
-# copy_coordinator_image HOST: this host's coordinator image to an export host,
-# skipped when its layers already match; then retagged there like a builder.
-copy_coordinator_image() {
-  local host="$1" want have
-  want="$(layers_of bash -c "$coordinator_tag")"
-  [[ -n "$want" ]] || release_die "no local $coordinator_tag to distribute"
-  have="$(layers_of export_ssh "$host" "$coordinator_tag")"
-  if [[ -n "$want" && "$want" == "$have" ]]; then
-    printf 'Export host %s already has %s\n' "$host" "$coordinator_tag"
-  else
-    printf 'Copying %s to export host %s compressed\n' "$coordinator_tag" "$host"
-    docker image save "$coordinator_tag" | zstd -T8 -3 -q |
-      export_ssh "$host" "${release_bulk_ssh_opts[@]}" "zstd -d -q | docker image load" >/dev/null
-  fi
-  export_ssh "$host" bash -s -- "$COORDINATOR_DOCKER_DEV" "$coordinator_tag" "$(repo_of "$COORDINATOR_DOCKER_DEV")" <<<"$retag_body"
-  [[ "$(layers_of export_ssh "$host" "$COORDINATOR_DOCKER_DEV")" == "$want" ]] ||
-    release_die "export host $host did not receive $coordinator_tag"
 }
 # Preserve old si-* images for campaigns, and old tc-* images before moving a local default.
 # A same-toolchain rebuild (or a refreshed receiver: docker load moves the tc- tag)
@@ -247,9 +211,6 @@ if ((distribute_only)); then
   if [[ "$role" != coordinator ]]; then
     for host in "${spark_hosts[@]:1}"; do distribute_spark_image "$host"; done
   fi
-  if [[ "$role" != expert ]]; then
-    for host in ${export_hosts[@]+"${export_hosts[@]}"}; do copy_coordinator_image "$host"; done
-  fi
   printf 'Done. Receivers hold this toolchain'"'"'s images; running containers keep theirs.\n'
   exit 0
 fi
@@ -266,8 +227,6 @@ esac
 if ((!publish)); then
   if [[ "$role" != expert ]]; then
     bash -c "$retag_body" _ "$COORDINATOR_DOCKER_DEV" "$coordinator_tag" "$(repo_of "$COORDINATOR_DOCKER_DEV")"
-    # Remote coordinator exports admit only a layer-identical image.
-    for host in ${export_hosts[@]+"${export_hosts[@]}"}; do copy_coordinator_image "$host"; done
   fi
   if [[ "$role" != coordinator ]]; then
     ssh -o BatchMode=yes "$seed_host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"

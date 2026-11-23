@@ -1274,10 +1274,151 @@ extern "C" cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf)
   return ok();
 }
 
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+namespace {
+// Live carveout ranges: base -> physical parts in map order (handle, bytes).
+struct CarveoutRange {
+  size_t bytes;
+  std::vector<std::pair<CUmemGenericAllocationHandle, size_t>> parts;
+};
+std::mutex carveout_mutex;
+std::unordered_map<uintptr_t, CarveoutRange> carveout_ranges;
+
+// Undo a (partial) range: unmap what was mapped, free the reservation, release
+// every handle. Returns the first driver error.
+CUresult release_carveout_range(CUdeviceptr base, size_t reserved, size_t mapped_parts,
+    const std::vector<std::pair<CUmemGenericAllocationHandle, size_t>>& parts) {
+  CUresult first = CUDA_SUCCESS;
+  CUdeviceptr at = base;
+  for (size_t i = 0; i < mapped_parts; ++i) {
+    const CUresult r = cuMemUnmap(at, parts[i].second);
+    if (first == CUDA_SUCCESS) first = r;
+    at += parts[i].second;
+  }
+  if (base != 0) {
+    const CUresult r = cuMemAddressFree(base, reserved);
+    if (first == CUDA_SUCCESS) first = r;
+  }
+  for (const auto& part : parts) {
+    const CUresult r = cuMemRelease(part.first);
+    if (first == CUDA_SUCCESS) first = r;
+  }
+  return first;
+}
+
+cuteafd_status_t fail_cu(const char* action, CUresult result) {
+  const char* name = nullptr;
+  cuGetErrorName(result, &name);
+  return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, std::string(action) + " failed (" + (name ? name : "?") + ")");
+}
+}  // namespace
+#endif
+
+extern "C" cuteafd_status_t cuteafd_alloc_carveout_device_buffer(size_t bytes, const int* fds,
+    const size_t* fd_bytes, size_t fd_count, cuteafd_device_buffer_t* out,
+    size_t* out_tail_bytes, uint32_t kind, const char* owner) {
+  if (const cuteafd_status_t tagged = check_tag(kind, owner); tagged != CUTEAFD_STATUS_OK) return tagged;
+  constexpr size_t slice = size_t{2} << 20;
+  if (out == nullptr || out_tail_bytes == nullptr || (fd_count > 0 && (fds == nullptr || fd_bytes == nullptr))) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "carveout device buffer arguments are null");
+  }
+  if (bytes == 0 || bytes % slice != 0 || fd_count == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "carveout device buffer needs a whole 2 MiB size and at least one carveout part");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  int device = -1;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaGetDevice", err);
+  // The runtime's primary context is current for the selected device.
+  cudaFree(nullptr);
+  std::vector<std::pair<CUmemGenericAllocationHandle, size_t>> parts;
+  size_t carveout = 0;
+  auto undo = [&](CUdeviceptr base, size_t mapped) { release_carveout_range(base, bytes, mapped, parts); };
+  for (size_t i = 0; i < fd_count; ++i) {
+    if (fd_bytes[i] == 0 || fd_bytes[i] % slice != 0 || carveout + fd_bytes[i] > bytes) {
+      undo(0, 0);
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "carveout part is not whole 2 MiB slices inside the range");
+    }
+    CUmemGenericAllocationHandle handle = 0;
+    const CUresult r = cuMemImportFromShareableHandle(&handle,
+        reinterpret_cast<void*>(static_cast<intptr_t>(fds[i])), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+    if (r != CUDA_SUCCESS) { undo(0, 0); return fail_cu("cuMemImportFromShareableHandle(carveout)", r); }
+    parts.emplace_back(handle, fd_bytes[i]);
+    carveout += fd_bytes[i];
+  }
+  const size_t tail = bytes - carveout;
+  if (tail > 0) {
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    CUmemGenericAllocationHandle handle = 0;
+    const CUresult r = CUTEAFD_CHECK_MEMORY("cuMemCreate", "cuda", cuMemCreate(&handle, tail, &prop, 0),
+                                            tail, 1, nullptr);
+    if (r != CUDA_SUCCESS) { undo(0, 0); return fail_cu("cuMemCreate(carveout tail)", r); }
+    parts.emplace_back(handle, tail);
+  }
+  CUdeviceptr base = 0;
+  CUresult r = cuMemAddressReserve(&base, bytes, slice, 0, 0);
+  if (r != CUDA_SUCCESS) { undo(0, 0); return fail_cu("cuMemAddressReserve(carveout)", r); }
+  size_t mapped = 0;
+  CUdeviceptr at = base;
+  for (const auto& part : parts) {
+    r = cuMemMap(at, part.second, 0, part.first, 0);
+    if (r != CUDA_SUCCESS) { undo(base, mapped); return fail_cu("cuMemMap(carveout)", r); }
+    ++mapped;
+    at += part.second;
+  }
+  CUmemAccessDesc access{};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  r = cuMemSetAccess(base, bytes, &access, 1);
+  if (r != CUDA_SUCCESS) { undo(base, mapped); return fail_cu("cuMemSetAccess(carveout)", r); }
+  {
+    std::lock_guard<std::mutex> lock(carveout_mutex);
+    carveout_ranges[static_cast<uintptr_t>(base)] = CarveoutRange{bytes, std::move(parts)};
+  }
+  // The Rust ledger records the range under its two owners (carveout, tail).
+  out->ptr = reinterpret_cast<void*>(base);
+  out->bytes = bytes;
+  out->device_id = device;
+  out->flags = CUTEAFD_DEVICE_BUFFER_FLAG_CARVEOUT;
+  *out_tail_bytes = tail;
+  return ok();
+#else
+  (void)fds; (void)fd_bytes;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "carveout device buffers require CUDA");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf) {
   if (buf == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "device buffer pointer is null");
   }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  if (buf->ptr != nullptr && (buf->flags & CUTEAFD_DEVICE_BUFFER_FLAG_CARVEOUT) != 0) {
+    CarveoutRange range;
+    {
+      std::lock_guard<std::mutex> lock(carveout_mutex);
+      auto found = carveout_ranges.find(reinterpret_cast<uintptr_t>(buf->ptr));
+      if (found == carveout_ranges.end()) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "carveout device buffer is not a live range base");
+      }
+      range = std::move(found->second);
+      carveout_ranges.erase(found);
+    }
+    const CUresult r = release_carveout_range(reinterpret_cast<CUdeviceptr>(buf->ptr), range.bytes,
+                                              range.parts.size(), range.parts);
+    buf->ptr = nullptr;
+    buf->bytes = 0;
+    buf->device_id = -1;
+    buf->flags = CUTEAFD_DEVICE_BUFFER_FLAG_NONE;
+    if (r != CUDA_SUCCESS) return fail_cu("carveout range release", r);
+    return ok();
+  }
+#endif
   if (buf->ptr != nullptr) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
     cudaError_t err = CUTEAFD_TRACK_FREE(buf->ptr, cudaFree(buf->ptr));

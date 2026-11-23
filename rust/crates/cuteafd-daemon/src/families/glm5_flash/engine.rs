@@ -1479,6 +1479,9 @@ pub(crate) struct GlmfEngine<'a> {
     graphs_warmed: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
+    /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): eager decode reads back each
+    /// DSA layer's selection as logical 4-token pools. None: no drain or copy.
+    selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
     /// A decode segment is being captured: host-side probe work stays out of the graph.
     capturing: std::cell::Cell<bool>,
     ops: Option<RefCell<OpTimes>>,
@@ -1782,6 +1785,7 @@ impl<'a> GlmfEngine<'a> {
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
+            selection_dump: None,
             spark_bf16: false, capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
@@ -2156,11 +2160,6 @@ impl<'a> GlmfEngine<'a> {
     fn publish_tp2_abort(&self) -> Result<()> {
         let mut failures = Vec::new();
         for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
-            match exchange.terminal_state() {
-                crate::shared::peer_split::TerminalState::Aborting
-                | crate::shared::peer_split::TerminalState::Drained => continue,
-                _ => {}
-            }
             if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
         }
         if let Some(drafter) = &self.drafter {
@@ -3382,6 +3381,48 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: this engine owns the destination and its rank stream; uploads
         // precede new consumers and follow previous consumers outside capture.
         unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream_of(rank)) }
+    }
+
+    /// Diagnostic: the real decode rows' expanded selection (record slots,
+    /// inverted through each row's page table) as logical 4-token pools: the
+    /// indexer's 512 top-k pools plus the open tail pool, or every pool of a
+    /// row at or below the dense limit (2051 tokens).
+    fn dump_selection(&self, w: &Workspace<'_>, index: usize, tables: &StepTables) -> Result<()> {
+        use crate::shared::selection_dump::{self as dump, Layout, Row};
+        let rows = tables.real_rows;
+        let positions: Vec<u64> = tables.positions[..rows].iter().map(|&p| p as u64).collect();
+        let width = self.cfg.index_topk / KPOOL + 1;
+        let layout = Layout { width, unit_tokens: KPOOL as u32, source: index, heads: 1 };
+        dump::record(self.selection_dump.as_deref(), index, layout, &positions, || {
+            let raw = self.download(&w.indices, rows * SPARSE_TOPK * 4)?;
+            let lengths = dump::i32s(&self.download(&w.lengths, rows * 4)?);
+            let slots = dump::i32s(&raw);
+            (0..rows).map(|row| {
+                let count = (positions[row] as usize + 1).div_ceil(PAGE_ROWS).min(tables.page_stride);
+                let table = &tables.page_table[row * tables.page_stride..row * tables.page_stride + count];
+                let length = usize::try_from(lengths[row])?.min(SPARSE_TOPK);
+                let tokens = dump::logical_tokens(&slots[row * SPARSE_TOPK..row * SPARSE_TOPK + length], table, PAGE_ROWS)?;
+                let mut pools: Vec<i32> = tokens.iter().map(|&token| token / KPOOL as i32).collect();
+                pools.dedup();
+                pools.sort_unstable();
+                pools.dedup();
+                Ok(Row { position: positions[row], frontier: tables.cache_lengths[row], ids: pools })
+            }).collect()
+        })
+    }
+
+    /// Attaches the selection dump before startup graphs: decode then runs
+    /// eagerly (no capture, like `CUTEAFD_GLMF_GRAPHS=0`), heads or whole
+    /// placement with every MLA layer present on rank 0.
+    pub(crate) fn attach_selection_dump(&mut self, dump: std::sync::Arc<crate::shared::selection_dump::SelectionDump>) -> Result<()> {
+        use crate::shared::selection_dump::ENV_DIR;
+        ensure!(self.context.is_none() && self.context_mode.is_none(), "{ENV_DIR} needs heads or whole attention placement on GLM Flash");
+        ensure!(self.weights.layers.iter().all(|layer| !matches!(layer.attention, GlmNextAttention::Mla)
+            || layer.attention_share.present()), "{ENV_DIR} needs every DSA layer on GLM Flash rank 0");
+        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0, "{ENV_DIR} refuses attached CUDA graphs");
+        self.use_graphs = false;
+        self.selection_dump = Some(dump);
+        Ok(())
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
@@ -5090,6 +5131,9 @@ impl<'a> GlmfEngine<'a> {
                 ("indices", row_at(&w.indices, first, SPARSE_TOPK * 4)), ("lengths", row_at(&w.lengths, first, 4))],
                 &[rows, Scalar::I32(tables.page_stride as i32)])?;
         }
+        if rank == 0 && tables.decode && self.context.is_none() {
+            self.dump_selection(w, index, tables)?;
+        }
         if let Some(dir) = trace {
             for (name, buffer, bytes) in [("mla_indices.bin", &w.indices, t * SPARSE_TOPK * 4),
                 ("mla_lengths.bin", &w.lengths, t * 4)] {
@@ -5776,7 +5820,10 @@ mod prefill_lane_tests {
             // Fork #300 explicitly disables native scaling for NC: whole-shape deferral keeps
             // scaled-BF16 operands in both thin and wide tiles. Re-audited registry routes,
             // warps, groups and wide selection remain unchanged; no new row-count crossover.
-            ("integration/cuteafd/_fp8_gemv_nc.py", 0xe94e797f8b1fb0d9_u64),
+            // Fork #423 guards `_query_device_caps` with `aot_target.active_target()` when
+            // offline for CPU-only AOT export; kernel arithmetic, routes, warps, groups and
+            // exported objects are byte-identical.
+            ("integration/cuteafd/_fp8_gemv_nc.py", 0x8842_ec04_88e6_b1c3_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;

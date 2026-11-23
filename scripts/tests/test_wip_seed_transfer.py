@@ -418,25 +418,12 @@ def test_wip_seed_lease_balances_only_automatic_lan_seeds():
     assert 'kakapo' not in early
 
 
-def test_remote_exports_connect_by_ssh_hostname():
-    text = (ROOT / 'scripts/build/export-remote.sh').read_text()
-    assert 'ssh_host=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host")' in text
-    images = (ROOT / 'scripts/build/build-dev-images.sh').read_text()
-    export_ssh = images[images.index('export_ssh() {'):images.index('\nif [[ "$role" != coordinator ]]')]
-    assert 'release_ssh -o ConnectTimeout=10 "$host" "$@"' in export_ssh
-    for script in (text, export_ssh):
-        assert 'HostKeyAlias' not in script and 'HostName=' not in script
-    assert 'CUTEAFD_EXPORT_HOST_ADDR' not in text + images + WIP
-    config = (ROOT / 'cuteafd.config').read_text()
-    assert '\nCUTEAFD_EXPORT_HOST=maxq\n' in config
-
-
-def test_dev_images_refresh_export_hosts_and_distribute_only_never_builds(tmp_path):
+def test_dev_images_distribute_only_never_builds(tmp_path):
     text = (ROOT / 'scripts/build/build-dev-images.sh').read_text()
-    assert '[[ "$export_hosts_csv" != __config__ ]] || export_hosts_csv="${CUTEAFD_EXPORT_HOST:-}"' in text
     only = text[text.index('if ((distribute_only)); then'):text.index('case "$role" in\n  both) build_supervise')]
     assert 'exit 0' in only and 'docker build' not in only and 'retag_body" _' not in only
-    assert 'copy_coordinator_image "$host"' in only and 'distribute_spark_image "$host"' in only
+    assert 'distribute_spark_image "$host"' in only
+    assert 'CUTEAFD_EXPORT_HOST' not in text + WIP
     # The receiver keeps its old same-tc image as prev-ID instead of re-owning the tc- tag.
     retag = text[text.index("retag_body='"):text.index("check_body='")]
     script = 'set -euo pipefail\n' + retag.split("'", 1)[1].rsplit("'", 1)[0]

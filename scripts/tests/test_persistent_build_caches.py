@@ -166,13 +166,13 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
             result = subprocess.run(['bash', '-s', '--', *args], input=body, env=env, text=True, capture_output=True)
         else:
             body = text.split('build_spark_release_leg() {', 1)[1].split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
-            # Cache setup + exact Docker export argv, omitting GPU admission and supervision.
+            # Cache setup + exact Docker export argv.
             begin = body.index('container_home=/tmp/cuteafd-home')
-            end = body.index('spark_export_container_pid=$!')
+            end = body.index('(( spark_export_status == 0 ))')
             body = body[begin:end]
             prefix += f'cd "{ROOT}"; release_build_root="{tmp_path}/build"; remote_dir="{tmp_path}/remote"; export_container=test; dev_image=image\n'
             prefix += 'compiler_cache_args=(); native_build_env_args=(); release_build_root_args=(); spark_tp_roles=; expert_families=; bf16_families=; audio_aot=OFF\n'
-            prefix += body + '\nwait\n'
+            prefix += body + '\n'
         if entry != "remote-wip":
             result = subprocess.run(['bash', '-c', prefix], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -102,8 +102,8 @@ def test_both_release_legs_and_the_artifact_compiler_carry_the_group():
                   '-e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"',
                   '-e "CARGO_HOME=$container_home/cargo"'):
         assert token in remote, token
-    # Both the idle probe and the export run as the invoking uid/gid.
-    assert remote.count('--user "$(id -u):$(id -g)"') == 2
+    # The CPU-only Spark export runs as the invoking uid/gid.
+    assert remote.count('--user "$(id -u):$(id -g)"') == 1
     assert 'container_home="$release_build_root/container-home"' in remote
     # The container, not the caller, creates the writable roots: the bind-mounted
     # home does not exist on the host before the container first writes it.

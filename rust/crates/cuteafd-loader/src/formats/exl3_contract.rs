@@ -39,8 +39,9 @@ pub(crate) fn routed(name: &str) -> bool {
 }
 
 fn mtp(name: &str, backbone_layers: usize) -> bool {
-    // `mtp_dspark.`: Mistral Large 4's bundled dSpark drafter.
-    name.starts_with("mtp.") || name.starts_with("mtp_dspark.") || name.contains(".mtp.") || name.split_once(".layers.")
+    // `mtp_dspark.`: Mistral Large 4's bundled dSpark drafter; `model.dfly_layers.`: Hy4-flash DFly2 drafter.
+    name.starts_with("mtp.") || name.starts_with("mtp_dspark.") || name.starts_with("model.dfly_layers.")
+        || name.contains(".mtp.") || name.split_once(".layers.")
         .and_then(|(_, tail)| tail.split('.').next()?.parse::<usize>().ok())
         .is_some_and(|layer| layer >= backbone_layers)
 }
@@ -57,11 +58,11 @@ fn bits(key: &str, value: &Value, max: usize) -> Result<usize> {
 pub(crate) fn check_header_widths(
     quant: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
 ) -> Result<()> {
-    for key in ["core_bits", "head_bits", "mtp_bits"] {
+    for key in ["core_bits", "head_bits", "mtp_bits", "drafter_bits"] {
         let Some(value) = quant.get(key) else { continue };
         let width = bits(key, value, if key == "head_bits" { 16 } else { 8 })?;
         let mut modules = derived.iter().filter(|(name, _)| match key {
-            "mtp_bits" => mtp(name, backbone_layers),
+            "mtp_bits" | "drafter_bits" => mtp(name, backbone_layers),
             "head_bits" => head(name),
             _ => !routed(name) && !mtp(name, backbone_layers)
                 && !(head(name) && quant.get("head_bits").is_some()),
@@ -207,7 +208,7 @@ pub(crate) fn check_gptqmodel_manifest(
     // regexes, determine inventory. calibration and meta record how weights were
     // produced, not runtime transforms; retain them only as publication provenance.
     // out_scales describes whether the quantizer folded scales into svh.
-    ensure!(manifest["codebook"] == "mcg"
+    ensure!(matches!(manifest["codebook"].as_str(), Some("mcg" | "mul1"))
         && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
         && manifest["group_size"] == -1 && manifest["desc_act"] == false
         && manifest.get("pack_dtype").is_none_or(|v| v == "int32")
@@ -219,18 +220,49 @@ pub(crate) fn check_gptqmodel_manifest(
     let object = manifest.as_object().context("EXL3 manifest must be an object")?;
     for key in object.keys() {
         ensure!(matches!(key.as_str(),
-            "bits" | "checkpoint_format" | "codebook" | "core_bits" | "head_bits" | "mtp_bits"
+            "bits" | "checkpoint_format" | "codebook" | "codebook_multiplier" | "core_bits"
+            | "drafter_bits" | "head_bits" | "mtp_bits" | "engram_checkpoint_dtype" | "safetensors_index"
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
-            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
+            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "mul1_multiplier"
+            | "expert_bits" | "expert_bits_by_layer"
             | "kept_tensors" | "fused_expert_layout" | "retained_native_tensors"), "EXL3 manifest has unexpected key {key}");
     }
     if let Some(layout) = manifest.get("fused_expert_layout") {
         check_fused_expert_layout(layout, derived, backbone_layers)?;
     }
     if let Some(multiplier) = manifest.get("mcg_multiplier") {
+        ensure!(manifest["codebook"] == "mcg", "EXL3 mcg_multiplier requires codebook=mcg");
         ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MCG_MULTIPLIER),
             "EXL3 mcg_multiplier {multiplier} (the decoders implement 0xCBAC1FED)");
+    }
+    if let Some(multiplier) = manifest.get("mul1_multiplier") {
+        ensure!(manifest["codebook"] == "mul1", "EXL3 mul1_multiplier requires codebook=mul1");
+        ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MUL1_MULTIPLIER),
+            "EXL3 mul1_multiplier {multiplier} (the decoders implement 0x83DCD12D)");
+    }
+    if let Some(multiplier) = manifest.get("codebook_multiplier") {
+        let expected = match manifest["codebook"].as_str() {
+            Some("mcg") => super::exl3_storage::EXL3_MCG_MULTIPLIER,
+            Some("mul1") => super::exl3_storage::EXL3_MUL1_MULTIPLIER,
+            other => anyhow::bail!("EXL3 codebook_multiplier with unsupported codebook {other:?}"),
+        };
+        ensure!(multiplier.as_u64() == Some(expected),
+            "EXL3 codebook_multiplier {multiplier} disagrees with codebook {} ({expected})", manifest["codebook"]);
+    }
+    if let Some(dtype) = manifest.get("engram_checkpoint_dtype") {
+        ensure!(dtype.as_str() == Some("BF16"),
+            "EXL3 engram_checkpoint_dtype must be BF16, not {dtype}");
+    }
+    if let Some(index) = manifest.get("safetensors_index") {
+        ensure!(index.as_str().is_some_and(|s| s.ends_with(".safetensors.index.json") && !s.contains('/') && !s.contains('\\')),
+            "EXL3 safetensors_index must name a local safetensors index file, not {index}");
+    }
+    if let Some(declared) = manifest.get("codebook").and_then(Value::as_str) {
+        if let Some(codebook) = super::exl3_storage::Exl3Codebook::from_marker(declared) {
+            ensure!(derived.is_empty() || derived.values().any(|module| module.codebook == codebook),
+                "EXL3 manifest codebook={declared:?} disagrees with the safetensors headers");
+        }
     }
     if let Some(kept) = manifest.get("kept_tensors") {
         ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");
@@ -246,6 +278,11 @@ pub(crate) fn check_gptqmodel_manifest(
         if key == "per_module_metadata" {
             ensure!(matches!(value.as_str(), Some("quantize_config.json:tensor_storage" | "quantize_config.k6.json:tensor_storage" | "quantize_config.k8.json:tensor_storage")),
                 "EXL3 per_module_metadata must name the selected quantization tensor_storage, not {value}");
+            continue;
+        }
+        if key == "safetensors_index" {
+            ensure!(value.as_str().is_some_and(|s| s.ends_with(".safetensors.index.json") && !s.contains('/') && !s.contains('\\')),
+                "EXL3 safetensors_index must name a local safetensors index file, not {value}");
             continue;
         }
         ensure!(manifest.get(key) == Some(value), "compact/full EXL3 metadata disagree at {key}");

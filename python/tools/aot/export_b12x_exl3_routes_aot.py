@@ -145,5 +145,12 @@ if __name__ == '__main__':
     parser.add_argument('--experts', type=int, default=384)
     parser.add_argument('--topk', type=int, choices=range(1, 17), metavar='1..16', default=6)
     parser.add_argument('--block-size', type=int, choices=(8,16,32,64), default=8)
+    parser.add_argument('--capability', type=int, choices=(120, 121), default=120)
     args = parser.parse_args()
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target(args.capability)
     export(args.output,args.capacity,args.experts,args.topk,args.block_size)
+    if torch.cuda.is_initialized():
+        raise RuntimeError('offline EXL3 route export initialized CUDA')

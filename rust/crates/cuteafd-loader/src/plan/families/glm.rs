@@ -198,7 +198,7 @@ impl Family for Glm {
             ("glm5_flash", Component::RoutedExpert) | ("glm5_flash", Component::SpeculatorExpert) => (
                 "top-8 of 288 sigmoid routed experts with SwiGLU clamp 10".to_string(),
                 "EXL3 K3/K4 checkpoints: the glm:exl3 recipe at hidden 4096 / inter 2048 / 288 experts with \
-                 the clamp enabled (python/tools/aot/package_exl3_aot.py, exl3_cross_sm121.py for Sparks). \
+                 the clamp enabled (python/tools/aot/package_exl3_aot.py). \
                  FP8 checkpoints: the fp8 routed family (native/cmake/shared/fp8_moe.cmake) at this geometry.".to_string(),
             ),
             (_, Component::Attention) | (_, Component::Indexer) => (
@@ -542,7 +542,7 @@ impl GlmModel {
         require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
         let exl3 = if self.id == "glm5" { 4..=5 } else { 3..=4 };
         require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
-            || operand.exl3_bits().is_some_and(|bits| exl3.contains(&bits))
+            || operand.exl3_routed().is_some_and(|(bits, _)| exl3.contains(&bits))
             || self.id == "glm5" && matches!(operand.encoding, crate::plan::format::Encoding::Exlr8 { bits: 2..=4 })
             || operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == 16), || {
             format!("routed experts run E4M3 with 128x128 scales, EXL3 K{}-K{} or ModelOpt NVFP4 (group 16); found {}",
@@ -647,12 +647,13 @@ impl FamilyModel for GlmModel {
                 local,
             });
         }
-        if operand.exl3_bits().is_some() {
+        if let Some((_, codebook)) = operand.exl3_routed() {
             let tiers = if self.id == "glm5" { "k45" } else { "k34" };
+            let package = format!("{}:exl3-{tiers}{}", self.geometry(), codebook.package_suffix());
             return Some(ExpertContract {
-                package: format!("{}:exl3-{tiers}", self.geometry()),
+                spark_worlds: spark_worlds(&package, moe.intermediate),
+                package,
                 block: 128,
-                spark_worlds: spark_worlds(&format!("{}:exl3-{tiers}", self.geometry()), moe.intermediate),
                 local,
             });
         }

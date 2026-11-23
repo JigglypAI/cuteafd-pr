@@ -32,6 +32,7 @@ FAMILIES = {
     "Step-5": "step5",
     "Muse": "muse_spark",
     "Inkling": "inkling2",
+    "Hy4-flash": "hy4_flash",
 }
 COLUMNS = list(FAMILIES)
 
@@ -66,7 +67,7 @@ def family_keys(family: str) -> set[str]:
     )
     assert result.returncode == 0, result.stderr
     # release_reject_unused_keys always allows the shared site/build keys.
-    return set(result.stdout.split()) | {"CUTEAFD_EXPORT_HOST", "WIP_BUILD_SEED"}
+    return set(result.stdout.split()) | {"WIP_BUILD_SEED"}
 
 
 def tables(lines: list[str]):
@@ -217,7 +218,7 @@ def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_pat
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
-    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2"}
+    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "hy4_flash"}
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
@@ -405,6 +406,11 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == COLUMNS
                 assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
                 assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+            elif key == "DECODE_LANES":
+                # V4.1's default is two lanes; the lever is the one-lane opt-in.
+                assert lever["families"] == ["V4.1"]
+                assert default == "2"
+                assert "`DECODE_LANES=1`" in lever["enable"]
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
@@ -461,7 +467,7 @@ def test_embedding_value_support_and_expert_usage_adapters():
     text = DOC.read_text()
     section = text.split("Token embedding placement (`EMBEDDING`", 1)[1].split("Speculator", 1)[0]
     host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
-    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 4
+    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 5
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
         "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3"}
 
@@ -536,7 +542,7 @@ def test_every_family_accepts_the_shared_draft_policy_key():
         assert removed not in MATRIX and removed not in launcher
     assert all(MATRIX["DRAFT_POLICY"].values())
     for family in ("deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5",
-                   "muse_spark", "minimax_m3", "inkling2"):
+                   "muse_spark", "minimax_m3", "inkling2", "hy4_flash"):
         assert "DRAFT_POLICY" in family_keys(family), family
 
 

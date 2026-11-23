@@ -62,7 +62,7 @@ def isolated_lock_dir(tmp_path_factory):
     """Point every lock user at a private directory for the whole session.
 
     `CUTEAFD_LOCK_DIR` reaches code that resolves the lock directory at call time
-    (hwlock.lock_dir, build-resource, export-placement) and every subprocess that
+    (hwlock.lock_dir, build-resource) and every subprocess that
     inherits the environment; modules already imported that cached a lock-dir
     attribute get it overwritten too. xdist gives each worker its own directory."""
     lock_dir = tmp_path_factory.mktemp("hardware-locks")
@@ -207,6 +207,7 @@ def no_live_cache(tmp_path_factory):
     hub = root / ".cache/huggingface"
     seed_checkpoint_metadata(hub)
     patch.setenv("HF_HOME", str(hub))
+    patch.setenv("HF_HUB_OFFLINE", "1")
     yield root
     patch.undo()
 

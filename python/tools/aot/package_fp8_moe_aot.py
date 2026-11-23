@@ -49,7 +49,7 @@ program (compile_fp8_moe_aot(prefill="w8a16" | "w8a8")), launched while the
 matching option is set.
 
   package_fp8_moe_aot.py build --role spark --geometry mimo --output DIR --build-dir DIR \\
-      [--cross-sm121] --cxx c++ --cuda-include I --cuda-libdir L --runtime libcute_dsl_runtime.so
+      --cxx c++ --cuda-include I --cuda-libdir L --runtime libcute_dsl_runtime.so
   package_fp8_moe_aot.py verify --package DIR
 """
 
@@ -594,11 +594,10 @@ def info_words(g, capacities: list[int], wire: bool, nvfp4_input: bool = False) 
 
 
 def build(args: argparse.Namespace) -> None:
-    if args.cross_sm121:
-        from exl3_cross_sm121 import describe_gb10
-
-        describe_gb10()
     import _pinned_sparkinfer
+    from b12x._lib.aot_target import describe_target
+
+    describe_target(ROLE_COMPUTE[args.role])
     import torch
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
@@ -608,8 +607,7 @@ def build(args: argparse.Namespace) -> None:
 
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != ROLE_COMPUTE[args.role]:
-        raise SystemExit(f"{args.role} packages need compute {ROLE_COMPUTE[args.role]} "
-                         f"(use --cross-sm121 on an SM120 host)")
+        raise SystemExit(f"{args.role} packages need compute {ROLE_COMPUTE[args.role]}")
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
     unit = 16 if base.weights == "nvfp4" else 32 if base.weights == "mxfp4" else 128
@@ -766,6 +764,8 @@ def build(args: argparse.Namespace) -> None:
             path.chmod(0o755 if path.is_dir() or path.suffix == ".so" else 0o644)
     print(json.dumps({"package": str(args.output), "role": args.role, "layouts": layouts,
                       "capacities": capacities}), flush=True)
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline FP8 MoE packaging initialized CUDA")
 
 
 def verify(package: Path, *, revision: str | None = None, role: str | None = None,
@@ -838,7 +838,6 @@ def main() -> None:
     create.add_argument("--input", choices=("wire", "bf16", "nvfp4"),
                         help="expert input rows (NVFP4: bf16, or nvfp4 for the exact pre-quantized wire; "
                         "otherwise wire for spark, bf16 for coordinator)")
-    create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")
     create.add_argument("--build-dir", type=Path, required=True)
     create.add_argument("--output", type=Path, required=True)
     create.add_argument("--cxx", default="c++")

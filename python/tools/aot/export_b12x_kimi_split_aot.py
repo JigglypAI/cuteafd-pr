@@ -67,6 +67,10 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--only", help="comma-separated export names")
     args = parser.parse_args()
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target("sm120")
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -100,6 +104,8 @@ def main():
         source_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"], programs=records), indent=2) + "\n")
     (output / "kimi_split_programs.h").write_text("\n".join([
         "#pragma once", *includes, "#define CUTEAFD_KIMI_SPLIT_PROGRAMS " + ", ".join(entries), ""]))
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline Kimi split export initialized CUDA")
 
 
 if __name__ == "__main__":

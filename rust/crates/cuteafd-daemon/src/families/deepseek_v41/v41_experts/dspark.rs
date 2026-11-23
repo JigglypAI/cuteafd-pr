@@ -159,6 +159,20 @@ pub(crate) struct PreparedDspark<'a> {
     grouped_output_scales: [crate::shared::memory::DeviceAllocation<'a>; 3],
     projection_scales: [crate::shared::memory::DeviceAllocation<'a>; 13],
 }
+
+/// The draft lanes a request limit runs on and each lane's member limit: the
+/// resolved decode lanes (`lanes`), one lane at a single request. Every V4.1
+/// draft owner (inventory, loader, runtime) sizes its chains with this.
+pub(crate) fn draft_lanes(requests: u32, lanes: u8) -> Result<(u32, u32)> {
+    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
+    ensure!(matches!(lanes, 1 | 2), "V4.1 drafts on one or two decode lanes");
+    let lanes = if requests == 1 { 1 } else { u32::from(lanes) };
+    let members = requests.div_ceil(lanes);
+    ensure!(members as usize <= cuteafd_core::V41_MAX_LANE_MEMBERS,
+        "{members} draft lane members exceed the {} per lane", cuteafd_core::V41_MAX_LANE_MEMBERS);
+    Ok((lanes, members))
+}
+
 impl<'a> PreparedDspark<'a> {
     fn finish(self, experts: ExpertStages<'a>) -> DsparkWeights<'a> {
         DsparkWeights { standalone: std::rc::Rc::new(crate::shared::memory::StandaloneStream::new(
@@ -260,12 +274,12 @@ impl<'library> DsparkWeights<'library> {
     /// request lanes, main contexts and windows as one exact named owner, and
     /// the loader's load phase. Marks are 0; the caller fills `marks`.
     pub fn single_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize)
+        context_capacity: u32, requests: u32, lanes: u8, width: usize)
         -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
         use cuteafd_core::memory_layout::{Basis, Category};
-        let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, width)?;
+        let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, lanes, width)?;
         // `load_serving_with_width` plans at the full request batch; its check is weights-only.
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(draft_lanes(requests, lanes)?.1, width)?;
         let budget = Self::plan_with_width(library, catalog, capacity, width)?;
         let peak = budget.load_bound()?;
         Ok(cuteafd_loader::placement::families::deepseek_v41::DraftInventory {
@@ -283,16 +297,15 @@ impl<'library> DsparkWeights<'library> {
     /// exactly what `load_serving*` and `DraftRuntime::with_distributed_requests`
     /// later allocate; the admission solver places them as one drafter Movable.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn distributed_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize, tp2_experts: bool,
+        context_capacity: u32, requests: u32, lanes: u8, width: usize, tp2_experts: bool,
         split: usize, mark_bytes: usize)
         -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
         use cuteafd_core::memory_layout::{Basis, Category};
         use cuteafd_loader::placement::Demand;
-        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
-        let lanes = if requests == 1 { 1 } else { 2 };
-        let lane_requests = requests.div_ceil(lanes);
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
+        let (lanes, lane_requests) = draft_lanes(requests, lanes)?;
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(lane_requests, width)?;
         let experts = if tp2_experts { DraftExpertKind::Tp2 } else { DraftExpertKind::Full };
         let shape = DsparkShape { library, width, experts };
         let budget = Self::plan_with_width(library, catalog, capacity, width)?;
@@ -344,10 +357,8 @@ impl<'library> DsparkWeights<'library> {
 
     /// Exact single-coordinator serving owners, before reading any payload.
     pub fn serving_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize) -> Result<(usize, usize, usize)> {
-        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
-        let lanes = if requests == 1 { 1 } else { 2 };
-        let members = requests.div_ceil(lanes);
+        context_capacity: u32, requests: u32, lanes: u8, width: usize) -> Result<(usize, usize, usize)> {
+        let (lanes, members) = draft_lanes(requests, lanes)?;
         let capacity = DsparkAttentionWave::projection_capacity_with_width(members, width)?;
         let budget = Self::plan_with_width(library, catalog, capacity, width)?;
         let chain = [budget.execution_bytes_per_wave, budget.shared_execution_bytes_per_wave,
@@ -381,22 +392,24 @@ impl<'library> DsparkWeights<'library> {
         device_budget: usize,
         pinned_staging_bytes: usize,
     ) -> Result<Self> {
-        Self::load_serving_with_width(library, catalog, context_capacity, requests,
+        Self::load_serving_with_width(library, catalog, context_capacity, requests, 2,
             device_budget, pinned_staging_bytes, 5)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn load_serving_with_width(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, device_budget: usize,
+        context_capacity: u32, requests: u32, lanes: u8, device_budget: usize,
         pinned_staging_bytes: usize, width: usize) -> Result<Self> {
         // The main context is a draft-runtime owner, allocated later from its own budget.
         let _ = context_capacity;
-        let draft_capacity = DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
+        let draft_capacity = DsparkAttentionWave::projection_capacity_with_width(draft_lanes(requests, lanes)?.1, width)?;
         Self::load_with_width(library, catalog, draft_capacity, 1, device_budget, pinned_staging_bytes, width)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn load_serving_tp2(library:&'library NativeLibrary,catalog:&OfficialV41Catalog,
-        context_capacity:u32,requests:u32,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
+        context_capacity:u32,requests:u32,lanes:u8,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
         let _ = context_capacity;
-        let capacity=DsparkAttentionWave::projection_capacity_with_width(requests.div_ceil(if requests == 1 { 1 } else { 2 }),width)?;
+        let capacity=DsparkAttentionWave::projection_capacity_with_width(draft_lanes(requests, lanes)?.1,width)?;
         Self::load_tp2_with_width(library,catalog,capacity,2,budgets,pinned_staging_bytes,width)
     }
 
@@ -437,10 +450,9 @@ impl<'library> DsparkWeights<'library> {
     /// Record only auxiliary tensors before push. Expert views are installed
     /// from the committed mixed backbone/draft arena, never recorded as dense.
     pub fn prepare_serving_tp2(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
-        requests: u32, budgets: [usize; 2], pinned_staging_bytes: usize, width: usize)
+        requests: u32, lanes: u8, budgets: [usize; 2], pinned_staging_bytes: usize, width: usize)
         -> Result<PreparedDspark<'library>> {
-        let capacity = DsparkAttentionWave::projection_capacity_with_width(
-            requests.div_ceil(if requests == 1 { 1 } else { 2 }), width)?;
+        let capacity = DsparkAttentionWave::projection_capacity_with_width(draft_lanes(requests, lanes)?.1, width)?;
         let (budget, resident) = Self::tp2_budget(library, catalog, capacity, budgets, width)?;
         Self::prepare_auxiliary(library, catalog, budgets[1], pinned_staging_bytes, width, budget, resident[1])
     }

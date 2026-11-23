@@ -334,6 +334,34 @@ patterns:
 - **Duels:** give the same task as a Sol or Opus agent to Gemini or Grok in a
   separate worktree, and compare the results. Kernel design and optimization
   are the best duels.
+- **Kernel duel sandbox: CPU trace check.** Duel entrants run CPU-only in
+  `bwrap` (no `/dev/nvidia*`, `CUDA_VISIBLE_DEVICES=-1`). Give them
+  SparkInfer's `b12x.tools.cpu_trace_check` so a CuTe DSL trace-time error
+  such as `TYPE_UNSTABLE_JOIN` surfaces in the entrant's turn, not the
+  organizer's export (two routed MUL1 entries were voided that way, #2571). It
+  needs no device: it describes SM120 or SM121 to Torch and the DSL, then
+  traces and lowers each selected routed mixed-Trellis program to a cubin with
+  the exporter's options. It stops at the first error and prints the DSL's own
+  diagnostic. Before round 1, build the duel's stock packages as usual, then
+  write the scored shapes with `python -m b12x.tools.cpu_trace_check --package
+  <stock pkg-coordinator> --package <stock pkg-spark> [--match rtx-tp2/ ...]
+  --save-shapes shapes.json`. Add to the entrant wrapper `--ro-bind
+  ~/.cache/cuteafd/tools/x86_64/cute-dsl-cpu /srv/cute-dsl-cpu --ro-bind
+  shapes.json /srv/duel-shapes.json`. The recipe's `/srv` is already a tmpfs.
+  That toolchain is a relocatable CPython 3.12 with the pinned
+  nvidia-cutlass-dsl 4.8.1, CPU Torch 2.12 and Triton. The brief then tells
+  the entrant to run, from the entry checkout, `/srv/cute-dsl-cpu/bin/python3
+  -m b12x.tools.cpu_trace_check --shapes /srv/duel-shapes.json` before
+  committing, with `--arch sm120|sm121`, `--capacities 1,80` and `--match` to
+  narrow it. An entry branched from a fork base without the module can still
+  use it: also bind the file (`--ro-bind <fork>/b12x/tools/cpu_trace_check.py
+  /srv/cpu_trace_check.py`) and run `PYTHONPATH=$PWD
+  /srv/cute-dsl-cpu/bin/python3 /srv/cpu_trace_check.py ...`. A pass proves
+  only that the programs trace and lower, not correctness, speed or launch
+  limits. It runs on one core, about 2 s per decode program and 5 s per WS
+  prefill program. The hy4f RTX set (16 programs) takes 1 min, the hy4f Spark
+  TP1/2/4/6 set (32) 2.3 min and the full routed RTX set (hy4f, GLM and Qwen4
+  in both codebooks, 96) 6 min. `--trace-only` halves that.
 - **Low-priority tasks** on their own.
 - **Reviews** of another agent's PR, compared with the code reviewer's.
 - **Research and vision** (Gemini): compare with our web search (Exa).
@@ -449,12 +477,10 @@ These apply to every agent and are also in `AGENTS.md`.
 - **Disk:** builds fill raptor's root NVMe fast (`builds/` reached 1.4 TB and
   crashed runs with "No space left on device"). Delete Cargo `target*` and
   release staging when a task finishes; check `df -h /` before large builds.
-- **AOT exports outside the locks:** CuTe/Triton exporters query the device
-  at compile time, so the export container needs a GPU, but not a lock.
-  Pin it to an idle RTX (≤512 MiB used, bounded wait), watchdog its
-  memory, and on a Spark export only when no serving container runs and
-  ≥100 GiB CUDA memory is free. Log host, GPU and time so a concurrent
-  measurement can be explained.
+- **AOT exports run on CPU without locks:** CuTe DSL and Triton AOT exporters
+  run CPU-only (`CUDA_VISIBLE_DEVICES=""`) using `b12x._lib.aot_target.describe_target`
+  and never touch a GPU or take a hardware lock. Build-slot admission and
+  host-wide CPU worker caps keep concurrent builds from starving serving runs.
 - **Root:** run privileged commands directly as
   `agent-sudo -n --agent-context "<why>" <command>` with the whole command
   visible. A wrapper script under sudo (`sudo python profile.py`) is flagged by

@@ -9,9 +9,9 @@ dead process and is removed. A request takes its locks only when no older live
 ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
-order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, kakapo-export,
-cassowary-export, maxq), so callers that still use plain flock stay excluded (they are
-just not queued fairly). Exit 75 when the wait expires.
+order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, maxq), so callers
+that still use plain flock stay excluded (they are just not queued fairly).
+Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
 them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
@@ -31,6 +31,37 @@ KillMode=mixed or process, or a TimeoutStopSec below 90 s.
 after grant with --preflight-at-grant), while
 locks are still held even in --gate mode. Failure or timeout exits 78 without
 running CMD; --preflight-timeout defaults to 300 seconds per check.
+
+Bounded backfill (--max-run SECONDS). The bound is recorded in the ticket and
+enforced from the grant on, at-grant preflight included: SIGTERM to CMD (or to
+an in-process holder) at the bound, the usual STOP_GRACE_S, then SIGKILL; such
+a run exits 124. Every holder publishes `SEQ.PID.held` in the queue (flocked
+like a ticket) naming its locks and `release_by`, the latest wall time its
+locks are free again (bound + HARD_STOP_S), or null without --max-run. A
+request with --max-run, not --gate, not inside a live gate, may start before
+older live tickets that want some of its locks only when all of these hold:
+  - none of its locks is flocked or named by a live holder record;
+  - for every such older ticket T (still waiting: a granted gate's locks are
+    named by its holder record), each lock T wants beyond ours is free or held by recorded holders that
+    all have a release_by; at least one is held; and our own release_by is no
+    later than W(T), the earliest of those release_by values (T cannot start
+    before that blocker is gone, and it must be gone by then).
+A lock held outside the queue (plain flock, `cuteafd bench smoke`) or by a
+holder without a bound counts as "may free any moment", so nobody backfills
+past a ticket waiting on it. A backfilled job is gone by W(T), so it keeps T
+waiting at most until W(T); every backfill fits under the same W(T), so no
+number of small jobs moves T's start past it. The bound must cover the
+at-grant preflight and CMD's own teardown. Inside a live gate the gate's own
+bound applies (its children take flocks without tickets or records).
+A request without --max-run never backfills and queues exactly as before.
+
+No nesting inside a backfilled job: any acquisition (a new ticket, --gate or
+in-process hold) by the backfilled holder's process or its descendants (by
+/proc parent links) is refused at once (exit 77), since an inner ticket would
+queue behind the very ticket the backfill went ahead of. Backfill never applies
+inside any live holder or gate: such a request queues as before. The --gate
+child path is unchanged: inside a live gate a hold takes the flocks without a
+ticket.
 """
 from __future__ import annotations
 
@@ -43,18 +74,17 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 # kakapo and cassowary are the LAN-only build seeds (10 GbE, never serve): after
 # every serving lock, so a serving job's locks are always taken before a seed
-# lease's. Each seed's GPU-export turn (SEED-export) comes last: a build takes it
-# while its counting lease on that seed is live (scripts/build/build-resource.py).
+# lease's. Kernel AOT exports run on CPU and need no GPU export lock.
 LAN_SEEDS = ('kakapo', 'cassowary')
-# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles builds, AOT exports, quants,
-# CPU gates and single-GPU correctness, never perf A/B, cards or serving.
-ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS),
-         'maxq')
+# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles quants, CPU gates and
+# single-GPU correctness, never perf A/B, cards or serving.
+ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, 'maxq')
 _DEFAULT_LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 # An explicit assignment (a driver pinning a private directory, a test) wins;
 # otherwise CUTEAFD_LOCK_DIR is read when the lock is taken, so a process that
@@ -75,6 +105,11 @@ POLL_S = 2.0
 STOP_GRACE_S = 80.0
 FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)
+# From a bounded run's SIGTERM to its SIGKILL: the stop grace plus a margin for
+# run_forwarding's 0.5 s poll, so a CLI holder kills CMD itself first.
+HARD_STOP_S = STOP_GRACE_S + 5.0
+OVERRAN = [False]  # set when this process's --max-run bound fired
+NESTED_EXIT = 77
 
 
 def canonical(names) -> list[str]:
@@ -100,18 +135,141 @@ def _next_seq(queue: Path) -> int:
         return seq
 
 
-def _take_ticket(queue: Path, locks: list[str]) -> tuple[int, Path, object]:
-    seq = _next_seq(queue)
-    staged = queue / f'.{seq:012d}.{os.getpid()}.tmp'
+def _publish(queue: Path, seq: int, suffix: str, data: dict) -> tuple[Path, object]:
+    staged = queue / f'.{seq:012d}.{os.getpid()}.{suffix}.tmp'
     handle = open(staged, 'w')
-    # Lock before the ticket becomes visible, so nobody can mistake it for stale.
+    # Lock before the entry becomes visible, so nobody can mistake it for stale.
     fcntl.flock(handle, fcntl.LOCK_EX)
-    handle.write(json.dumps(dict(locks=locks, pid=os.getpid(), host=socket.gethostname(),
-                                 created=time.time(), argv=sys.argv[1:][:8])))
+    handle.write(json.dumps(data))
     handle.flush()
-    path = queue / f'{seq:012d}.{os.getpid()}.ticket'
+    path = queue / f'{seq:012d}.{os.getpid()}.{suffix}'
     os.rename(staged, path)
+    return path, handle
+
+
+def _take_ticket(queue: Path, locks: list[str], max_run: float | None = None) -> tuple[int, Path, object]:
+    seq = _next_seq(queue)
+    data = dict(locks=locks, pid=os.getpid(), host=socket.gethostname(), created=time.time(), argv=sys.argv[1:][:8])
+    if max_run is not None:
+        data['max_run'] = max_run
+    path, handle = _publish(queue, seq, 'ticket', data)
     return seq, path, handle
+
+
+def _live_entries(queue: Path, suffix: str) -> list[tuple[int, str, dict]]:
+    """Live `SEQ.PID.SUFFIX` entries, oldest first, as (seq, name, data). Removes
+    stale ones on the way (their owner's flock is free)."""
+    found = []
+    for path in sorted(queue.glob(f'*.{suffix}')):
+        try:
+            seq = int(path.name.split('.', 1)[0])
+        except ValueError:
+            continue
+        try:
+            with open(path) as other:
+                try:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    found.append((seq, path.name, json.loads(path.read_text() or '{}')))
+                    continue
+                path.unlink(missing_ok=True)  # its owner is gone
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return found
+
+
+def _lock_busy(name: str) -> bool:
+    """Whether someone holds `name`'s flock now (a brief non-blocking probe)."""
+    held = _try_flocks([name])
+    if held is None:
+        return True
+    for handle in held:
+        handle.close()
+    return False
+
+
+def _ancestry() -> set[int]:
+    """This process and its ancestors (by /proc parent links)."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            pid = int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    return pids
+
+
+class NestedAcquisition(ValueError):
+    """An acquisition inside a backfilled job (refused)."""
+
+
+def enclosing_holders(queue: Path) -> list[dict]:
+    """Live holder records of this process or its ancestors (we run inside them)."""
+    host, mine = socket.gethostname(), _ancestry()
+    return [data for _, _, data in _live_entries(queue, 'held') if data.get('host') == host and data.get('pid') in mine]
+
+
+def backfill_check(queue: Path, locks: list[str], seq: int, max_run: float, now: float | None = None) -> tuple[bool, str]:
+    """Whether ticket `seq` (wanting `locks`, bounded by `max_run`) may start now
+    ahead of the older live tickets that want some of its locks (module doc).
+    Returns (allowed, reason)."""
+    now = time.time() if now is None else now
+    ours = now + max_run + HARD_STOP_S
+    holders = _live_entries(queue, 'held')
+    release: dict[str, list] = {}
+    for _, _, data in holders:
+        for name in data.get('locks', []):
+            release.setdefault(name, []).append(data.get('release_by'))
+    # A granted ticket's record names all of its locks, so an older ticket that
+    # holds its turn (a gate) and overlaps ours is refused here too.
+    for name in locks:
+        if name in release:
+            return False, f'{name} is held'
+    wanted, ancestors, passed = set(locks), gate_ancestors(), []
+    for other, _, data in _live_entries(queue, 'ticket'):
+        theirs = set(data.get('locks', []))
+        if other >= seq or other in ancestors or not wanted & theirs:
+            continue
+        bounds = []
+        for name in sorted(theirs - wanted):
+            if name in release:
+                if any(bound is None for bound in release[name]):
+                    return False, f'ticket {other} waits on {name}, held without a bound'
+                bounds.append(max(release[name]))
+            elif _lock_busy(name):
+                return False, f'ticket {other} waits on {name}, held outside the queue'
+        if not bounds:
+            return False, f'ticket {other} could start now'
+        if ours > min(bounds):
+            return False, f'our bound ends {ours - min(bounds):.0f} s after ticket {other}\'s first blocker must release'
+        passed.append(other)
+    return True, 'ahead of ticket(s) ' + ','.join(map(str, passed))
+
+
+class _Watchdog:
+    """Enforces a holder's bound from the grant: SIGTERM to this process at
+    `max_run` (run_forwarding passes it to CMD; an in-process holder's own
+    handler tears down), SIGKILL HARD_STOP_S later if it still runs."""
+
+    def __init__(self, max_run: float):
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(max_run,), daemon=True)
+        self.thread.start()
+
+    def _run(self, max_run):
+        if self.done.wait(max_run):
+            return
+        OVERRAN[0] = True
+        print(f'hwlock: --max-run {max_run:.0f} s reached; stopping', file=sys.stderr, flush=True)
+        os.kill(os.getpid(), signal.SIGTERM)
+        if self.done.wait(HARD_STOP_S):
+            return
+        print(f'hwlock: still running {HARD_STOP_S:.0f} s past --max-run; killing', file=sys.stderr, flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    def stop(self):
+        self.done.set()
 
 
 GATE_ENV = 'CUTEAFD_HW_GATE_TICKETS'
@@ -211,11 +369,24 @@ def check_preflight(command, timeout):
 
 @contextlib.contextmanager
 def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str = '',
-         preflight_timeout: float = 300, preflight_at_grant_only: bool = False, cancelled=None):
+         preflight_timeout: float = 300, preflight_at_grant_only: bool = False, cancelled=None,
+         max_run: float | None = None):
     """Hold `names` (canonical order) for the body; FIFO against other tickets.
     With `gate`, release the flocks at our turn and keep the ticket instead.
-    `cancelled()`, polled while waiting, raises Cancelled when true."""
+    `cancelled()`, polled while waiting, raises Cancelled when true. `max_run`
+    bounds the hold from its grant (enforced) and lets a non-gate request
+    backfill (module doc); inside a backfilled job, NestedAcquisition."""
     locks = canonical(names)
+    if max_run is not None and not 0 < max_run < float('inf'):
+        raise ValueError('max_run must be finite and positive')
+    # Read without creating the queue: a failing enqueue preflight leaves no trace.
+    enclosing = enclosing_holders(lock_dir() / 'hwq')
+    inner = next((data for data in enclosing if data.get('backfill')), None)
+    if inner is not None:
+        raise NestedAcquisition(
+            f'refusing {",".join(locks)} inside backfilled ticket {inner.get("seq")} '
+            f'(holding {",".join(inner.get("locks", []))}): an inner ticket would queue behind the ticket '
+            'it went ahead of; request every lock in the one outer hwlock call')
     # A check on state the queue itself changes (free memory on shared hosts) is
     # meaningful only once our turn comes; such checks run at grant alone.
     if not preflight_at_grant_only:
@@ -238,15 +409,22 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
             for handle in held:
                 handle.close()
         return
-    seq, path, ticket = _take_ticket(queue, locks)
+    seq, path, ticket = _take_ticket(queue, locks, max_run)
     GATE_SEQ[0] = seq
     deadline = time.monotonic() + wait
-    held, announced = None, False
+    held, announced, backfill = None, False, False
     try:
         while True:
             if not older_conflicts(queue, locks, seq):
                 held = _try_flocks(locks)
                 if held is not None:
+                    break
+            elif max_run is not None and not gate and not enclosing:
+                allowed, reason = backfill_check(queue, locks, seq, max_run)
+                if allowed and (held := _try_flocks(locks)) is not None:
+                    backfill = True
+                    print(f'hwlock: ticket {seq} backfilled for {",".join(locks)} with --max-run {max_run:.0f} s, '
+                          f'{reason}', file=sys.stderr)
                     break
             if cancelled is not None and cancelled():
                 raise Cancelled(f'stopped waiting for {",".join(locks)}')
@@ -260,11 +438,31 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
         path.unlink(missing_ok=True)
         ticket.close()
         raise
+    # Published while the flocks are held, before the at-grant preflight: the
+    # bound counts from here, and waiters see it before our ticket goes.
+    granted, started = time.time(), time.monotonic()
+    record, record_handle = _publish(queue, seq, 'held', dict(
+        seq=seq, locks=locks, pid=os.getpid(), host=socket.gethostname(), granted=granted, gate=gate,
+        backfill=backfill, max_run=max_run, release_by=None if max_run is None else granted + max_run + HARD_STOP_S))
+    watchdog = None
+
+    def release_record():
+        if watchdog is not None:
+            watchdog.stop()
+        record.unlink(missing_ok=True)
+        record_handle.close()
     try:
-        check_preflight(preflight, preflight_timeout)
+        # The at-grant check runs inside the bound; the watchdog takes the rest.
+        check_preflight(preflight, preflight_timeout if max_run is None else min(preflight_timeout, max_run))
+        if max_run is not None:
+            left = max_run - (time.monotonic() - started)
+            if left < 1:
+                raise PreflightFailed(f'the at-grant preflight used the whole --max-run {max_run:.0f} s')
+            watchdog = _Watchdog(left)
     except BaseException:
         for handle in held:
             handle.close()
+        release_record()
         path.unlink(missing_ok=True)
         ticket.close()
         raise
@@ -281,6 +479,7 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
     finally:
         for handle in held:
             handle.close()
+        release_record()
         if gate:
             path.unlink(missing_ok=True)
             ticket.close()
@@ -338,6 +537,9 @@ def main() -> int:
     parser.add_argument('--preflight-at-grant', action='store_true',
                         help='run --preflight only after the locks are granted (for checks on shared, queue-dependent state)')
     parser.add_argument('--gate', action='store_true', help='CMD takes the locks itself; keep only our turn')
+    parser.add_argument('--max-run', type=float, metavar='SECONDS',
+                        help='hard bound on the hold from its grant (SIGTERM, grace, SIGKILL; exit 124); '
+                        'lets this request backfill ahead of older tickets it cannot delay (not with --gate)')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     cmd = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
@@ -345,17 +547,23 @@ def main() -> int:
         parser.error('missing command')
     if not 0 < args.preflight_timeout < float('inf'):
         parser.error('--preflight-timeout must be finite and positive')
+    if args.max_run is not None and not 0 < args.max_run < float('inf'):
+        parser.error('--max-run must be finite and positive')
     try:
         locks = canonical(args.locks.split(','))
         with hold(locks, args.wait, ' '.join(cmd[:2]), gate=args.gate,
                   preflight=args.preflight, preflight_timeout=args.preflight_timeout,
-                  preflight_at_grant_only=args.preflight_at_grant):
+                  preflight_at_grant_only=args.preflight_at_grant, max_run=args.max_run):
             env = dict(os.environ)
             if not args.gate:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
             else:
                 env[GATE_ENV] = ':'.join(filter(None, [os.environ.get(GATE_ENV, ''), str(GATE_SEQ[0])]))
-            return run_forwarding(cmd, env)
+            code = run_forwarding(cmd, env)
+        return 124 if OVERRAN[0] else code
+    except NestedAcquisition as error:
+        print(f'hwlock: {error}', file=sys.stderr)
+        return NESTED_EXIT
     except PreflightFailed as error:
         print(f'hwlock: {error}', file=sys.stderr)
         return 78
