@@ -43,7 +43,7 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
   - A padded head records logical vs stored N, padded to 128, with zero padding scales.
 - **Quantizer support:** GPTQModel already handles MUL1 (`gptqmodel/exllamav3/modules/quant/exl3_lib/quantize.py`, `codebook_mul1_mult`, `mul1` in `quant_args`).
 - **Record the codebook** in `quantize_config*.json`, `cuteafd-mc.json` and the model card's recipe table.
-- **Engine status:** the core path loads MUL1. **The routed-expert kernels require MCG today**: `deepseek_v41/v41_exl3.rs:489` ("routed expert kernels require MCG"), and the fork's `w4a16/prepare.py` refuses the MUL1 runtime marker. Expert MUL1 support is separate engine work, so a MUL1-expert checkpoint won't serve until it lands. Produce the correct MUL1 checkpoint anyway.
+- **Engine status:** the engine serves MUL1 for both the core and the routed experts (routed-expert MUL1 since #2538, with the SM120/SM121 decode duel winners from fork #420/#421 pinned in #2581). The loader reads the codebook from the per-tensor `mcg`/`mul1` marker (`cuteafd-loader/src/plan/format.rs`).
 - **Don't use an E4M3-rounded codebook at K6.** **Why:** it failed all 20 pilot tensors at 2.28–2.39× NMSE.
 
 ## 3. Calibration data
