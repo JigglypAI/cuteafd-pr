@@ -424,9 +424,13 @@ fn add_matrix(
     let effective_rank = if split == CoreSplit::Whole { 0 } else { rank };
 
     if let Some(proj) = core_projections.get(stem) {
-        let side = match split {
-            CoreSplit::Input => TrellisSide::Input,
-            CoreSplit::Output | CoreSplit::Whole => TrellisSide::Output,
+        let side = if effective_ranks == 1 {
+            TrellisSide::Output
+        } else {
+            match split {
+                CoreSplit::Input => TrellisSide::Input,
+                CoreSplit::Output | CoreSplit::Whole => TrellisSide::Output,
+            }
         };
         let layout = if stem == HEAD_STEM && effective_ranks == 2 {
             CoreWeightLayout::output_shard(proj, effective_rank)?
