@@ -442,6 +442,64 @@ def tidy(args) -> int:
     return 0
 
 
+def cycle_starts(session_path: Path) -> list[int]:
+    """Engine position at which each task cycle of a chained session starts
+    (the prompt of the cycle's first turn; cycle 0 starts at 0)."""
+    session = json.loads(session_path.read_text())["sessions"][0]
+    turns, starts = session["turns"], {}
+    for task in session.get("chain", []):
+        starts.setdefault(task["cycle"], task["first_turn"])
+    return [0 if cycle == 0 else int(turns[turn]["prompt_tokens"] or 0)
+            for cycle, turn in sorted(starts.items()) if turn < len(turns)]
+
+
+def split_cycles(args) -> int:
+    """Per layer and band, the reuse metrics of task cycle 0 (the agent meets the
+    fixture for the first time) against later cycles (it re-reads and re-fixes the
+    same files), from a tidy directory and its session."""
+    import bisect
+    starts = cycle_starts(args.session)
+    cycle_of = lambda position: bisect.bisect_right(starts, position) - 1
+    rows = collections.defaultdict(lambda: collections.defaultdict(list))
+    def tag(row):
+        return (row["layer"], band_of(int(row["position"])), "cycle0" if cycle_of(int(row["position"])) == 0 else "later")
+    for row in csv.DictReader((args.tidy / "churn.csv").open()):
+        key = tag(row)
+        rows[key][f"jaccard_{row['kind']}"].append(float(row["jaccard"]))
+        rows[key][f"entered_{row['kind']}"].append(float(row["entered"]))
+    for row in csv.DictReader((args.tidy / "cluster.csv").open()):
+        key = tag(row)
+        for k in ("share_1", "share_4", "share_16", "amplification_64", "reach_fraction"):
+            rows[key][k].append(float(row[k]))
+    for row in csv.DictReader((args.tidy / "working.csv").open()):
+        if row["window"] in ("16", "128"):
+            rows[tag(row)][f"working_{row['window']}"].append(float(row["fraction"]))
+    for row in csv.DictReader((args.tidy / "cache.csv").open()):
+        if row["policy"] != "lru_pin1k":
+            continue
+        key = tag(row)
+        rows[key]["selected"].append(int(row["selected"]))
+        rows[key]["first_reference"].append(int(row["first_reference"]))
+        for capacity in RESIDENT:
+            rows[key][f"misses_{capacity}"].append(int(row[f"misses_{capacity}"]))
+    out = []
+    for (layer, band, part), values in sorted(rows.items(), key=lambda kv: (int(kv[0][0]), kv[0][1], kv[0][2])):
+        row = dict(layer=int(layer), band=band, part=part, steps=len(values.get("share_4", [])))
+        for k, v in values.items():
+            if k in ("selected", "first_reference") or k.startswith("misses_"):
+                continue
+            row[k] = float(np.mean(v)) if v else None
+        selected = sum(values.get("selected", [])) or 1
+        row["first_reference_rate"] = sum(values.get("first_reference", [])) / selected
+        for capacity in RESIDENT:
+            row[f"lru_pin1k_{capacity}_hit"] = 1 - sum(values.get(f"misses_{capacity}", [])) / selected
+        out.append(row)
+    write_csv(args.tidy / "cycles.csv", out)
+    (args.tidy / "cycles.json").write_text(json.dumps(dict(cycle_starts=starts, session=str(args.session),
+                                                           session_sha256=sha256(args.session)), indent=1) + "\n")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -456,8 +514,11 @@ def main(argv=None) -> int:
                    help="resident indexer-key bytes per virtual token, all selecting layers")
     t.add_argument("--kv-bytes-per-token", type=float, required=True,
                    help="KV bytes per token of one selecting layer (to convert resident tokens to bytes)")
+    c = sub.add_parser("cycles", help="split a chained session's metrics into task cycle 0 and later cycles")
+    c.add_argument("--tidy", type=Path, required=True)
+    c.add_argument("--session", type=Path, required=True)
     args = parser.parse_args(argv)
-    return tidy(args)
+    return tidy(args) if args.mode == "tidy" else split_cycles(args)
 
 
 if __name__ == "__main__":

@@ -72,3 +72,23 @@ def test_tidy_reads_dumps_and_reports_every_table(tmp_path):
     assert summary["9|0-16K"]["amp_1"] == 1.0 and summary["9|0-16K"]["amp_128"] >= 1.0
     provenance = json.loads((out / "provenance.json").read_text())
     assert set(provenance["inputs"]) == {"layer-003.bin", "layer-007.bin", "layer-009.bin"}
+
+
+def test_cycles_split_tags_records_by_the_sessions_cycle_starts(tmp_path):
+    import json
+    study = load()
+    rows = [(p, list(range(0, 50)) + [p]) for p in range(1000, 1200)]
+    write(tmp_path / "layer-003.bin", 3, 64, 1, 1, rows)
+    out = tmp_path / "out"
+    assert study.main(["tidy", "--family", "t", "--dump", str(tmp_path), "--out", str(out),
+                       "--index-bytes-per-token", "1", "--kv-bytes-per-token", "1", "--min-position", "0"]) == 0
+    session = tmp_path / "session.json"
+    turns = [{"prompt_tokens": n} for n in (900, 1100, 1150)]
+    session.write_text(json.dumps({"sessions": [{"turns": turns, "chain": [
+        {"task": "a", "cycle": 0, "first_turn": 0}, {"task": "b", "cycle": 1, "first_turn": 1}]}]}))
+    assert study.main(["cycles", "--tidy", str(out), "--session", str(session)]) == 0
+    import csv
+    parts = {(r["band"], r["part"]): r for r in csv.DictReader((out / "cycles.csv").open())}
+    assert set(parts) == {("0-16K", "cycle0"), ("0-16K", "later")}
+    assert int(parts[("0-16K", "cycle0")]["steps"]) == 100 and int(parts[("0-16K", "later")]["steps"]) == 100
+    assert json.loads((out / "cycles.json").read_text())["cycle_starts"] == [0, 1100]
