@@ -692,9 +692,9 @@ impl DraftHistory {
             let p = self.requests.get_mut(&ids[i]).and_then(|r| r.pending.as_mut()).expect("eligible stop");
             p.planned[NEURAL].push(stop);
             p.granted[NEURAL] += 1;
-            pending.granted[COPY] = copy.len();
+            p.granted[COPY] = copy.len();
             granted[i] += 1 + copy.len();
-            pending.planned[COPY] = copy;
+            p.planned[COPY] = copy;
         }
         granted
     }
