@@ -313,6 +313,13 @@ impl Family for KimiK3 {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "large experts and dense core: compute-heavy Spark waves leave little round trip to hide (predicted loss, #744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            15,
+            "Kimi coordinator decode programs cover 64 rows (missing kimik3/kimik31 *_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // Kimi decode/verify steps send at most 64 rows (`rows.min(64)`).
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })

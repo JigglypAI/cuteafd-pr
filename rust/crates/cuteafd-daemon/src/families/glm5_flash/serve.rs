@@ -170,6 +170,18 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("glm5_flash", max_sequences as u64)?;
+    let verify_rows = cuteafd_loader::plan::resolve_decode_rows(
+        "glm5_flash",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.engine.decode_rows,
+            concurrency: max_sequences as u64,
+            decode_lanes: 1,
+            rtx_gpus: 1 + usize::from(args.engine.split_device.is_some()),
+            draft_length: if args.engine.draft.is_some() { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
+        },
+    )?;
+    args.engine.decode_rows = Some(verify_rows);
+    cuteafd_bench::context::set_resolved("decode-rows", &verify_rows.to_string());
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();

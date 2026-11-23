@@ -105,6 +105,7 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     requests: std::collections::BTreeMap<u64, DraftRequest>,
     pending: Vec<Option<(Vec<(u64, u32, u64, usize)>, Instant)>>,
     request_limit: usize,
+    verify_rows: usize,
     draft_limit: usize,
     draft_width: usize,
     // The confidence head's raw logit per drafted position, downloaded whenever
@@ -135,7 +136,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
-        capacity: u32, requests: u32, lanes: u8,
+        capacity: u32, decode_rows: u32, requests: u32, lanes: u8,
     ) -> Result<Self> {
         let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
         let lane_count = lane_count as usize;
@@ -144,7 +145,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         let shared_bytes = weights.draft_bytes(lane_requests)?;
         let lane_bytes = weights.draft_bytes(lane_requests)?;
         let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-        if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
+        if lane_count > 1 { mains.push(weights.main_context(decode_rows, DsparkMainContext::device_bytes(lib, decode_rows)?)?); }
         let chains = (0..lane_count).map(|_| weights.draft(table, head, lane_requests, lane_bytes))
             .collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes=lane_count, lane_requests, draft_width=weights.draft_width(), shared_workspace_bytes=shared_bytes,
@@ -160,6 +161,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             requests: Default::default(),
             pending: vec![None; lane_count],
             request_limit: requests as usize,
+            verify_rows: decode_rows as usize,
             draft_limit: weights.draft_width(),
             draft_width: weights.draft_width(),
             confidence_trace: Default::default(),
@@ -226,7 +228,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let requests: Vec<_> = seeds.iter().map(|&(id, _, end, remaining)|
             (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
         let depths = match &mut self.policy {
-            Some(policy) => policy.plan(&requests, cuteafd_core::V41_VERIFY_ROWS),
+            Some(policy) => policy.plan(&requests, self.verify_rows),
             None => requests.iter().map(|&(_, room)| room.min(self.draft_limit)).collect(),
         };
         self.lanes[lane].depths = depths.clone();
@@ -242,7 +244,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let mut drafts: Vec<Vec<u32>> = inputs.iter().map(|input| input[1..].to_vec()).collect();
         let mut proposals: Vec<_> = members.iter().zip(drafts.iter_mut()).map(|(&(id, history, greedy), tokens)|
             Proposal { id, tokens, head: self.confidence_trace.get(&id).map(Vec::as_slice), history, greedy }).collect();
-        let neural = policy.shape(&mut proposals, cuteafd_core::V41_VERIFY_ROWS);
+        let neural = policy.shape(&mut proposals, self.verify_rows);
         drop(proposals);
         for (((input, draft), neural), &(id, _, _)) in inputs.iter_mut().zip(drafts).zip(neural).zip(members) {
             if draft.len() > neural { self.neural_lengths.insert(id, neural); }
@@ -867,7 +869,7 @@ mod anchor_fallback_tests {
             mains: Vec::new(), chains: (0..2).map(|_| FailingChain::new(at, device_error)).collect(),
             windows: [window()?, window()?, window()?], pending_commit_ids: vec![Vec::new(); 2],
             pending_prefix_ids: [None, None], requests: Default::default(), pending: vec![None; 2],
-            request_limit: 4, draft_limit: 5, draft_width: 5, confidence_trace: Default::default(),
+            request_limit: 4, verify_rows: cuteafd_core::V41_VERIFY_ROWS, draft_limit: 5, draft_width: 5, confidence_trace: Default::default(),
             neural_lengths: Default::default(), length: Default::default(), policy: None,
             lanes: vec![LaneDraft::default(); 2],
         };

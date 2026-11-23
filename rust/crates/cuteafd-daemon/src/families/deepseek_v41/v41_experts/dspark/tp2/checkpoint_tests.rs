@@ -42,8 +42,8 @@ fn cuda_dspark_tp2_planner_matches_serving_inventory() -> Result<()> {
         for width in [5, 7] {
             let lanes = if requests == 1 { 1 } else { 2 };
             let actual = super::DsparkWeights::distributed_inventory(&lib, &catalog, 256,
-                requests, 2, width, true, 64640, 0)?;
-            let planned = programs.dspark_tp2(&full, &halves, 256, u64::from(requests), lanes,
+                cuteafd_core::V41_VERIFY_ROWS as u32, requests, 2, width, true, 64640, 0)?;
+            let planned = programs.dspark_tp2(&full, &halves, 256, owners::DECODE_LANE_ROWS, u64::from(requests), lanes,
                 width as u64, resident::Fp8Head::configured())?;
             for demand in &actual.runtime {
                 let expected = planned.iter().find(|d| d.gpu == demand.gpu && d.group == demand.group)

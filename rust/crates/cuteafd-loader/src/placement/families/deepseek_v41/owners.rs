@@ -53,9 +53,10 @@ const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 == DECODE_LANE_ROWS);
 /// 0..20 on GPU0, 20..40 on GPU1).
 fn v41_attention_gpu(layer: usize) -> usize { usize::from(layer >= 20) }
 
-/// Full-head sparse attention storage (64 heads) for units of `unit` rows.
-fn sparse64(unit: u64) -> u64 {
-    let batch = unit.min(cuteafd_core::V41_VERIFY_ROWS as u64);
+/// Full-head sparse attention storage (64 heads) for units of `unit` rows,
+/// with batched decode split scratch sized to `unit.min(decode_rows)`.
+fn sparse64(unit: u64, decode_rows: u64) -> u64 {
+    let batch = unit.min(decode_rows);
     2 * unit * 64 * 1024 + batch * 10 * 64 * 514 * 4 / 64 * 64 + batch * 120 + unit * 8 + unit * 80
 }
 
@@ -378,10 +379,12 @@ impl<'a> NativePrograms<'a> {
     /// by the daemon's plan == runtime test), plus each of the `slots` slot
     /// passes' private device owners (its verify-width target head and window
     /// batch table). Excludes local expert / TP2 FFN arenas.
-    pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
+    pub fn prefill_slots(&self, reserve: u64, unit: u64, decode_rows: u64, ranks: usize, slots: usize, concurrency: u64,
         head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
         cuteafd_core::concurrency::validate("deepseek_v41", concurrency)?;
-        ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
+        ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256
+            && (1..=cuteafd_core::V41_VOCAB_ROWS as u64).contains(&decode_rows)
+            && matches!(ranks, 1 | 2)
             && (1..=4).contains(&slots) && (!window_batch || ranks == 1),
             "invalid V4.1 prefill slot geometry");
         let (r, u) = (reserve, unit);
@@ -394,7 +397,7 @@ impl<'a> NativePrograms<'a> {
             let query = 4 + u * 81160 + self.scratch(u, 5120, 1280)? + self.scratch(u, 1280, 32768)?;
             let output = 4 + r * 92424 + self.scratch(u, 32768, 8192)? + self.scratch(u, 8192, 5120)?;
             let shared = if placed { 0 } else { self.shared_ffn(u)? + r * 20480 };
-            let sparse = sparse64(u);
+            let sparse = sparse64(u, decode_rows);
             add(&mut out, "lane", 2 * crate::serving_capacity::v41_workspace::hc(r as usize)?.bytes() as u64
                 + query + output + shared + sparse + r * 17105);
             // Cache producers: window storage and the source compressor storage(s).
@@ -435,16 +438,15 @@ impl<'a> NativePrograms<'a> {
                     u as usize, self.scratch(u, 6144, 25600)? as usize)?.bytes() as u64);
             }
             if rank == ranks - 1 { add(&mut out, "target taps", r * 30720); }
-            add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode)?);
+            add(&mut out, "target heads", slots as u64 * self.head(ranks, rank, head_mode, cuteafd_core::V41_VERIFY_ROWS as u64)?);
         }
         Ok(out)
     }
 
-    /// One slot pass's verify-width target head on `rank` (every pass has one),
-    /// with the GEMV scratch of `head_mode`'s resident copy when target logits
-    /// project through it.
-    fn head(&self, ranks: usize, rank: usize, head_mode: Fp8Head) -> Result<u64> {
-        let head_rows = cuteafd_core::V41_VERIFY_ROWS as u64;
+    /// One pass's target head on `rank` at `head_rows` rows, with the GEMV
+    /// scratch of `head_mode`'s resident copy when target logits project
+    /// through it.
+    fn head(&self, ranks: usize, rank: usize, head_mode: Fp8Head, head_rows: u64) -> Result<u64> {
         let normalization = head_rows * (40960 + 16 + 10240 + 10240);
         let sampler = head_rows * (64 + 64 + 2 * VOCAB.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 32);
         let head = if ranks == 1 {
@@ -460,20 +462,20 @@ impl<'a> NativePrograms<'a> {
 
     /// Every target owner but the conditional local expert / TP2 FFN arenas,
     /// weights, cache/prefix banks, vision and Spark transports: the `lanes`
-    /// decode lanes, private at `decode_rows` (`DECODE_LANE_ROWS`), and the
-    /// prefill slots' storage ([`Self::prefill_slots`]).
+    /// decode lanes, private at `decode_rows`, and the prefill slots' storage
+    /// ([`Self::prefill_slots`]).
     #[allow(clippy::too_many_arguments)]
     pub fn target(&self, decode_rows: u64, lanes: u8, reserve: u64, unit: u64, ranks: usize, slots: usize,
         concurrency: u64, head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
         let mut out = self.decode_lanes(decode_rows, lanes, ranks, head_mode, window_batch)?;
-        out.extend(self.prefill_slots(reserve, unit, ranks, slots, concurrency, head_mode, window_batch)?);
+        out.extend(self.prefill_slots(reserve, unit, decode_rows, ranks, slots, concurrency, head_mode, window_batch)?);
         Ok(out)
     }
 
     /// The `lanes` decode lanes (one or two), every owner private at `rows`.
     pub fn decode_lanes(&self, rows: u64, lanes: u8, ranks: usize, head_mode: Fp8Head,
         window_batch: bool) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && matches!(ranks, 1 | 2) && matches!(lanes, 1 | 2)
+        ensure!((1..=cuteafd_core::V41_VOCAB_ROWS as u64).contains(&rows) && matches!(ranks, 1 | 2) && matches!(lanes, 1 | 2)
             && (!window_batch || ranks == 1), "invalid V4.1 target owner geometry");
         let mut out = Vec::new();
         for rank in 0..ranks {
@@ -485,7 +487,7 @@ impl<'a> NativePrograms<'a> {
                 let output = 4 + rows * (65536 + 16384 + 10240 + 8 + 256)
                     + self.scratch(rows, 32768, 8192)? + self.scratch(rows, 8192, 5120)?;
                 let sparse = rows * (64 * 2048 + 88)
-                    + rows.min(cuteafd_core::V41_VERIFY_ROWS as u64) * (10 * 64 * 514 * 4 + 120);
+                    + rows * (10 * 64 * 514 * 4 + 120);
                 let shared = if ranks == 1 { self.shared_ffn(rows)? + rows * 20480 } else { 0 };
                 add(&mut out, "backbone", 2 * crate::serving_capacity::v41_workspace::hc(rows as usize)?.bytes() as u64
                     + query + output + sparse
@@ -523,7 +525,7 @@ impl<'a> NativePrograms<'a> {
                         rows as usize, self.scratch(rows, 6144, 25600)? as usize)?.bytes() as u64);
                 }
                 if rank == ranks - 1 { add(&mut out, "target taps", index_rows * 30720); }
-                add(&mut out, "target head", self.head(ranks, rank, head_mode)?);
+                add(&mut out, "target head", self.head(ranks, rank, head_mode, rows)?);
             }
         }
         Ok(out)
@@ -534,9 +536,10 @@ impl<'a> NativePrograms<'a> {
     /// committed windows are shared across them. `experts` is the published
     /// coordinator (not RTX backbone) manifest.
     #[allow(clippy::too_many_arguments)]
-    pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, lanes: u64, width: u64,
+    pub fn dspark(&self, experts: &Value, rows: u64, decode_rows: u64, requests: u64, lanes: u64, width: u64,
         ranks: usize, head_mode: Fp8Head) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&requests)
+        ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::V41_VOCAB_ROWS as u64).contains(&decode_rows)
+            && (1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&requests)
             && matches!(lanes, 1 | 2) && requests.div_ceil(lanes) <= cuteafd_core::V41_MAX_LANE_MEMBERS as u64
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
@@ -582,7 +585,7 @@ impl<'a> NativePrograms<'a> {
                 + if head_mode.draft() { self.head_scratch(head_mode, live, VOCAB / ranks as u64)? } else { 0 }));
         }
         add(decoder, "dSpark main context", self.main_context(rows)?
-            + if lanes > 1 { self.main_context(DECODE_LANE_ROWS)? } else { 0 });
+            + if lanes > 1 { self.main_context(decode_rows)? } else { 0 });
         add(decoder, "dSpark windows", 3 * (requests * 128 * 528 + rows * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64));
         Ok(out)
     }
@@ -590,9 +593,9 @@ impl<'a> NativePrograms<'a> {
     /// Replace each full draft FFN by its native TP2 fork/join owners. The
     /// scratch maximum covers every installed variant the runtime retains.
     #[allow(clippy::too_many_arguments)]
-    pub fn dspark_tp2(&self, experts: &Value, halves: &Value, rows: u64, requests: u64, lanes: u64,
+    pub fn dspark_tp2(&self, experts: &Value, halves: &Value, rows: u64, decode_rows: u64, requests: u64, lanes: u64,
         width: u64, head_mode: Fp8Head) -> Result<Vec<Demand>> {
-        let mut out = self.dspark(experts, rows, requests, lanes, width, 2, head_mode)?;
+        let mut out = self.dspark(experts, rows, decode_rows, requests, lanes, width, 2, head_mode)?;
         ensure!(halves["role"] == "dspark_tp2" && halves["input_format"] == "fp8_k32",
             "invalid V4.1 TP2 draft expert manifest role/input");
         for (key, expected) in [("hidden", 5120), ("intermediate", 1152),
@@ -847,7 +850,7 @@ mod tests {
         let programs = NativePrograms::new(&manifest, 188)?;
         for ranks in [1, 2] {
             for concurrency in [16, 33, 64] {
-                let owners = programs.prefill_slots(8256, 2752, ranks, 3, concurrency,
+                let owners = programs.prefill_slots(8256, 2752, DECODE_LANE_ROWS, ranks, 3, concurrency,
                     Fp8Head::Off, ranks == 1)?;
                 let expected = (2752u64.min(concurrency * 128) + concurrency * 128) * 40976;
                 assert_eq!(owner(&owners, 0, "prefill slots encoder suffix"), expected);
@@ -876,26 +879,26 @@ mod tests {
                     assert_eq!(owner(&target, rank, &format!("lane 0 {group}")),
                         owner(&target, rank, &format!("lane 1 {group}")), "{group}");
                 }
-                // One slot set per GPU; four slot passes' heads in it.
+                // One slot set per GPU; four slot passes' heads in it (prefill slots stay at verify-width 64).
                 assert_eq!(owner(&target, rank, "prefill slots target heads"),
-                    4 * owner(&target, rank, "lane 0 target head"));
+                    4 * programs.head(ranks, rank as usize, Fp8Head::Off, DECODE_LANE_ROWS)?);
                 assert!(owner(&target, rank, "prefill slots lane") > owner(&target, rank, "lane 0 backbone"));
             }
             // The packed arena plus one prompt suffix per request slot.
             assert_eq!(owner(&target, 0, "prefill slots encoder suffix"), (2048 + 16 * 128) * (40960 + 16));
             assert!(!target.iter().any(|d| d.gpu != 0 && d.group.ends_with("encoder suffix")));
-            let small = programs.prefill_slots(256, 64, ranks, 2, 16, Fp8Head::Off, ranks == 1)?;
+            let small = programs.prefill_slots(256, 64, DECODE_LANE_ROWS, ranks, 2, 16, Fp8Head::Off, ranks == 1)?;
             assert_eq!(owner(&small, 0, "prefill slots encoder suffix"), (64 + 16 * 128) * (40960 + 16));
-            let one = programs.prefill_slots(256, 64, ranks, 2, 1, Fp8Head::Off, ranks == 1)?;
+            let one = programs.prefill_slots(256, 64, DECODE_LANE_ROWS, ranks, 2, 1, Fp8Head::Off, ranks == 1)?;
             assert_eq!(owner(&one, 0, "prefill slots encoder suffix"), (64 + 128) * (40960 + 16));
-            assert!(programs.prefill_slots(256, 64, ranks, 2, 0, Fp8Head::Off, ranks == 1).is_err());
+            assert!(programs.prefill_slots(256, 64, DECODE_LANE_ROWS, ranks, 2, 0, Fp8Head::Off, ranks == 1).is_err());
             assert!(target.iter().all(|d| d.category == Category::Workspace));
             assert!(!target.iter().any(|d| d.group.starts_with("lane 2")), "decode lanes only");
             // Engram planes live with the gates (layers 1 and 14, GPU0 on two RTX).
             assert!(!target.iter().any(|d| d.gpu != 0 && d.group.contains("engram")));
             // The slot set's rows scale with the reserve, its scratch with the unit.
-            let narrow = programs.prefill_slots(8256, 2048, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
-            let short = programs.prefill_slots(4224, 2048, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
+            let narrow = programs.prefill_slots(8256, 2048, DECODE_LANE_ROWS, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
+            let short = programs.prefill_slots(4224, 2048, DECODE_LANE_ROWS, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 assert!(owner(&narrow, rank, "prefill slots lane") > owner(&short, rank, "prefill slots lane"));
             }
@@ -918,7 +921,7 @@ mod tests {
         assert!(programs.target(80, 2, 8256, 4097, 2, 2, 16, Fp8Head::All, false).is_err());
         assert!(programs.target(80, 2, 8256, 4096, 3, 2, 16, Fp8Head::All, false).is_err());
         assert!(programs.target(80, 2, 8256, 4096, 2, 2, 16, Fp8Head::All, true).is_err());
-        assert!(programs.prefill_slots(2048, 4096, 1, 2, 16, Fp8Head::Off, false).is_err(), "unit wider than the reserve");
+        assert!(programs.prefill_slots(2048, 4096, DECODE_LANE_ROWS, 1, 2, 16, Fp8Head::Off, false).is_err(), "unit wider than the reserve");
         let off = programs.target(80, 2, 8256, 4096, 1, 4, 16, Fp8Head::Off, false)?;
         let on = programs.target(80, 2, 8256, 4096, 1, 4, 16, Fp8Head::Off, true)?;
         assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>() - off.iter().map(|d| d.bytes).sum::<u64>(),
@@ -959,14 +962,24 @@ mod tests {
         let experts = experts();
         for ranks in [1, 2] {
             let decoder = (ranks - 1) as u8;
-            let one = programs.dspark(&experts, 1024, 16, 1, 7, ranks, Fp8Head::Off)?;
-            let two = programs.dspark(&experts, 1024, 16, 2, 7, ranks, Fp8Head::Off)?;
+            let one = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, 16, 1, 7, ranks, Fp8Head::Off)?;
+            let two = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, 16, 2, 7, ranks, Fp8Head::Off)?;
             assert_eq!(owner(&two, decoder, "dSpark main context") - owner(&one, decoder, "dSpark main context"),
                 programs.main_context(DECODE_LANE_ROWS)?);
             assert_eq!(owner(&one, decoder, "dSpark windows"), owner(&two, decoder, "dSpark windows"));
             // A lane is capped at the member limit.
-            assert!(programs.dspark(&experts, 1024, cuteafd_core::V41_MAX_LANE_MEMBERS as u64 + 1, 1, 7, ranks,
+            assert!(programs.dspark(&experts, 1024, DECODE_LANE_ROWS, cuteafd_core::V41_MAX_LANE_MEMBERS as u64 + 1, 1, 7, ranks,
                 Fp8Head::Off).is_err());
+            // Wider decode rows grow lane 1's main context and decode-lane owners.
+            let wide_two = programs.dspark(&experts, 1024, 128, 16, 2, 7, ranks, Fp8Head::Off)?;
+            assert_eq!(owner(&wide_two, decoder, "dSpark main context") - owner(&one, decoder, "dSpark main context"),
+                programs.main_context(128)?);
+            let lane64 = programs.decode_lanes(64, 1, ranks, Fp8Head::Packed, ranks == 1)?;
+            let lane128 = programs.decode_lanes(128, 1, ranks, Fp8Head::Packed, ranks == 1)?;
+            let lane256 = programs.decode_lanes(256, 1, ranks, Fp8Head::Packed, ranks == 1)?;
+            assert!(sum(&lane128, "lane 0 ") > sum(&lane64, "lane 0 "));
+            assert!(sum(&lane256, "lane 0 ") > sum(&lane128, "lane 0 "));
+            assert!(programs.decode_lanes(257, 1, ranks, Fp8Head::Packed, false).is_err());
         }
         Ok(())
     }
@@ -990,8 +1003,8 @@ mod tests {
         let programs = NativePrograms::new(&manifest, 188)?;
         let experts = experts();
         for ranks in [1, 2] {
-            let one = programs.dspark(&experts, 1024, 1, 1, 5, ranks, Fp8Head::Off)?;
-            let two = programs.dspark(&experts, 1024, 2, 2, 5, ranks, Fp8Head::Off)?;
+            let one = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, 1, 1, 5, ranks, Fp8Head::Off)?;
+            let two = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, 2, 2, 5, ranks, Fp8Head::Off)?;
             let decoder = (ranks - 1) as u8;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&two, rank, "dSpark request lanes"),
@@ -1001,14 +1014,14 @@ mod tests {
                 - owner(&one, decoder, "dSpark main context"), programs.main_context(DECODE_LANE_ROWS)?);
             assert_eq!(owner(&two, decoder, "dSpark windows")
                 - owner(&one, decoder, "dSpark windows"), 3 * 128 * 528);
-            let lanes_packed = programs.dspark(&experts, 1024, 2, 2, 5, ranks, Fp8Head::Packed)?;
+            let lanes_packed = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, 2, 2, 5, ranks, Fp8Head::Packed)?;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&lanes_packed, rank, "dSpark request lanes") - owner(&two, rank, "dSpark request lanes"),
                     2 * programs.packed_vocabulary_scratch(5, VOCAB / ranks as u64)?);
             }
             for requests in [1, 4, 16, 17, 32, 64] {
                 for width in [5, 7] {
-                    let demands = programs.dspark(&experts, 1024, requests, 2, width, ranks, Fp8Head::All)?;
+                    let demands = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, requests, 2, width, ranks, Fp8Head::All)?;
                     assert!(demands.iter().all(|d| d.category == Category::Drafter));
                     assert_eq!(owner(&demands, decoder, "dSpark windows"),
                         3 * (requests * 128 * 528 + 1024 * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64));
@@ -1018,15 +1031,15 @@ mod tests {
         for (key, value) in [("input_format", json!("fp8")), ("role", json!("rtx_backbone"))] {
             let mut bad = experts.clone();
             bad[key] = value;
-            assert!(programs.dspark(&bad, 256, 1, 1, 5, 1, Fp8Head::Off).is_err());
+            assert!(programs.dspark(&bad, 256, DECODE_LANE_ROWS, 1, 1, 5, 1, Fp8Head::Off).is_err());
         }
         let mut bad = experts.clone();
         bad["geometry"]["kernel_intermediate"] = 2560.into();
-        assert!(programs.dspark(&bad, 256, 1, 1, 5, 1, Fp8Head::Off).is_err());
+        assert!(programs.dspark(&bad, 256, DECODE_LANE_ROWS, 1, 1, 5, 1, Fp8Head::Off).is_err());
         let mut duplicate = experts.clone();
         let variant = duplicate["variants"][0].clone();
         duplicate["variants"].as_array_mut().unwrap().push(variant);
-        assert!(programs.dspark(&duplicate, 256, 1, 1, 5, 1, Fp8Head::Off).is_err());
+        assert!(programs.dspark(&duplicate, 256, DECODE_LANE_ROWS, 1, 1, 5, 1, Fp8Head::Off).is_err());
         Ok(())
     }
 
@@ -1044,8 +1057,8 @@ mod tests {
                 let live = requests.div_ceil(lanes) * width;
                 let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= 80 { 80 } else { 256 };
                 let cover = if capacity <= 16 { 16 } else if capacity <= 80 { 80 } else { 256 };
-                let full = programs.dspark(&experts, 1024, requests, lanes, width, 2, Fp8Head::All)?;
-                let split = programs.dspark_tp2(&experts, &halves, 1024, requests, lanes, width, Fp8Head::All)?;
+                let full = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, requests, lanes, width, 2, Fp8Head::All)?;
+                let split = programs.dspark_tp2(&experts, &halves, 1024, DECODE_LANE_ROWS, requests, lanes, width, Fp8Head::All)?;
                 let scratch = cover * 11;
                 assert_eq!(owner(&split, 0, "dSpark request lanes") - owner(&full, 0, "dSpark request lanes"),
                     lanes * 3 * (scratch + capacity * 5304));
@@ -1058,7 +1071,7 @@ mod tests {
             }
         }
         halves["variants"].as_array_mut().unwrap().remove(1);
-        assert!(programs.dspark_tp2(&experts, &halves, 1024, 1, 1, 5, Fp8Head::All).is_err());
+        assert!(programs.dspark_tp2(&experts, &halves, 1024, DECODE_LANE_ROWS, 1, 1, 5, Fp8Head::All).is_err());
         Ok(())
     }
 

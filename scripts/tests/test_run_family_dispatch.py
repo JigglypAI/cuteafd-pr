@@ -1181,8 +1181,18 @@ if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41"
     sys.exit("unsupported --decode-lanes for " + family)
 if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
+raw_decode_rows = value("--decode-rows", "auto")
+decode_rows = 64 if raw_decode_rows in (None, "", "auto") else int(raw_decode_rows)
+if decode_rows < 1:
+    sys.exit("DECODE_ROWS must be auto or a positive integer")
+if family == "glm5_flash" and gpus == 2 and decode_rows > 64:
+    sys.exit("glm5_flash on 2 RTX GPUs supports DECODE_ROWS up to 64 (missing glmf2_*_m128)")
+if family == "glm5_flash" and decode_rows > 128:
+    sys.exit("glm5_flash on 1 RTX GPU supports DECODE_ROWS up to 128 (missing glmf_*_m256)")
+if family not in ("deepseek_v41", "glm5_flash") and decode_rows > 64:
+    sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
-    decode_lanes=decode_lanes)
+    decode_lanes=decode_lanes, decode_rows=decode_rows)
 expert_world = int(report.get("spark_expert_world", ranks))
 roles = report.get("spark_roles", [dict(rank=i, experts=i < expert_world, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)])
 for key, field in (("encoder", "encoder"), ("audio_encoder", "audio_encoder")):
@@ -1206,7 +1216,7 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=expert_world), peers=peers,
     speculator=("mtp" if config.get("text_config", config).get("mtp_num_hidden_layers", 0) > 0
-        else "off") if family == "qwen4" and value("--speculator") == "auto" else value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
+        else "off") if family == "qwen4" and value("--speculator") == "auto" else value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes, decode_rows=decode_rows,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_policy={}),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -3399,24 +3409,31 @@ def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, 
                    and "python3 -I -" not in line for line in result.stderr.splitlines())
 
 
-@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
-                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
-def test_glmf_decode_rows_are_forwarded_only_at_128(tmp_path, keys, forwarded):
-    """GLM5_FLASH_DECODE_ROWS=128 reaches the coordinator as --decode-rows 128 (the wide decode
-    programs); 64, the default, passes nothing; no Spark worker sees it."""
+@pytest.mark.parametrize("keys,expected_flag", [
+    ("", None),
+    ("DECODE_ROWS=auto\n", None),
+    ("DECODE_ROWS=64\n", "--decode-rows 64"),
+    ("DECODE_ROWS=128\n", "--decode-rows 128"),
+])
+def test_glmf_decode_rows_are_forwarded_from_global_key(tmp_path, keys, expected_flag):
+    """DECODE_ROWS=128 (and explicit 64) reaches the coordinator as --decode-rows N; auto/unset
+    omits it; no Spark worker sees it."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     launch = next(line for line in lines if "cuteafd serve-glmf" in line)
-    assert ("--decode-rows 128" in launch) == forwarded and launch.count("--decode-rows") == int(forwarded)
+    if expected_flag is None:
+        assert "--decode-rows" not in launch, launch
+    else:
+        assert expected_flag in launch and launch.count("--decode-rows") == 1, launch
     assert not any("--decode-rows" in line for line in lines if "cuteafd expertd-native" in line)
 
 
 def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
     """128-row steps keep their records in the prefill scratch too: both keys reach the coordinator."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n"
+                                  "RTX_GPUS=1\nDECODE_ROWS=128\n"
                                   "GLM5_FLASH_REPLAY_RECORDS=shared\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -3424,15 +3441,17 @@ def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
 
 
 @pytest.mark.parametrize("keys,message", [
-    ("RTX_GPUS=2\nGLM5_FLASH_DECODE_ROWS=128\n", "a head split takes 64"),
-    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=127\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
-    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=wide\n", "GLM5_FLASH_DECODE_ROWS must be 64 or 128"),
+    ("RTX_GPUS=2\nDECODE_ROWS=128\n", "glmf2_*_m128"),
+    ("RTX_GPUS=1\nDECODE_ROWS=256\n", "glmf_*_m256"),
+    ("RTX_GPUS=1\nDECODE_ROWS=wide\n", "DECODE_ROWS must be auto or a positive integer"),
+    ("RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n", "GLM5_FLASH_DECODE_ROWS"),
 ])
 def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   keys)
-    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert result.returncode != 0 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
+                   and "cuteafd plan" not in line
                    for line in result.stderr.splitlines())
 
 
@@ -4675,12 +4694,14 @@ def test_glmf_text_launch_gives_the_plan_no_template_source(tmp_path):
     assert "cuteafd plan" in result.stderr and "--chat-template-from" not in result.stderr
 
 
-@pytest.mark.parametrize("keys,forwarded", [("", False), ("GLM5_FLASH_DECODE_ROWS=64\n", False),
-                                             ("GLM5_FLASH_DECODE_ROWS=128\n", True)])
-def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, keys, forwarded):
-    """The encoder placement plan charges what serving admits: GLM5_FLASH_DECODE_ROWS=128 reaches
-    `cuteafd plan --layout` as --decode-rows 128 beside the coordinator's, with a fixed near-fit pool
-    and the vision tower on the RTX; 64, the default, passes it to neither."""
+@pytest.mark.parametrize("keys,expected_plan,expected_serve", [
+    ("", None, None),
+    ("DECODE_ROWS=64\n", "--decode-rows 64", "--decode-rows 64"),
+    ("DECODE_ROWS=128\n", "--decode-rows 128", "--decode-rows 128"),
+])
+def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, keys, expected_plan, expected_serve):
+    """The encoder placement plan charges what serving admits: DECODE_ROWS reaches both
+    `cuteafd plan --deployment` and `cuteafd serve-glmf` identically."""
     config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
@@ -4693,8 +4714,11 @@ def test_glmf_encoder_placement_plans_the_decode_rows_serving_takes(tmp_path, ke
     planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     launch = next(line for line in lines if "cuteafd serve-glmf" in line)
     assert "--vision rtx" in planner and "--pool-tokens 262144" in planner, planner
-    for command in [planner, launch]:
-        assert ("--decode-rows 128" in command) == forwarded and command.count("--decode-rows") == int(forwarded), command
+    for command, expected in [(planner, expected_plan), (launch, expected_serve)]:
+        if expected is None:
+            assert "--decode-rows" not in command, command
+        else:
+            assert expected in command and command.count("--decode-rows") == 1, command
 
 
 GLMF_VISION = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
@@ -4757,7 +4781,7 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
              "index_producer_c", "kda_commit_c"]
     manifest = {"programs": [{"name": "glmf_" + n + "_m128"} for n in stems]} if wide else None
     keys = (f"RTX_GPUS={2 if split else 1}\nSPECULATOR=off\nVISION=rtx\n"
-            "GLM5_FLASH_DECODE_ROWS=auto\nGLM5_FLASH_INDEX_CACHE=auto\nGLM5_FLASH_REPLAY_RECORDS=auto\n")
+            "DECODE_ROWS=auto\nGLM5_FLASH_INDEX_CACHE=auto\nGLM5_FLASH_REPLAY_RECORDS=auto\n")
     if fixed: keys += "POOL_TOKENS=262144\n"
     if local: keys += "SPARK_COUNT=0\nEXPERT_BACKEND=local\n"
     else: keys += f"SPARK_COUNT={4 if split else 2}\n"
@@ -4773,7 +4797,6 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     assert ("--index-cache compact" in serve) == (not split), serve
     assert "--index-cache" not in planner and "--replay-records" not in planner, planner
     assert ("--replay-records shared" in serve) == (not split and not fixed and not local), serve
-    assert result.stderr.count("GLM5_FLASH_DECODE_ROWS=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_INDEX_CACHE=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_REPLAY_RECORDS=auto ->") == 1
     assert serve.count("--host-cache-bytes") == 1 and "--host-cache-bytes auto" in serve
@@ -4794,15 +4817,13 @@ def test_glmf_auto_rows_keep_64_even_with_wide_programs(tmp_path, index, state, 
     manifest = {"programs": [{"name": "glmf_" + n + "_m128"} for n in stems if n != missing]}
     keys = (f"RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nSPARK_COUNT=2\n"
             f"GLM5_FLASH_INDEX_CACHE={index}\nGLM5_FLASH_KDA_STATE={state}\n"
-            "GLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_DECODE_ROWS=auto\n")
+            "GLM5_FLASH_KDA_FP8=off\nDECODE_ROWS=auto\n")
     result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash", keys,
                                   program_manifest=manifest, encoder_plan=GLMF_RTX_ENCODER_PLAN)
     assert result.returncode == 0, result.stderr
     for line in result.stderr.splitlines():
         if "cuteafd plan" in line or "cuteafd serve-glmf" in line:
             assert "--decode-rows 128" not in line, line
-    assert "GLM5_FLASH_DECODE_ROWS=auto -> 64 (" in result.stderr
-    assert "128 rows remain opt-in; C16 and post-C16 C1 draft-cost gate" in result.stderr
 
 
 @pytest.mark.parametrize("fp8", ["auto", "off"])

@@ -26,6 +26,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let mut options = PlanOptions {
         fp8_prefill: args.fp8_prefill.clone(),
         decode_lanes: args.decode_lanes,
+        decode_rows: args.decode_rows,
+        draft_length: args.draft_length,
         attention_precision: args.attention.attention_precision,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
@@ -93,7 +95,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 exlr8_prefill_activations: args.exlr8_prefill_activations.unwrap_or_default(),
                 exlr8_prefill_pin: args.exlr8_prefill_activations,
                 prefill_span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows),
-                glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
                     head: args.head_format, ..Default::default() },
@@ -335,6 +336,16 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     configured!(concurrency, "CONCURRENCY");
     configured!(draft_context_window, "DRAFT_CONTEXT_WINDOW");
     configured!(prefill_waves, "PREFILL_WAVES");
+    if !args.explicit_settings.contains("decode_rows") {
+        if let Some(value) = get("DECODE_ROWS") {
+            args.decode_rows = cuteafd_loader::plan::decode_rows::parse_setting(value)
+                .map_err(|error| anyhow::anyhow!("DECODE_ROWS: {error}"))?;
+        }
+    }
+    if args.draft_length.is_none() {
+        args.draft_length = get("DRAFT_LENGTH").filter(|v| *v != "auto")
+            .map(|v| v.parse().context("DRAFT_LENGTH")).transpose()?;
+    }
     if !args.explicit_settings.contains("fp8_prefill") {
         if let Some(value) = get("FP8_PREFILL") { args.fp8_prefill = value.parse().map_err(anyhow::Error::msg)?; }
     }
@@ -2086,7 +2097,7 @@ mod tests {
             context_tokens: Some(262144),
             prefill_rows: 0, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
-            decode_rows: 64,
+            decode_rows: None, draft_length: None,
             index_cache: Some(crate::families::glm5_flash::engine::IndexCache::Keys),
             replay_records: Some(crate::cli::PlanReplayRecords::Own),
             concurrency: 8,

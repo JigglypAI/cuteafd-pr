@@ -165,11 +165,12 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     sampling: TargetSamplingWave<'a>,
 }
 impl<'a> TargetHeadWave<'a, '_> {
-    /// Target verification rows are bounded by the shared V4.1 verifier budget.
+    /// Target verification rows are bounded by the V4.1 vocabulary-row ceiling.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
-            (1..=80).contains(&capacity),
-            "target head capacity must be 1..80"
+            (1..=cuteafd_core::V41_VOCAB_ROWS).contains(&capacity),
+            "target head capacity must be 1..{}",
+            cuteafd_core::V41_VOCAB_ROWS
         );
         Ok(V41VocabularyProjection::WORKSPACE_BYTES
             + capacity * STRIDES.iter().sum::<usize>()

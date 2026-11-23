@@ -200,7 +200,7 @@ def manifest(job_dir):
     job = json.loads((job_dir / 'job.json').read_text())
     result = json.loads((job_dir / 'result.json').read_text()) if (job_dir / 'result.json').is_file() else {}
     keep = ('MODEL_ID', 'MODEL_REVISION', 'SPECULATOR', 'SPECULATOR_MODEL_ID', 'CORE_VIEW', 'DRAFT_LENGTH',
-            'RTX_GPUS', 'SPARK_COUNT', 'GLM5_FLASH_DECODE_ROWS', 'COORDINATOR_DOCKER_INFERENCE')
+            'RTX_GPUS', 'SPARK_COUNT', 'DECODE_ROWS', 'COORDINATOR_DOCKER_INFERENCE')
     thermal, context_points = [], []
     for report in sorted(job_dir.glob('reports/**/report.json')):
         for panel in json.loads(report.read_text()).get('panels', []):
@@ -506,7 +506,7 @@ def replay(rows, fit, rule, batch_rule=None, max_rows=64):
     rounds = collections.defaultdict(list)
     for r in rows:
         rounds[(r['card'], r['round'], r['lane'])].append(r)
-    tokens = seconds = verify_rows = 0.
+    tokens = seconds = decode_rows = 0.
     for members in rounds.values():
         lengths = batch_rule(members, fit) if batch_rule else settle([rule(m) for m in members], members, max_rows)
         committed = sum(1 + min(L, accepted_run(m)) for L, m in zip(lengths, members))

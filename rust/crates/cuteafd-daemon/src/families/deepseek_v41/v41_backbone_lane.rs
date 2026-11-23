@@ -171,7 +171,7 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        let bank=crate::shared::decode_graph::LayerGraphs::new(device.library, super::graph_policy::max_decode_rows(), "deepseek_v41");
         Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
@@ -850,7 +850,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
         let prewarm: Vec<_> = if decode {
-            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
+            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, super::graph_policy::max_decode_rows() as usize)
                 .into_iter().map(|entry| entry.rows).collect()
         } else { super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity) };
         ensure!(prewarm.iter().all(|&row| row <= self.capacity) && (!decode || (sinks.len() == 40 && selections.len() == 40)),

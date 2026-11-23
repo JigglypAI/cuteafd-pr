@@ -11,6 +11,13 @@ impl Family for Qwen35 {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "dense Qwen runs RTX-only: no Spark round trip for a second lane to hide (#744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            7,
+            "dense Qwen coordinator decode programs cover 64 rows (missing qwen35/qwen38 *_m128 export)",
+        )
+    }
     fn id(&self) -> &'static str { "qwen3_5" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

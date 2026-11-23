@@ -186,6 +186,10 @@ pub trait Family: Sync {
     fn decode_lanes(&self) -> super::decode_lanes::LaneSupport {
         super::decode_lanes::LaneSupport::One { reason: super::decode_lanes::DRAFTER }
     }
+    /// Per-lane verify-row budget capacity (`DECODE_ROWS` / `--decode-rows`, #2184).
+    fn decode_rows(&self) -> super::decode_rows::DecodeRowSupport {
+        super::decode_rows::DRAFTER_SUPPORT
+    }
     /// Attention QK/PV operand modes (`ATTENTION_PRECISION`).
     fn attention_precision(&self) -> super::attention_precision::PrecisionSupport {
         super::attention_precision::BF16_ONLY

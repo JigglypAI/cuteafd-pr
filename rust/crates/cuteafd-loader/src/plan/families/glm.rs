@@ -82,6 +82,23 @@ impl Family for Glm {
     }
     fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        if self.id == "glm5_flash" {
+            crate::plan::decode_rows::DecodeRowSupport {
+                single_gpu_max: 128,
+                multi_gpu_max: 64,
+                native_draft_block: 7,
+                missing_single_gpu: "GLM Flash 1-GPU wide decode programs cover up to 128 rows (glmf_*_m128; missing glmf_*_m256 export)",
+                missing_multi_gpu: "GLM Flash 2-GPU head-split decode programs cover 64 rows (missing glmf2_*_m128 export)",
+            }
+        } else {
+            crate::plan::decode_rows::DecodeRowSupport::fixed(
+                64,
+                7,
+                "GLM 5.3 coordinator decode programs cover 64 rows (missing glm*_m128 export)",
+            )
+        }
+    }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA
     }
@@ -582,7 +599,7 @@ impl FamilyModel for GlmModel {
         match &self.cache_cfg {
             GlmCacheConfig::Dsa(cfg) => glm_cache_geometry(cfg, cfg.layers, options.coordinator_ranks).map(Some),
             GlmCacheConfig::Flash(cfg) => glm_flash_rank_cache_geometry_rows(cfg, cfg.layers, options.coordinator_ranks,
-                options.glmf_index, options.kda_state_bytes, options.glmf_decode_rows).map(Some),
+                options.glmf_index, options.kda_state_bytes, if options.decode_rows > 64 { 128 } else { 64 }).map(Some),
         }
     }
 

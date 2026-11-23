@@ -77,10 +77,8 @@ pub struct LayoutOptions {
     pub exlr8_prefill_activations: crate::plan::exlr8::PrefillActivations,
     /// Preserve explicit selection separately from the family's automatic rule.
     pub exlr8_prefill_pin: Option<crate::plan::exlr8::PrefillActivations>,
-    /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
-    /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
-    /// replay records hold this many rows.
-    pub glmf_decode_rows: u64,
+    /// Resolved per-lane verify-row budget (`DECODE_ROWS` / `--decode-rows`, default 64).
+    pub decode_rows: u32,
     /// Loaded projection/head formats; defaults match the launcher.
     pub glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation,
     /// Recurrent state precision, including active slots, prefix marks and program scratch.
@@ -303,7 +301,7 @@ impl Default for LayoutOptions {
             decode_lanes: 1,
             exlr8_prefill_activations: Default::default(),
             exlr8_prefill_pin: None,
-            glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
+            decode_rows: super::decode_rows::DEFAULT_DECODE_ROWS,
             glmf_representation: Default::default(),
             glmf_kda_state: Default::default(),
             glmf_prefill_expanded: true,
@@ -501,6 +499,9 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
+    let decode_rows = decode_rows.or_else(|| {
+        (options.decode_rows != super::decode_rows::DEFAULT_DECODE_ROWS).then_some(options.decode_rows)
+    });
     super::spark_executions::admit_family_lanes(family, &backend.exports(), decode_rows, unit, options.prefill_waves,
         options.decode_lanes)
 }
@@ -1567,7 +1568,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         prefill_rows: report.prefill_unit_rows.unwrap_or(admitted_rows.unwrap_or(shape.prefill_rows)),
         prefill_span_rows: admitted_rows.unwrap_or(0),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
-        glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
+        decode_rows: u64::from(options.decode_rows), ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
     // concatenates those owners, so its aggregate is the single-owner geometry.
     let cache = if id == "glm5_flash" {
@@ -1579,8 +1580,9 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
             AttentionPlacement::Heads if ranks == 2 => crate::serving_capacity::GlmfIndexCache::Keys,
             _ => options.glmf_index,
         };
+        let glmf_program_rows = if options.decode_rows > 64 { 128 } else { 64 };
         crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
-            index, options.glmf_kda_state.bytes(), options.glmf_decode_rows, attention, 0)?
+            index, options.glmf_kda_state.bytes(), glmf_program_rows, attention, 0)?
     } else {
         model.cache_geometry(if id == "qwen4" { CacheOptions { coordinator_ranks: 1, ..selected } }
             else { selected })?.context("host cache layout unavailable")?

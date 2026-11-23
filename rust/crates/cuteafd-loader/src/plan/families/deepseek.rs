@@ -16,7 +16,7 @@ pub struct DeepSeek {
     architecture: &'static str,
     runtime: RuntimeStatus,
     decode_lanes: crate::plan::decode_lanes::LaneSupport,
-    /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
+    /// Rows one decode/verify step sends a Spark (V4.1: `V41_DECODE_ROWS`).
     decode_rows: u32,
 }
 
@@ -56,6 +56,21 @@ impl Family for DeepSeek {
         }
     }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        if self.id == "deepseek_v41" {
+            crate::plan::decode_rows::DecodeRowSupport::fixed(
+                cuteafd_core::V41_VOCAB_ROWS as u32,
+                cuteafd_core::MAX_DSPARK_PROPOSALS as u32,
+                "V4.1 compiled verify programs cover up to 256 rows (V41_FP8_AOT / V41_TARGET_CAPACITIES / V41_VOCAB_ROWS)",
+            )
+        } else {
+            crate::plan::decode_rows::DecodeRowSupport::fixed(
+                64,
+                7,
+                "DeepSeek V4 coordinator decode programs cover 64 rows (missing dsv4*_m128 export)",
+            )
+        }
+    }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         if self.id == "deepseek_v41" { crate::plan::attention_precision::MLA_BF16_ONLY }
         else { crate::plan::attention_precision::MLA }
