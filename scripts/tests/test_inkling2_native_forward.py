@@ -77,7 +77,7 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'Whole::load(' not in resident and 'load_whole_weights(' not in resident
     push = weights.split('pub fn record_push(')[1].split('pub fn operand(')[0]
     assert 'Finish::PaddedTranspose' in push
-    assert 'CoordinatorPush::prepare_view_admitted' in weights
+    assert 'CoordinatorPush::prepare_view(' in weights
     assert 'PushPolicy::Required.committed(received)' in weights
     assert 'load_while_admitting(Some(pending)' in weights
     assert 'dense.operand(' in push and 'dense.finish(' in push

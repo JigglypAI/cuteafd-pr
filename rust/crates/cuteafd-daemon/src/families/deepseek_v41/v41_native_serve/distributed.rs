@@ -419,7 +419,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             "V4.1 Spark admission did not select required push");
         let records = records.as_ref().context("V4.1 required dense push records")?;
         super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets, draft_expert_bytes,
-            expert_world, pool.host.push.clone())
+            expert_world)
     })?;
     let (coordinator, ranks) = match coordinator {
         Some((planned, ranks)) => (Some(planned), ranks),

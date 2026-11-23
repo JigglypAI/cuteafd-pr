@@ -477,7 +477,6 @@ pub struct CoreInventory {
     pub selected_core_view: Option<crate::plan::checkpoint::CoreView>,
     pub projections: BTreeMap<String, CoreProjection>,
     pub native: BTreeMap<String, crate::formats::native_attention::NativeProjection>,
-    pub largest_selected_dense_bytes: Option<u64>,
 }
 
 impl CoreInventory {
@@ -527,12 +526,8 @@ impl CoreInventory {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
                 fp8: false });
         }
-        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.weight_map.keys()
-            .filter(|name| !name.contains(".experts."))
-            .filter_map(|name| checkpoint.header(name))
-            .map(|tensor| tensor.byte_length).max().unwrap_or(0));
         let selected_core_view = checkpoint.view.as_ref().filter(|v| v.is_mc() || v.mode() == crate::plan::checkpoint::CoreView::Fp8Compact).map(|v| v.mode());
-        let inventory = Self { selected_core_view, projections, native, largest_selected_dense_bytes };
+        let inventory = Self { selected_core_view, projections, native };
         inventory.validate_runtime_groups(cfg)?;
         Ok(inventory)
     }

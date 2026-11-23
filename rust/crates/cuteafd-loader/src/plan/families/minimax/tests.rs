@@ -853,7 +853,7 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
         expert_usage: None, resident_weight_limit: None,
-        push_host_envelopes: vec![None; routed.len() + 1],
+        push_required: false,
         mount }
 }
 
@@ -2036,17 +2036,12 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         unit_rows: 64, page_bytes: bytes * 60, mark_bytes: 0, draft_bytes: 0 };
     assert_eq!(heads.host_prefix.chunk_bytes, geometry(2 * (17408 + 17408 + 8448)).chunk_bytes().min(1 << 30));
     assert_eq!(layers.host_prefix.chunk_bytes, geometry(33792 + 33792 + 8448).chunk_bytes().min(1 << 30));
-    assert!(layers.push_host_envelopes.iter().all(Option::is_none));
+    assert!(!layers.push_required);
     // A namespace requires push even when expert candidates are mount-only.
-    // Count zero can still load the target through the admitted ring-only route.
+    // Count zero can still push dense weights without local experts.
     rustix::fs::setxattr(dir.path(), "user.sparknest.cluster", br#"{"me":"fixture"}"#,
         rustix::fs::XattrFlags::empty()).unwrap();
-    let push = gather(&request).unwrap();
-    for (count, envelope) in push.push_host_envelopes.iter().enumerate() {
-        let expected = crate::families::minimax_m3::weight_layout::push_host_envelope(
-            catalog.fp8().unwrap(), &push.expert_backings[count], 2).unwrap();
-        assert_eq!(envelope.as_ref(), Some(&expected));
-    }
+    assert!(gather(&request).unwrap().push_required);
     rustix::fs::setxattr(dir.path(), "user.sparknest.cluster", b"invalid",
         rustix::fs::XattrFlags::empty()).unwrap();
     let error = gather(&request).unwrap_err();
@@ -2112,19 +2107,16 @@ fn explicit_and_auto_heads_public_layouts_are_executable() {
 }
 
 #[test]
-fn selected_push_envelope_replaces_mount_until_commit() {
+fn push_route_omits_mount_and_push_staging_owners() {
     use crate::placement::families::minimax_m3::{self as shared, ExpertStorage};
     use crate::placement::{Onboard, planner::*};
-    use crate::push_load::PushHostEnvelope;
     for gpus in [1, 2] {
         for count in [0, 1] {
             let mut inputs = recipe_inputs(gpus, 4);
             for backings in &mut inputs.expert_backings {
                 for backing in backings { backing.storage = ExpertStorage::Push; }
             }
-            inputs.push_host_envelopes = (0..inputs.expert_backings.len()).map(|selected|
-                Some(PushHostEnvelope::new(vec![selected as u64 * 64; gpus],
-                    vec![0; gpus], 128, 1 << 20).unwrap())).collect();
+            inputs.push_required = true;
             if count > 0 {
                 inputs.spark_ranks = 0;
                 inputs.spark.iter_mut().for_each(Vec::clear);
@@ -2137,21 +2129,12 @@ fn selected_push_envelope_replaces_mount_until_commit() {
             let mut inputs = inputs.clone();
             inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
             let admitted = inputs.admit(request.clone()).unwrap();
-            let expected = inputs.push_host_envelopes[count].as_ref().unwrap();
-            assert_eq!(admitted.push_host_envelope.as_ref(), Some(expected));
             let owners = &admitted.solved.facts.allocations;
             assert!(!owners.iter().any(|owner| owner.id.starts_with("minimax.mount.")));
-            let actual = owners.iter().filter(|owner| owner.id.starts_with("minimax.push.")).collect::<Vec<_>>();
-            assert_eq!(actual.iter().map(|owner| owner.bytes).sum::<u64>(), expected.bytes().unwrap());
-            for expected in expected.allocations("minimax.push").unwrap() {
-                assert_eq!(actual.iter().filter(|owner| ***owner == expected).count(), 1);
-                assert_eq!(expected.location, Location::PINNED);
-                assert_eq!(expected.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
-            }
+            assert!(!owners.iter().any(|owner| owner.id.starts_with("minimax.push.")));
             let mut mount = inputs.clone();
-            mount.push_host_envelopes.fill(None);
+            mount.push_required = false;
             let mounted = mount.admit(request).unwrap();
-            assert!(mounted.push_host_envelope.is_none());
             assert!(!mounted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("minimax.push.")));
             assert!(mounted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("minimax.mount.")));
         }
@@ -2159,25 +2142,17 @@ fn selected_push_envelope_replaces_mount_until_commit() {
 }
 
 #[test]
-fn push_envelope_refuses_mixed_routes_bad_topology_and_mount_candidates() {
+fn push_route_refuses_mount_expert_candidates() {
     use crate::placement::families::minimax_m3 as shared;
     use crate::placement::{Onboard, planner::*};
-    use crate::push_load::PushHostEnvelope;
     for gpus in [1, 2] {
         let mut inputs = recipe_inputs(gpus, 4);
         let request = shared::request(inputs.context, Some(1 << 20), Onboard::Layers(0),
             inputs.prefill, Operation::Serving, None, Default::default());
         let mut inputs = inputs.clone();
         inputs.pool = crate::placement::prepare_pool(crate::placement::PoolFacts::new(inputs.context, Some(1 << 20), shared::PAGE_ROWS)).unwrap();
-        inputs.push_host_envelopes.clear();
-        assert!(inputs.prepare(&request).is_err());
-        inputs.push_host_envelopes = vec![Some(PushHostEnvelope::new(vec![0; gpus], vec![0; gpus], 128, 1 << 20).unwrap()); 2];
-        inputs.push_host_envelopes[1] = None;
-        assert!(inputs.prepare(&request).is_err());
-        inputs.push_host_envelopes.fill(Some(PushHostEnvelope::new(vec![0; 3 - gpus], vec![0; 3 - gpus], 128, 1 << 20).unwrap()));
-        assert!(inputs.prepare(&request).is_err());
-        inputs.push_host_envelopes.fill(Some(PushHostEnvelope::new(vec![0; gpus], vec![0; gpus], 128, 1 << 20).unwrap()));
-        assert!(inputs.admit(request.clone()).is_ok(), "count zero retains ring-only push");
+        inputs.push_required = true;
+        assert!(inputs.admit(request.clone()).is_ok(), "count zero can push dense weights only");
         let mut local = request;
         local.onboard = Pin::Exact(1);
         assert!(inputs.admit(local).is_err(), "required push cannot select mount experts");

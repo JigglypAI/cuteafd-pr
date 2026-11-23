@@ -594,27 +594,6 @@ pub(crate) fn with_engine<T>(
                     decode_rows, prefill_rows, prefill.waves as usize)?, None)?.select(&peers)?; }
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
-        if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?
-            != crate::shared::experts::rtx::push::PushPolicy::Mount {
-            use crate::shared::{experts::rtx::dense::HostStaging, memory::push_coordinator::CoordinatorExpertPlan};
-            let mut startup = facts.weights.startup.clone();
-            let host = (0..devices.len()).map(|rank| {
-                let bytes = |name| startup.host.iter().find(|item| item.rank == rank && item.name == name)
-                    .map_or(0, |item| item.bytes);
-                Ok(HostStaging { staging_bytes: usize::try_from(bytes("staging/coordinator-dense"))?,
-                    table_bytes: usize::try_from(bytes("staging/coordinator-dense-status"))?, largest_step: 0 })
-            }).collect::<Result<Vec<_>>>()?;
-            let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-            let peak = CoordinatorExpertPlan::admit_host(&vec![None; devices.len()], &host,
-                cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
-            ensure!(peak as u64 == startup.host_bytes()?, "V4 startup host inventory disagrees with admission");
-            startup.add_experts(&loaded.catalog, stages, &placement, args.tp2_dspark_experts)?;
-            let bound = startup.host_bytes()?;
-            ensure!(bound <= available, "V4 dense and expert startup need {bound} host bytes, available {available}");
-            for note in startup.notes()? { tracing::info!("{note}"); }
-            tracing::info!(plan_host_bound_bytes = bound, dense_host_bound_bytes = peak,
-                "V4 conservative dense and expert startup host bound admitted before allocation");
-        }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/before-push", Default::default())?;
         let started = Instant::now();
         let operands = cuteafd_loader::families::deepseek_v4::resident::resident_operands(

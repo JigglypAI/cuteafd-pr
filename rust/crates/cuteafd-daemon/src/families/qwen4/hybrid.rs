@@ -35,8 +35,7 @@ fn whole_package(args: &EngineArgs, catalog: &OfficialV41Catalog) -> Result<std:
 
 impl Opened {
     pub(super) fn load_hybrid<'a>(&'a self, args: &EngineArgs, devices: &[Device<'a>],
-        streams: &[*mut std::ffi::c_void], admitted: &ExpertAdmission,
-        host: &cuteafd_loader::placement::families::qwen4::QwenHost) -> Result<engine::HybridExperts<'a>> {
+        streams: &[*mut std::ffi::c_void], admitted: &ExpertAdmission) -> Result<engine::HybridExperts<'a>> {
         let catalog = self.experts.as_ref().context("Qwen routed expert catalog missing")?;
         let candidate = admitted.candidate.as_ref().context("Qwen expert prefix was not admitted")?;
         let layers = candidate.layers.clone();
@@ -47,11 +46,7 @@ impl Opened {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
         let policy = PushPolicy::for_snapshot(source)?;
         let pushed = if let Some(experts) = push_plan(catalog, &layers, gpus, rows, args, Some(candidate))? {
-            match policy.plan(|| {
-                let envelope = host.push.iter().find(|(name, _)| *name == "qwen.host.push.routed")
-                    .context("Qwen routed push lacks pre-allocation envelope")?.1.clone();
-                CoordinatorPush::prepare_alone_admitted(source, Some(catalog), gpus, Some(experts), envelope)
-            })? {
+            match policy.plan(|| CoordinatorPush::prepare_alone(source, Some(catalog), gpus, Some(experts)))? {
                 Some(push) => {
                     let (pushed, ()) = push.receive_with::<rtx::push::NoDense, _>(devices.to_vec(), Some(catalog), 0, None, || ());
                     policy.committed(pushed).context("Qwen admitted routed expert push")?

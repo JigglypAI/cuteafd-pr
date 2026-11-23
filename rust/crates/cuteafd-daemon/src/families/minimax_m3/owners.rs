@@ -782,7 +782,7 @@ pub(super) mod tests {
             measured_context: vec![0; gpus], graph_reserve: vec![500 << 20; gpus], head: serving::BlasHead::Gemm,
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
-            push_host_envelopes: vec![None; routed.len() + 1],
+            push_required: false,
             mount: match split { Some(split) => split.iter().map(|w| w.mount_load(checkpoint)).collect::<Result<_>>()?,
                 None => targets.iter().map(|target| target.mount_load(checkpoint)).collect::<Result<_>>()? }, targets })
     }

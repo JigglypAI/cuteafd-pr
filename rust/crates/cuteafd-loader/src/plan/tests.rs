@@ -3542,10 +3542,8 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
     assert_eq!(host.locations, [Location::HOST, Location::PINNED]);
     let owned = |ledger: &crate::plan::SolvedPhaseLedger, phase| ledger.phases.iter()
         .find(|row| row.budget == "coordinator host RAM" && row.phase == phase).unwrap().owned;
-    // Dense staging and push rings own the Load phase; pinned tables, logits
-    // and link storage own Ready.
-    let push = (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64;
-    assert!(owned(ledger, Phase::Load) >= push);
+    // Decode tables and logits are post-load. No checkpoint push staging is reserved.
+    assert_eq!(owned(ledger, Phase::Load), 0);
     assert!(owned(ledger, Phase::Ready) > 0);
     assert!(planned.memory_layout.unwrap().devices.iter().all(|device|
         device.items.iter().all(|item| item.group != "Spark egress")));

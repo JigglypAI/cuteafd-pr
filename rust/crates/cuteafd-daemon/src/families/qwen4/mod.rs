@@ -631,7 +631,7 @@ impl Opened {
         let (pool_tokens, admitted_host, admitted_experts) = admission::preallocate(&self.library, args, &self.checkpoint,
             &self.cfg, self.experts.as_ref(), layers, with_mtp, manifest_json.as_ref(),
             cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context),
-            &media, &inventory)?;
+            &inventory)?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
@@ -664,10 +664,8 @@ impl Opened {
             tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                 "Qwen coordinator dense records planned");
             let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &[device], 0)?;
-            let envelope = admitted_host.push.iter().find(|(name, _)| *name == "qwen.host.push.dense")
-                .context("Qwen dense push has no admitted envelope")?.1.clone();
-            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_admitted(
-                &args.snapshot, None, 1, None, envelope)?;
+            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
+                &args.snapshot, None, 1, None)?;
             Ok((push, embedding, model, records, dense))
         }).context("Qwen coordinator dense push planning")?;
         let (embedding, model) = match planned {
@@ -731,7 +729,7 @@ impl Opened {
         if args.shared_only {
             engine.set_experts(engine::Experts::SharedOnly);
         } else if self.experts.is_some() {
-            let experts = self.load_hybrid(args, &[device], &[stream], &admitted_experts, &admitted_host)?;
+            let experts = self.load_hybrid(args, &[device], &[stream], &admitted_experts)?;
             engine.install_hybrid(experts, &admitted_experts.placement, cuteafd_loader::placement::HopSpec {
                 storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
                 row_bytes: self.cfg.hc_width() as u64 * 2, rows: args.prefill_rows as u64,

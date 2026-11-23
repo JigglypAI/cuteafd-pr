@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_keeps_host_owners_out_of_gpu_and_charges_only_device_scratch() {
+    fn startup_charges_only_device_scratch() {
         use crate::shared::dense_read::STEP_BYTES;
         let (cfg, tensors) = fixture();
         for ranks in [1, 2] {
@@ -455,89 +455,8 @@ mod tests {
                 for rank in 0..ranks {
                     assert_eq!(phases[rank].bytes, STEP_BYTES as u64);
                 }
-                assert_eq!(weights.startup.host.iter().filter(|item| item.name == "weight-push").count(), ranks);
-                assert!(weights.startup.host_bytes().unwrap() >= ranks as u64 * 128 * 1024 * 1024);
-                assert!(weights.startup.host.iter().any(|item| item.name == "staging/coordinator-dense-status" && item.bytes == 4));
             }
         }
-    }
-
-    #[test]
-    fn expert_startup_names_native_draft_and_tp2_groups_without_charging_gpu() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        crate::plan::testing::write_v4_snapshot_with_dspark(root.path(), 3);
-        let input = crate::plan::PlanInput::open(root.path())?;
-        let catalog = input.expert_catalog()?;
-        let tp2 = crate::placement::Tp2Range { first: 1, layers: 2, peak_bytes: [0; 2] };
-        let ring = (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64;
-        for stages in [0, 3] {
-            for ranks in [1, 2] {
-                let whole = if ranks == 1 { vec![vec![1, 3]] } else { vec![vec![], vec![]] };
-                let mut startup = StartupInventory::default();
-                startup.add_selected_experts(catalog, stages, &whole, if ranks == 2 { Some(&tp2) } else { None }, false)?;
-                assert!(startup.device.is_empty());
-                assert!(startup.host.iter().filter(|item| item.name != "weight-push/coordinator-experts")
-                    .all(|item| item.bytes == 0)); // Native V4 lands scale bytes directly, without scale-code staging.
-                assert_eq!(startup.host_bytes()?, ring * (ranks as u64 + u64::from(ranks == 2 && stages > 0)));
-                assert!(startup.notes()?.iter().any(|note| note.contains("validation/coordinator-experts")));
-            }
-        }
-        let mut split = StartupInventory::default();
-        let stages_only = crate::placement::Tp2Range { layers: 0, ..tp2 };
-        split.add_selected_experts(catalog, 3, &[vec![], vec![]], Some(&stages_only), true)?;
-        assert_eq!(split.host_bytes()?, 2 * ring);
-        assert_eq!(split.host.iter().filter(|item| item.name == "weight-push/coordinator-experts")
-            .map(|item| item.bytes).collect::<Vec<_>>(), vec![ring; 2]);
-        let mut empty = StartupInventory::default();
-        empty.add_selected_experts(catalog, 0, &[vec![]], None, false)?;
-        assert!(empty.host.is_empty());
-        assert!(empty.add_selected_experts(catalog, 4, &[vec![]], None, false).is_err());
-        let bad = crate::placement::Tp2Range { first: usize::MAX, layers: 2, peak_bytes: [0; 2] };
-        assert!(empty.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&bad), false).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn expert_startup_exl3_validation_matches_each_rank_residency() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        crate::plan::testing::write_v4_pro_exl3_snapshot(root.path());
-        let input = crate::plan::PlanInput::open(root.path())?;
-        let catalog = input.expert_catalog()?;
-        let tp2 = crate::placement::Tp2Range { first: 1, layers: 1, peak_bytes: [0; 2] };
-        let mut startup = StartupInventory::default();
-        startup.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&tp2), false)?;
-        for rank in 0..2 {
-            let residency = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(1), 2, rank)?;
-            let expected = residency.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4;
-            assert_eq!(startup.host.iter().find(|item| item.rank == rank
-                && item.name == "validation/coordinator-experts").unwrap().bytes, expected);
-        }
-        assert!(startup.device.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn expert_startup_coded_scales_bound_full_sources_and_per_group_tables() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        crate::plan::testing::write_v41_snapshot(root.path());
-        let input = crate::plan::PlanInput::open(root.path())?;
-        let catalog = input.expert_catalog()?;
-        assert!(catalog.mxfp4_scale_codes());
-        let layer = catalog.routed_experts().first_layer;
-        let mut startup = StartupInventory::default();
-        startup.add_selected_experts(catalog, 0, &[vec![layer]], None, false)?;
-        let mut expected = 0;
-        for expert in 0..catalog.routed_experts().experts {
-            let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneFull { layer, expert })?;
-            for slot in [4, 3, 5] { expected += catalog.tensor(&staging.tensor_names()[slot])?.metadata.byte_length; }
-        }
-        assert!(expected > 0);
-        assert_eq!(startup.host.iter().find(|item| item.name == "staging/coordinator-expert-scales").unwrap().bytes, expected);
-        assert_eq!(startup.host.iter().find(|item| item.name == "staging/coordinator-expert-scale-table").unwrap().bytes, 1 << 20);
-        assert!(startup.device.is_empty());
-        startup.host.push(StartupItem { rank: 0, name: "overflow", bytes: u64::MAX });
-        assert!(startup.host_bytes().is_err());
-        Ok(())
     }
 
     #[test]
@@ -581,11 +500,10 @@ pub struct WeightInventory {
     pub startup: StartupInventory,
 }
 
-/// Loading-only owners; host mappings must never consume the GPU budget.
+/// Device scratch used only during checkpoint loading.
 #[derive(Debug, Clone, Default)]
 pub struct StartupInventory {
     pub device: Vec<StartupItem>,
-    pub host: Vec<StartupItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -599,100 +517,14 @@ impl StartupInventory {
     fn from_operands(operands: &[ResidentOperand], ranks: usize) -> Result<Self> {
         let mut inventory = Self::default();
         for rank in 0..ranks {
-            let mut staged = 0u64;
-            let mut scratch = 0;
-            let mut status = 0;
-            for item in operands.iter().filter(|item| item.rank == rank) {
-                let source = if item.format == "fp8-mma-scale" {
-                    scratch = crate::shared::dense_read::STEP_BYTES as u64;
-                    item.bytes / 512
-                } else if item.operand == "gate.tid2eid" {
-                    status = 4;
-                    item.bytes.checked_mul(2).context("V4 startup IDs overflow")?
-                } else { 0 };
-                staged = staged.checked_add(source).context("V4 startup staging overflow")?;
-            }
+            let scratch = if operands.iter().any(|item| item.rank == rank && item.format == "fp8-mma-scale") {
+                crate::shared::dense_read::STEP_BYTES as u64
+            } else { 0 };
             // Retained operands are views of the RESIDENT arena admitted beside
             // this group; only the device-side scale scratch is Load-only.
             inventory.device.push(StartupItem { rank, name: "staging/coordinator-dense-device", bytes: scratch });
-            inventory.host.extend([
-                StartupItem { rank, name: "staging/coordinator-dense", bytes: staged },
-                StartupItem { rank, name: "staging/coordinator-dense-status", bytes: status },
-                StartupItem { rank, name: "weight-push", bytes:
-                    (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64 },
-            ]);
         }
         Ok(inventory)
-    }
-
-    /// Sum independent startup groups conservatively, even though dense, whole
-    /// experts and TP2 experts receive sequentially. Host owners never enter VRAM.
-    pub fn add_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
-        placement: &crate::placement::Placement, tp2_draft: bool) -> Result<()> {
-        let whole = (0..placement.expert_ranges.len()).map(|rank| placement.layers.iter().enumerate()
-            .filter_map(|(layer, home)| (home.experts == crate::placement::ExpertHome::RtxWhole { gpu: rank as u8 })
-                .then_some(layer)).collect::<Vec<_>>()).collect::<Vec<_>>();
-        self.add_selected_experts(catalog, draft_stages, &whole, placement.tp2.as_ref(), tp2_draft)
-    }
-
-    fn add_selected_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
-        whole: &[Vec<usize>], tp2: Option<&crate::placement::Tp2Range>, tp2_draft: bool) -> Result<()> {
-        ensure!((1..=2).contains(&whole.len()), "V4 startup experts need one or two ranks");
-        ensure!(draft_stages <= catalog.routed_experts().draft_stages, "V4 startup draft stage out of range");
-        ensure!(tp2.is_none_or(|t| t.layers == 0 || whole.len() == 2), "V4 startup TP2 needs two ranks");
-        ensure!(!tp2_draft || (whole.len() == 2 && tp2.is_some() && draft_stages > 0), "V4 startup split draft needs two TP2 ranks and retained stages");
-        let ring = (cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64)
-            .checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).context("V4 expert ring overflow")?;
-        for (rank, layers) in whole.iter().enumerate() {
-            let mut selections = layers.iter().map(|&layer| (false, layer)).collect::<Vec<_>>();
-            if rank == 0 && !tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
-            let local_group = !selections.is_empty();
-            if tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
-            if let Some(t) = tp2.filter(|t| t.layers > 0) {
-                let end = t.first.checked_add(t.layers).context("V4 expert range overflow")?;
-                ensure!(end <= catalog.routed_experts().layers, "V4 startup expert range out of bounds");
-                selections.extend((t.first..end).map(|layer| (false, layer)));
-            }
-            if selections.is_empty() { continue; }
-            let (mut scales, mut validation) = (0u64, 0u64);
-            for (draft, layer) in selections {
-                if let Some(manifest) = catalog.exl3() {
-                    ensure!(layer < if draft { manifest.experts.draft_stages } else { manifest.experts.layers },
-                        "V4 startup EXL3 layer out of bounds");
-                    // Every residency loads three trellis projections per expert;
-                    // ValidationLayout retains one four-byte multiplier for each.
-                    let experts = if draft { manifest.experts.draft_experts } else { manifest.experts.experts };
-                    let bytes = (experts as u64).checked_mul(3 * 4).context("V4 expert validation overflow")?;
-                    validation = validation.checked_add(bytes).context("V4 expert validation overflow")?;
-                } else if catalog.mxfp4_scale_codes() {
-                    let layer = if draft { catalog.routed_experts().layers.checked_add(layer)
-                        .context("V4 draft expert layer overflow")? } else { layer };
-                    // Full source tensors bound every TP slice and any receive order.
-                    for expert in 0..catalog.routed_experts().experts {
-                        let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneFull { layer, expert })?;
-                        for slot in [4, 3, 5] {
-                            scales = scales.checked_add(catalog.tensor(&staging.tensor_names()[slot])?.metadata.byte_length)
-                                .context("V4 expert scale source overflow")?;
-                        }
-                    }
-                }
-            }
-            let table = if scales == 0 { 0 } else {
-                (std::mem::size_of::<cuteafd_ffi::V41ScaleCodeJob>() as u64)
-                    .checked_add(8).context("V4 expert scale table overflow")?.max(1 << 20)
-            };
-            let groups = u64::from(local_group) + u64::from(tp2_draft || tp2.is_some_and(|t| t.layers > 0));
-            self.host.extend([
-                StartupItem { rank, name: "staging/coordinator-expert-scales", bytes: scales },
-                StartupItem { rank, name: "staging/coordinator-expert-scale-table", bytes: table.checked_mul(groups)
-                    .context("V4 expert scale tables overflow")? },
-                StartupItem { rank, name: "validation/coordinator-experts", bytes: validation },
-                StartupItem { rank, name: "weight-push/coordinator-experts", bytes: ring.checked_mul(groups)
-                    .context("V4 expert rings overflow")? },
-            ]);
-        }
-        self.host_bytes()?;
-        Ok(())
     }
 
     pub fn device_bytes(&self, rank: usize) -> Result<u64> {
@@ -706,19 +538,9 @@ impl StartupInventory {
             "V4 coordinator dense loading", self.device_bytes(rank)?, Basis::Exact))).collect()
     }
 
-    pub fn host_bytes(&self) -> Result<u64> {
-        self.host.iter().try_fold(0u64, |sum, item|
-            sum.checked_add(item.bytes).context("V4 startup host overflow"))
-    }
-
-    pub fn notes(&self) -> Result<Vec<String>> {
-        let mut notes = self.device.iter().map(|item| format!(
-            "V4 startup device rtx{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes))
-            .chain(self.host.iter().map(|item| format!(
-                "V4 startup host rank{} {}: {} bytes (loading only)", item.rank, item.name, item.bytes)))
-            .collect::<Vec<_>>();
-        notes.push(format!("V4 startup host bound: {} bytes; conservative staged source footprint, exact physical extents admitted at receive", self.host_bytes()?));
-        Ok(notes)
+    pub fn notes(&self) -> Vec<String> {
+        self.device.iter().map(|item| format!("V4 startup device rtx{} {}: {} bytes (loading only)",
+            item.rank, item.name, item.bytes)).collect()
     }
 }
 

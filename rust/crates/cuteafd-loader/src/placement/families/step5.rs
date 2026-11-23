@@ -829,12 +829,6 @@ impl Recipe for Step5Recipe<'_> {
             contract.components.push(Component::allocation(owner.clone(),
                 ByteCurve::fixed(owner.bytes, self.maximum_pages), false, self.maximum_pages));
         }
-        if let Some(push) = &self.inputs.host.push {
-            for owner in push.allocations("step5.push")? {
-                contract.components.push(Component::allocation(owner.clone(),
-                    ByteCurve::fixed(owner.bytes, self.maximum_pages), false, self.maximum_pages));
-            }
-        }
         for (rank, gpu) in self.inputs.inventory.gpus.iter().enumerate() {
             if let Some(occupied) = sampled_occupancy(gpu)?.filter(|bytes| *bytes > 0) {
                 contract.components.push(Component { activation: Activation::always(),

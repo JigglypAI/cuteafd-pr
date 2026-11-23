@@ -306,7 +306,7 @@ mod tests {
             let cfg = cuteafd_loader::plan::families::step5::Config::parse(&checkpoint)?;
             let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: cuteafd_loader::plan::testing::SimulatedHost::raptor().layout().spark_capacities(8), graph_layout: None, decode_graphs: false,
                 bf16_target_head: opts.bf16_target_head,
-                host: admission::HostInputs::from_contract(&contract, &cfg, ranks,
+                host: admission::HostInputs::from_contract(&contract, ranks,
                     opts.host_memory.unwrap(), host, 8 << 30)?, resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
                 spark_reply_formats: Default::default(),
                 kv_format,

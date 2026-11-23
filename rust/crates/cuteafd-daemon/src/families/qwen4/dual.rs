@@ -74,23 +74,11 @@ impl Opened {
         // coordinator tower's) form one standalone group, admitted from headers here.
         use crate::shared::experts::rtx::push::{CoordinatorPush, PushPolicy};
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
-        let dense_envelope = push_policy.plan(|| {
-            let owners = qwen4::dual_owners(layers);
-            let staging = admission::dual_dense_staging(&self.checkpoint, &self.cfg, &owners, mtp,
-                args.fp8_decode, args.mtp_fp8_head, &media, [args.device, peer])?;
-            admission::dual_push_envelope(staging)
-        }).context("Qwen dual coordinator push admission")?;
         let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
             u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?)?
         } else { 0 };
-        let mut push_envelopes = dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect::<Vec<_>>();
-        let expert_policy = PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?;
-        if let Some(envelope) = expert_policy.plan(|| super::hybrid::push_plan(catalog,
-            &(0..layers).collect::<Vec<_>>(), 2, rows, args, None)?.context("Qwen dual routed push")?
-                .host_envelope(catalog, 2, &[]))? { push_envelopes.push(("qwen.host.push.routed", envelope)); }
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, sparks, self.checkpoint.spark_input_is_bf16(),
-            ple_info.map(|(row_bytes, _)| row_bytes), host_embedding,
-            push_envelopes)?;
+            ple_info.map(|(row_bytes, _)| row_bytes), host_embedding)?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs { target_pool: None,
         experts: Some(experts.clone()), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), context,
@@ -128,8 +116,8 @@ impl Opened {
         let ranks = [(devices[0], streams[0].raw), (devices[1], streams[1].raw)];
         let loader = loader.with_arenas(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head,
             args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?;
-        let (embedding, model) = match dense_envelope {
-            Some(envelope) => {
+        let (embedding, model) = match push_policy {
+            PushPolicy::Required => {
                 let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
                 let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
                 let model = {
@@ -145,7 +133,7 @@ impl Opened {
                 tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
                     "Qwen dual coordinator dense records planned");
                 let planned = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, 0);
-                let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, None, 2, None, envelope)
+                let push = CoordinatorPush::prepare_alone(&args.snapshot, None, 2, None)
                     .map_err(crate::shared::experts::rtx::push::PushStartupError::Planning)?;
                 let split = crate::shared::memory::load_timing::Split::start();
                 let (pushed, ()) = push.receive_with(devices.to_vec(), None, 0, Some(planned), || ());
@@ -154,7 +142,7 @@ impl Opened {
                 split.log("qwen4 dual dense push");
                 (embedding, model)
             }
-            None => {
+            PushPolicy::Mount => {
                 anyhow::ensure!(media.operands.is_empty() && media.steps.is_empty(),
                     "Qwen dual media records exist only under a push namespace");
                 crate::shared::token_io::TokenEmbedding::load_with(&self.library, self.embed_source()?,
@@ -178,7 +166,7 @@ impl Opened {
         weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding)?;
         let admitted = admission::ExpertAdmission { placement: placement.clone(),
             candidate: Some(experts.selected(&solved.decisions.onboard_layers[0])?.clone()), draft_budget };
-        let hybrid = self.load_hybrid(args, &devices, &streams.each_ref().map(|stream| stream.raw), &admitted, &host)?;
+        let hybrid = self.load_hybrid(args, &devices, &streams.each_ref().map(|stream| stream.raw), &admitted)?;
         let pool = usize::try_from(placement.pool_tokens)?;
         let context = crate::shared::context::pool_context("qwen4", context, pool)?;
         let engine_ranks = [(devices[0], &programs[0], streams[0].raw), (devices[1], &programs[1], streams[1].raw)];

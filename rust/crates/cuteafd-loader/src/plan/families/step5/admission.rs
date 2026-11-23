@@ -236,7 +236,6 @@ pub struct HostInputs {
     pub headroom: u64,
     pub retained_sync_h2d_bytes: u64,
     pub attention_mount_load: crate::shared::dense_read::MountLoad,
-    pub push: Option<crate::push_load::PushHostEnvelope>,
 }
 impl Default for HostInputs {
     fn default() -> Self {
@@ -245,33 +244,18 @@ impl Default for HostInputs {
             memory: crate::plan::testing::SimulatedHost::raptor().host_ram,
             #[cfg(not(test))]
             memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
-            retained_sync_h2d_bytes: 0, attention_mount_load: Default::default(), push: None }
+            retained_sync_h2d_bytes: 0, attention_mount_load: Default::default() }
     }
 }
 
 impl HostInputs {
-    pub fn from_contract(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
+    pub fn from_contract(contract: &super::coordinator::CoordinatorContract,
         gpus: usize, memory: (u64, u64), cache_bytes: Option<u64>, headroom: u64) -> Result<Self> {
         Ok(Self { memory, cache_bytes, headroom,
             retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
             attention_mount_load: contract.attention_mount_load(gpus)?,
-            push: Some(push_host_envelope(contract, cfg, gpus)?),
         })
     }
-}
-
-/// Header-derived upper bound for dense transforms and expert validation.
-/// Estimated staging until a Step-5 census supplies a tighter per-rank bound.
-pub fn push_host_envelope(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
-    gpus: usize) -> Result<crate::push_load::PushHostEnvelope> {
-    let (target, draft) = contract.core.bytes(cfg.layers);
-    let dense = checked_sum([contract.weights.resident_bytes, target, draft])?
-        .checked_mul(2).and_then(|n| n.checked_add(64 << 20))
-        .context("Step-5 dense push host bound overflow")?;
-    let validation = (cfg.layers as u64).checked_mul(cfg.experts as u64)
-        .and_then(|n| n.checked_mul(3 * 4)).context("Step-5 expert validation overflow")?;
-    Ok(crate::push_load::PushHostEnvelope::new(vec![validation.max(4 << 20); gpus],
-        vec![dense; gpus], 128, 1 << 20)?)
 }
 
 /// One rank's Step TP2 onboarding exchange planes beside the package arena:
@@ -1323,7 +1307,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn host_quota_and_push_share_one_capacity_before_allocation() -> Result<()> {
+    fn host_quota_is_admitted_without_push_staging() -> Result<()> {
         let mut inputs = inputs(1);
         inputs.marks.host = true;
         inputs.host.cache_bytes = Some(64 << 30);
@@ -1332,12 +1316,9 @@ mod tests {
         assert!(error.downcast_ref::<crate::placement::planner::Refusal>().is_some(), "{error:#}");
         assert!(format!("{error:#}").contains("host"), "{error:#}");
         inputs.host.memory = crate::plan::testing::SimulatedHost::raptor().host_ram;
-        inputs.host.push = Some(crate::push_load::PushHostEnvelope::new(vec![1024], vec![2048], 128, 1 << 20)?);
         let admitted = run(&inputs)?;
         assert_eq!(admitted.host_cache_bytes, 64 << 30);
-        let load = admitted.solved.phases.iter().find(|row| row.budget == "host"
-            && row.phase == crate::placement::planner::Phase::Load).unwrap();
-        assert!(load.owned >= inputs.host.push.as_ref().unwrap().bytes()?);
+        assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("step5.push")));
         Ok(())
     }
 

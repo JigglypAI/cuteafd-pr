@@ -339,7 +339,7 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         host_embedding,
         table_reactor: crate::formats::mapped_table::table_reactor_workspace_bytes(report.mapped_placement.mapped) as u64,
         preloaded_tables: report.mapped_placement.preloaded_bytes,
-        spark, push: Vec::new(),
+        spark,
     })
 }
 

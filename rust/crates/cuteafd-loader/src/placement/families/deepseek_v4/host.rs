@@ -229,12 +229,6 @@ pub fn components(inputs: &V4Inputs, host: &V4Host, prefix: HostPrefixOwners, pa
         components.push(host_component("v4.host.embedding".into(), Location::PINNED, bytes.clone(),
             Lifetime::RESIDENT, Category::Embedding, "host embedding", maximum)?);
     }
-    // Dense startup staging and push rings exist only while weights load.
-    for (index, item) in inputs.weights.startup.host.iter().enumerate().filter(|(_, item)| item.bytes > 0) {
-        components.push(host_component(format!("v4.host.startup.{index}"), Location::PINNED,
-            ByteCurve::fixed(item.bytes, maximum), Lifetime { first: Phase::Load, last: Phase::Load },
-            Category::Staging, item.name, maximum)?);
-    }
     // Both links' pinned and host storage; their GPU intake is a fixed demand.
     if inputs.spark_ranks > 0 {
         for link in links(inputs)? {

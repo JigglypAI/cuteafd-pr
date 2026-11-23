@@ -569,8 +569,7 @@ fn load_with_experts<'a, T>(args: &GoldenArgs, checkpoint: &Checkpoint,
         let dense = dense::plan_records(view.snapshot(), records, devices, args.peers.len())?;
         let contract = cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
         let cfg = Config::parse(checkpoint)?;
-        let envelope = cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, devices.len())?;
-        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(&catalog), devices.len(), None, envelope)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view(view, Some(&catalog), devices.len(), None)?;
         Ok((owners, dense, push, (streams, ranks)))
     })?;
     let (loaded, pending) = match planned {

@@ -344,7 +344,7 @@ fn with_backend<T>(args: &ServeArgs,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
     inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs::from_contract(
-        &contract, &cfg, ids.len(), cuteafd_loader::formats::mapped_preload::host_memory()?,
+        &contract, ids.len(), cuteafd_loader::formats::mapped_preload::host_memory()?,
         match args.prefix.host_cache_bytes {
             crate::shared::prefix::budget::HostBudget::Auto => None,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
@@ -468,11 +468,10 @@ fn with_backend<T>(args: &ServeArgs,
             let package = budget.package(&format, &args.native_lib)?;
             Some(budget.push_plan(&catalog, &package, ownership.onboarded_layers(), inputs.unit_rows(), devices.len())?)
         };
-        let envelope = inputs.host.push.clone().context("Step-5 admitted push host envelope")?;
         let prepared = if expert_world == 0 {
-            (CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?, None)
+            (CoordinatorPush::prepare_alone_view(&view, Some(&catalog), devices.len(), experts)?, None)
         } else {
-            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view(&view, Some(&catalog), devices.len(), experts)?;
             (push, Some((streams, ranks)))
         };
         Ok((prepared, loaded, records, dense))
@@ -806,12 +805,12 @@ mod tests {
         assert!(source.contains("Checkpoint::coordinator_view(&view"));
         assert!(source.contains("read_expert_catalog_view(&view)"));
         assert!(source.contains("SparkAdmission::plan_view(&view"));
-        assert!(source.contains("CoordinatorPush::prepare_alone_view_admitted(&view"));
-        assert!(source.contains("CoordinatorPush::prepare_view_admitted(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_alone_view(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_view(&view"));
         assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
         assert!(!source.contains("read_expert_catalog(&args.snapshot"));
-        assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
-        assert!(!source.contains("CoordinatorPush::prepare_admitted("));
+        assert!(!source.contains("CoordinatorPush::prepare_alone("));
+        assert!(!source.contains("CoordinatorPush::prepare("));
     }
 
     #[test]

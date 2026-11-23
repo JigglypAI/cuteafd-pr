@@ -6,7 +6,6 @@ use crate::placement::planner::{
     Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, Component,
     ComponentKind, Lifetime, Location, Phase, Refusal,
 };
-use crate::push_load::PushHostEnvelope;
 use crate::serving_capacity::qwen_graphs::{QWEN_UNIT_PAGES, QWEN_UNIT_ROWS};
 use cuteafd_core::memory_layout::{host_logits_bytes, Category};
 
@@ -145,8 +144,6 @@ pub struct QwenHost {
     pub preloaded_tables: u64,
     /// Spark rings, egress request slots and host-mode intake (single owner).
     pub spark: [u64; 3],
-    /// Push group receive envelopes admitted before the push starts.
-    pub push: Vec<(&'static str, PushHostEnvelope)>,
 }
 
 /// Shapes shared by every upload owner of one route.
@@ -260,10 +257,6 @@ impl QwenHost {
             out.push(fixed_owner(format!("qwen.host.spark.{kind}"), Location::PINNED, bytes,
                 Lifetime::RESIDENT, Category::Transport, group, max));
         }
-        for (prefix, envelope) in &self.push {
-            out.extend(envelope.allocations(prefix)?.into_iter().map(|owner| { let bytes = owner.bytes;
-                Component::allocation(owner, ByteCurve::fixed(bytes, max), false, max) }));
-        }
         out.retain(|component| component.bytes.0.iter().any(|piece|
             piece.bytes_at_first > 0 || piece.bytes_per_page > 0));
         Ok(out)
@@ -372,7 +365,7 @@ impl QwenHost {
         Ok(Self { memory: HostMemory { total: 1 << 40, available: 1 << 40 }, ple: None,
             uploads: vec![bounds; owners], mtp_upload: None, pinned_logits: 0, mtp_pinned_logits: 0, scoring_logits: 0,
             prefix_quota: 0, prefix_chunk: 0, loaded_media_cache: 0, host_embedding: 0, table_reactor: 0,
-            preloaded_tables: 0, spark: [0; 3], push: Vec::new() })
+            preloaded_tables: 0, spark: [0; 3] })
     }
 }
 

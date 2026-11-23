@@ -424,12 +424,8 @@ fn pushed_coordinator_operands(real_push: bool) -> Result<()> {
     let pushed = if real_push {
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
         let experts = CoordinatorExperts::Tp2 { layers: (0..layers).collect(), budgets: vec![80 << 30; 2] };
-        let dense_bounds = devices.iter().map(|device| crate::shared::experts::rtx::dense::RankLayout::new(
-            records.operands.clone(), records.steps.clone(), device.id).map(|layout| layout.host_staging))
-            .collect::<Result<Vec<_>>>()?;
-        let envelope = experts.host_envelope(&catalog, 2, &dense_bounds)?;
         let dense = crate::shared::experts::rtx::dense::plan_records(&snapshot, records.clone(), &devices, 0)?;
-        let push = CoordinatorPush::prepare_alone_admitted(&snapshot, Some(&catalog), 2, Some(experts), envelope)?;
+        let push = CoordinatorPush::prepare_alone(&snapshot, Some(&catalog), 2, Some(experts))?;
         let started = std::time::Instant::now();
         let (delivered, ()) = push.receive_with(devices.to_vec(), Some(&catalog), 0, Some(Ok(dense)), || ());
         let delivered = PushPolicy::Required.committed(delivered)?.context("required SparkNest group commit")?;
