@@ -188,6 +188,51 @@ mod tests{
     }
 }
 
+/// Prove this exact row width really replayed, not just that lazy first-touch
+/// agreed with eager execution. Unlike the width oracle, do not compare
+/// different widths: long contexts can reorder router ties (#1128).
+fn graph_parity(execution: &mut Execution<'_>, saved: &Placement, tokens: &[u32], args: &GoldenArgs) -> Result<()> {
+    use super::graphs::Mode;
+    let mut digests = Vec::new();
+    let mut evidence = Vec::new();
+    for (mode, width) in std::iter::once((Mode::Decode, 1)).chain(args.width_invariance.iter().map(|&width| (Mode::Verify, width))) {
+        let mut expected = None;
+        let mut before_replay = 0;
+        for pass in 0..3 {
+            restore(execution)?;
+            let mut placement = saved.clone();
+            let window = &tokens[..width];
+            let logits = match mode {
+                Mode::Decode => decode(execution, &mut placement, window)?,
+                Mode::Verify => verify(execution, &mut placement, window)?,
+            };
+            let sha = digest(&logits);
+            ensure!(expected.as_ref().is_none_or(|expected| *expected == sha),
+                "Inkling {mode:?} row {width} changed logits on pass {pass}");
+            expected = Some(sha);
+            if pass == 1 { before_replay = cuteafd_ffi::graph_captures(); }
+        }
+        ensure!(cuteafd_ffi::graph_captures() == before_replay, "Inkling {mode:?} row {width} recaptured on replay");
+        let banks = std::iter::once(execution.graphs.as_ref())
+            .chain(execution.peer.iter().map(|p| p.graphs.as_ref()));
+        let mut retained = Vec::new();
+        for graph in banks {
+            // Every rank captures attention once per target layer; route-only
+            // capture is not a valid replay witness.
+            let n = graph.map_or(0, |g| g.retained(width, mode));
+            ensure!(graph.is_none() || n >= execution.cfg.layers,
+                "Inkling {mode:?} row {width} retained only {n} graphs on a rank");
+            retained.push(n);
+        }
+        digests.push((format!("{mode:?}"), width, expected.unwrap()));
+        evidence.push((format!("{mode:?}"), width, retained));
+    }
+    std::fs::create_dir_all(&args.save_logits)?;
+    std::fs::write(args.save_logits.join("logits-sha256.json"), serde_json::to_vec_pretty(&digests)?)?;
+    std::fs::write(args.save_logits.join("graph-parity.json"), serde_json::to_vec_pretty(&evidence)?)?;
+    Ok(())
+}
+
 pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     use cuteafd_loader::{plan::Checkpoint,placement::planner::PrefillShape};
     ensure!(args.width_invariance.iter().all(|width|(1..=8).contains(width)),"Inkling width invariance supports1..=8 total verify rows, anchor included");
@@ -227,6 +272,9 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     execution.prefill(std::slice::from_mut(&mut placement),&[&tokens[..args.prefill]],&units,1,&mut|_,_,_|Ok(()))?;
     for requests in execution.request_ranks(){requests.cache.capture(0,0)?;requests.cache.drain()?;}
     let saved=placement.clone();
+    if args.graph_parity {
+        return graph_parity(&mut execution, &saved, &tokens[args.prefill..], args);
+    }
     let mut reference=Vec::new();let mut base_logits=Vec::new();
     for row in 0..maximum{
         execution.width_trace=Some(RefCell::new(Trace::default()));

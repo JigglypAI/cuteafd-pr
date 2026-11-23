@@ -88,6 +88,14 @@ impl UnitLayout {
         Ok(layout)
     }
 
+    pub fn serving_decode(cfg: &Inkling2Config, context: usize, kv_format: InklingKvCache,
+        sequences: usize, head_parts: usize) -> Result<Self> {
+        let mut layout = Self::serving_head_parts(cfg, 64, context, kv_format, sequences, head_parts)?;
+        // Immutable +0 operand preserves the exact eager accumulation, even for -0.
+        layout.buffers.insert("decode_zero_bf16".into(), layout.buffers["attended"].max(layout.buffers["expert_output"]));
+        Ok(layout)
+    }
+
     /// Exact bounded source schedule for one unit's full layer walk: five
     /// packed i64 planes plus starts, table selectors and CTA starts. The
     /// second allowance covers deferred MLP joins; global tables are one bank.

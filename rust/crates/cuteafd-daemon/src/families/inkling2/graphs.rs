@@ -60,6 +60,10 @@ impl<'a> DecodeGraphs<'a> {
         visit(self.device, "inkling2.section", false, &mut self.bank)
     }
 
+    pub(super) fn retained(&self, rows: usize, mode: Mode) -> usize {
+        self.bank.count(|key| key.rows == rows && key.mode == mode)
+    }
+
     pub(super) fn clear_drained(&mut self) { self.bank.cache_clear_drained(); }
 
     fn run(&mut self, key: Key, stream: &Stream<'a>, work: impl Fn() -> Result<()>) -> Result<()> {

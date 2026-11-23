@@ -403,11 +403,13 @@ impl InklingInputs {
     /// slot): projections, relative logits, attention output, the residual
     /// block stack, router scores and expert activation staging. Named per
     /// plane so the ledger reconciles them one by one.
-    fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, maximum: u64) -> Result<Vec<Component>, Refusal> {
+    fn unit_owners(&self, prefix: &str, gpu: usize, rows: u32, decode: bool, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
         let parts = if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 2 } else { 1 };
-        let layout = crate::families::inkling2::execution::UnitLayout::serving_head_parts(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize, parts)
+        use crate::families::inkling2::execution::UnitLayout;
+        let layout = if decode { UnitLayout::serving_decode(&self.cfg, context, self.kv_format, self.sequences as usize, parts) }
+            else { UnitLayout::serving_head_parts(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize, parts) }
             .map_err(refusal)?;
         let mut out = Vec::new();
         let uploads = layout.upload_shape(&self.cfg, usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("Inkling upload members"))?
@@ -501,9 +503,9 @@ impl InklingInputs {
             "exact retained SWA and FP32 convolution marks", maximum));
         // One decode lane on every rank (its layers' work), then one owner set
         // per in-flight prefill slot (PrefillHooks unit slots).
-        out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, DECODE_ROWS, maximum)?);
+        out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, DECODE_ROWS, true, maximum)?);
         for slot in 0..self.prefill.waves {
-            out.extend(self.unit_owners(&format!("inkling2.unit.{gpu}.{slot}"), gpu, rows, maximum)?);
+            out.extend(self.unit_owners(&format!("inkling2.unit.{gpu}.{slot}"), gpu, rows, false, maximum)?);
         }
         if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) {
             let bytes = self.prefill.rows.max(u64::from(DECODE_ROWS)) * cfg.hidden as u64 * 4;
