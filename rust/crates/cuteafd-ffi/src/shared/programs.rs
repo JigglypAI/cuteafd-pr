@@ -1156,6 +1156,22 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Pack an already sharded transposed BF16 KV-B matrix into its final MLA arena views.
+    ///
+    /// # Safety
+    /// `kv_b` holds `[lat, heads * (nope + v)]`; `uk` and `uv` hold disjoint
+    /// `[heads, lat, nope]` and `[heads, v, lat]` outputs. All are live on `stream`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_absorb_transposed(&self, kv_b: *const c_void, uk: *mut c_void, uv: *mut c_void,
+        heads: usize, nope: usize, v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Pack = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64, *mut c_void) -> i32;
+        // SAFETY: the symbol's native signature matches Pack and the caller owns the buffers.
+        let pack = *unsafe { self.lib.get::<Pack>(b"cuteafd_load_kvb_absorb_transposed") }?;
+        let status = unsafe { pack(kv_b, uk, uv, i64::try_from(heads)?, i64::try_from(nope)?,
+            i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        self.status_to_result("cuteafd_load_kvb_absorb_transposed", status)
+    }
+
     /// FP8 MLA `kv_b` rows of `heads` heads (E4M3 `[heads * (nope + v), lat]`, the
     /// first at kv_b row `row0`) with the whole tensor's FP32 128x128 `grid` (both
     /// device-visible) split per head into the GLM FP8 programs' `uk`

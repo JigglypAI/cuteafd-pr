@@ -106,6 +106,22 @@ __global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, 
     else uv[i - nk] = lq::absorb_uv(kv_b, h0, nope, v, lat, i - nk);
   }
 }
+__global__ void absorb_transposed_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv,
+                                         int64_t heads, int64_t nope, int64_t v, int64_t lat) {
+  const int64_t nk = heads * lat * nope, nv = heads * v * lat;
+  const int64_t source_stride = heads * (nope + v);
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < nk + nv;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    if (i < nk) {
+      const int64_t h = i / (lat * nope), c = (i / nope) % lat, d = i % nope;
+      uk[i] = kv_b[c * source_stride + h * (nope + v) + d];
+    } else {
+      const int64_t j = i - nk;
+      const int64_t h = j / (v * lat), r = (j / lat) % v, c = j % lat;
+      uv[j] = kv_b[c * source_stride + h * (nope + v) + nope + r];
+    }
+  }
+}
 __global__ void absorb_fp8_kernel(const uint8_t* kv_b, const float* grid, uint8_t* uk, float* uk_s, uint8_t* uv,
                                   float* uv_s, int64_t row0, int64_t heads, int64_t nope, int64_t v, int64_t lat) {
   const int64_t nk = heads * lat * nope, nv = heads * v * lat;
@@ -181,6 +197,16 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
   absorb_kernel<<<grid_for(heads * (nope + v) * lat), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint16_t*>(kv_b), static_cast<uint16_t*>(uk), static_cast<uint16_t*>(uv), h0, heads, nope,
       v, lat);
+  return cudaGetLastError();
+}
+
+// BF16 W^T [lat, heads * (nope + v)] from EXL3 dequantization with I @ W^T.
+extern "C" int32_t cuteafd_load_kvb_absorb_transposed(const void* kv_b, void* uk, void* uv,
+                                                      int64_t heads, int64_t nope, int64_t v, int64_t lat,
+                                                      void* stream) {
+  if (!kv_b || !uk || !uv || heads < 1 || nope < 1 || v < 1 || lat < 1) return cudaErrorInvalidValue;
+  absorb_transposed_kernel<<<grid_for(heads * (nope + v) * lat), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(kv_b), static_cast<uint16_t*>(uk), static_cast<uint16_t*>(uv), heads, nope, v, lat);
   return cudaGetLastError();
 }
 
