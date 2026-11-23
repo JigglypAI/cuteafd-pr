@@ -290,11 +290,11 @@ fn launch_proj_split(
 
 struct RankRuntime<'a> {
     device: Device<'a>,
-    stream: Stream<'a>,
+    stream: std::rc::Rc<Stream<'a>>,
     peer_ready: Event<'a>,
     programs: Hy4Programs<'a>,
     weights: Hy4RankWeights<'a>,
-    cache: Hy4CacheRank<'a>,
+    cache: std::rc::Rc<Hy4CacheRank<'a>>,
     scratch: RankScratch<'a>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
@@ -357,14 +357,22 @@ impl<'a> Hy4Engine<'a> {
         let mut ranks = Vec::with_capacity(gpus);
         for (rank, weights) in weights_all.into_iter().enumerate() {
             let device = devices[rank];
-            let stream = Stream::new(device)?;
+            let stream = std::rc::Rc::new(Stream::new(device)?);
             let peer_ready = Event::new(device)?;
             let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format, max_rows))?;
             let attn_scratch = progs
                 .dsa_scratch_bytes
                 .max(progs.swa_decode_scratch_bytes)
                 .max(progs.swa_extend_scratch_bytes);
-            let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, max_rows, 0, &stream)?;
+            let cache = std::rc::Rc::new(Hy4CacheRank::new(
+                vec![stream.clone()],
+                &cfg,
+                kv_format,
+                max_pages,
+                1,
+                max_rows,
+                0,
+            )?);
             let native_layout = weights.native.scratch_layout(max_rows)?;
             let native_head_layout = weights.native.head_scratch_layout(max_rows.min(64))?;
             let scratch = RankScratch::new(
@@ -464,10 +472,7 @@ impl<'a> Hy4Engine<'a> {
 
     pub(crate) fn reset(&mut self) -> Result<()> {
         for r in &mut self.ranks {
-            r.cache.zero_all(&r.stream)?;
-            for seq in &mut r.cache.pending_counts {
-                seq.fill(0);
-            }
+            r.cache.zero_all()?;
         }
         self.engram_histories = self.engram.start_histories();
         self.committed_pos = 0;
@@ -594,7 +599,7 @@ impl<'a> Hy4Engine<'a> {
         let swa_cu_bytes: Vec<u8> = [0i32, rows as i32].into_iter().flat_map(i32::to_le_bytes).collect();
         let limits_bytes: Vec<u8> = (pos_start..pos_end).flat_map(|p| ((p / 4) as i32).to_le_bytes()).collect();
         // Every DSA layer processes the same token stream in lockstep, so pending/complete_groups match.
-        let pending_common = self.ranks[0].cache.pending_counts[0].first().copied().unwrap_or(0);
+        let pending_common = self.ranks[0].cache.pending_counts.borrow()[0].first().copied().unwrap_or(0);
         let complete_groups_common = (pending_common + rows) / 4;
         let (g_pos_bytes, g_slots_bytes) = if complete_groups_common > 0 {
             let first_gid = (pos_start - pending_common) / 4;
@@ -842,7 +847,7 @@ impl<'a> Hy4Engine<'a> {
                                 &s_rows, r.stream.raw,
                             )?;
 
-                            let pending = r.cache.pending_counts[0][dsa_idx];
+                            let pending = r.cache.pending_counts.borrow()[0][dsa_idx];
                             ensure!(
                                 pending == pending_common,
                                 "Hy4 DSA layer {layer} pending count {pending} diverged from {pending_common}"
@@ -901,7 +906,7 @@ impl<'a> Hy4Engine<'a> {
                                     r.device.library.copy_d2d_async(pending_buf, src, new_pending * IDX_DIM * 2, r.stream.raw)?;
                                 }
                             }
-                            r.cache.pending_counts[0][dsa_idx] = new_pending;
+                            r.cache.pending_counts.borrow_mut()[0][dsa_idx] = new_pending;
 
                             let total_groups = pos_end / 4;
                             if pos_end > CANDIDATE_TOPK && total_groups > 0 {
