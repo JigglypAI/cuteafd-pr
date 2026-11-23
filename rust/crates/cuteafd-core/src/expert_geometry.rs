@@ -294,6 +294,27 @@ impl SparkEndpoint {
     }
 }
 
+/// Explicit routed-expert activation/clamp discriminator on [`ExpertGeometry`].
+///
+/// Families with identical `(hidden, experts, topk, intermediate)` dimensions
+/// (such as [`ExpertGeometry::GLM5`] unclamped SiLU vs [`ExpertGeometry::HY4`]
+/// SwiGLU clamped at 10.0) stay distinct in [`ExpertGeometry::same_shape`],
+/// [`ExpertGeometry::family`], [`ExpertGeometry::swiglu_limit`], and
+/// [`ExpertGeometry::activation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpertActivation {
+    /// Pre-SiLU gate/up unclamped (`SiluBf16Product { limit: None }`).
+    SiluUnclamped,
+    /// Pre-SiLU gate/up clamped at 10.0 (`SiluBf16Product { limit: Some(10.0) }`).
+    SiluClamp10,
+    /// Post-SiLU clamped at 7.0 in FP32 (`SiluPostClampFp32Product { limit: 7.0 }`).
+    SiluPostClamp7,
+    /// SwiGLU-OAI (`alpha=1.702, beta=1.0, limit=7.0`).
+    SwigluOai7,
+    /// SiTU (`beta=4.0, linear_beta=Some(25.0)`).
+    Situ4_25,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExpertGeometry {
     /// Model hidden size: the width of every routed row and partial.
@@ -306,52 +327,73 @@ pub struct ExpertGeometry {
     pub intermediate: u32,
     /// Backbone layers with routed experts.
     pub layers: u32,
+    /// Routed-expert activation / SwiGLU clamp class.
+    pub activation: ExpertActivation,
 }
 
 impl ExpertGeometry {
-    pub const DEEPSEEK_V41: Self = Self { hidden: 5120, experts: 384, topk: 6, intermediate: 2304, layers: 40 };
-    pub const DEEPSEEK_V4_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 6, intermediate: 2048, layers: 43 };
-    pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072, layers: 61 };
-    /// GLM 5.3 (glm_moe_dsa): routed layers 3..78 (layers is the id bound).
-    pub const GLM5: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
+    pub const DEEPSEEK_V41: Self = Self { hidden: 5120, experts: 384, topk: 6, intermediate: 2304, layers: 40, activation: ExpertActivation::SiluClamp10 };
+    pub const DEEPSEEK_V4_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 6, intermediate: 2048, layers: 43, activation: ExpertActivation::SiluClamp10 };
+    pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072, layers: 61, activation: ExpertActivation::SiluClamp10 };
+    /// GLM 5.3 (glm_moe_dsa): routed layers 3..78 (layers is the id bound), unclamped SiLU.
+    pub const GLM5: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78, activation: ExpertActivation::SiluUnclamped };
     /// MiMo V2 Flash (mimo_v2_flash): routed layers 1..48, FP8 experts.
-    pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48 };
+    pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48, activation: ExpertActivation::SiluUnclamped };
     /// MiMo V2.6 Pro (mimo_v2): routed layers 1..70, MXFP4 experts.
-    pub const MIMO_V26_PRO: Self = Self { hidden: 6144, experts: 384, topk: 8, intermediate: 2048, layers: 70 };
+    pub const MIMO_V26_PRO: Self = Self { hidden: 6144, experts: 384, topk: 8, intermediate: 2048, layers: 70, activation: ExpertActivation::SiluUnclamped };
     /// GLM 5.3 Flash (glm5_next): routed layers 3..45, SwiGLU clamped at 10.
-    pub const GLM5_FLASH: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
+    pub const GLM5_FLASH: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45, activation: ExpertActivation::SiluClamp10 };
     /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
-    pub const QWEN4: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48 };
+    pub const QWEN4: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48, activation: ExpertActivation::SiluUnclamped };
     /// Kimi K3 latent MoE: experts see the 3584-wide `routed_expert_down_proj`
     /// output (not the 7168 residual); routed layers 1..93, sigmoid top-16, Situ.
-    pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93 };
+    pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93, activation: ExpertActivation::Situ4_25 };
 
     /// Mistral Large 4 (mistral_large4): routed layers 1..72, softmax top-4,
     /// SiLU unclamped, one shared expert on the coordinator.
-    pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
+    pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72, activation: ExpertActivation::SiluUnclamped };
     /// MiniMax M3.1 Flash: native NVFP4 routed layers 3..60, SwiGLU-OAI.
-    pub const MINIMAX_M3: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 3072, layers: 60 };
+    pub const MINIMAX_M3: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 3072, layers: 60, activation: ExpertActivation::SwigluOai7 };
     /// Inkling 2 Small: every layer routed (48), sigmoid top-8, SiTU (4/25);
     /// experts MXFP8, native NVFP4 or EXL3 K4 by checkpoint and layer.
-    pub const INKLING2: Self = Self { hidden: 4608, experts: 384, topk: 8, intermediate: 2304, layers: 48 };
+    pub const INKLING2: Self = Self { hidden: 4608, experts: 384, topk: 8, intermediate: 2304, layers: 48, activation: ExpertActivation::Situ4_25 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
-    pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
+    pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91, activation: ExpertActivation::SiluPostClamp7 };
     /// Muse Spark: experts see the 4096-wide `pre_expert_proj` stream (not the
     /// 8192 residual); 62 routed layers, sigmoid top-8, each expert's output
     /// RMS-normalized before its routing weight.
-    pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62 };
+    pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62, activation: ExpertActivation::SiluUnclamped };
     /// Hy4-flash (`hy_v4_flash`): latent MoE experts see the 1536-wide
     /// `routed_expert_down_proj` stream (not the 3072 residual); routed layers
     /// 1..42 (41 layers, layer 0 dense), sigmoid top-16, SwiGLU clamped at 10.
-    pub const HY4_FLASH: Self = Self { hidden: 1536, experts: 512, topk: 16, intermediate: 1536, layers: 42 };
+    pub const HY4_FLASH: Self = Self { hidden: 1536, experts: 512, topk: 16, intermediate: 1536, layers: 42, activation: ExpertActivation::SiluClamp10 };
     /// Hy4 (`hy_v4_vl`): direct MoE on 6144 hidden, routed layers 1..78 (77 layers,
     /// layer 0 dense), 256 experts top-8, intermediate 2048, SwiGLU clamped at 10,
-    /// EXL3 K4 MUL1 only (#2550). Note: shares the `(6144, 256, 8, 2048, 78)` 5-tuple
-    /// with [`Self::GLM5`] (unclamped SiLU), so Step 3 Spark/RTX package bring-up
-    /// will disambiguate `family()` / `swiglu_limit()` explicitly rather than by
-    /// `same_shape()` alone; wire/ring sizing depends only on `(hidden, topk)`.
-    pub const HY4: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
+    /// EXL3 K4 MUL1 only (#2550). Distinguished from [`Self::GLM5`] (unclamped SiLU)
+    /// by `activation: ExpertActivation::SiluClamp10`.
+    pub const HY4: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78, activation: ExpertActivation::SiluClamp10 };
+
+    /// Construct a geometry from legacy 5-tuple wire dimensions (such as
+    /// `WorkerIdentity`'s fixed `[u32; 5]` field, where the checkpoint digest
+    /// already distinguishes families and only wire/ring sizing is computed).
+    /// Callers selecting a family kernel or activation must pass `activation`
+    /// explicitly (or use the family `const`) so `GLM5` and `HY4` never alias.
+    pub const fn from_wire_dims(hidden: u32, experts: u32, topk: u32, intermediate: u32, layers: u32) -> Self {
+        let activation = match (hidden, experts, topk, intermediate) {
+            (6144, 256, 8, 2048)
+            | (4096, 256, 8, 2048)
+            | (6144, 384, 8, 2048)
+            | (2560, 512, 10, 640)
+            | (6144, 128, 4, 6144)
+            | (4096, 256, 8, 4096) => ExpertActivation::SiluUnclamped,
+            (4096, 352, 8, 1536) => ExpertActivation::SiluPostClamp7,
+            (6144, 128, 4, 3072) => ExpertActivation::SwigluOai7,
+            (3584, 896, 16, 3072) | (4608, 384, 8, 2304) => ExpertActivation::Situ4_25,
+            _ => ExpertActivation::SiluClamp10,
+        };
+        Self { hidden, experts, topk, intermediate, layers, activation }
+    }
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -424,6 +466,8 @@ impl ExpertGeometry {
     /// and exporter `--geometry` name of the AOT kernels built for this shape.
     /// The layer-id bound is not part of the kernel shape: an FP8 GLM catalog
     /// also serves its MTP layer (id 78, bound 79) with the `glm` kernels.
+    /// `same_shape` includes `activation`, so `GLM5` (unclamped) and `HY4`
+    /// (SwiGLU clamped at 10) never collide.
     pub fn family(&self) -> Option<&'static str> {
         [
             (Self::DEEPSEEK_V41, "v41"),
@@ -441,6 +485,7 @@ impl ExpertGeometry {
             (Self::MINIMAX_M3, "minimax"),
             (Self::INKLING2, "inkling2"),
             (Self::HY4_FLASH, "hy4f"),
+            (Self::HY4, "hy4"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
@@ -459,31 +504,30 @@ impl ExpertGeometry {
             .checked_mul(self.hidden as usize * 2)).flatten()
     }
 
-    /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
-    /// Qwen 3.8 Flash Next Kimi K3, Muse Spark and Mistral Large 4 are unclamped (`None`).
-    pub fn swiglu_limit(&self) -> Option<f32> {
-        if self.same_shape(&Self::STEP5) || self.same_shape(&Self::MINIMAX_M3) { return Some(7.0); }
-        (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
-            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)
-            && !self.same_shape(&Self::INKLING2)).then_some(10.0)
-    }
-
-    /// Expert arithmetic; existing families retain their legacy rounding exactly.
-    pub fn activation(&self) -> crate::FfnActivation {
-        if self.same_shape(&Self::MINIMAX_M3) {
-            crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }
-        } else if self.same_shape(&Self::KIMI_K3) || self.same_shape(&Self::INKLING2) {
-            crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }
-        } else if self.same_shape(&Self::STEP5) {
-            crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }
-        } else {
-            crate::FfnActivation::SiluBf16Product { limit: self.swiglu_limit() }
+    /// Routed-expert SwiGLU clamp derived from the explicit [`Self::activation`]
+    /// field: DeepSeek, GLM 5.3 Flash, Hy4-flash, and Hy4 clamp gate/up at 10;
+    /// Step-5 and MiniMax clamp at 7; unclamped SiLU and SiTU families return `None`.
+    pub const fn swiglu_limit(&self) -> Option<f32> {
+        match self.activation {
+            ExpertActivation::SiluClamp10 => Some(10.0),
+            ExpertActivation::SiluPostClamp7 | ExpertActivation::SwigluOai7 => Some(7.0),
+            ExpertActivation::SiluUnclamped | ExpertActivation::Situ4_25 => None,
         }
     }
 
-    /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.
+    /// Expert arithmetic; existing families retain their legacy rounding exactly.
+    pub const fn activation(&self) -> crate::FfnActivation {
+        match self.activation {
+            ExpertActivation::SiluUnclamped => crate::FfnActivation::SiluBf16Product { limit: None },
+            ExpertActivation::SiluClamp10 => crate::FfnActivation::SiluBf16Product { limit: Some(10.0) },
+            ExpertActivation::SiluPostClamp7 => crate::FfnActivation::SiluPostClampFp32Product { limit: 7.0 },
+            ExpertActivation::SwigluOai7 => crate::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 },
+            ExpertActivation::Situ4_25 => crate::FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) },
+        }
+    }
+
+    /// Equal kernel shape (hidden, experts, top-k, intermediate, activation),
+    /// independent of the layer bound.
     pub fn same_shape(&self, other: &Self) -> bool {
         Self { layers: other.layers, ..*self } == *other
     }
@@ -798,6 +842,66 @@ mod tests {
         assert_eq!(hy4.slice(3), Some(512));
         assert_eq!(hy4.slice(4), Some(384));
         assert_eq!(hy4.slice(6), Some(256));
+    }
+
+    #[test]
+    fn glm5_and_hy4_are_distinct_and_all_family_consts_map_cleanly() {
+        use crate::FfnActivation;
+        // GLM5 and HY4 share identical (hidden, experts, topk, intermediate, layers)
+        // but must never collide in equality, same_shape, family, swiglu_limit, or activation.
+        assert_eq!(
+            (ExpertGeometry::GLM5.hidden, ExpertGeometry::GLM5.experts, ExpertGeometry::GLM5.topk,
+             ExpertGeometry::GLM5.intermediate, ExpertGeometry::GLM5.layers),
+            (ExpertGeometry::HY4.hidden, ExpertGeometry::HY4.experts, ExpertGeometry::HY4.topk,
+             ExpertGeometry::HY4.intermediate, ExpertGeometry::HY4.layers),
+        );
+        assert_ne!(ExpertGeometry::GLM5, ExpertGeometry::HY4);
+        assert!(!ExpertGeometry::GLM5.same_shape(&ExpertGeometry::HY4));
+        assert!(!ExpertGeometry::HY4.same_shape(&ExpertGeometry::GLM5));
+        assert_eq!(ExpertGeometry::GLM5.family(), Some("glm"));
+        assert_eq!(ExpertGeometry::GLM5.swiglu_limit(), None);
+        assert_eq!(ExpertGeometry::GLM5.activation(), FfnActivation::SiluBf16Product { limit: None });
+        assert_eq!(ExpertGeometry::HY4.family(), Some("hy4"));
+        assert_eq!(ExpertGeometry::HY4.swiglu_limit(), Some(10.0));
+        assert_eq!(ExpertGeometry::HY4.activation(), FfnActivation::SiluBf16Product { limit: Some(10.0) });
+        // Layer-bound variations preserve family identity without aliasing.
+        assert_eq!(ExpertGeometry { layers: 79, ..ExpertGeometry::GLM5 }.family(), Some("glm"));
+        assert_eq!(ExpertGeometry { layers: 79, ..ExpertGeometry::HY4 }.family(), Some("hy4"));
+        assert!(!ExpertGeometry { layers: 79, ..ExpertGeometry::GLM5 }.same_shape(&ExpertGeometry::HY4));
+        assert!(!ExpertGeometry { layers: 79, ..ExpertGeometry::HY4 }.same_shape(&ExpertGeometry::GLM5));
+
+        // Exhaustive check: every existing family const keeps its exact mapping,
+        // and no two family consts collide under same_shape().
+        let expected: &[(ExpertGeometry, &str, Option<f32>, FfnActivation, bool)] = &[
+            (ExpertGeometry::DEEPSEEK_V41, "v41", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+            (ExpertGeometry::DEEPSEEK_V4_FLASH, "dsv4f", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+            (ExpertGeometry::DEEPSEEK_V4_PRO, "dsv4p", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+            (ExpertGeometry::GLM5, "glm", None, FfnActivation::SiluBf16Product { limit: None }, false),
+            (ExpertGeometry::MIMO_V2_FLASH, "mimo", None, FfnActivation::SiluBf16Product { limit: None }, false),
+            (ExpertGeometry::MIMO_V26_PRO, "mimop", None, FfnActivation::SiluBf16Product { limit: None }, false),
+            (ExpertGeometry::GLM5_FLASH, "glmf", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+            (ExpertGeometry::QWEN4, "qwen4", None, FfnActivation::SiluBf16Product { limit: None }, false),
+            (ExpertGeometry::KIMI_K3, "kimik3", None, FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }, false),
+            (ExpertGeometry::MISTRAL_LARGE4, "ml4", None, FfnActivation::SiluBf16Product { limit: None }, false),
+            (ExpertGeometry::MINIMAX_M3, "minimax", Some(7.0), FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }, false),
+            (ExpertGeometry::INKLING2, "inkling2", None, FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }, false),
+            (ExpertGeometry::STEP5, "step5", Some(7.0), FfnActivation::SiluPostClampFp32Product { limit: 7.0 }, false),
+            (ExpertGeometry::MUSE_SPARK, "muse", None, FfnActivation::SiluBf16Product { limit: None }, true),
+            (ExpertGeometry::HY4_FLASH, "hy4f", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+            (ExpertGeometry::HY4, "hy4", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),
+        ];
+        for (i, &(g, fam, limit, act, partial)) in expected.iter().enumerate() {
+            assert_eq!(g.family(), Some(fam), "family mismatch for {fam}");
+            assert_eq!(g.swiglu_limit(), limit, "swiglu_limit mismatch for {fam}");
+            assert_eq!(g.activation(), act, "activation mismatch for {fam}");
+            assert_eq!(g.partial_replies(), partial, "partial_replies mismatch for {fam}");
+            assert!(g.same_shape(&g), "self same_shape failed for {fam}");
+            for (j, &(other, other_fam, ..)) in expected.iter().enumerate() {
+                if i != j {
+                    assert!(!g.same_shape(&other), "collision between {fam} and {other_fam}");
+                }
+            }
+        }
     }
 
     #[test]

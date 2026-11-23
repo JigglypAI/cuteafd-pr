@@ -298,7 +298,8 @@ impl ProcessOwners {
     pub fn spark_link(&mut self, i: &GlmfInputs<'_>, bf16: bool) -> Result<(), p::Refusal> {
         if i.spark_ranks == 0 { return Ok(()); }
         let geometry = cuteafd_core::ExpertGeometry { hidden: i.cfg.hidden as u32, experts: i.cfg.experts as u32,
-            topk: i.cfg.topk as u32, intermediate: i.cfg.moe_intermediate as u32, layers: i.cfg.layers as u32 };
+            topk: i.cfg.topk as u32, intermediate: i.cfg.moe_intermediate as u32, layers: i.cfg.layers as u32,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10 };
         self.links.push(PreparedSparkLink::endpoint("glmf.spark", 0, SparkEndpointOwners {
             ranks: i.spark_ranks, geometry, endpoint: cuteafd_core::SparkEndpoint {
                 capacity: u32::try_from(i.prefill_rows.max(i.decode_rows)).map_err(|_| p::Refusal::Overflow("Flash wire rows"))?,

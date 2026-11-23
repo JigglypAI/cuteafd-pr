@@ -2694,7 +2694,8 @@ impl Opened {
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
                 else { cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
                     experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
-                    intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
+                    intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)?,
+                    activation: cuteafd_core::ExpertActivation::SiluClamp10 } };
             let capacity = u32::try_from(args.expert_rows())?;
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };

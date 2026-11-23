@@ -836,7 +836,7 @@ impl FamilyModel for Model {
                         "hy4:exl3-k45".into()
                     },
                     block: 128,
-                    // 2048 / 128 = 16 blocks -> planned hy4:exl3 Spark worlds 3..=6 (#2550).
+                    // 2048 / 128 = 16 blocks -> matches spark-package-ranges.json hy4:exl3 worlds 3..=6.
                     spark_worlds: vec![3, 4, 5, 6],
                     local: if is_mul1 {
                         Ok("Hy4 RTX EXL3 K4 MUL1 onboarding (whole 2048 or TP2 1024+1024)".into())

@@ -30,7 +30,8 @@ fn production_link(cfg: &GlmDsaConfig, ranks: usize, shape: PrefillShape, prefil
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
         experts: cfg.experts as u32, topk: cfg.topk as u32,
-        intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     PreparedSparkLink::endpoint(if prefill { "test.prefill" } else { "test.decode" }, 0,
         SparkEndpointOwners { ranks, geometry,
             endpoint: cuteafd_core::SparkEndpoint { capacity: shape.rows as u32,

@@ -451,6 +451,11 @@ fn hy4_exl3_k4_mul1_placement_fits_min_max_and_k6_compact() {
     //    - 2x RTX PRO 6000 (96 GiB) + 6 Sparks (121 GiB) ContextSplit FP8 KV -> hits 2M target!
     let dir_orig = synthetic_hy4_snapshot(true, None);
     let input_orig = PlanInput::open(dir_orig.path()).unwrap();
+    let cat_geom = input_orig.expert_catalog().unwrap().routed_experts().geometry().unwrap();
+    assert_eq!(cat_geom, cuteafd_core::ExpertGeometry::HY4);
+    assert_eq!(cat_geom.family(), Some("hy4"));
+    assert_eq!(cat_geom.swiglu_limit(), Some(10.0));
+    assert!(!cat_geom.same_shape(&cuteafd_core::ExpertGeometry::GLM5));
     let mut layout_min = LayoutOptions::default();
     layout_min.rtx_bytes = vec![96 * GIB];
     layout_min.spark_bytes = 121 * GIB;

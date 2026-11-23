@@ -194,7 +194,8 @@ impl MuseSparkConfig {
     /// Routed expert kernel shape: experts see the `moe_hidden_size` stream.
     pub fn expert_geometry(&self) -> cuteafd_core::ExpertGeometry {
         cuteafd_core::ExpertGeometry { hidden: self.expert_hidden as u32, experts: self.experts as u32,
-            topk: self.topk as u32, intermediate: self.moe_intermediate as u32, layers: self.layers as u32 }
+            topk: self.topk as u32, intermediate: self.moe_intermediate as u32, layers: self.layers as u32,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped }
     }
 
     /// Residual gate coefficients for one gate parameter `g` (FP32, as the reference).

@@ -228,7 +228,8 @@ mod load_order_tests {
     #[test]
     fn shuffled_native_checkpoint_weights_and_admission_are_byte_identical() -> Result<()> {
         let shape = RoutedExpertShape { layers: 5, first_layer: 1, experts: 2, topk: 1,
-            hidden: 128, intermediate: 768, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 768, draft_stages: 0, draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let layers = [1, 3, 4];
         for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4, ExpertFormat::Bf16] {
             let root = tempfile::tempdir()?;

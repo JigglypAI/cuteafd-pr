@@ -319,7 +319,7 @@ mod tests {
         write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
         let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
             layers: 2, first_layer: 0, experts: 8, topk: 8, hidden: 4096, intermediate: 256,
-            draft_stages: 0, draft_experts: 0 })?;
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluClamp10 })?;
         let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 8, topk: 8,
             tp: 2, wire_input: false, nvfp4_input: false, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
@@ -348,7 +348,7 @@ mod tests {
         write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
         let tensors = Fp8ExpertTensors::read(root.path(), cuteafd_loader::RoutedExpertShape {
             layers: 1, first_layer: 0, experts: 1, topk: 1, hidden: 4096, intermediate: 256,
-            draft_stages: 0, draft_experts: 0 })?;
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped })?;
         assert_eq!(tensors.scale_region_bytes_with(cuteafd_loader::formats::fp8_experts::Fp8Projection::Gate,
             2, 0, Slicing::Blocks(128))?, 128);
         let error = crate::shared::memory::push_fp8::RankPlan::from_tensors(&tensors,
@@ -360,7 +360,8 @@ mod tests {
     #[test]
     fn sparse_backbone_inventory_preserves_ids_and_rejects_gaps() -> Result<()> {
         let shape = cuteafd_loader::RoutedExpertShape { layers: 18, first_layer: 3,
-            experts: 1, topk: 1, hidden: 256, intermediate: 256, draft_stages: 1, draft_experts: 1 };
+            experts: 1, topk: 1, hidden: 256, intermediate: 256, draft_stages: 1, draft_experts: 1,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let layers = [3, 13, 15];
         for rank in 0..2 {
             validate_layers(&layers, &shape, rank)?;
@@ -404,7 +405,7 @@ mod tests {
             }
             write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
             let tensors = Fp8ExpertTensors::read(root.path(), RoutedExpertShape { layers: 1, first_layer: 0,
-                experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
+                experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped })?;
             for rank in 0..2 {
                 let mut info = Fp8MoeInfo { hidden, intermediate, slice: tensors.rank_width(2, rank, Slicing::Blocks(128))?,
                     experts: 1, topk, tp: 2, wire_input: format == ExpertFormat::Mxfp8, nvfp4_input: false,

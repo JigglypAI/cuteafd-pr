@@ -592,7 +592,7 @@ fn installed_minimax_nvfp4_push_and_mount_match_with_synthetic_payloads() -> Res
     // Keep the vendor's names, dtypes and full matrix dimensions. Only the
     // number of fixture experts is reduced; no vendor payload is read.
     let shape = RoutedExpertShape { layers: 60, first_layer: 3, experts: 32, topk: 1,
-        hidden: 6144, intermediate: 3072, draft_stages: 0, draft_experts: 0 };
+        hidden: 6144, intermediate: 3072, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SwigluOai7 };
     let tensors = Fp8ExpertTensors::read_layers(root.path(), shape, &[3].into())?;
     assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
     for expert in 0..32 {

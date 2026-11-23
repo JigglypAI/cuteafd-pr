@@ -1,7 +1,7 @@
 //! Native TP2 draft expert ownership and graph integration.
 use crate::shared::experts::rtx::draft::{rank, pair, Layout};
 pub(super) const LAYOUT: Layout = Layout {
-    geometry: cuteafd_core::ExpertGeometry { hidden: 5120, experts: 128, topk: 3, intermediate: 2304, layers: 3 },
+    geometry: cuteafd_core::ExpertGeometry { hidden: 5120, experts: 128, topk: 3, intermediate: 2304, layers: 3, activation: cuteafd_core::ExpertActivation::SiluClamp10 },
     stages: 3, owner: 1,
 };
 #[cfg(test)]

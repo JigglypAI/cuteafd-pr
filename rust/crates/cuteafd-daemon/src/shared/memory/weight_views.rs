@@ -244,7 +244,7 @@ mod tests {
                 hidden: 256,
                 intermediate: 768,
                 draft_stages: 0,
-                draft_experts: 0,
+                draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
             };
             let tensors = Fp8ExpertTensors::read_layers(dir.path(), shape, &[0].into())?;
             for world in [4, 6] {
@@ -307,7 +307,7 @@ mod tests {
                 hidden: get(&["hidden_size"]),
                 intermediate: get(&["moe_intermediate_size"]),
                 draft_stages: 0,
-                draft_experts: 0,
+                draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
             };
             let tensors =
                 Fp8ExpertTensors::read_layers(snapshot, shape, &[shape.first_layer].into())?;

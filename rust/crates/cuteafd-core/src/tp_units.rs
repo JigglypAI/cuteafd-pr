@@ -22,8 +22,30 @@ pub enum UnitMapError {
 /// Checkpoint-provenanced export coverage, shared by planner and wire admission.
 pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
     static DATA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-    &DATA.get_or_init(|| serde_json::from_str(include_str!(
-        "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
+    &DATA.get_or_init(|| {
+        let mut parsed: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges");
+        // Planned Hy4 EXL3 K4 MUL1 geometry (2048 intermediate, 128-col blocks,
+        // Spark TP3..6) until Step 3 adds the published checkpoint revision to
+        // spark-package-ranges.json and republishes placement-inputs (#2550).
+        if let Some(entries) = parsed.get_mut("entries").and_then(serde_json::Value::as_object_mut) {
+            entries.entry("hy4:exl3".to_string()).or_insert_with(|| serde_json::json!({
+                "intermediate": 2048,
+                "minimum": 3,
+                "maximum": 6,
+                "basis": "lower_bound",
+                "worlds": [3, 4, 5, 6],
+                "native_layout": {
+                    "unit_columns": 128,
+                    "storage_alignment": 1,
+                    "exact_worlds": [],
+                    "coverage_unit_columns": 128,
+                    "legacy_unit_columns": 128
+                }
+            }));
+        }
+        parsed
+    })["entries"][key]
 }
 
 /// Native microscale/storage blocks, independent of a world's ownership policy.
