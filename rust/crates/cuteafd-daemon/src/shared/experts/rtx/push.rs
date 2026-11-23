@@ -338,7 +338,7 @@ fn receive_sets_rank<'a, D: PushDestination<Delivered = ()>>(
         }).collect::<Result<Vec<_>>>().map(PushedExperts::Exl3)
         }).collect::<Result<Vec<_>>>()
     });
-    if let Err(error) = &candidate { tracing::warn!(group, rank, %error, "coordinator push candidate rejected"); }
+    if let Err(error) = &candidate { tracing::warn!(group, rank, error = %format_args!("{error:#}"), "coordinator push candidate rejected"); }
     if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push completion")? {
         let weights = candidate?;
         for ready in host_ready { ready.store(true, std::sync::atomic::Ordering::Release); }
@@ -351,10 +351,13 @@ fn receive_sets_rank<'a, D: PushDestination<Delivered = ()>>(
         tracing::info!(group, rank, expert_sets = weights.len(), layers = weights.iter().map(PushedExperts::len).sum::<usize>(), "coordinator push committed; publishing ready rank arena");
         return Ok(Some(weights));
     }
-    drop(candidate);
+    // A successful local candidate is dropped before acknowledging the group drain.
+    let allocation_error = candidate.err().filter(|error| error.chain().any(|cause|
+        matches!(cause.downcast_ref::<PushStartupError>(), Some(PushStartupError::StagingAllocation { .. }))));
     ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe startup cleanup");
     push::drained(stream).context("coordinator push drained barrier")?;
     tracing::warn!(group, rank, "whole push group discarded before coordinator startup failure");
+    if let Some(error) = allocation_error { return Err(error); }
     Ok(None)
 }
 

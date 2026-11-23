@@ -304,7 +304,7 @@ impl<'a> DenseArena<'a> {
                 }), "generated load view overlaps delivery or another finish destination");
         }
         let stream = device.run(|| device.library.cuda_stream_create())?;
-        let kernels = match LoadKernels::new(device.library) {
+        let kernels = match LoadKernels::for_push(device.library, device.id) {
             Ok(kernels) => kernels,
             Err(error) => {
                 // SAFETY: the stream was just created and has no work.
