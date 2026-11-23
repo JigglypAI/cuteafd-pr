@@ -1414,7 +1414,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), draft)|
             Proposal { id: a.ticket.id(), tokens, history: &a.history, greedy: a.job.sampling.is_greedy(),
                 head: draft.as_ref().map(|d| d.confidence.as_slice()).filter(|head| !head.is_empty()) }).collect();
-        policy.shape(&mut shaped, verify_rows);
+        policy.shape_with_padding(&mut shaped, verify_rows, |rows| engine.serving_decode_rows(rows, true));
     }
     let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, proposal)| {
         let mut rows: Vec<u32> = std::iter::once(a.next).chain(proposal.iter().copied()).collect();
