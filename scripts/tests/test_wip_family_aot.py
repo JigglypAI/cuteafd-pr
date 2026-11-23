@@ -847,11 +847,12 @@ def _serve_mock_hub(monkeypatch, routes: dict[str, tuple[int, dict[str, str], by
             monkeypatch.setenv('HF_HUB_OFFLINE', '0')
             monkeypatch.setenv('HF_HUB_DISABLE_TELEMETRY', '1')
             monkeypatch.setenv('HF_HUB_DISABLE_XET', '1')
-            # Patch huggingface_hub constants cached at import time so HF_ENDPOINT/offline updates apply.
+            # Hub may already have imported and cached these environment values.
             import huggingface_hub.constants as hf_const
             monkeypatch.setattr(hf_const, 'ENDPOINT', url)
             monkeypatch.setattr(hf_const, 'HUGGINGFACE_CO_URL_TEMPLATE', url_template)
             monkeypatch.setattr(hf_const, 'HF_HUB_OFFLINE', False)
+            monkeypatch.setattr(hf_const, 'HF_HUB_DISABLE_TELEMETRY', True)
             yield requests
         finally:
             server.shutdown()
