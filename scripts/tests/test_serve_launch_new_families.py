@@ -851,6 +851,14 @@ def test_muse_target_kv_reaches_plan_and_serve(tmp_path: Path, selection: str, e
     assert _flag(serve, "--kv-cache") == _flag(plan, "--kv-cache") == expected
 
 
+def test_muse_plan_and_serve_share_graph_reserve_and_media_cache(tmp_path: Path) -> None:
+    result = _muse(tmp_path, "VISION=auto\nGPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB\nMEDIA_CACHE_BYTES=2GiB\n")
+    serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
+    for line in (plan, serve):
+        assert "CUTEAFD_GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB" in line
+    assert _flag(serve, "--media-cache-bytes") == _flag(plan, "--media-cache-bytes") == "2GiB"
+
+
 def test_muse_invalid_target_kv_is_refused_before_launch(tmp_path: Path) -> None:
     result = _muse(tmp_path, "KV_CACHE=int8\n")
     assert result.returncode == 2
