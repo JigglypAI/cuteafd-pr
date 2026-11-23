@@ -345,6 +345,13 @@ impl ExpertGeometry {
     /// `routed_expert_down_proj` stream (not the 3072 residual); routed layers
     /// 1..42 (41 layers, layer 0 dense), sigmoid top-16, SwiGLU clamped at 10.
     pub const HY4_FLASH: Self = Self { hidden: 1536, experts: 512, topk: 16, intermediate: 1536, layers: 42 };
+    /// Hy4 (`hy_v4_vl`): direct MoE on 6144 hidden, routed layers 1..78 (77 layers,
+    /// layer 0 dense), 256 experts top-8, intermediate 2048, SwiGLU clamped at 10,
+    /// EXL3 K4 MUL1 only (#2550). Note: shares the `(6144, 256, 8, 2048, 78)` 5-tuple
+    /// with [`Self::GLM5`] (unclamped SiLU), so Step 3 Spark/RTX package bring-up
+    /// will disambiguate `family()` / `swiglu_limit()` explicitly rather than by
+    /// `same_shape()` alone; wire/ring sizing depends only on `(hidden, topk)`.
+    pub const HY4: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {

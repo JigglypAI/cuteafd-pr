@@ -979,6 +979,29 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         return Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
+    if config["model_type"] == "hy_v4_vl" {
+        let cfg = crate::families::hy4::Hy4Config::from_hf(config)?;
+        cfg.release_geometry()?;
+        let first_layer = cfg.dense_layer.iter().position(|&dense| !dense)
+            .context("Hy4 config has no routed layers")?;
+        let end = cfg.dense_layer.iter().rposition(|&dense| !dense).unwrap() + 1;
+        ensure!(cfg.dense_layer[first_layer..end].iter().all(|&dense| !dense),
+            "Hy4 routed layer set is not contiguous");
+        let shape = RoutedExpertShape {
+            layers: end,
+            first_layer,
+            experts: cfg.experts,
+            topk: cfg.topk,
+            hidden: cfg.hidden,
+            intermediate: cfg.moe_intermediate,
+            draft_stages: 0,
+            draft_experts: 0,
+        };
+        let is_exl3 = config["quantization_config"]["quant_method"] == "exl3"
+            || checkpoint.is_some_and(|c| c.contains_tensor(&format!("model.layers.{first_layer}.mlp.experts.0.gate_proj.trellis")));
+        ensure!(is_exl3, "Hy4 expert catalog supports EXL3 MUL1 checkpoints; BF16 fused experts have no Spark/RTX package");
+        return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
+    }
     if config["model_type"] == "hy_v4_flash" {
         let cfg = crate::families::hy4_flash::Hy4FlashConfig::from_hf(config)?;
         cfg.release_geometry()?;
