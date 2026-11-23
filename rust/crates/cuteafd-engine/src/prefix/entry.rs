@@ -62,6 +62,9 @@ pub(crate) struct Entry<M> {
     pub mark: Option<Mark>,
     pub after: After,
     pub meta: M,
+    /// First row whose state may differ from an exact prefill (an approximate replay's taint
+    /// row, inherited by descendants); positional state is then approximate throughout.
+    pub approximate_from: Option<usize>,
     pub draft: Option<super::DraftPageAttachment>,
     pub last_use: u64,
     /// The host tier's write-behind copy, when one was issued.

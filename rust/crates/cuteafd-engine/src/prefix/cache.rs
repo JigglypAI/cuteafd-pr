@@ -15,7 +15,15 @@
 //! [`PrefixCache::release`] drops the placement's references.
 //!
 //! Selection is the most computation saved under the family's [`ReuseRule`](cuteafd_core::prefix::ReuseRule)
-//! (`cuteafd_core::prefix::Retention`, prompts and turns in bounded banks). Eviction is least
+//! (`cuteafd_core::prefix::Retention`, prompts and turns in bounded banks), on both tiers: an exact
+//! ancestor wins over an approximate partial match unless the partial saves more than the rule's
+//! ancestor slack beyond it.
+//!
+//! Approximate lineage is scoped to a row ([`Entry::approximate_from`]): a placement restored by
+//! approximate replay, or from a snapshot that carries such lineage, may differ from an exact
+//! prefill from that row on (and in all of its positional state). Pages wholly before it keep
+//! token-content host identities; a later partial restore that shares only pages before it is
+//! not tainted by it. Eviction is least
 //! recently used across both banks, prompt before turn at equal use ([`victim`]); `make_room`
 //! runs before every admission and capture that needs pages. A restore that cannot complete is a
 //! cache miss, never a request error.
@@ -105,8 +113,11 @@ pub struct Source {
     pub host: bool,
     /// A divergent match, not a retained ancestor. Numerical fidelity is separate.
     pub partial: bool,
-    /// The family's restore plan.
+    /// The family's restore plan; its fidelity covers inherited lineage too.
     pub plan: RestorePlan,
+    /// First row whose restored state may differ from an exact prefill (positional state is then
+    /// approximate throughout); `None` for an exact restore.
+    pub approximate_from: Option<usize>,
 }
 
 /// An admitted request: its placement, the rows already in it, and the first token's source
@@ -127,6 +138,8 @@ pub struct HostPayload<M = ()> {
     pub media: Vec<MediaSpan>,
     /// The family's snapshot metadata ([`PrefixFamily::capture_meta`]).
     pub family: M,
+    /// The snapshot's approximate lineage ([`PrefixFamily::approximate_from`]).
+    pub approximate_from: Option<usize>,
     pub draft: Option<super::DraftPageAttachment>,
 }
 
@@ -141,8 +154,11 @@ pub struct PrefixStats {
     pub exact_hits: u64,
     /// Hits on a divergent match, including exactly reusable paged state.
     pub partial_hits: u64,
-    /// Restores explicitly labelled ApproximateReplay by the family plan.
+    /// Restores whose own plan replays approximately (a partial match under a replay rule).
     pub approximate_replay_hits: u64,
+    /// Restores that replay nothing themselves but reuse state descended from an approximate
+    /// replay (pages from its taint row on, or its positional mark); labelled ApproximateReplay.
+    pub approximate_lineage_hits: u64,
     pub hit_tokens: u64,
     /// Host-tier restores: a lookup that re-inserted the entry from the host cache
     /// (`host_mark: Some(..)`). Not [`Self::mark_promotions`], which counts host mark
@@ -411,29 +427,30 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 self.device_compatible_hit(tokens, media, sampled, compatible)
             } else { self.lookup_media(tokens, media, sampled) };
             let rule = self.layout.rule;
-            let host_deeper = compatible.is_some_and(|compatible| self.host_compatible_hit(tokens, media,
-                sampled, compatible).is_some_and(|(host, resume)| rule.rank(host.common, host.frontier, resume)
-                    > hit.as_ref().map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume))));
-            let host_ancestor = self.layout.rule.prefers_ancestors()
-                && hit.as_ref().is_some_and(|h| h.common < h.frontier)
+            let device_rank = hit.as_ref().map_or((0, false), |h| rule.rank(h.common, h.frontier, h.resume));
+            // A host snapshot that ranks above the device hit under the same rule (rows saved,
+            // with the ancestor slack of an approximate partial rule) is promoted. Exact-only
+            // families keep their device hit unless a compatibility check applies.
+            let host_better = (compatible.is_some() || rule.approximate_partial()) && hit.is_some()
                 && self.host_verified_hit(tokens, media, sampled, compatible)
-                    .is_some_and(|(h, _)| h.common == h.frontier);
-            if hit.is_none() || host_deeper || host_ancestor {
+                    .is_some_and(|(host, resume)| rule.rank(host.common, host.frontier, resume) > device_rank);
+            if hit.is_none() || host_better {
+                let device = hit.take();
                 let restored = self.promote(family, tokens, media, sampled, compatible)?;
                 promoted = restored.is_some();
-                // Promotion can evict the previous device candidate before failing.
-                // Do not fall back to approximate replay if an ancestor was available.
-                hit = if promoted || host_ancestor { restored }
+                // Promotion can evict the previous device candidate before failing: fall back to
+                // it only while it is still retained.
+                hit = if promoted { restored }
                 else if let Some(compatible) = compatible {
                     self.device_compatible_hit(tokens, media, sampled, compatible)
-                } else { None };
+                } else { device.filter(|h| self.entries.contains_key(&h.id)) };
             }
             if let Some(hit) = hit {
                 if compatible.is_some() {
                     self.clock += 1;
                     if let Some(entry) = self.entries.get_mut(&hit.id) { entry.last_use = self.clock; }
                 }
-                let context = RestoreContext { native_tokens: native, media };
+                let context = RestoreContext { native_tokens: native, media, approximate_from: None };
                 let result = self.restore_hit(family, &hit, tokens, &context, total, capacity.max(tokens.len()), promoted, &mut build);
                 if promoted {
                     let mark = self.entries.get_mut(&hit.id).and_then(|e| e.mark.take());
@@ -530,23 +547,25 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn peek_media(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> usize {
         if !self.enabled() { return 0; }
         let rule = self.layout.rule;
+        // (rank, resume): the better-ranked tier and the rows it saves.
+        let none = ((0, false), 0);
         let device = if media.is_empty() {
             let mut query = tokens;
             loop {
-                let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break (false, 0) };
-                let Some(entry) = self.entries.get(&id) else { break (false, 0) };
+                let Some((common, frontier, &id)) = self.retained.peek_reusable(query) else { break none };
+                let Some(entry) = self.entries.get(&id) else { break none };
                 let resume = self.layout.rule.skipped(common, frontier);
-                if !verify_media(resume, &entry.media, media) { break (false, 0); }
+                if !verify_media(resume, &entry.media, media) { break none; }
                 if resume == tokens.len() && !entry.after.serves(sampled) {
-                    if query.len() < tokens.len() || tokens.len() < 2 { break (false, 0); }
+                    if query.len() < tokens.len() || tokens.len() < 2 { break none; }
                     query = &tokens[..tokens.len() - 1];
-                } else { break rule.rank(common, frontier, resume); }
+                } else { break (rule.rank(common, frontier, resume), resume); }
             }
         } else {
-            self.device_media_hit(tokens, media, sampled).0.map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume))
+            self.device_media_hit(tokens, media, sampled).0.map_or(none, |h| (rule.rank(h.common, h.frontier, h.resume), h.resume))
         };
         let host = self.host_verified_hit(tokens, media, sampled, None)
-            .map_or((false, 0), |(h, resume)| rule.rank(h.common, h.frontier, resume));
+            .map_or(none, |(h, resume)| (rule.rank(h.common, h.frontier, resume), resume));
         device.max(host).1
     }
 
@@ -555,10 +574,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         compatible: &dyn Fn(&M, usize) -> bool) -> usize {
         if !self.enabled() { return 0; }
         let rule = self.layout.rule;
+        let none = ((0, false), 0);
         let device = self.device_compatible_hit(tokens, media, sampled, compatible)
-            .map_or((false, 0), |h| rule.rank(h.common, h.frontier, h.resume));
+            .map_or(none, |h| (rule.rank(h.common, h.frontier, h.resume), h.resume));
         let host = self.host_compatible_hit(tokens, media, sampled, compatible)
-            .map_or((false, 0), |(h, resume)| rule.rank(h.common, h.frontier, resume));
+            .map_or(none, |(h, resume)| (rule.rank(h.common, h.frontier, resume), resume));
         device.max(host).1
     }
 
@@ -587,7 +607,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     fn device_media_hit(&self, tokens: &[u32], media: &[MediaSpan], sampled: bool) -> (Option<Hit>, u64) {
         let mut best = None;
-        let mut rank = ((false, 0), false, 0);
+        let mut rank = ((0, false), false, 0);
         let mut collisions = 0;
         for (&id, entry) in &self.entries {
             let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &entry.tokens,
@@ -617,7 +637,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         -> (Option<(cuteafd_hostcache::snapshot::Hit, usize)>, u64) {
         let Some(host) = &self.host else { return (None, 0) };
         let mut best = None;
-        let mut rank = ((false, 0), false, 0);
+        let mut rank = ((0, false), false, 0);
         let mut collisions = 0;
         for (meta, key, payload) in host.resident_payloads() {
             let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &meta.tokens,
@@ -681,7 +701,13 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
         let (fork_pages, copies) = self.pool.fork_writable(&entry.pages, source_end, total, writable)?;
         let ancestor = plan.restores_mark();
-        if family.approximate_snapshot(&entry.meta) { plan.fidelity = RestoreFidelity::ApproximateReplay; }
+        // Scoped lineage: an ancestor restore reuses the snapshot's positional state, so it
+        // inherits any lineage; a partial restore inherits it only when it shares a page row
+        // at or past the snapshot's taint row. Its own replay taints rows from `source_end`.
+        let replays = !plan.exact();
+        let inherited = entry.approximate_from.filter(|&from| ancestor || from < source_end);
+        let approximate_from = inherited.into_iter().chain(replays.then_some(source_end)).min();
+        if approximate_from.is_some() { plan.fidelity = RestoreFidelity::ApproximateReplay; }
         let (mut mark, meta) = if ancestor { (entry.mark.clone(), Some(entry.meta.clone())) } else { (None, None) };
         let host_mark = if ancestor && self.layout.mark_bytes > 0 && mark.is_none() { entry.host_mark } else { None };
         let after = (resume == tokens.len()).then(|| entry.after.clone());
@@ -708,7 +734,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 self.stats.cow_copies += 1;
                 family.copy_rows(copy).map_err(|e| ("copy", e))
             }))
-            .and_then(|()| family.restore_with(mark.as_ref(), meta.as_ref(), &mut placement, &plan, context)
+            .and_then(|()| family.restore_with(mark.as_ref(), meta.as_ref(), &mut placement, &plan,
+                &RestoreContext { approximate_from, ..*context })
                 .map_err(|e| ("restore", e)))
             .and_then(|()| match family.restore_draft_pages(draft.as_ref(), &mut placement, resume) {
                 Err(error) if draft.is_some() && draft_exhaustion(error.as_ref()).is_some() =>
@@ -742,13 +769,15 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.stats.hit_tokens += resume as u64;
         self.stats.exact_hits += u64::from(after.is_some() && plan.exact());
         self.stats.partial_hits += u64::from(!ancestor);
-        self.stats.approximate_replay_hits += u64::from(plan.fidelity == RestoreFidelity::ApproximateReplay);
+        self.stats.approximate_replay_hits += u64::from(replays);
+        self.stats.approximate_lineage_hits += u64::from(!replays && approximate_from.is_some());
         self.restored_session = session.clone();
         Ok(Some(Admitted {
             placement,
             resume,
             after,
-            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: host_hit, partial: !ancestor, plan }),
+            source: Some(Source { session, kind: hit.kind, frontier: hit.frontier, host: host_hit, partial: !ancestor,
+                plan, approximate_from }),
         }))
     }
 
@@ -917,6 +946,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let len = tokens.len();
         let meta = family.capture_meta(placement, len)
             .map_err(|source| PrefixError::Family { what: "capture metadata", source })?;
+        // A snapshot no longer than its taint row still holds approximate positional state.
+        let approximate_from = family.approximate_from(placement)
+            .map_err(|source| PrefixError::Family { what: "capture lineage", source })?.map(|from| from.min(len));
         // Replace the same snapshot, or keep the bank within its bound (pending captures count),
         // before taking storage.
         if let Some(old) = self.retained.bank_mut(kind).remove_exact(tokens) {
@@ -985,7 +1017,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
         };
         let entry = Entry { session: self.capture_session.clone(), tokens: tokens.to_vec(),
-            media: snapshot_media(len, media), kind, pages: fork_pages, mark, after, meta, draft,
+            media: snapshot_media(len, media), kind, pages: fork_pages, mark, after, meta, approximate_from, draft,
             last_use: 0, ticket: None, host_mark: None };
         Ok(Some(Prepared { entry, copies }))
     }
@@ -1530,10 +1562,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
 
     /// Token-only page identities are safe only when all paged state follows the target
     /// frontier. Predictor-inclusive pages can differ for the same tokens (a no-spec writer),
-    /// so use allocation identities rather than deduplicating their canonical state.
-    fn identities<F: PrefixFamily<M>>(&self, family: &F, tokens: &[u32], media: &[MediaSpan], pages: &[u32], meta: &M) -> Vec<DevicePageId> {
-        let chain = if !family.approximate_snapshot(meta) && family.write_frontier(tokens.len()) == tokens.len() {
-            page_chain_media(tokens, media, self.layout.page_rows)
+    /// so use allocation identities rather than deduplicating their canonical state. Pages at or
+    /// past an approximate lineage's taint row hold rows an exact prefill may not reproduce:
+    /// only the pages wholly before it are named by content.
+    pub(super) fn identities<F: PrefixFamily<M>>(&self, family: &F, tokens: &[u32], media: &[MediaSpan], pages: &[u32],
+        approximate_from: Option<usize>) -> Vec<DevicePageId> {
+        let chain = if family.write_frontier(tokens.len()) == tokens.len() {
+            let exact = approximate_from.unwrap_or(tokens.len()).min(tokens.len());
+            page_chain_media(&tokens[..exact], media, self.layout.page_rows)
         } else { Vec::new() };
         pages
             .iter()
@@ -1553,7 +1589,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.drain(family)?;
         let entry = self.entries.get(&id).expect("stored entry is retained");
         self.check_owners(family, &entry.pages).map_err(|source| PrefixError::Family { what: "page owners", source })?;
-        let ids = self.identities(family, &entry.tokens, &entry.media, &entry.pages, &entry.meta);
+        let ids = self.identities(family, &entry.tokens, &entry.media, &entry.pages, entry.approximate_from);
         let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
         pages[0] = entry.pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         if let Some(draft) = &entry.draft {
@@ -1571,7 +1607,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             scores: Vec::new(),
         };
         let payload = HostPayload { record_format: family.record_format(), session: entry.session.clone(), after: entry.after.clone(), media: entry.media.clone(),
-            family: entry.meta.clone(), draft: entry.draft.clone() };
+            family: entry.meta.clone(), approximate_from: entry.approximate_from, draft: entry.draft.clone() };
         let host = self.host.as_mut().expect("checked");
         let ticket = match host.store(&snapshot, payload) {
             StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => Some(ticket),
@@ -1617,6 +1653,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let saved_media = payload.media.clone();
         let session = payload.session.clone();
         let meta = payload.family.clone();
+        let approximate_from = payload.approximate_from;
         let saved_draft = payload.draft.clone();
         let (resume, common, collision) = media_resume(self.layout.rule, tokens, media, &snapshot_tokens,
             &saved_media, &after, sampled);
@@ -1665,7 +1702,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             self.give_back(family, mark)?;
             return Ok(None);
         }
-        let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages, &meta);
+        let ids = self.identities(family, &snapshot_tokens, &saved_media, &pages, approximate_from);
         let mut target_pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let tail = match Self::mark_segments(family, mark.as_ref()) {
@@ -1755,7 +1792,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         let id = self.next_id;
         self.next_id += 1;
         self.entries.insert(id, Entry { session, tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
-            meta, draft, last_use: self.clock, ticket: None, host_mark: Some(hit.key) });
+            meta, approximate_from, draft, last_use: self.clock, ticket: None, host_mark: Some(hit.key) });
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
         }

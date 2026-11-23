@@ -264,9 +264,9 @@ fn partial_hit_replay_window_boundary() {
     assert_eq!(metrics.host_hits, 4);
 }
 
-/// V4.1 host lookups keep the ancestor even when a partial would save more work.
+/// V4.1 host lookups keep the ancestor while a partial saves no more than the ancestor slack.
 #[test]
-fn exact_ancestor_precedes_a_longer_partial_match() {
+fn exact_ancestor_precedes_a_longer_partial_match_within_its_slack() {
     let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(DEVICE_BYTES);
     let ancestor = snap(&mut device, SnapshotKind::Turn, &seq(0, 250), &[id(30, 1)]);
@@ -294,7 +294,7 @@ fn exact_ancestor_precedes_a_longer_partial_match() {
     assert_eq!(hit.key, key_of_ancestor, "tie prefers the exact ancestor");
     assert_eq!((hit.common, hit.frontier), (250, 250));
 
-    // Divergence at 381 saves 380-128 = 252 > 250, but the ancestor still wins.
+    // Divergence at 381 saves 380-128 = 252 > 250, within the slack: the ancestor still wins.
     let mut query = seq(0, 381);
     query.push(999);
     let hit = cache.lookup(&query).expect("hit");
@@ -307,6 +307,34 @@ fn exact_ancestor_precedes_a_longer_partial_match() {
     let hit = cache.lookup(&query).expect("hit");
     assert_eq!(hit.key, key_of_longer);
     assert_eq!((hit.common, hit.frontier), (500, 500));
+}
+
+/// The host tier ranks by rows saved like the device: a shallow exact ancestor left after
+/// evictions loses to a deep partial that replays only the bounded window.
+#[test]
+fn deep_partial_beats_a_shallow_ancestor_beyond_the_slack() {
+    let slack = cuteafd_core::prefix::ANCESTOR_SLACK;
+    let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
+    let mut device = Device::new(DEVICE_BYTES);
+    let ancestor = snap(&mut device, SnapshotKind::Turn, &seq(0, 250), &[id(32, 1)]);
+    write_snapshot(cache.engine_mut(), &ancestor);
+    store_resident(&mut cache, &ancestor, 1);
+    let deep_len = 250 + slack + 400;
+    let deep = snap(&mut device, SnapshotKind::Prompt, &seq(0, deep_len), &[id(33, 2)]);
+    write_snapshot(cache.engine_mut(), &deep);
+    store_resident(&mut cache, &deep, 2);
+    let key_of_ancestor = cache.lookup(&seq(0, 250)).expect("ancestor").key;
+    let key_of_deep = cache.lookup(&seq(0, deep_len)).expect("deep").key;
+    // Saves 250 + slack: a tie with the ancestor's slack keeps the exact ancestor.
+    let mut query = seq(0, 250 + slack + 128);
+    query.push(999);
+    assert_eq!(cache.lookup(&query).expect("hit").key, key_of_ancestor);
+    // Two rows more: the deep partial wins.
+    let mut query = seq(0, 250 + slack + 130);
+    query.push(999);
+    let hit = cache.lookup(&query).expect("hit");
+    assert_eq!(hit.key, key_of_deep);
+    assert_eq!((hit.common, hit.frontier), (250 + slack + 130, deep_len));
 }
 
 /// Port of the sglang radix split invariants (`test_insert_then_match_round_trips` plus edge
