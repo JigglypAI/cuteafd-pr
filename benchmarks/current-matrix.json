@@ -288,6 +288,18 @@
         "status": "current",
         "report": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-mxfp8-2rtx-4spark-inkling2-mxfp8-max"
       }
+    },
+    {
+      "family": "hy4_flash",
+      "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+      "1rtx": {
+        "status": "pending",
+        "reason": "v7 bring-up, cards not yet measured"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "v7 bring-up, cards not yet measured"
+      }
     }
   ],
   "mc_views": [
