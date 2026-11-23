@@ -42,12 +42,17 @@ pub const KEEP_CUT: f64 = 0.3;
 /// 25/25/30/20 context mix, six scored families; score 0.9911 of the per-cell
 /// best cut, held-out (fit 4 families, score 2, 15 rotations) mean 0.9898.
 /// Replaces the first fit K = 3.8, M = 2, LO = 0.3, HI = 0.6 (sweep edge at
-/// 0.6). A refit changes these four.
+/// 0.6). Second refit (#2460, 2026-11-23) on the live 7-card A/B traces: round
+/// time is concave in rows (C8-C16 save 0.2-1.8 ms per removed row against the
+/// band line's 0.6-4.3), so the line overprices rows at high concurrency and
+/// K = 3.4, HI = 0.7 cut drafts that paid (Qwen4 C8 0.92). K = 2, HI = 0.45
+/// scores worst card 0.996, mean 1.0095 of `history` in counterfactual replay
+/// (error vs the measured A/B -0.009 +- 0.029). A refit changes these four.
 pub mod clamped {
-    pub const K: f64 = 3.4;
+    pub const K: f64 = 2.;
     pub const M: f64 = 1.;
     pub const LO: f64 = 0.3;
-    pub const HI: f64 = 0.7;
+    pub const HI: f64 = 0.45;
     /// Rounds a context band needs before its line sets the cut (before that: [`super::KEEP_CUT`]).
     pub const WARM_ROUNDS: u32 = 32;
     // The fit's x: (N / requests) / e, with (N, e) the OLS line of round time
@@ -1072,7 +1077,7 @@ mod tests {
         feed(&mut cost, 40_000, 0.040, 0.002, &[8, 32, 64], 20);
         let expect = |n: usize| (clamped::K / ((0.040 / n as f64) / 0.002 + clamped::M)).clamp(clamped::LO, clamped::HI);
         for n in [1, 2, 4, 8, 16] { assert!((cost.cut(40_000, n) - expect(n)).abs() < 1e-9, "C{n}"); }
-        // C1: x = 20, 3.4 / 21 < LO, so the cut is LO. C16: x = 1.25, 3.4 / 2.25 > HI, so HI.
+        // C1: x = 20, 2 / 21 < LO, so the cut is LO. C16: x = 1.25, 2 / 2.25 > HI, so HI.
         assert_eq!((cost.cut(40_000, 1), cost.cut(40_000, 16)), (clamped::LO, clamped::HI));
         assert!(cost.cut(40_000, 4) > clamped::LO && cost.cut(40_000, 4) < clamped::HI);
     }
@@ -1091,15 +1096,15 @@ mod tests {
         let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
         let mut fixed = DraftHistory::new(spec, DraftControl::History);
         let mut clamped = DraftHistory::new(spec, DraftControl::History).with_cut_rule(CutRule::Clamped);
-        let scores = [0.9, 0.8, 0.7, 0.6];
-        // Cold clamped is exactly history: cut 0.3, 0.9*0.8*0.7 = 0.504 > 0.3 keeps three.
+        let scores = [0.9, 0.6, 0.7, 0.6];
+        // Cold clamped is exactly history: cut 0.3, 0.9*0.6*0.7 = 0.378 > 0.3 keeps three.
         for policy in [&mut fixed, &mut clamped] {
             policy.begin_round(0, 8);
             assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
             assert_eq!(policy.refine(1, 4, Some(&scores)), 4);
             policy.observe(&[outcome(1, 4, 4)], false);
         }
-        // Warm the cost so C8 lands on HI = 0.7: 0.9*0.8 = 0.72 > 0.7, *0.7 = 0.504 < 0.7.
+        // Warm the cost so C8 lands on HI = 0.45: 0.9*0.6 = 0.54 > 0.45, *0.7 = 0.378 < 0.45.
         for r in [8, 32, 64] { for _ in 0..20 { clamped.observe_cost(0, r, 0.010 + 0.002 * r as f64); } }
         clamped.begin_round(0, 8);
         assert_eq!(clamped.round_cut(), clamped::HI);
