@@ -24,7 +24,8 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    decode_lanes: crate::plan::decode_lanes::LaneSupport::FixedTwo,
+    // Two until the one-lane A/B (#2460) decides the default.
+    decode_lanes: crate::plan::decode_lanes::LaneSupport::OneOrTwo { default: 2 },
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {

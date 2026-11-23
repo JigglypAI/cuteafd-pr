@@ -450,9 +450,7 @@ fn spark_count_resolution_reuses_the_preflight_checkpoint() {
 #[test]
 fn planner_rejects_unsupported_decode_views_before_family_layout() {
     let glm = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
-    let v41 = tempfile::tempdir().unwrap();
-    write_v41_snapshot(v41.path());
-    for (path, family, lanes) in [(glm.path(), "glm5", 2), (v41.path(), "deepseek_v41", 1)] {
+    for (path, family, lanes) in [(glm.path(), "glm5", 2)] {
         let options = PlanOptions { decode_lanes: Some(lanes), ..Default::default() };
         let error = plan(path, &options).unwrap_err();
         assert!(matches!(&error, PlanError::UnsupportedOption { family: actual, value, .. } if actual == family && *value == lanes));
@@ -1138,7 +1136,7 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             let experts: Value = serde_json::from_slice(&std::fs::read(dir.path().join("share/V41_EXPERT_AOT.json")).unwrap()).unwrap();
             let sms = crate::placement::ArchContext::for_device("sm_120", 96 << 30).sms;
             let programs = crate::placement::families::deepseek_v41::owners::NativePrograms::new(&manifest, sms).unwrap();
-            let expected = programs.dspark(&experts, 4096, concurrency, 7, gpus,
+            let expected = programs.dspark(&experts, 4096, concurrency, 2, 7, gpus,
                 crate::placement::families::deepseek_v41::resident::Fp8Head::Packed).unwrap();
             for owner in expected.iter().filter(|owner| owner.group == "dSpark request lanes") {
                 let actual: u64 = memory.devices[usize::from(owner.gpu)].items.iter()
@@ -1146,6 +1144,49 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
                 assert_eq!(actual, owner.bytes, "native-seven lane owner GPU{} C{concurrency}", owner.gpu);
             }
         }
+    }
+}
+
+/// V4.1 at `DECODE_LANES=1`: the report names one lane, the coordinator
+/// charges no lane-1 owner, one Spark decode execution and link are charged,
+/// and the freed bytes go to the KV pool. At concurrency one both requests
+/// resolve one lane.
+#[test]
+fn v41_one_decode_lane_charges_one_lane_and_returns_the_rest_to_kv() {
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    let plan = |lanes: Option<u8>, concurrency: u64| {
+        let mut options = wave_plan_options(dir.path(), 6);
+        options.decode_lanes = lanes;
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![96 << 30; 2];
+        layout.concurrency = concurrency;
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = None;
+        layout.workspace_manifest = v41_workspace(dir.path());
+        layout.native_mtp_layers = 3;
+        input.plan_spark_count(&options, 6, Some(6)).unwrap()
+    };
+    let items = |report: &PlanReport, prefix: &str| -> u64 { report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).flat_map(|d| &d.items)
+        .filter(|i| i.group.starts_with(prefix)).map(|i| i.bytes).sum() };
+    let two = plan(None, 16);
+    let one = plan(Some(1), 16);
+    assert!(two.fits && one.fits, "{}\n{}", render(&two), render(&one));
+    assert_eq!((two.decode_lanes, one.decode_lanes), (2, 1));
+    assert!(items(&two, "lane 1 ") > 0);
+    assert_eq!(items(&one, "lane 1 "), 0, "{}", render(&one));
+    assert_eq!(items(&one, "lane 0 "), items(&two, "lane 0 "));
+    assert!(one.memory_layout.as_ref().unwrap().pool_tokens >= two.memory_layout.as_ref().unwrap().pool_tokens);
+    // Spark ranks charge one fewer decode execution owner and link.
+    let spark = |report: &PlanReport, group: &str| -> u64 { report.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).flat_map(|d| &d.items)
+        .filter(|i| i.group == group).map(|i| i.bytes).sum() };
+    for group in ["execution owners", "rdma rings"] {
+        assert!(spark(&one, group) < spark(&two, group), "{group}");
+    }
+    for lanes in [None, Some(1), Some(2)] {
+        assert_eq!(plan(lanes, 1).decode_lanes, 1);
     }
 }
 
@@ -2109,11 +2150,11 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
                             else { cuteafd_core::SparkIngress::Fp8K32 };
-                        // Rings at the resolved unit, one link per target pass (two decode
-                        // lanes plus each further prefill slot), as serve opens them.
+                        // Rings at the resolved unit: one link per resolved decode lane
+                        // plus the one prefill link, as serve opens them.
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: report.prefill_unit_rows.unwrap() as u32,
-                            ingress, partial_reply_bytes: None }; report.prefill_waves.unwrap().max(2) as usize];
+                            ingress, partial_reply_bytes: None }; usize::from(report.decode_lanes) + 1];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -2126,7 +2167,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
                             report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap() as usize,
                             report.prefill_waves.unwrap() * report.prefill_unit_rows.unwrap(),
-                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS).unwrap();
+                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, report.decode_lanes).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
@@ -3036,7 +3077,7 @@ fn mounted_mimo_audio_inventory_is_independently_admitted() {
         let owner = match audio.kind { EncoderKind::Spark { rank } => format!("spark{rank} audio"), _ => unreachable!() };
         assert_eq!(on.bytes_by_owner[&owner], audio.admitted_bytes());
         let memory = on.memory_layout.as_ref().unwrap();
-        assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).flat_map(|d| &d.items).filter(|item| item.group == "audio tower")
+        assert_eq!(memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).flat_map(|d| &d.items).filter(|item| item.group == "audio tower")
             .map(|item| item.bytes).sum::<u64>(), audio.weights);
         assert!(!memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| &d.items).any(|item| item.group == "audio tower" || item.group == "audio"));
         let off = plan(&snapshot, &PlanOptions { audio: MediaMode::Off, ..options }).unwrap();

@@ -135,13 +135,12 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
-        capacity: u32, requests: u32,
+        capacity: u32, requests: u32, lanes: u8,
     ) -> Result<Self> {
-        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
+        let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
+        let lane_count = lane_count as usize;
         let window = || DsparkWindow::new(lib, requests as usize, capacity,
             DsparkWindow::device_bytes(requests as usize, capacity)?);
-        let lane_count = if requests == 1 { 1 } else { 2 };
-        let lane_requests = requests.div_ceil(lane_count as u32);
         let shared_bytes = weights.draft_bytes(lane_requests)?;
         let lane_bytes = weights.draft_bytes(lane_requests)?;
         let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];

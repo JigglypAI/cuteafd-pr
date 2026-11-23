@@ -850,8 +850,8 @@ release_validate_deployment "$count_plan" deepseek_v41 ||
 v41_weight_budget_gib="$(jq -er '.resolved_settings.coordinator_weight_budget_gib.value' <<<"$count_plan")"
 release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
-resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
-  release_die "DeepSeek V4.1 deployment requires two decode lanes"
+resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$count_plan")" ||
+  release_die "DeepSeek V4.1 deployment does not name one or two decode lanes"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   ((selected_count <= SPARK_COUNT)) || release_die "planner requested more Spark ranks than configured: $selected_count > $SPARK_COUNT"

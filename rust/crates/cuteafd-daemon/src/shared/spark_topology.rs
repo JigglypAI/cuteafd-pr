@@ -273,7 +273,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             assert_eq!(intake, 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(waves * rows * hidden * 2)?, "{key}");
             if family == "v41" {
                 use cuteafd_loader::placement::families::deepseek_v41::owners;
-                let charged = owners::transports_bytes(64, rows, peers, waves as usize, cuteafd_core::SparkReplyFormat::Bf16)?;
+                let charged = owners::transports_bytes(64, 2, rows, peers, waves as usize, cuteafd_core::SparkReplyFormat::Bf16)?;
                 assert_eq!(charged, 2 * (8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * 5120 * 2)?
                     + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
                     + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);

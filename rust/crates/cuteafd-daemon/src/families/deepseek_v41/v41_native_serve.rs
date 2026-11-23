@@ -155,6 +155,8 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     args.prefix.resolve_entries(args.concurrency as usize);
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    // Every later owner, admission and scheduler reads the resolved count.
+    args.decode_lanes = lanes;
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
     Ok(lanes)
 }
@@ -170,7 +172,7 @@ fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::co
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
-    let lanes = normalize_serving(&mut args)?;
+    normalize_serving(&mut args)?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -392,8 +394,9 @@ fn worker(
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
         if args.dspark { "dspark" } else { "off" }))?;
 
-    // Two private decode lanes at decode width, and `slots` prefill slots on
-    // one shared storage set (PLAN "Prefill contract").
+    // The resolved decode lanes (one or two) at decode width, and `slots`
+    // prefill slots on one shared storage set (PLAN "Prefill contract").
+    let lanes = args.decode_lanes;
     let admitted = AdmittedPrefill::resolve(&args)?;
     ensure!(admitted.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         admitted.unit_cap);
@@ -501,9 +504,10 @@ fn worker(
             TargetTapWave::device_bytes(decode_rows_usize)?))?,
         Duration::from_secs(120),
     );
-    let (mut pass, mut second) = (make_decode_pass()?, make_decode_pass()?);
+    let mut pass = make_decode_pass()?;
+    let mut second = (lanes > 1).then(make_decode_pass).transpose()?;
     pass.install_expert_usage(usage.clone());
-    second.install_expert_usage(usage.clone());
+    if let Some(second) = &mut second { second.install_expert_usage(usage.clone()); }
     admission::startup_phase(&lib, "v41/workspace:decode-lanes", device_total)?;
     // The prefill slots: one storage set (row planes at the reserve, scratch
     // at the unit), each slot's host objects on it (`shared::memory::row_window`).
@@ -544,19 +548,21 @@ fn worker(
         .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
-    admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots,
-        args.concurrency)?;
+    admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, lanes, reserve as u64,
+        capacity, slots, args.concurrency)?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every Spark world reserves its exact physical rank plane count.
-    // Decode lanes' links at their own width (P3); the prefill link below at the unit.
-    let lanes = crate::shared::serve::lanes::LaneSet::default();
-    let [mut transport, mut second_transport] = lanes.try_map(|lane| match spark_world {
+    // Each decode lane's link at its own width (P3); the prefill link below at the unit.
+    let lane_set = crate::shared::serve::lanes::LaneSet::default();
+    let decode_transport = |lane: crate::shared::serve::lanes::LaneLease<'_>| match spark_world {
         Some(world) => NativeTp4Wave::new(&lib, spark_transport(&args.peers, decode_rows,
             protocol_v2_timing, world, u32::try_from(lane.index())?)?,
             NativeTp4Wave::device_bytes_for(decode_rows, expert_world)?),
         None => NativeTp4Wave::unlinked(&lib, decode_rows),
-    })?;
+    };
+    let mut transport = decode_transport(lane_set.lease(0))?;
+    let mut second_transport = (lanes > 1).then(|| decode_transport(lane_set.lease(1))).transpose()?;
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     // The one prefill link (endpoint after the lanes'), one return slot per
     // prefill slot, held by slot 0's FFN owner; the other slots' units send
@@ -571,12 +577,12 @@ fn worker(
         slots: slot_passes.drain(..).zip(slot_transports).collect() };
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
-    second.install_attention_plan(attention_plan)?;
+    if let Some(second) = &mut second { second.install_attention_plan(attention_plan)?; }
     for (slot, _) in &mut prefill_slots.slots { slot.install_attention_plan(attention_plan)?; }
     // L2 prefetch serves decode/verify steps only: the decode lanes.
     if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
         pass.enable_l2_prefetch(budget)?;
-        second.enable_l2_prefetch(budget)?;
+        if let Some(second) = &mut second { second.enable_l2_prefetch(budget)?; }
     }
     let recorder = dense::Recorder::start(records.is_some())?;
     let draft_weights = if args.dspark {
@@ -585,6 +591,7 @@ fn worker(
             &catalog,
             capacity,
             args.concurrency,
+            lanes,
             32 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
             cuteafd_core::MAX_DSPARK_PROPOSALS,
@@ -595,7 +602,7 @@ fn worker(
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     let mut draft = draft_weights
         .as_ref()
-        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency))
+        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency, lanes))
         .transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_length(args.draft_length)?;
@@ -623,10 +630,10 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     if local_workspace > 0 {
         admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 1, capacity,
-            slots, reserve as u64, local_workspace)?;
+            slots, reserve as u64, lanes, local_workspace)?;
     }
     pass.bind_execution_plan(&pool.placement)?;
-    second.bind_execution_plan(&pool.placement)?;
+    if let Some(second) = &mut second { second.bind_execution_plan(&pool.placement)?; }
     for (slot, _) in &mut prefill_slots.slots { slot.bind_execution_plan(&pool.placement)?; }
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,local_layers=pool.placement.onboard_layers,
@@ -646,7 +653,7 @@ fn worker(
         else { (0, 0) };
     let admitted_experts = pool.placement.expert_ranges[0];
     let expected = resident_bytes + if local_layers > 0 {
-        per_slot * slots + per_decode * 2 + budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)
+        per_slot * slots + per_decode * usize::from(lanes) + budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)
     } else { 0 };
     ensure!(expected as u64 <= admitted_experts.peak_bytes, "runtime local owners exceed shared admission");
     let spark_plan = admission::plan_sparks(&args, &catalog, local_layers, capacity)?;
@@ -694,7 +701,7 @@ fn worker(
                     let layout = ExpertWeights::arena_layout(device, &catalog, selections.iter().copied())?;
                     crate::shared::experts::weight_layout::admit(&layout,
                         budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0),
-                        per_slot * slots + per_decode * 2, usize::try_from(admitted_experts.peak_bytes)?)?;
+                        per_slot * slots + per_decode * usize::from(lanes), usize::try_from(admitted_experts.peak_bytes)?)?;
                     let arena = ExpertWeights::arena(device, &catalog, selections.iter().copied())?;
                     selections.into_iter().enumerate().map(|(index, layer)| ExpertWeights::load_into(
                         &lib, &catalog, layer, budgets[index].peak_device_bytes()?, &arena))
@@ -705,7 +712,7 @@ fn worker(
             for (_, transport) in &mut prefill_slots.slots {
                 transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_slot)?)?;
             }
-            for transport in [&mut transport, &mut second_transport] {
+            for transport in std::iter::once(&mut transport).chain(second_transport.as_mut()) {
                 transport.install_local(LocalExpertWave::new(&lib, weights.clone(), decode_rows, per_decode)?)?;
             }
         }
@@ -717,7 +724,7 @@ fn worker(
         // The workers serve their layers now: open the sessions and start each
         // link's exchange worker using its admitted geometry.
         transport.bootstrap(catalog.nvfp4().is_some())?;
-        second_transport.bootstrap(catalog.nvfp4().is_some())?;
+        if let Some(second) = &mut second_transport { second.bootstrap(catalog.nvfp4().is_some())?; }
         prefill_slots.slots[0].1.bootstrap(catalog.nvfp4().is_some())?;
     }
     let (free, total) = lib.cuda_memory_info()?;
@@ -731,7 +738,7 @@ fn worker(
     if let Some(draft) = &mut draft { draft.bind_policy((0..40).filter(|&layer| transport.has_local_layer(layer)).count()); }
     let mut visit = |f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>| -> Result<()> {
         pass.visit_graph_banks(f)?;
-        second.visit_graph_banks(f)?;
+        if let Some(second) = &mut second { second.visit_graph_banks(f)?; }
         for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
         if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
         Ok(())
@@ -744,9 +751,9 @@ fn worker(
     if let Some(_startup) = crate::shared::decode_graph::sites::startup(
         super::graph_policy::spanning_layout(1)) {
     let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
-    for (site, result) in [("target pass 0", pass.capture_startup(requests.cache(), &local)),
-        ("target pass 1", second.capture_startup(requests.cache(), &local))] {
-        if let Err(error) = result { tracing::warn!(%error, site, "V4.1 best-effort startup graph prewarm failed"); }
+    for (site, result) in [("target pass 0", Some(pass.capture_startup(requests.cache(), &local))),
+        ("target pass 1", second.as_mut().map(|second| second.capture_startup(requests.cache(), &local)))] {
+        if let Some(Err(error)) = result { tracing::warn!(%error, site, "V4.1 best-effort startup graph prewarm failed"); }
     }
     for index in super::graph_policy::PREFILL_PREWARM_SLOTS {
         let (slot, transport) = &mut prefill_slots.slots[index];
@@ -773,7 +780,7 @@ fn worker(
     unsafe { // SAFETY: startup work is complete and all backing owners remain live.
         crate::shared::decode_graph::device::observe_completed(&lib, |f| {
             pass.visit_graph_banks(f)?;
-            second.visit_graph_banks(f)?;
+            if let Some(second) = &mut second { second.visit_graph_banks(f)?; }
             for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
             if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
             Ok(())
@@ -783,8 +790,8 @@ fn worker(
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     crate::shared::memory_report::reconcile::capture("ready");
     let health = vision.health_handle();
-    scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
-        &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes, || {
+    scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, second.as_mut(),
+        &mut requests, &mut transport, second_transport.as_mut(), &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes, || {
             ready.take().context("startup readiness missing")?
                 .send(Ok((health, args.max_context_tokens)))
                 .map_err(|_| anyhow::anyhow!("API startup cancelled"))
@@ -1148,7 +1155,7 @@ mod admitted_prefill_tests {
         assert_eq!((one.unit_cap, one.waves, one.reserve_rows()), (4096, 1, 4096));
         let capped = resolve(&["--prefill-waves", "3", "--prefill-batch-tokens", "1792", "--prefill-reserve-rows", "5376"]);
         assert_eq!((capped.unit_cap, capped.waves, capped.reserve_rows()), (1792, 3, 5376));
-        assert!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(80, 4096, 4, 1, cuteafd_core::SparkReplyFormat::Bf16).is_ok());
+        assert!(cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(80, 2, 4096, 4, 1, cuteafd_core::SparkReplyFormat::Bf16).is_ok());
     }
 }
 
