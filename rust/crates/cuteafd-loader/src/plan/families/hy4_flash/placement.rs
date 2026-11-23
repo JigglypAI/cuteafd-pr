@@ -7,14 +7,13 @@
 //! `exl3_spark_arena_bytes`), and measured host Engram owners
 //! (`MappedPlacement`, `RowCache`, `table_reactor_workspace_bytes`).
 use super::Model;
-use crate::families::hy4_flash::engram::{mapped_engram_bytes, DEFAULT_CACHE_SHARES};
+use crate::families::hy4_flash::engram::{mapped_engram_bytes, Hy4EngramShape};
 use crate::families::hy4_flash::execution::{CacheLayout, INDEX_GROUP_RECORD_BYTES, PAGE_ROWS};
 use crate::families::hy4_flash::weight_layout::{fp8_role, target_arenas};
 use crate::families::hy4_flash::Hy4KvCache;
 use crate::formats::mapped_preload::MappedPlacement;
-use crate::formats::mapped_table::row_cache::RowCache;
 use crate::placement::families::hy4_flash::{
-    self, Hy4Inputs, LocalBacking, LocalPackage, SparkCharge, HY4_FLASH, LANES,
+    self, Hy4Inputs, LocalBacking, LocalPackage, SparkCharge, DECODE_ROWS, HY4_FLASH, LANES,
 };
 use crate::placement::planner::{Baseline, Budget, Context, Device, Domain, Location, Operation, PrefillShape};
 use crate::placement::{ArchContext, LayerMode, Onboard, PoolFacts, PoolMemory, ResidentWeights, SparkWorkingSet};
@@ -439,28 +438,44 @@ pub(super) fn layout(
         chunk_bytes: host_chunk_bytes.min(host_quota.max(1)),
     };
 
-    // Real measured host Engram owners (fail-closed, never GPU memory):
-    // 1. MappedPlacement for the 4 Engram tables (61.47 GiB FP8 strided default, 118.02 GiB BF16 fallback)
-    // 2. Per-layer RowCache (`RowCache::host_bytes(row_bytes, DEFAULT_CACHE_SHARES)`)
-    // 3. Shared table-read reactor workspace (`table_reactor_workspace_bytes(mapped.mapped)`)
-    let (engram_storage, engram_table_bytes, _per_layer) = match mapped_engram_bytes(input.checkpoint(), cfg) {
+    // Real measured host Engram owners (fail-closed, FP8-only, never GPU memory):
+    // 1. MappedPlacement for the 4 FP8 Engram tables (`engram-fp8-layer-*-part-*.safetensors`, 61.47 GiB)
+    // 2. Per-layer `RowCache` (`Hy4EngramShape::cache_bytes`)
+    // 3. Pinned prefill/decode staging pools (`Hy4EngramShape::staging_bytes`)
+    // 4. Shared table-read reactor workspace (`table_reactor_workspace_bytes(mapped.mapped)`)
+    let (engram_table_bytes, _per_layer) = match mapped_engram_bytes(input.checkpoint(), cfg) {
         Ok(v) => v,
         Err(error) => {
             report.refuse_placement(
                 format!("Hy4-flash Engram table inventory refused: {error:#}"),
-                "Verify cuteafd-mc.json engram_fp8 declarations and config engram_layer_head_vocab_sizes.",
+                "Provide FP8 Engram shards (engram-fp8-layer-*-part-*.safetensors) declared in cuteafd-mc.json.",
             );
             return empty(notes);
         }
     };
-    let engram_row_cache_bytes = (cfg.engram_layers.len() as u64)
-        .checked_mul(RowCache::host_bytes(engram_storage.row_bytes(), DEFAULT_CACHE_SHARES) as u64)
-        .expect("Hy4-flash Engram RowCache bytes overflow");
+    let engram_shape = match Hy4EngramShape::new(
+        shape.rows as usize,
+        shape.waves as usize,
+        DECODE_ROWS as usize,
+        cfg.engram_layers.len(),
+    ) {
+        Ok(s) => s,
+        Err(error) => {
+            report.refuse_placement(
+                format!("Hy4-flash Engram staging shape refused: {error:#}"),
+                "Use supported prefill unit rows and wave count.",
+            );
+            return empty(notes);
+        }
+    };
+    let engram_row_cache_bytes = engram_shape.cache_bytes() as u64;
+    let engram_staging_bytes = engram_shape.staging_bytes() as u64;
     let host_headroom = (8u64 << 30).max(host_total / 10);
     let engram_preload_budget = host_available
         .saturating_sub(host_headroom)
         .saturating_sub(host_quota)
-        .saturating_sub(engram_row_cache_bytes);
+        .saturating_sub(engram_row_cache_bytes)
+        .saturating_sub(engram_staging_bytes);
     let engram_mapped = MappedPlacement::resolve(
         cfg.engram_layers.len(),
         0,
@@ -556,6 +571,7 @@ pub(super) fn layout(
         host_prefix,
         engram_mapped: engram_mapped.clone(),
         engram_row_cache_bytes,
+        engram_staging_bytes,
         resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
     };
 
@@ -606,13 +622,12 @@ pub(super) fn layout(
 
     notes.push(format!(
         "Hy4-flash attention {}: pool {} tokens (12 DSA layers paged, 30 SWA-512 fixed per-sequence rings); \
-         {} of {} routed layers onboarded ({}); Engram {} ({}); unit {} x {} waves; C{}",
+         {} of {} routed layers onboarded ({}); Engram engram_fp8 61.5 GiB ({}); unit {} x {} waves; C{}",
         placed.attention_summary(),
         placed.pool_tokens,
         onboarded,
         routed.len(),
         if gpus == 2 { "TP2 768+768" } else { "whole 1536" },
-        if model.has_engram_fp8 { "engram_fp8 61.5 GiB" } else { "BF16 118.0 GiB" },
         engram_mapped.reason,
         shape.rows,
         shape.waves,

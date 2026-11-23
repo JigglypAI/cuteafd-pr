@@ -59,9 +59,6 @@ pub(crate) struct ServeArgs {
     pub prefill_rows: Option<usize>,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
     pub prefill_waves: Option<u8>,
-    /// Force BF16 Engram fallback tables instead of `engram_fp8`.
-    #[arg(long)]
-    pub engram_bf16: bool,
     /// Optional explicit path to `exl3-hy4f-k45-mul1/rtx-tp{1,2}` package directory.
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
@@ -452,11 +449,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 cfg.clone(),
                 worker_args.kv_format,
                 unit_rows,
+                usize::try_from(prefill.waves)?,
                 chosen_pages,
                 worker_args.max_sequences,
                 served_context,
                 mark_slots,
-                worker_args.engram_bf16,
                 false,
                 onboarded,
             )?;

@@ -153,11 +153,13 @@ pub struct Hy4Inputs {
     pub code: Vec<u64>,
     pub graph_reserve: Vec<u64>,
     pub host_prefix: serving::HostPrefixOwners,
-    /// Host-mapped Engram preload policy (`MappedPlacement`, 61.47 GiB FP8 strided default or 118.02 GiB BF16),
+    /// Host-mapped FP8 Engram preload policy (`MappedPlacement`, 61.47 GiB `engram_fp8`),
     /// charged strictly to raptor host RAM (never GPU memory).
     pub engram_mapped: crate::formats::mapped_preload::MappedPlacement,
-    /// Measured per-layer `RowCache` host bytes (`4 * RowCache::host_bytes(row_bytes, DEFAULT_CACHE_SHARES)`).
+    /// Measured per-layer `RowCache` host bytes (`Hy4EngramShape::cache_bytes()`).
     pub engram_row_cache_bytes: u64,
+    /// Measured pinned host staging bytes for prefill & decode Engram gathers (`Hy4EngramShape::staging_bytes()`).
+    pub engram_staging_bytes: u64,
     pub resident_weight_limit: Option<ResidentWeights>,
 }
 
@@ -654,7 +656,8 @@ impl Recipe for Hy4Inputs {
         // Real measured host Engram owners (never GPU memory):
         // 1. Preloaded tables via MappedPlacement (`mapped-tables/preloaded (coordinator local)`)
         // 2. Shared table-read reactor workspace (`table_reactor_workspace_bytes`) for any mapped tables
-        // 3. Per-layer `RowCache` (`RowCache::host_bytes(row_bytes, DEFAULT_CACHE_SHARES)`)
+        // 3. Per-layer `RowCache` (`Hy4EngramShape::cache_bytes`)
+        // 4. Pinned prefill/decode staging pools (`Hy4EngramShape::staging_bytes`)
         components.extend(buffer(
             "hy4_flash.engram.preloaded",
             Location::HOST,
@@ -680,6 +683,15 @@ impl Recipe for Hy4Inputs {
             Lifetime::RESIDENT,
             Category::Workspace,
             "hy4_flash/engram-row-cache",
+            maximum,
+        ));
+        components.extend(buffer(
+            "hy4_flash.engram.staging",
+            Location::PINNED,
+            self.engram_staging_bytes,
+            Lifetime::RESIDENT,
+            Category::Staging,
+            "hy4_flash/engram-staging",
             maximum,
         ));
 

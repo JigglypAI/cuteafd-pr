@@ -320,8 +320,14 @@ pool rather than assuming the default target fits these owners.
 
 Hy4-flash (`hy4_flash`, `hy_v4_flash`) exposes `cuteafd serve --family hy4_flash`
 (`serve-hy4f`) and `./run.sh --wip SLOT` on one or two RTX GPUs with `0..=6`
-Spark expert peers (#2478). Routed LatentMoE layers use MUL1 EXL3 (`hy4f:exl3-k45-mul1`);
-Engram tables run host-mapped `engram_fp8` by default.
+Spark expert peers (#2478). Routed LatentMoE layers use MUL1 EXL3 (`hy4f:exl3-k45-mul1`).
+Engram tables are FP8-only (`engram-fp8-layer-*-part-*.safetensors`, 100-byte strided
+E4M3 + F32 scale rows declared in `cuteafd-mc.json`, with no BF16 fallback): checkpoints
+lacking FP8 Engram shards are refused by name in plan, serve and golden. All four Engram
+layers (`[1, 11, 21, 31]`) read ahead from request admission (prefill) and immediately
+when candidate tokens exist (decode/verify) onto the shared `mapped_table::lookahead`
+planner and per-layer bounded `RowCache`s, with background gather and FP8→BF16 decode
+overlapped with earlier GPU layers.
 
 `CORE_VIEW=original|k8-compact|k6-compact|fp8-compact` selects the dense-core
 view (`original` default; `k8-compact` and `k6-compact` use stored trellis cores;

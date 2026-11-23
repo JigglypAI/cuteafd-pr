@@ -1,12 +1,12 @@
 //! Hy4-flash (`HYV4FlashForConditionalGeneration`, `hy_v4_flash`):
 //! 42-layer hybrid MLA (12 compressed-indexer DSA + 30 SWA-512) with 4-stream
-//! identity hyper-connections (iHC), 4-layer host-mapped Engram (FP8 strided
-//! default with BF16 fallback), LatentMoE (41 routed layers × 512 EXL3 K4 MUL1
-//! experts, top-16, 1536 latent width, 1 shared expert, SwiGLU limit 10.0),
-//! optional 5-layer DFly2 drafter and 27-layer ViT (#2478).
+//! identity hyper-connections (iHC), 4-layer host-mapped FP8 Engram
+//! (`engram-fp8-layer-*-part-*.safetensors`), LatentMoE (41 routed layers ×
+//! 512 EXL3 K4 MUL1 experts, top-16, 1536 latent width, 1 shared expert,
+//! SwiGLU limit 10.0), optional 5-layer DFly2 drafter and 27-layer ViT (#2478).
 //!
 //! Validates strictly from the checkpoint's own `config.json`, safetensors
-//! tensor headers, and (when present) `cuteafd-mc.json` view / `engram_fp8`.
+//! tensor headers, and `cuteafd-mc.json` view / `engram_fp8` declarations.
 use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
@@ -34,8 +34,8 @@ pub(crate) enum Storage {
     Bf16,
     F32,
     I32,
-    /// Host-mapped Engram table (`BF16 [rows, 96]` in the index; `engram_fp8`
-    /// strided alternate opened directly from `cuteafd-mc.json`).
+    /// Host-mapped Engram table (`engram-fp8-layer-*-part-*.safetensors`
+    /// declared in `cuteafd-mc.json`, 100-byte strided E4M3 + F32 scale rows).
     MappedEngram,
 }
 
@@ -61,7 +61,6 @@ pub struct Model {
     pub core: BTreeMap<String, CoreProjection>,
     pub(crate) routed_bytes: u64,
     pub(crate) expert_storage: BTreeMap<usize, ExpertStorage>,
-    pub has_engram_fp8: bool,
 }
 
 impl Model {
@@ -238,8 +237,8 @@ impl Model {
             }
         }
 
-        let has_engram_fp8 = checkpoint.view.as_ref().and_then(|v| v.engram_fp8()).is_some();
-        let spec = build_spec(&cfg, dfly.as_ref(), vision.is_some(), &expert_storage, has_engram_fp8, checkpoint);
+        let _ = crate::families::hy4_flash::engram::mapped_engram_bytes(checkpoint, &cfg)?;
+        let spec = build_spec(&cfg, dfly.as_ref(), vision.is_some(), &expert_storage, checkpoint);
 
         Ok(Self {
             cfg,
@@ -248,7 +247,6 @@ impl Model {
             core,
             routed_bytes,
             expert_storage,
-            has_engram_fp8,
         })
     }
 
@@ -279,7 +277,6 @@ fn build_spec(
     dfly: Option<&Hy4DflyConfig>,
     vision: bool,
     expert_storage: &BTreeMap<usize, ExpertStorage>,
-    has_engram_fp8: bool,
     checkpoint: &Checkpoint,
 ) -> ModelSpec {
     let layers = (0..cfg.layers).map(|layer| {
@@ -334,14 +331,10 @@ fn build_spec(
             formats.iter().map(|(label, ls)| format!("{label} ({} layers)", ls.len())).collect::<Vec<_>>().join("; ")
         ),
         format!(
-            "Engram: 4 host-mapped tables at layers {:?} ({} heads x {} dims, {} total rows); storage: {}",
+            "Engram: 4 host-mapped FP8 tables at layers {:?} ({} heads x {} dims, {} total rows); \
+             storage: engram_fp8 strided shards declared in cuteafd-mc.json (61.5 GiB, bitwise-exact to BF16 roundtrip)",
             cfg.engram_layers, cfg.engram_total_heads(), cfg.engram_head_width(),
             cfg.engram_layers.iter().filter_map(|&l| cfg.engram_rows(l)).sum::<u64>(),
-            if has_engram_fp8 {
-                "engram_fp8 strided alternate declared in cuteafd-mc.json (61.5 GiB, bitwise-exact to BF16 roundtrip)"
-            } else {
-                "BF16 indexed tables (118.0 GiB)"
-            }
         ),
     ];
     if let Some(d) = dfly {
@@ -471,7 +464,7 @@ impl Family for Hy4Flash {
             Component::Indexer => "Export Hy4-flash 16-head compressed indexer (4-token gated pooling + intra_group_ape + top-511 group recall + current group -> 2048 candidate slots); see #2478.",
             Component::HyperConnection => "Export 4-stream iHC pre/post kernels and MhcHeadKernel(H=3072) in sparkinfer-glmrt; see #2478.",
             Component::RoutedExpert => "Wire hy4f EXL3 K4 MUL1 routed expert package (H1536, I1536, E512, K16, swiglu_limit=10.0) on the MUL1 branches (#415 / #2538); see #2478.",
-            Component::MappedTable | Component::TableProjection => "Wire Hy4EngramTable (FP8 strided default, BF16 fallback) and 4-stream GPU Engram gate kernel; see #2478.",
+            Component::MappedTable | Component::TableProjection => "Wire FP8-only Hy4EngramTable + shared look-ahead and 4-stream GPU Engram gate kernel; see #2478.",
             Component::Vision => "Optional 27-layer ViT vision tower is a follow-up item on #2478; text serving runs with --vision off.",
             Component::Speculator => "Optional 5-layer DFly2 drafter is a follow-up item on #2478; text serving runs without speculation first.",
             _ => "Implement Hy4-flash text forward, golden parity, and serve-hy4f over the shared scheduler; see #2478.",

@@ -448,17 +448,32 @@ fn ready_to_plan(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> bool {
 
 /// The oldest piece and later table whose rows are due: the previous table has
 /// landed through unit `u + d - 1` (or as far as planning has gone when the
-/// window or the caches stop it).
+/// window or the caches stop it). Scanning every unstarted `(piece, table)`
+/// candidate keeps N-table (>2) pipelines advancing table `k` across all pieces
+/// of a unit before table `k + 1` becomes due, while preserving 2-table order.
 fn due(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> Option<(usize, usize)> {
     let committed = plan.committed.load(Ordering::Acquire);
-    let (index, table) = plan.pieces.iter().enumerate().filter(|(_, piece)| piece.end > committed)
-        .find_map(|(index, piece)| (1..piece.steps.len()).find(|&t| !piece.steps[t].started).map(|t| (index, t)))?;
-    let last = (plan.pieces[index].unit + plan.units.depth - 1).min(plan.units.ends.len() - 1);
-    let horizon = plan.units.ends[last];
     let planned_end = plan.start + plan.next as u64;
-    if planned_end < horizon && ready_to_plan(plan, tables) { return None; }
-    plan.pieces.iter().filter(|piece| piece.unit <= last).all(|piece| piece.landed(table - 1))
-        .then_some((index, table))
+    let can_plan = ready_to_plan(plan, tables);
+    for (index, piece) in plan.pieces.iter().enumerate() {
+        if piece.end <= committed {
+            continue;
+        }
+        let last = (piece.unit + plan.units.depth - 1).min(plan.units.ends.len() - 1);
+        let horizon = plan.units.ends[last];
+        if planned_end < horizon && can_plan {
+            continue;
+        }
+        for table in 1..piece.steps.len() {
+            if piece.steps[table].started {
+                continue;
+            }
+            if plan.pieces.iter().filter(|p| p.unit <= last).all(|p| p.landed(table - 1)) {
+                return Some((index, table));
+            }
+        }
+    }
+    None
 }
 
 /// Rows one look-ahead read reserves and submits: one reactor batch.
@@ -645,5 +660,56 @@ mod tests {
         // Several tables: the widest row decides.
         let both = vec![shape(160, 16, [1 << 20, 1024]), shape(264, 24, [1 << 20, 1024])];
         assert_eq!(piece_tokens(&both), 64);
+    }
+
+    #[test]
+    fn four_table_due_advances_all_pieces_per_table_before_next_table() {
+        let tables: Vec<Arc<dyn LookaheadTable>> = (0..4)
+            .map(|_| shape(100, 16, [1 << 16, 1024]))
+            .collect();
+        struct DummySource;
+        impl RowSource for DummySource {
+            fn tokens(&self) -> usize { 128 }
+            fn rows(&mut self, _: Range<usize>) -> Result<Vec<Vec<u64>>> { unreachable!() }
+        }
+        let make_step = |started: bool| Step { started, queue: VecDeque::new(), pins: Vec::new(), read: None };
+        let mut plan = Plan {
+            id: 1,
+            tag: 1,
+            admitted: std::time::Instant::now(),
+            remote: false,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            source: Box::new(DummySource),
+            start: 0,
+            next: 128,
+            units: UnitPlan::new(vec![128], 1),
+            committed: Arc::new(AtomicU64::new(0)),
+            reserved: Arc::new(AtomicU64::new(0)),
+            pieces: VecDeque::from([
+                PlanPiece { end: 64, unit: 0, steps: vec![make_step(true), make_step(false), make_step(false), make_step(false)] },
+                PlanPiece { end: 128, unit: 0, steps: vec![make_step(true), make_step(false), make_step(false), make_step(false)] },
+            ]),
+            skipped_tokens: 0,
+            needed: vec![0; 4],
+            cached: vec![0; 4],
+            joined: vec![0; 4],
+            read: vec![0; 4],
+            read_waiting: vec![0; 4],
+            skipped: 0,
+        };
+        // Table 1 must run on both piece 0 and piece 1 before table 2 becomes due.
+        assert_eq!(due(&plan, &tables), Some((0, 1)));
+        plan.pieces[0].steps[1].started = true;
+        assert_eq!(due(&plan, &tables), Some((1, 1)));
+        plan.pieces[1].steps[1].started = true;
+        assert_eq!(due(&plan, &tables), Some((0, 2)));
+        plan.pieces[0].steps[2].started = true;
+        assert_eq!(due(&plan, &tables), Some((1, 2)));
+        plan.pieces[1].steps[2].started = true;
+        assert_eq!(due(&plan, &tables), Some((0, 3)));
+        plan.pieces[0].steps[3].started = true;
+        assert_eq!(due(&plan, &tables), Some((1, 3)));
+        plan.pieces[1].steps[3].started = true;
+        assert_eq!(due(&plan, &tables), None);
     }
 }

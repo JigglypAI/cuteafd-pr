@@ -325,7 +325,172 @@ pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::Pa
     }
 
     let dir = tempfile::tempdir().unwrap();
-    write_snapshot(dir.path(), &cfg, &tensors, None);
+    let mut non_engram = Vec::with_capacity(tensors.len());
+    let mut weight_map = serde_json::Map::new();
+    for tensor in tensors {
+        if tensor.0.ends_with(".engram_layer.multi_head_embedding.embedding.weight") {
+            let layer: usize = tensor
+                .0
+                .strip_prefix("model.layers.")
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap();
+            let shard = format!("engram-bf16-layer-{layer:02}.safetensors");
+            crate::plan::testing::write_safetensors(&dir.path().join(&shard), std::slice::from_ref(&tensor));
+            weight_map.insert(tensor.0, serde_json::json!(shard));
+        } else {
+            weight_map.insert(tensor.0.clone(), serde_json::json!("model-00001-of-00001.safetensors"));
+            non_engram.push(tensor);
+        }
+    }
+    write_snapshot(dir.path(), &cfg, &non_engram, None);
+    let idx_bytes = serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap();
+    std::fs::write(dir.path().join("model.safetensors.index.json"), &idx_bytes).unwrap();
+    let mut tensor_storage = serde_json::Map::new();
+    for layer in parsed.routed_layers() {
+        let base = format!("model.layers.{layer}");
+        for expert in 0..parsed.experts {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let stem = format!("{base}.mlp.experts.{expert}.{proj}");
+                tensor_storage.insert(
+                    stem.clone(),
+                    serde_json::json!({
+                        "quant_format": "exl3",
+                        "bits_per_weight": 4,
+                        "mul1_multiplier": 2212286765u64,
+                        "stored_tensors": {
+                            format!("{stem}.trellis"): {"dtype": "int16", "shape": [96, 96, 64]},
+                            format!("{stem}.suh"): {"dtype": "float16", "shape": [1536]},
+                            format!("{stem}.svh"): {"dtype": "float16", "shape": [1536]},
+                            format!("{stem}.mul1"): {"dtype": "int32", "shape": []},
+                        }
+                    }),
+                );
+            }
+        }
+    }
+    let mut quant_cfg = cfg["quantization_config"].as_object().unwrap().clone();
+    quant_cfg.insert("method".to_string(), serde_json::json!("exl3"));
+    quant_cfg.insert("out_scales".to_string(), serde_json::json!("auto"));
+    quant_cfg.insert("group_size".to_string(), serde_json::json!(-1));
+    quant_cfg.insert("desc_act".to_string(), serde_json::json!(false));
+    quant_cfg.insert("lm_head".to_string(), serde_json::json!(false));
+    quant_cfg.insert("tensor_storage".to_string(), serde_json::Value::Object(tensor_storage));
+    let quant_bytes = serde_json::to_vec(&serde_json::Value::Object(quant_cfg)).unwrap();
+    std::fs::write(dir.path().join("quantize_config.json"), &quant_bytes).unwrap();
+    let cfg_bytes = std::fs::read(dir.path().join("config.json")).unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        let core_tensor = "model.layers.0.self_attn.q_a_proj.weight";
+        let mut sorted: std::collections::BTreeMap<String, String> = weight_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+            .collect();
+        sorted.remove(core_tensor);
+        let mut sh = Sha256::new();
+        for (k, v) in &sorted {
+            sh.update(format!("{k}\0{v}\n"));
+        }
+        let shared_digest = format!("{:x}", sh.finalize());
+        let mut metas = std::collections::BTreeMap::new();
+        metas.insert("config.json".to_string(), format!("{:x}", Sha256::digest(&cfg_bytes)));
+        metas.insert(
+            "model.safetensors.index.json".to_string(),
+            format!("{:x}", Sha256::digest(&idx_bytes)),
+        );
+        metas.insert("quantize_config.json".to_string(), format!("{:x}", Sha256::digest(&quant_bytes)));
+        let mut fp = Sha256::new();
+        fp.update(format!("cuteafd-mc-view-v1\0original\0{shared_digest}\0"));
+        for (k, v) in &metas {
+            fp.update(format!("{k}\0{v}\n"));
+        }
+        let fingerprint = format!("{:x}", fp.finalize());
+        let k8_idx_bytes = idx_bytes.clone();
+        let k8_cfg_bytes = cfg_bytes.clone();
+        let k8_quant_bytes = quant_bytes.clone();
+        std::fs::write(dir.path().join("model.k8.safetensors.index.json"), &k8_idx_bytes).unwrap();
+        std::fs::write(dir.path().join("config.k8.json"), &k8_cfg_bytes).unwrap();
+        std::fs::write(dir.path().join("quantize_config.k8.json"), &k8_quant_bytes).unwrap();
+        let mut k8_metas = std::collections::BTreeMap::new();
+        k8_metas.insert("config.k8.json".to_string(), format!("{:x}", Sha256::digest(&k8_cfg_bytes)));
+        k8_metas.insert(
+            "model.k8.safetensors.index.json".to_string(),
+            format!("{:x}", Sha256::digest(&k8_idx_bytes)),
+        );
+        k8_metas.insert(
+            "quantize_config.k8.json".to_string(),
+            format!("{:x}", Sha256::digest(&k8_quant_bytes)),
+        );
+        let mut k8_fp = Sha256::new();
+        k8_fp.update(format!("cuteafd-mc-view-v1\0k8-compact\0{shared_digest}\0"));
+        for (k, v) in &k8_metas {
+            k8_fp.update(format!("{k}\0{v}\n"));
+        }
+        let k8_fingerprint = format!("{:x}", k8_fp.finalize());
+        let engram_layers: Vec<serde_json::Value> = parsed
+            .engram_layers
+            .iter()
+            .map(|&layer| {
+                let rows = parsed.engram_rows(layer).unwrap();
+                serde_json::json!({
+                    "tensor": format!("model.layers.{layer}.engram_layer.multi_head_embedding.embedding.weight"),
+                    "sha256": "b".repeat(64),
+                    "parts": [{
+                        "tensor": format!("model.layers.{layer}.engram_layer.multi_head_embedding.embedding.strided_00000"),
+                        "file": format!("engram-fp8-layer-{layer:02}-part-00000.safetensors"),
+                        "rows": rows,
+                        "sha256": "c".repeat(64),
+                    }]
+                })
+            })
+            .collect();
+        let manifest_mc = serde_json::json!({
+            "schema": "cuteafd-mc-v1",
+            "required_features": [],
+            "source": {"repo": "synthetic/hy4-flash", "revision": "a".repeat(40)},
+            "original_core_dtype": "BF16",
+            "shared_inventory_sha256": shared_digest,
+            "variants": [
+                {
+                    "name": "original",
+                    "index": "model.safetensors.index.json",
+                    "config": "config.json",
+                    "quantize": "quantize_config.json",
+                    "core_bits": 16,
+                    "core_tensors": [core_tensor],
+                    "metadata_sha256": metas,
+                    "fingerprint": fingerprint,
+                },
+                {
+                    "name": "k8-compact",
+                    "index": "model.k8.safetensors.index.json",
+                    "config": "config.k8.json",
+                    "quantize": "quantize_config.k8.json",
+                    "core_bits": 8,
+                    "core_tensors": [core_tensor],
+                    "metadata_sha256": k8_metas,
+                    "fingerprint": k8_fingerprint,
+                }
+            ],
+            "engram_fp8": {
+                "layout": crate::plan::checkpoint::mc::ENGRAM_FP8_LAYOUT,
+                "row_bytes": crate::plan::checkpoint::mc::ENGRAM_FP8_ROW_BYTES,
+                "code_dtype": "F8_E4M3",
+                "scale_dtype": "F32",
+                "recipe": format!(
+                    "vendor BF16 per-row E4M3 round trip, BF16 scale held in F32, decode = BF16(F32 code*scale); reference={}",
+                    "a".repeat(40)
+                ),
+                "layers": engram_layers,
+            },
+            "exl3_codebook": {"name": "mul1", "multiplier": 2212286765u64},
+        });
+        std::fs::write(
+            dir.path().join(crate::plan::checkpoint::mc::MC_MANIFEST),
+            serde_json::to_vec(&manifest_mc).unwrap(),
+        )
+        .unwrap();
+    }
     let manifest = dir.path().join("share/PROGRAMS.json");
     std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
     std::fs::write(&manifest, r#"{"programs":[]}"#).unwrap();
@@ -415,4 +580,21 @@ fn installed_hy4_flash_plan_across_all_mc_views_and_two_cards() {
             dev.name()
         );
     }
+}
+
+#[test]
+fn hy4_flash_plan_refuses_checkpoint_without_engram_fp8() {
+    let (dir, _manifest) = concurrency_matrix_snapshot();
+    // Remove cuteafd-mc.json so no FP8 Engram shards are declared; planning must refuse by name.
+    std::fs::remove_file(dir.path().join(crate::plan::checkpoint::mc::MC_MANIFEST)).unwrap();
+    let input = PlanInput::open(dir.path()).expect("open plain snapshot");
+    let report = input.plan(&PlanOptions::default()).expect("plan plain snapshot");
+    let err = report
+        .config_error
+        .as_ref()
+        .expect("Hy4-flash without engram_fp8 must refuse");
+    assert!(
+        err.contains("engram-fp8-layer-"),
+        "expected refusal naming engram-fp8-layer-* shards, got: {err}"
+    );
 }

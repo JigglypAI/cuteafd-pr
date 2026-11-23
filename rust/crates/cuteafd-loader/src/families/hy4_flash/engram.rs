@@ -1,20 +1,24 @@
-//! Hy4-flash Engram n-gram hashing, FP8 alternate mapped-table reader
-//! (`fp8_e4m3_f32scale_row_interleaved_v1`, 100-byte rows) with BF16 fallback,
-//! and bitwise-exact BF16 decode/QDQ verification.
+//! Hy4-flash Engram n-gram hashing, FP8-only mapped-table reader
+//! (`engram-fp8-layer-*-part-*.safetensors`, `fp8_e4m3_f32scale_row_interleaved_v1`,
+//! 100-byte rows), shared `TokenTable` row cache, and multi-layer look-ahead over
+//! `formats::mapped_table::lookahead`.
 //!
 //! Matches `python/reference/families/hy4_flash/model.py` (`engram_rows`) and
 //! `quantization/hy4_flash/engram.py` (`decode_rows` / `_codes_and_scale`).
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 
+use crate::formats::mapped_table::lookahead::{Lookahead, LookaheadHandle, LookaheadTable, RowSource, UnitPlan};
 use crate::formats::mapped_table::row_cache::RowCache;
-use crate::formats::mapped_table::{GatherMode, ReadPriority};
+use crate::formats::mapped_table::token_table::TokenTable;
+use crate::formats::mapped_table::ReadPriority;
 use crate::plan::checkpoint::mc::{EngramFp8Layer, ENGRAM_FP8_LAYOUT};
 use crate::plan::checkpoint::Checkpoint;
 use crate::{MappedTable, RowFormat, TablePart};
@@ -23,12 +27,83 @@ use super::Hy4FlashConfig;
 
 /// Elements per Engram embedding row (`engram_n_embed_per_ngram / engram_n_head_per_ngram`).
 pub const ENGRAM_EMBED_WIDTH: usize = 96;
-/// Bytes per row in the FP8 alternate (`96` E4M3 codes + little-endian `F32` scale).
+/// Engram heads per token (`(engram_max_ngram_size - 1) * engram_n_head_per_ngram`).
+pub const ENGRAM_HEADS: usize = 16;
+/// Bytes per row in the FP8 shards (`96` E4M3 codes + little-endian `F32` scale).
 pub const ENGRAM_FP8_ROW_BYTES: usize = 100;
-/// Bytes per row in the standard BF16 table (`96 * 2`).
-pub const ENGRAM_BF16_ROW_BYTES: usize = ENGRAM_EMBED_WIDTH * 2;
-/// Default per-layer `RowCache` shares (hot + probation = 5120 rows).
-pub const DEFAULT_CACHE_SHARES: [usize; 2] = [4096, 1024];
+/// Decoded BF16 payload bytes per token across all 16 heads (`16 * 96 * 2`).
+pub const ENGRAM_DECODED_TOKEN_BYTES: usize = ENGRAM_HEADS * ENGRAM_EMBED_WIDTH * 2;
+
+/// Host-memory sizing for Hy4-flash's 4 FP8 Engram tables, bounded row caches,
+/// and pinned prefill/decode staging pools. Shared by planner admission and runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hy4EngramShape {
+    pub unit_rows: usize,
+    pub waves: usize,
+    pub decode_rows: usize,
+    pub layers: usize,
+}
+
+impl Hy4EngramShape {
+    pub fn new(unit_rows: usize, waves: usize, decode_rows: usize, layers: usize) -> Result<Self> {
+        ensure!(
+            (1..=4096).contains(&unit_rows)
+                && (1..=4).contains(&waves)
+                && (1..=256).contains(&decode_rows)
+                && (1..=8).contains(&layers),
+            "invalid Hy4 Engram shape: unit_rows={unit_rows} waves={waves} decode_rows={decode_rows} layers={layers}"
+        );
+        Ok(Self { unit_rows, waves, decode_rows, layers })
+    }
+
+    /// Per-layer `(prefill, decode)` `RowCache` slot counts matching the shared
+    /// `lookahead::window_units(waves) + 1` prefill window and two decode rounds.
+    pub fn cache_shares(self) -> [usize; 2] {
+        TokenTable::shares(self.unit_rows, self.waves, self.decode_rows, ENGRAM_HEADS)
+    }
+
+    /// Total host bytes of all per-layer `RowCache`s (100-byte FP8 rows + index).
+    pub fn cache_bytes(self) -> usize {
+        self.layers * TokenTable::cache_bytes(ENGRAM_FP8_ROW_BYTES, self.cache_shares())
+    }
+
+    /// Pinned host staging slots for prefill gathers (one per Engram layer per wave + 1 in-flight copy).
+    pub fn prefill_slots(self) -> usize {
+        self.layers * (self.waves + 1)
+    }
+
+    /// Pinned host staging slots for decode/verify gathers (two rounds × all Engram layers).
+    pub fn decode_slots(self) -> usize {
+        self.layers * 2
+    }
+
+    /// Bytes of one prefill staging slot (decoded BF16 rows + per-row mask bytes).
+    pub fn prefill_slot_bytes(self) -> usize {
+        self.unit_rows * (ENGRAM_DECODED_TOKEN_BYTES + 1)
+    }
+
+    /// Bytes of one decode staging slot (decoded BF16 rows + per-row mask bytes).
+    pub fn decode_slot_bytes(self) -> usize {
+        self.decode_rows * (ENGRAM_DECODED_TOKEN_BYTES + 1)
+    }
+
+    /// Total pinned host bytes for prefill and decode Engram staging pools.
+    pub fn staging_bytes(self) -> usize {
+        self.prefill_slots() * self.prefill_slot_bytes() + self.decode_slots() * self.decode_slot_bytes()
+    }
+}
+
+/// Advance a rolling 2-token Engram tail by `accepted` tokens (clamped to `tokens.len()`).
+/// Used for accepted-prefix history transactions so rejected or cancelled rows never commit.
+#[inline]
+pub fn advance_tail(tail: [u32; 2], tokens: &[u32], accepted: usize) -> [u32; 2] {
+    let take = accepted.min(tokens.len());
+    match take {
+        0 => tail,
+        1 => [tail[1], tokens[0]],
+        n => [tokens[n - 2], tokens[n - 1]],
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pure-Rust NumPy SeedSequence + PCG64 + Lemire bounded uint64
@@ -239,13 +314,8 @@ impl Hy4EngramHasher {
 }
 
 // ---------------------------------------------------------------------------
-// Bitwise-exact OCP E4M3FN <-> F32 / BF16 codec matching quantization/hy4_flash/engram.py
+// Bitwise-exact OCP E4M3FN -> F32 / BF16 decoder matching quantization/hy4_flash/engram.py
 // ---------------------------------------------------------------------------
-
-#[inline]
-pub fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
 
 #[inline]
 pub fn f32_to_bf16_rne(value: f32) -> u16 {
@@ -279,61 +349,6 @@ pub fn e4m3fn_to_f32(code: u8) -> f32 {
     f32::from_bits(sign | (f_exp << 23) | f_mant)
 }
 
-/// Exact F32 to OCP FP8 E4M3FN (`float8_e4m3fn`) with round-to-nearest-even and saturation at ±448.
-#[inline]
-pub fn f32_to_e4m3fn_rne(value: f32) -> u8 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 24) & 0x80) as u8;
-    let abs_bits = bits & 0x7fff_ffff;
-    if abs_bits > 0x7f80_0000 {
-        return sign | 0x7f; // NaN
-    }
-    if abs_bits >= 0x43e0_0000 {
-        // >= 448.0 saturates to 0x7e (448.0), matching torch clamp(-448, 448).to(float8_e4m3fn)
-        return sign | 0x7e;
-    }
-    if abs_bits == 0 {
-        return sign;
-    }
-    let f_exp = ((abs_bits >> 23) & 0xff) as i32 - 127;
-    let f_mant = abs_bits & 0x007f_ffff;
-    if f_exp < -6 {
-        // Subnormal or underflow in E4M3FN (min positive subnormal is 2^-9; bias 7, 3 mant bits).
-        let shift = (-6 - f_exp) as u32; // >= 1
-        if shift > 24 {
-            return sign;
-        }
-        let sig = (1u32 << 23) | f_mant;
-        // We want round(sig / 2^(20 + shift))
-        let total_shift = 20 + shift;
-        if total_shift >= 32 {
-            return sign;
-        }
-        let q = sig >> total_shift;
-        let rem = sig & ((1u32 << total_shift) - 1);
-        let half = 1u32 << (total_shift - 1);
-        let rounded = if rem > half || (rem == half && (q & 1) == 1) { q + 1 } else { q };
-        if rounded >= 8 {
-            return sign | (1u8 << 3); // promoted to smallest normal (exp=1, mant=0)
-        }
-        return sign | (rounded as u8);
-    }
-    let e4 = (f_exp + 7) as u32;
-    let q = f_mant >> 20;
-    let rem = f_mant & 0x000f_ffff;
-    let half = 0x0008_0000;
-    let mut m3 = if rem > half || (rem == half && (q & 1) == 1) { q + 1 } else { q };
-    let mut e = e4;
-    if m3 >= 8 {
-        m3 = 0;
-        e += 1;
-    }
-    if e > 15 || (e == 15 && m3 >= 7) {
-        return sign | 0x7e;
-    }
-    sign | ((e as u8) << 3) | (m3 as u8)
-}
-
 /// Decode one 100-byte `fp8_e4m3_f32scale_row_interleaved_v1` row into 96 BF16 elements:
 /// `BF16(F32(code_e4m3) * scale_f32)`. Bitwise identical to `quantization/hy4_flash/engram.py:decode_rows`.
 #[inline]
@@ -344,57 +359,43 @@ pub fn decode_fp8_row(packed: &[u8; ENGRAM_FP8_ROW_BYTES], out_bf16: &mut [u16; 
     }
 }
 
-/// Exact stock Transformers BF16 Engram per-row E4M3 round-trip:
-/// `x + (decoded - x)` in BF16 arithmetic, used for the BF16 table fallback path.
-pub fn vendor_bf16_roundtrip(src_bf16: &[u16; ENGRAM_EMBED_WIDTH], out_bf16: &mut [u16; ENGRAM_EMBED_WIDTH]) {
-    const FP8_MAX: f32 = 448.0;
-    let floor = f32_to_bf16_rne(1e-12);
-    let floor_f32 = bf16_to_f32(floor);
-    let mut amax = 0.0f32;
-    for &b in src_bf16 {
-        let a = bf16_to_f32(b & 0x7fff);
-        if a > amax { amax = a; }
-    }
-    let clamped_amax = if amax < floor_f32 { floor_f32 } else { amax };
-    let scale = bf16_to_f32(f32_to_bf16_rne(clamped_amax / FP8_MAX));
-    for j in 0..ENGRAM_EMBED_WIDTH {
-        let x = bf16_to_f32(src_bf16[j]);
-        let scaled = bf16_to_f32(f32_to_bf16_rne(x / scale)).clamp(-FP8_MAX, FP8_MAX);
-        let code = f32_to_e4m3fn_rne(scaled);
-        let code_bf16 = bf16_to_f32(f32_to_bf16_rne(e4m3fn_to_f32(code)));
-        let decoded = bf16_to_f32(f32_to_bf16_rne(code_bf16 * scale));
-        let diff = bf16_to_f32(f32_to_bf16_rne(decoded - x));
-        out_bf16[j] = f32_to_bf16_rne(x + diff);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Mapped table reader: FP8 alternate default + BF16 fallback
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hy4EngramStorage {
-    /// Derived 100-byte row-interleaved E4M3 + F32 scale shards declared in `cuteafd-mc.json` `engram_fp8`.
-    Fp8Strided,
-    /// Official 192-byte BF16 embedding table indexed in the standard view.
-    Bf16Fallback,
-}
-
-impl Hy4EngramStorage {
-    pub const fn row_bytes(self) -> usize {
-        match self {
-            Self::Fp8Strided => ENGRAM_FP8_ROW_BYTES,
-            Self::Bf16Fallback => ENGRAM_BF16_ROW_BYTES,
+/// Decode a contiguous slice of 100-byte FP8 Engram rows into little-endian BF16 bytes (`rows * 192`).
+pub fn decode_fp8_rows_to_bf16_bytes(raw_fp8: &[u8], out_bf16_bytes: &mut [u8]) -> Result<()> {
+    ensure!(
+        raw_fp8.len() % ENGRAM_FP8_ROW_BYTES == 0,
+        "FP8 Engram payload {} not a multiple of {ENGRAM_FP8_ROW_BYTES}",
+        raw_fp8.len()
+    );
+    let count = raw_fp8.len() / ENGRAM_FP8_ROW_BYTES;
+    let expected_out = count * ENGRAM_EMBED_WIDTH * 2;
+    ensure!(
+        out_bf16_bytes.len() == expected_out,
+        "FP8 Engram BF16 destination {} != expected {expected_out}",
+        out_bf16_bytes.len()
+    );
+    let mut row_bf16 = [0u16; ENGRAM_EMBED_WIDTH];
+    for (i, chunk) in raw_fp8.chunks_exact(ENGRAM_FP8_ROW_BYTES).enumerate() {
+        let src: &[u8; ENGRAM_FP8_ROW_BYTES] = chunk.try_into().unwrap();
+        decode_fp8_row(src, &mut row_bf16);
+        let dst = &mut out_bf16_bytes[i * ENGRAM_EMBED_WIDTH * 2..(i + 1) * ENGRAM_EMBED_WIDTH * 2];
+        for (j, &val) in row_bf16.iter().enumerate() {
+            let le = val.to_le_bytes();
+            dst[j * 2] = le[0];
+            dst[j * 2 + 1] = le[1];
         }
     }
+    Ok(())
 }
 
-/// One Hy4-flash Engram embedding table backed by the shared page-cache `MappedTable` + `RowCache`.
+// ---------------------------------------------------------------------------
+// FP8-only mapped-table reader & multi-layer look-ahead over shared TokenTable
+// ---------------------------------------------------------------------------
+
+/// One Hy4-flash FP8 Engram embedding table backed by the shared [`TokenTable`]
+/// (`MappedTable` + bounded [`RowCache`] + shared read reactor).
 pub struct Hy4EngramTable {
     layer: usize,
-    storage: Hy4EngramStorage,
-    table: MappedTable,
-    cache: Arc<RowCache>,
+    table: Arc<TokenTable>,
 }
 
 fn read_fp8_part_header(path: &Path, expected_tensor: &str, expected_row_start: u64, expected_rows: u64) -> Result<u64> {
@@ -443,19 +444,18 @@ fn read_fp8_part_header(path: &Path, expected_tensor: &str, expected_row_start: 
 
 impl Hy4EngramTable {
     pub fn layer(&self) -> usize { self.layer }
-    pub fn storage(&self) -> Hy4EngramStorage { self.storage }
-    pub fn rows(&self) -> u64 { self.table.rows() }
+    pub fn rows(&self) -> u64 { self.table.table().rows() }
     pub fn row_bytes(&self) -> usize { self.table.row_bytes() }
-    pub fn mapped(&self) -> &MappedTable { &self.table }
-    pub fn cache(&self) -> &Arc<RowCache> { &self.cache }
+    pub fn mapped(&self) -> &MappedTable { self.table.table() }
+    pub fn token_table(&self) -> &Arc<TokenTable> { &self.table }
+    pub fn cache(&self) -> &Arc<RowCache> { self.table.cache() }
 
-    /// Open a Hy4-flash Engram layer from `checkpoint`: prefers the `engram_fp8`
-    /// alternate declared in `cuteafd-mc.json` when present, falling back to the
-    /// indexed BF16 table when absent.
+    /// Open a Hy4-flash FP8 Engram layer from `checkpoint` using `shares` for its `RowCache`.
+    /// Refuses checkpoints without `engram_fp8` (`engram-fp8-layer-*-part-*.safetensors`) by name.
     ///
     /// # Safety
     /// Checkpoint shard files must remain immutable while this table is mapped.
-    pub unsafe fn open(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, layer: usize) -> Result<Self> {
+    pub unsafe fn open(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, layer: usize, shares: [usize; 2]) -> Result<Self> {
         ensure!(
             cfg.engram_head_width() == ENGRAM_EMBED_WIDTH,
             "Hy4-flash Engram head width {} differs from expected {ENGRAM_EMBED_WIDTH}",
@@ -463,21 +463,35 @@ impl Hy4EngramTable {
         );
         let expected_rows = cfg.engram_rows(layer)
             .with_context(|| format!("Hy4-flash layer {layer} is not an Engram layer"))?;
-        if let Some(engram_fp8) = checkpoint.view.as_ref().and_then(|v| v.engram_fp8()) {
-            let entry = engram_fp8.layer(layer)
-                .with_context(|| format!("cuteafd-mc.json engram_fp8 lacks layer {layer}"))?;
-            // SAFETY: forwarded from caller.
-            return unsafe { Self::open_fp8_parts(&checkpoint.snapshot, layer, entry, expected_rows) };
-        }
+        let engram_fp8 = checkpoint
+            .view
+            .as_ref()
+            .and_then(|v| v.engram_fp8())
+            .with_context(|| {
+                format!(
+                    "Hy4-flash requires FP8 Engram shards (engram-fp8-layer-{layer:02}-part-*.safetensors) declared in cuteafd-mc.json"
+                )
+            })?;
+        let entry = engram_fp8.layer(layer).with_context(|| {
+            format!(
+                "cuteafd-mc.json engram_fp8 lacks layer {layer} (expected engram-fp8-layer-{layer:02}-part-*.safetensors)"
+            )
+        })?;
         // SAFETY: forwarded from caller.
-        unsafe { Self::open_bf16(checkpoint, layer, expected_rows) }
+        unsafe { Self::open_fp8_parts(&checkpoint.snapshot, layer, entry, expected_rows, shares) }
     }
 
-    /// Open strictly the `engram_fp8` strided parts for `layer`.
+    /// Open strictly the `engram_fp8` strided parts for `layer` backed by [`TokenTable`].
     ///
     /// # Safety
     /// Referenced shard files must remain immutable while mapped.
-    pub unsafe fn open_fp8_parts(snapshot: &Path, layer: usize, entry: &EngramFp8Layer, expected_rows: u64) -> Result<Self> {
+    pub unsafe fn open_fp8_parts(
+        snapshot: &Path,
+        layer: usize,
+        entry: &EngramFp8Layer,
+        expected_rows: u64,
+        shares: [usize; 2],
+    ) -> Result<Self> {
         let total = entry.total_rows()?;
         ensure!(total == expected_rows,
             "Hy4 Engram FP8 layer {layer} has {total} rows, config expects {expected_rows}");
@@ -493,75 +507,131 @@ impl Hy4EngramTable {
             row_start = row_start.checked_add(part.rows).context("FP8 Engram row_start overflow")?;
         }
         // SAFETY: forwarded from caller.
-        let table = unsafe { MappedTable::open(&parts, RowFormat::of(DType::U8, ENGRAM_FP8_ROW_BYTES)?)? };
-        table.name_stats(format!("hy4_engram.{layer}.fp8_strided"));
-        let cache = RowCache::new(ENGRAM_FP8_ROW_BYTES, DEFAULT_CACHE_SHARES, table.shared_stats())?;
-        Ok(Self { layer, storage: Hy4EngramStorage::Fp8Strided, table, cache })
+        let mapped = unsafe { MappedTable::open(&parts, RowFormat::of(DType::U8, ENGRAM_FP8_ROW_BYTES)?)? };
+        mapped.prepare_reads();
+        mapped.name_stats(format!("hy4_engram.{layer}.fp8_strided"));
+        let table = TokenTable::new(mapped, shares, ENGRAM_HEADS)?;
+        Ok(Self { layer, table })
     }
 
-    /// Open strictly the indexed BF16 Engram table for `layer` (fallback or verification source).
-    ///
-    /// # Safety
-    /// Referenced shard file must remain immutable while mapped.
-    pub unsafe fn open_bf16(checkpoint: &Checkpoint, layer: usize, expected_rows: u64) -> Result<Self> {
-        let name = format!("model.layers.{layer}.engram_layer.multi_head_embedding.embedding.weight");
-        let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == name)
-            .with_context(|| format!("missing BF16 Engram tensor {name}"))?;
-        ensure!(tensor.meta.dtype == DType::Bf16
-            && tensor.meta.shape == [expected_rows as usize, ENGRAM_EMBED_WIDTH]
-            && tensor.meta.byte_length == expected_rows * ENGRAM_BF16_ROW_BYTES as u64,
-            "invalid BF16 Engram header for {name}: {:?} {:?}", tensor.meta.dtype, tensor.meta.shape);
-        ensure!(!tensor.shard.is_empty()
-            && Path::new(&tensor.shard).components().all(|c| matches!(c, Component::Normal(_))),
-            "invalid BF16 Engram shard path {}", tensor.shard);
-        let path = checkpoint.snapshot.join(&tensor.shard);
-        // SAFETY: forwarded from caller.
-        let table = unsafe {
-            MappedTable::single(&path, tensor.meta.byte_offset, expected_rows, RowFormat::of(DType::Bf16, ENGRAM_EMBED_WIDTH)?)?
-        };
-        table.name_stats(format!("hy4_engram.{layer}.bf16"));
-        let cache = RowCache::new(ENGRAM_BF16_ROW_BYTES, DEFAULT_CACHE_SHARES, table.shared_stats())?;
-        Ok(Self { layer, storage: Hy4EngramStorage::Bf16Fallback, table, cache })
-    }
-
-    /// Gather raw row bytes via the shared mapped-table reactor into `out`.
-    pub fn gather_raw(&self, rows: &[u64], priority: ReadPriority) -> Result<Vec<u8>> {
-        let width = self.table.row_bytes();
-        let mut out = vec![0u8; rows.len() * width];
-        if rows.is_empty() { return Ok(out); }
-        let slots: Vec<usize> = (0..rows.len()).collect();
-        let mut prepared = self.table.prepare_gather(rows, &slots, &mut out, priority, 2, GatherMode::default())?;
-        while !prepared.step(&self.table, &mut out)? {}
+    /// Gather raw 100-byte FP8 rows through the shared [`RowCache`] (joining in-flight
+    /// look-ahead reads and falling back synchronously on cache misses).
+    pub fn gather_raw(&self, rows: &[u64], priority: ReadPriority, first_layer: bool) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; rows.len() * ENGRAM_FP8_ROW_BYTES];
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        let prio = if first_layer { priority.first() } else { priority };
+        self.table.gather_at_priority(rows, &mut out, prio)?;
         Ok(out)
     }
 
-    /// Gather `rows` and decode into BF16 (`rows.len() * 96` BF16 values),
-    /// matching the stock BF16 lookup expression bitwise for both `Fp8Strided` and `Bf16Fallback`.
-    pub fn gather_decoded_bf16(&self, rows: &[u64], priority: ReadPriority) -> Result<Vec<u16>> {
-        let raw = self.gather_raw(rows, priority)?;
+    /// Gather `rows` through [`RowCache`] and decode into little-endian BF16 bytes (`rows.len() * 192`).
+    pub fn gather_decoded_bf16_into(
+        &self,
+        rows: &[u64],
+        priority: ReadPriority,
+        first_layer: bool,
+        out_bf16_bytes: &mut [u8],
+    ) -> Result<()> {
+        let raw = self.gather_raw(rows, priority, first_layer)?;
+        decode_fp8_rows_to_bf16_bytes(&raw, out_bf16_bytes)
+    }
+
+    /// Gather `rows` through [`RowCache`] and decode into `Vec<u16>` (`rows.len() * 96` BF16 values).
+    pub fn gather_decoded_bf16(&self, rows: &[u64], priority: ReadPriority, first_layer: bool) -> Result<Vec<u16>> {
+        let raw = self.gather_raw(rows, priority, first_layer)?;
         let mut out = vec![0u16; rows.len() * ENGRAM_EMBED_WIDTH];
-        match self.storage {
-            Hy4EngramStorage::Fp8Strided => {
-                for (i, chunk) in raw.chunks_exact(ENGRAM_FP8_ROW_BYTES).enumerate() {
-                    let src: &[u8; ENGRAM_FP8_ROW_BYTES] = chunk.try_into().unwrap();
-                    let dst: &mut [u16; ENGRAM_EMBED_WIDTH] =
-                        (&mut out[i * ENGRAM_EMBED_WIDTH..(i + 1) * ENGRAM_EMBED_WIDTH]).try_into().unwrap();
-                    decode_fp8_row(src, dst);
-                }
-            }
-            Hy4EngramStorage::Bf16Fallback => {
-                for (i, chunk) in raw.chunks_exact(ENGRAM_BF16_ROW_BYTES).enumerate() {
-                    let mut src_bf16 = [0u16; ENGRAM_EMBED_WIDTH];
-                    for (j, pair) in chunk.chunks_exact(2).enumerate() {
-                        src_bf16[j] = u16::from_le_bytes([pair[0], pair[1]]);
-                    }
-                    let dst: &mut [u16; ENGRAM_EMBED_WIDTH] =
-                        (&mut out[i * ENGRAM_EMBED_WIDTH..(i + 1) * ENGRAM_EMBED_WIDTH]).try_into().unwrap();
-                    vendor_bf16_roundtrip(&src_bf16, dst);
-                }
-            }
+        for (i, chunk) in raw.chunks_exact(ENGRAM_FP8_ROW_BYTES).enumerate() {
+            let src: &[u8; ENGRAM_FP8_ROW_BYTES] = chunk.try_into().unwrap();
+            let dst: &mut [u16; ENGRAM_EMBED_WIDTH] =
+                (&mut out[i * ENGRAM_EMBED_WIDTH..(i + 1) * ENGRAM_EMBED_WIDTH]).try_into().unwrap();
+            decode_fp8_row(src, dst);
         }
         Ok(out)
+    }
+}
+
+/// Multi-layer Hy4-flash prompt row source over a forked 2-token history per layer.
+/// Never mutates any committed request history; dropping the handle cancels cleanly.
+struct Hy4EngramRowSource {
+    hashers: Vec<Arc<Hy4EngramHasher>>,
+    histories: Vec<Hy4EngramHistory>,
+    tokens: Vec<u32>,
+}
+
+impl RowSource for Hy4EngramRowSource {
+    fn tokens(&self) -> usize { self.tokens.len() }
+    fn rows(&mut self, tokens: Range<usize>) -> Result<Vec<Vec<u64>>> {
+        let slice = &self.tokens[tokens];
+        let mut per_layer = Vec::with_capacity(self.hashers.len());
+        for (hasher, history) in self.hashers.iter().zip(&mut self.histories) {
+            let mut rows = Vec::with_capacity(slice.len() * hasher.heads());
+            hasher.hash(history, slice, &mut rows)?;
+            per_layer.push(rows);
+        }
+        Ok(per_layer)
+    }
+}
+
+/// Earliest-possible multi-layer Engram look-ahead over all Hy4-flash Engram layers
+/// (`[1, 11, 21, 31]`), built directly on [`lookahead::Lookahead`].
+pub struct Hy4EngramLookahead {
+    planner: Lookahead,
+    hashers: Vec<Arc<Hy4EngramHasher>>,
+}
+
+impl Hy4EngramLookahead {
+    pub fn new(tables: Vec<Arc<TokenTable>>, hashers: Vec<Arc<Hy4EngramHasher>>) -> Result<Self> {
+        ensure!(!tables.is_empty() && tables.len() == hashers.len(), "Hy4 Engram look-ahead table/hasher count mismatch");
+        let lookahead_tables = tables
+            .into_iter()
+            .map(|table| table as Arc<dyn LookaheadTable>)
+            .collect();
+        let planner = Lookahead::new("hy4_engram", lookahead_tables)?;
+        Ok(Self { planner, hashers })
+    }
+
+    pub fn remote(&self) -> bool { self.planner.remote() }
+
+    /// Start reading all Engram layers' rows for `tokens` (starting at absolute position
+    /// `start` after a forked `initial_tail`) into each layer's `RowCache` in N-layer deadline order.
+    pub fn start(
+        &self,
+        tag: u64,
+        start: u64,
+        initial_tail: [u32; 2],
+        tokens: Vec<u32>,
+        units: UnitPlan,
+    ) -> LookaheadHandle {
+        let histories = (0..self.hashers.len())
+            .map(|_| Hy4EngramHistory(initial_tail.to_vec()))
+            .collect();
+        let source = Hy4EngramRowSource {
+            hashers: self.hashers.clone(),
+            histories,
+            tokens,
+        };
+        self.planner.start(tag, start, Box::new(source), units)
+    }
+
+    /// Hash candidate decode/verify tokens from each sequence's forked rolling tail and
+    /// submit all Engram layers' rows to the shared look-ahead's decode share. Never blocks.
+    pub fn decode(&self, members: &[([u32; 2], &[u32])]) -> Result<()> {
+        let mut per_layer: Vec<Vec<u64>> = (0..self.hashers.len()).map(|_| Vec::new()).collect();
+        for &(tail, tokens) in members {
+            if tokens.is_empty() {
+                continue;
+            }
+            for (hasher, out) in self.hashers.iter().zip(&mut per_layer) {
+                let mut hist = Hy4EngramHistory(tail.to_vec());
+                hasher.hash(&mut hist, tokens, out)?;
+            }
+        }
+        if per_layer.iter().any(|rows| !rows.is_empty()) {
+            self.planner.decode(per_layer);
+        }
+        Ok(())
     }
 }
 
@@ -580,43 +650,46 @@ pub fn read_lookup_table(checkpoint: &Checkpoint, layer: usize, expected_len: us
     Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
 }
 
-/// Total on-disk Engram table bytes across all declared layers for the active storage mode.
-/// Cross-checks `cuteafd-mc.json`'s `engram_fp8.total_bytes()` when present (fail-closed).
-pub fn mapped_engram_bytes(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig) -> Result<(Hy4EngramStorage, u64, BTreeMap<usize, u64>)> {
-    let engram_fp8 = checkpoint.view.as_ref().and_then(|v| v.engram_fp8());
-    let storage = if engram_fp8.is_some() {
-        Hy4EngramStorage::Fp8Strided
-    } else {
-        Hy4EngramStorage::Bf16Fallback
-    };
+/// Total on-disk FP8 Engram table bytes across all declared layers.
+/// Refuses checkpoints without `engram_fp8` (`engram-fp8-layer-*-part-*.safetensors`) by name,
+/// and cross-checks `cuteafd-mc.json`'s `engram_fp8.total_bytes()` (fail-closed).
+pub fn mapped_engram_bytes(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig) -> Result<(u64, BTreeMap<usize, u64>)> {
+    let engram_fp8 = checkpoint
+        .view
+        .as_ref()
+        .and_then(|v| v.engram_fp8())
+        .context("Hy4-flash requires FP8 Engram shards (engram-fp8-layer-*-part-*.safetensors) declared in cuteafd-mc.json")?;
     let mut per_layer = BTreeMap::new();
     let mut total = 0u64;
     for &layer in &cfg.engram_layers {
         let rows = cfg.engram_rows(layer).context("missing engram rows")?;
-        let bytes = rows.checked_mul(storage.row_bytes() as u64).context("engram bytes overflow")?;
+        let entry = engram_fp8.layer(layer).with_context(|| {
+            format!("cuteafd-mc.json engram_fp8 lacks layer {layer} (expected engram-fp8-layer-{layer:02}-part-*.safetensors)")
+        })?;
+        ensure!(
+            entry.total_rows()? == rows,
+            "cuteafd-mc.json engram_fp8 layer {layer} rows differ from config ({rows})"
+        );
+        let bytes = rows.checked_mul(ENGRAM_FP8_ROW_BYTES as u64).context("engram bytes overflow")?;
         per_layer.insert(layer, bytes);
         total = total.checked_add(bytes).context("total engram bytes overflow")?;
     }
-    if let Some(fp8) = engram_fp8 {
-        let declared = fp8.total_bytes().context("invalid cuteafd-mc.json engram_fp8 byte total")?;
-        ensure!(
-            declared == total,
-            "cuteafd-mc.json engram_fp8 total bytes ({declared}) differs from config rows * {} ({total})",
-            storage.row_bytes()
-        );
-    }
-    Ok((storage, total, per_layer))
+    let declared = engram_fp8.total_bytes().context("invalid cuteafd-mc.json engram_fp8 byte total")?;
+    ensure!(
+        declared == total,
+        "cuteafd-mc.json engram_fp8 total bytes ({declared}) differs from config rows * {ENGRAM_FP8_ROW_BYTES} ({total})"
+    );
+    Ok((total, per_layer))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    use crate::formats::mapped_table::row_cache::{Lookup, RowClass};
+    use std::os::unix::fs::FileExt;
 
     #[test]
     fn numpy_pcg64_factors_match_reference_exactly() {
-        // Exact values verified against `numpy.random.default_rng(0 + 10007 * (layer + 1))`
-        // with `bound = i64::MAX // (92619 + 1) // 2 = 49_791_470_723_681`.
         let bound = (i64::MAX / 92_620 / 2) as u64;
         assert_eq!(bound, 49_791_470_723_681);
         for (layer, expected) in [
@@ -636,89 +709,152 @@ mod tests {
     }
 
     #[test]
-    fn fp8_decode_matches_vendor_bf16_roundtrip_on_edges() {
-        // Synthetic rows covering ±0, subnormals, 1e-12 floor, ±448 endpoints and midpoints.
-        let mut row = [0u16; ENGRAM_EMBED_WIDTH];
-        let samples = [
-            0.0f32, -0.0, 1e-14, -1e-14, 1e-12, -1e-12, 0.001953125, -0.001953125,
-            0.015625, 0.125, 0.375, 1.0, -1.5, 3.25, 7.5, -15.5, 128.0, -448.0, 448.0,
-        ];
-        for (j, slot) in row.iter_mut().enumerate() {
-            *slot = f32_to_bf16_rne(samples[j % samples.len()]);
-        }
-        let mut reference = [0u16; ENGRAM_EMBED_WIDTH];
-        vendor_bf16_roundtrip(&row, &mut reference);
-
-        // Pack exactly as `quantization/hy4_flash/engram.py:_checked_pack` does.
-        let floor = bf16_to_f32(f32_to_bf16_rne(1e-12));
-        let amax = row.iter().map(|&b| bf16_to_f32(b & 0x7fff)).fold(0.0f32, f32::max).max(floor);
-        let scale = bf16_to_f32(f32_to_bf16_rne(amax / 448.0));
+    fn decode_fp8_row_matches_exact_e4m3_scale_product() {
+        let scale = 0.25f32;
         let mut packed = [0u8; ENGRAM_FP8_ROW_BYTES];
         for j in 0..ENGRAM_EMBED_WIDTH {
-            let scaled = bf16_to_f32(f32_to_bf16_rne(bf16_to_f32(row[j]) / scale)).clamp(-448.0, 448.0);
-            let mut code = f32_to_e4m3fn_rne(scaled);
-            if (code & 0x7f) == 0 {
-                code = if (reference[j] & 0x8000) != 0 { 0x80 } else { 0x00 };
-            }
+            // Cover positive/negative zeros, subnormals, normals, and max finite 448 (0x7e).
+            let code = match j % 8 {
+                0 => 0x00,
+                1 => 0x80,
+                2 => 0x01, // smallest subnormal 2^-9
+                3 => 0x38, // 1.0
+                4 => 0xb8, // -1.0
+                5 => 0x44, // 3.0
+                6 => 0x7e, // 448.0
+                _ => 0xfe, // -448.0
+            };
             packed[j] = code;
         }
         packed[96..100].copy_from_slice(&scale.to_le_bytes());
-
         let mut decoded = [0u16; ENGRAM_EMBED_WIDTH];
         decode_fp8_row(&packed, &mut decoded);
-        assert_eq!(decoded, reference);
+        assert_eq!(decoded[0], 0x0000);
+        assert_eq!(decoded[1], 0x8000);
+        assert_eq!(decoded[3], f32_to_bf16_rne(0.25));
+        assert_eq!(decoded[4], f32_to_bf16_rne(-0.25));
+        assert_eq!(decoded[6], f32_to_bf16_rne(112.0));
+        assert_eq!(decoded[7], f32_to_bf16_rne(-112.0));
+
+        let mut bytes = vec![0u8; ENGRAM_EMBED_WIDTH * 2];
+        decode_fp8_rows_to_bf16_bytes(&packed, &mut bytes).unwrap();
+        for (j, &u) in decoded.iter().enumerate() {
+            assert_eq!(&bytes[j * 2..j * 2 + 2], &u.to_le_bytes());
+        }
     }
 
     #[test]
-    #[ignore = "installed Hy4-flash K4 MC bitwise FP8 vs BF16 Engram verification"]
-    fn installed_hy4_engram_fp8_matches_bf16_bitwise_on_real_lookups() -> Result<()> {
-        let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").context("installed HF home required")?;
-        let snapshot = Path::new(&home)
-            .join("hub/models--wrldsuksgo2mars--Hy4-flash-EXL3-K4-MC/snapshots/cc72179113573d751ed3245e3e58d3640694378d");
-        let view = CheckpointView::select(&snapshot, CoreView::Original)?;
-        let checkpoint = Checkpoint::open_view(&view)?;
-        let cfg = Hy4FlashConfig::from_hf(&checkpoint.config)?;
-        let tokens = [120_000u32, 42, 100, 120_820, 7, 120_002, 500, 1024];
+    fn advance_tail_commits_only_accepted_prefix() {
+        let start = [10, 20];
+        assert_eq!(advance_tail(start, &[30, 40, 50], 0), [10, 20]);
+        assert_eq!(advance_tail(start, &[30, 40, 50], 1), [20, 30]);
+        assert_eq!(advance_tail(start, &[30, 40, 50], 2), [30, 40]);
+        assert_eq!(advance_tail(start, &[30, 40, 50], 3), [40, 50]);
+        assert_eq!(advance_tail(start, &[30], 5), [20, 30]);
+    }
 
-        for &layer in &cfg.engram_layers {
-            let lookup = read_lookup_table(&checkpoint, layer, cfg.engram_lookup_table_size)?;
-            let hasher = Hy4EngramHasher::new(&cfg, layer, lookup)?;
-            let mut full_hist = hasher.start();
-            let mut rows = Vec::new();
-            hasher.hash(&mut full_hist, &tokens, &mut rows)?;
+    fn toy_hasher(layer: usize) -> Arc<Hy4EngramHasher> {
+        let sizes = vec![16u64; ENGRAM_HEADS];
+        let offsets = (0..ENGRAM_HEADS).map(|h| (h * 16) as u64).collect();
+        Arc::new(Hy4EngramHasher {
+            layer,
+            lookup: (0..256i32).collect(),
+            factors: vec![13 + layer as i64 * 2, 29 + layer as i64 * 2, 53 + layer as i64 * 2],
+            sizes,
+            offsets,
+            heads_per_ngram: 8,
+            pad_id: 0,
+            masked_tokens: [0, 1, 2],
+        })
+    }
 
-            // Streaming chunk-by-chunk must equal single pass.
-            let mut split_hist = hasher.start();
-            let mut split_rows = Vec::new();
-            hasher.hash(&mut split_hist, &tokens[..3], &mut split_rows)?;
-            hasher.hash(&mut split_hist, &tokens[3..], &mut split_rows)?;
-            assert_eq!(rows, split_rows, "streaming mismatch layer {layer}");
-            assert_eq!(full_hist, split_hist);
-
-            if layer == 1 {
-                // Exact row match against `python/reference/families/hy4_flash/model.py:engram_rows`.
-                assert_eq!(&rows[0..16], &[
-                    4_258_903, 16_210_259, 27_260_810, 31_206_235, 46_090_317, 56_488_174, 70_058_412, 75_384_515,
-                    91_716_212, 103_088_154, 112_241_750, 118_054_132, 125_718_195, 134_064_584, 150_441_785, 156_008_176,
-                ]);
-                assert_eq!(&rows[48..64], &[
-                    235_426, 18_785_785, 27_351_194, 33_367_523, 42_293_259, 52_181_829, 67_674_724, 81_119_641,
-                    87_193_657, 102_541_383, 103_437_646, 117_820_561, 129_480_352, 138_758_752, 145_934_975, 159_886_767,
-                ]);
+    fn toy_table(layer: usize, rows: u64) -> Result<(tempfile::NamedTempFile, Arc<TokenTable>)> {
+        let file = tempfile::NamedTempFile::new()?;
+        file.as_file().set_len(rows * ENGRAM_FP8_ROW_BYTES as u64)?;
+        for row in 0..rows {
+            let mut buf = [0u8; ENGRAM_FP8_ROW_BYTES];
+            for j in 0..ENGRAM_EMBED_WIDTH {
+                buf[j] = ((layer * 31 + row as usize * 7 + j) % 0x7e) as u8;
             }
-
-            let expected_rows = cfg.engram_rows(layer).unwrap();
-            // SAFETY: immutable published checkpoint snapshot.
-            let fp8_table = unsafe { Hy4EngramTable::open(&checkpoint, &cfg, layer)? };
-            assert_eq!(fp8_table.storage(), Hy4EngramStorage::Fp8Strided);
-            // SAFETY: immutable published checkpoint snapshot.
-            let bf16_table = unsafe { Hy4EngramTable::open_bf16(&checkpoint, layer, expected_rows)? };
-            assert_eq!(bf16_table.storage(), Hy4EngramStorage::Bf16Fallback);
-
-            let fp8_decoded = fp8_table.gather_decoded_bf16(&rows, ReadPriority::Prefill)?;
-            let bf16_decoded = bf16_table.gather_decoded_bf16(&rows, ReadPriority::Prefill)?;
-            assert_eq!(fp8_decoded, bf16_decoded, "layer {layer} FP8 vs BF16 bit mismatch");
+            buf[96..100].copy_from_slice(&1.0f32.to_le_bytes());
+            file.as_file().write_all_at(&buf, row * ENGRAM_FP8_ROW_BYTES as u64)?;
         }
+        // SAFETY: file stays owned for the test's lifetime.
+        let mapped = unsafe {
+            MappedTable::single(
+                file.path(),
+                0,
+                rows,
+                RowFormat::of(DType::U8, ENGRAM_FP8_ROW_BYTES)?,
+            )?
+        };
+        mapped.prepare_reads();
+        mapped.name_stats(format!("hy4_test_engram.{layer}.fp8_strided"));
+        let shares = TokenTable::shares(128, 1, 16, ENGRAM_HEADS);
+        Ok((file, TokenTable::new(mapped, shares, ENGRAM_HEADS)?))
+    }
+
+    #[test]
+    fn four_layer_lookahead_fills_caches_in_deadline_order_and_decode_prefetch_hits() -> Result<()> {
+        let layers = [1usize, 11, 21, 31];
+        let hashers: Vec<Arc<Hy4EngramHasher>> = layers.iter().map(|&l| toy_hasher(l)).collect();
+        let mut files = Vec::new();
+        let mut tables = Vec::new();
+        for &l in &layers {
+            let (f, t) = toy_table(l, 256)?;
+            files.push(f);
+            tables.push(t);
+        }
+        let ahead = Hy4EngramLookahead::new(tables.clone(), hashers.clone())?;
+        let tokens: Vec<u32> = (3..131).collect();
+        let handle = ahead.start(1, 0, [0, 0], tokens.clone(), UnitPlan::new(vec![128], 1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tables.iter().any(|t| t.table().stats().snapshot().lookahead_pieces < 1) {
+            assert!(std::time::Instant::now() < deadline, "4-layer Hy4 look-ahead did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Every layer's demand gather over the prefetched prompt hits RowCache with 0 fallback misses.
+        for (idx, (hasher, table)) in hashers.iter().zip(&tables).enumerate() {
+            let mut hist = Hy4EngramHistory(vec![0, 0]);
+            let mut row_ids = Vec::new();
+            hasher.hash(&mut hist, &tokens, &mut row_ids)?;
+            let before = table.table().stats().snapshot();
+            let mut out = vec![0u8; row_ids.len() * ENGRAM_FP8_ROW_BYTES];
+            let prio = if idx == 0 { ReadPriority::PrefillFirst } else { ReadPriority::Prefill };
+            table.gather_at_priority(&row_ids, &mut out, prio)?;
+            let delta = table.table().stats().snapshot().since(&before);
+            assert_eq!(delta.stall_prefill_fallback_rows, 0, "layer {} fell back on prefetched rows", layers[idx]);
+            assert!(delta.cache_hit_rows > 0);
+        }
+        assert!(!handle.commit(128));
+        drop(handle);
+
+        // Decode prefetch populates all 4 layers' decode shares without mutating committed tail.
+        let committed_tail = [129u32, 130];
+        let cand = [200u32];
+        ahead.decode(&[(committed_tail, &cand)])?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut all_cached = true;
+            for (hasher, table) in hashers.iter().zip(&tables) {
+                let mut h = Hy4EngramHistory(committed_tail.to_vec());
+                let mut ids = Vec::new();
+                hasher.hash(&mut h, &cand, &mut ids)?;
+                let (_pins, lookups) = table.cache().acquire(&ids[..1], RowClass::Decode);
+                if !matches!(lookups[0], Lookup::Ready(_)) {
+                    all_cached = false;
+                    break;
+                }
+            }
+            if all_cached {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "decode prefetch did not land in all 4 layers");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(ahead);
+        drop(files);
         Ok(())
     }
 }

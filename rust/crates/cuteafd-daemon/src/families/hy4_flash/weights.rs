@@ -1,6 +1,9 @@
-//! Header-admitted packed target weight arena and host-resident Engram tables for Hy4-flash.
+//! Header-admitted packed target weight arena and host-resident FP8 Engram tables
+//! with earliest-possible look-ahead and background pinned staging for Hy4-flash.
 use super::native::{dequant_kv_b_trellis_absorbed, Hy4NativeCore};
+use crate::shared::mapped_table::wait_rows;
 use crate::shared::memory::{
+    budget::admit_host_memory,
     device::{Allocation, Device},
     weight_arena::DeviceWeightArena,
     Tag,
@@ -12,126 +15,374 @@ use anyhow::{bail, ensure, Context, Result};
 use cuteafd_core::memory_layout::ArenaTag;
 use cuteafd_core::DType;
 use cuteafd_ffi::programs::{Programs, VocabularyHead};
-use cuteafd_ffi::CuteafdDeviceBuffer;
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, PinnedBytes};
 use cuteafd_loader::families::hy4_flash::engram::{
-    read_lookup_table, Hy4EngramHasher, Hy4EngramHistory, Hy4EngramTable, ENGRAM_EMBED_WIDTH,
+    read_lookup_table, Hy4EngramHasher, Hy4EngramHistory, Hy4EngramLookahead, Hy4EngramShape,
+    Hy4EngramTable, ENGRAM_DECODED_TOKEN_BYTES, ENGRAM_HEADS,
 };
 use cuteafd_loader::families::hy4_flash::weight_layout::{core_split, target_arenas, CoordinatorWeights};
 use cuteafd_loader::families::hy4_flash::Hy4FlashConfig;
-use cuteafd_loader::formats::trellis_core::CoreSplit;
+use cuteafd_loader::formats::mapped_preload::{MappedPlacement, DEFAULT_CAP_BYTES};
+use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, UnitPlan};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
+use cuteafd_loader::formats::trellis_core::CoreSplit;
 use cuteafd_loader::placement::families::hy4_flash as hy4_placement;
 use cuteafd_loader::placement::AttentionPlacement;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use cuteafd_loader::plan::families::hy4_flash as hy4_plan;
+use cuteafd_loader::shared::token_table::{AdmissionTimedOut, TablePipeline};
+use cuteafd_loader::{GatherLease, GatherTicket, TableStatsSnapshot};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const HEAD_WS_BYTES: usize = 32 << 20;
+const ENGRAM_GATHER_WAIT: Duration = Duration::from_secs(120);
 
-/// Host-resident Engram state across all 4 Hy4-flash Engram layers (`[1, 11, 21, 31]`).
+pub(crate) struct Hy4EngramSlot {
+    pub(crate) bytes: PinnedBytes,
+}
+
+#[derive(Clone)]
+pub(crate) struct Hy4EngramJob {
+    layer_idx: usize,
+    row_ids: Vec<u64>,
+    masked: Vec<u8>,
+    priority: ReadPriority,
+}
+
+type EngramPipeline = TablePipeline<Hy4EngramSlot, Hy4EngramJob>;
+type EngramTicket = GatherTicket<Hy4EngramSlot, Hy4EngramJob, anyhow::Error>;
+pub(crate) type EngramLease = GatherLease<Hy4EngramSlot, Hy4EngramJob>;
+
+enum LayerGather {
+    Pending(Hy4EngramJob),
+    Queued(EngramTicket),
+    Consumed,
+}
+
+fn engram_gather_timeout(cause: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(crate::shared::experts::rtx::pair::RecoverableStepError::new(
+        crate::shared::experts::rtx::pair::Recovery::HostGather,
+        format!("hy4_engram token-table: {cause:#}"),
+    ))
+}
+
+/// Request-owned early Engram I/O wave spanning all Engram layers in one unit.
+/// Background gather + FP8->BF16 decode runs overlapped with GPU layers; dropping
+/// the wave cancels any unconsumed tickets and returns their pinned staging slots.
+pub(crate) struct Hy4EngramWave {
+    tables: Vec<Arc<Hy4EngramTable>>,
+    pipeline: Arc<EngramPipeline>,
+    layers: BTreeMap<usize, (usize, LayerGather)>,
+    rows: usize,
+    decode: bool,
+}
+
+impl Hy4EngramWave {
+    fn admit_pending(&mut self) -> Result<()> {
+        self.pipeline.reclaim_copies()?;
+        for (layer_idx, state) in self.layers.values_mut() {
+            if let LayerGather::Pending(job) = state {
+                if let Some(ticket) = self.pipeline.try_submit(job.clone(), *layer_idx == 0)? {
+                    *state = LayerGather::Queued(ticket);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait for `layer`'s decoded BF16 + mask pinned staging buffer right before launching
+    /// that layer's GPU Engram kernels. Returns `(lease, raw_bytes, masked_bytes)`.
+    pub(crate) fn take_layer(&mut self, layer: usize) -> Result<(EngramLease, usize, usize)> {
+        let (layer_idx, state) = self
+            .layers
+            .get_mut(&layer)
+            .with_context(|| format!("Hy4 Engram wave has no entry for layer {layer}"))?;
+        let layer_idx = *layer_idx;
+        let current = std::mem::replace(state, LayerGather::Consumed);
+        let started = Instant::now();
+        let mut ticket = match current {
+            LayerGather::Queued(ticket) => ticket,
+            LayerGather::Pending(job) => {
+                self.pipeline.reclaim_copies()?;
+                match self.pipeline.submit_timeout(job, layer_idx == 0, ENGRAM_GATHER_WAIT) {
+                    Ok(ticket) => ticket,
+                    Err(error) if error.is::<AdmissionTimedOut>() => return Err(engram_gather_timeout(error)),
+                    Err(error) => return Err(error),
+                }
+            }
+            LayerGather::Consumed => bail!("Hy4 Engram layer {layer} already consumed"),
+        };
+        let lease = wait_rows("hy4_engram", &mut ticket, ENGRAM_GATHER_WAIT)?;
+        let elapsed = started.elapsed();
+        let stats = self.tables[layer_idx].mapped().stats();
+        stats.record_stall(elapsed);
+        if self.decode {
+            stats.record_decode_stall(elapsed);
+        }
+        if elapsed >= Duration::from_micros(100) {
+            stats.record_consumer_stall(self.decode, elapsed);
+        }
+        let _ = self.admit_pending();
+        Ok((lease, self.rows * ENGRAM_DECODED_TOKEN_BYTES, self.rows))
+    }
+
+    pub(crate) fn retain_copy(&self, lease: EngramLease) {
+        self.pipeline.retain_copy(lease);
+    }
+}
+
+/// Host-resident FP8 Engram state across all 4 Hy4-flash Engram layers (`[1, 11, 21, 31]`):
+/// shared `TokenTable` row caches, multi-layer `Hy4EngramLookahead`, and pinned prefill/decode
+/// background gather pipelines.
 pub(crate) struct Hy4EngramHost {
-    layers: BTreeMap<usize, (Hy4EngramHasher, Hy4EngramTable)>,
+    shape: Hy4EngramShape,
+    layer_ids: Vec<usize>,
+    hashers: Vec<Arc<Hy4EngramHasher>>,
+    tables: Vec<Arc<Hy4EngramTable>>,
+    lookahead: Hy4EngramLookahead,
+    prefill: Arc<EngramPipeline>,
+    decode: Arc<EngramPipeline>,
+    logged: Vec<Cell<TableStatsSnapshot>>,
 }
 
 impl Hy4EngramHost {
-    /// Open all 4 host-mapped Engram tables (`engram_fp8` by default, or BF16 when `force_bf16`).
+    /// Open all 4 host-mapped FP8 Engram tables (`engram-fp8-layer-*-part-*.safetensors`),
+    /// admit host row-cache and pinned staging memory, and start the shared look-ahead
+    /// and background gather pipelines.
     ///
     /// # Safety
     /// Checkpoint shard files must remain immutable for the lifetime of this struct.
-    pub(crate) unsafe fn open(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, force_bf16: bool) -> Result<Self> {
-        let mut layers = BTreeMap::new();
+    pub(crate) unsafe fn open(
+        library: &NativeLibrary,
+        checkpoint: &Checkpoint,
+        cfg: &Hy4FlashConfig,
+        max_rows: usize,
+        prefill_waves: usize,
+    ) -> Result<Self> {
+        let shape = Hy4EngramShape::new(
+            max_rows,
+            prefill_waves.max(1),
+            hy4_placement::DECODE_ROWS as usize,
+            cfg.engram_layers.len(),
+        )?;
+        let _scope = cuteafd_ffi::memory_ledger::scope("hy4-engram");
+        admit_host_memory(
+            0,
+            &[
+                ("hy4_flash/engram-staging", shape.staging_bytes() as u64),
+                ("hy4_flash/engram-row-cache", shape.cache_bytes() as u64),
+            ],
+            0,
+            0,
+        )?;
+
+        let shares = shape.cache_shares();
+        let mut layer_ids = Vec::with_capacity(cfg.engram_layers.len());
+        let mut hashers = Vec::with_capacity(cfg.engram_layers.len());
+        let mut tables = Vec::with_capacity(cfg.engram_layers.len());
+        let mut token_tables = Vec::with_capacity(cfg.engram_layers.len());
+        let mut logged = Vec::with_capacity(cfg.engram_layers.len());
+
         for &layer in &cfg.engram_layers {
             let lookup = read_lookup_table(checkpoint, layer, cfg.engram_lookup_table_size)?;
-            let hasher = Hy4EngramHasher::new(cfg, layer, lookup)?;
-            let expected_rows = cfg
-                .engram_rows(layer)
-                .with_context(|| format!("Hy4-flash config lacks engram_rows for layer {layer}"))?;
+            let hasher = Arc::new(Hy4EngramHasher::new(cfg, layer, lookup)?);
             // SAFETY: forwarded from caller.
-            let table = if force_bf16 {
-                unsafe { Hy4EngramTable::open_bf16(checkpoint, layer, expected_rows)? }
-            } else {
-                unsafe { Hy4EngramTable::open(checkpoint, cfg, layer)? }
-            };
+            let table = Arc::new(unsafe { Hy4EngramTable::open(checkpoint, cfg, layer, shares)? });
             tracing::info!(
                 layer,
-                storage = ?table.storage(),
                 rows = table.rows(),
                 row_bytes = table.row_bytes(),
-                "Hy4-flash Engram host table ready"
+                prefill_cache_rows = shares[0],
+                decode_cache_rows = shares[1],
+                "Hy4-flash FP8 Engram host table ready"
             );
-            layers.insert(layer, (hasher, table));
+            logged.push(Cell::new(table.mapped().stats().snapshot()));
+            token_tables.push(Arc::clone(table.token_table()));
+            layer_ids.push(layer);
+            hashers.push(hasher);
+            tables.push(table);
         }
-        Ok(Self { layers })
+
+        let lookahead = Hy4EngramLookahead::new(token_tables, hashers.clone())?;
+
+        let make_pipeline = |name: &str, slots: usize, slot_bytes: usize| -> Result<Arc<EngramPipeline>> {
+            let worker_tables = tables.clone();
+            let storage = (0..slots)
+                .map(|_| {
+                    Ok(Hy4EngramSlot {
+                        bytes: library.pinned_bytes(slot_bytes, Tag::staging("hy4_flash/engram-staging"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(TablePipeline::new(
+                name,
+                storage,
+                move |slot: &mut Hy4EngramSlot, job: &Hy4EngramJob| {
+                    let rows = job.masked.len();
+                    let raw_bytes = rows * ENGRAM_DECODED_TOKEN_BYTES;
+                    let total = raw_bytes + rows;
+                    let dst = slot.bytes.bytes_mut();
+                    ensure!(total <= dst.len(), "Hy4 Engram staging slot overflow ({total} > {})", dst.len());
+                    worker_tables[job.layer_idx].gather_decoded_bf16_into(
+                        &job.row_ids,
+                        job.priority,
+                        job.layer_idx == 0,
+                        &mut dst[..raw_bytes],
+                    )?;
+                    dst[raw_bytes..total].copy_from_slice(&job.masked);
+                    Ok(())
+                },
+                |slot| Ok(slot.bytes.copy_ready()?),
+            )?))
+        };
+
+        let prefill = make_pipeline("hy4-engram-prefill", shape.prefill_slots(), shape.prefill_slot_bytes())?;
+        let decode = make_pipeline("hy4-engram-decode", shape.decode_slots(), shape.decode_slot_bytes())?;
+
+        cuteafd_bench::context::set_mapped_placement(MappedPlacement::resolve(
+            cfg.engram_layers.len(),
+            0,
+            0,
+            DEFAULT_CAP_BYTES,
+            0,
+        ));
+
+        Ok(Self {
+            shape,
+            layer_ids,
+            hashers,
+            tables,
+            lookahead,
+            prefill,
+            decode,
+            logged,
+        })
     }
 
-    pub(crate) fn start_histories(&self) -> BTreeMap<usize, Hy4EngramHistory> {
-        self.layers
-            .iter()
-            .map(|(&layer, (hasher, _))| (layer, hasher.start()))
-            .collect()
-    }
-
-    /// Gather decoded BF16 `[tokens.len(), 16, 96]` rows and `masked [tokens.len()]` u8 flags.
-    pub(crate) fn lookup_chunk(
+    /// Start earliest-possible prompt look-ahead across all 4 Engram layers from admission.
+    pub(crate) fn start_lookahead(
         &self,
-        layer: usize,
-        history: &mut Hy4EngramHistory,
-        tokens: &[u32],
-    ) -> Result<(Vec<u16>, Vec<u8>)> {
-        let (hasher, table) = self
-            .layers
-            .get(&layer)
-            .with_context(|| format!("layer {layer} is not a Hy4-flash Engram layer"))?;
-        let mut row_ids = Vec::with_capacity(tokens.len() * hasher.heads());
-        hasher.hash(history, tokens, &mut row_ids)?;
-        let decoded = table.gather_decoded_bf16(&row_ids, ReadPriority::Prefill)?;
-        ensure!(
-            decoded.len() == tokens.len() * hasher.heads() * ENGRAM_EMBED_WIDTH,
-            "Hy4 Engram decoded length mismatch"
-        );
-        let masked: Vec<u8> = tokens.iter().map(|&t| u8::from(hasher.is_masked(t))).collect();
-        Ok((decoded, masked))
+        tag: u64,
+        start: u64,
+        initial_tail: [u32; 2],
+        tokens: Vec<u32>,
+        units: UnitPlan,
+    ) -> LookaheadHandle {
+        self.lookahead.start(tag, start, initial_tail, tokens, units)
     }
 
-    /// Batched multi-sequence Engram lookup for one Engram layer.
-    /// Each entry is `(engram_tail, tokens)`. Returns concatenated BF16 `[total_rows, 16, 96]`
-    /// bytes, `masked [total_rows]` u8 flags, and the updated `[u32; 2]` tail per sequence.
-    pub(crate) fn lookup_batch(
+    /// Non-blocking decode/verify prefetch across all 4 Engram layers as soon as candidate tokens exist.
+    pub(crate) fn prefetch_decode(&self, members: &[([u32; 2], &[u32])]) -> Result<()> {
+        self.lookahead.decode(members)
+    }
+
+    /// Hash all Engram layers in `layer_span` from forked rolling histories (never mutating
+    /// committed tails) and submit background gather + FP8->BF16 decode into pinned staging
+    /// immediately so execution overlaps with GPU layers.
+    pub(crate) fn begin_wave(
         &self,
-        layer: usize,
+        layer_span: &Range<usize>,
         members: &[([u32; 2], &[u32])],
         priority: ReadPriority,
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<[u32; 2]>)> {
-        let (hasher, table) = self
-            .layers
-            .get(&layer)
-            .with_context(|| format!("layer {layer} is not a Hy4-flash Engram layer"))?;
+    ) -> Result<Hy4EngramWave> {
         let total_rows: usize = members.iter().map(|(_, t)| t.len()).sum();
-        let mut row_ids = Vec::with_capacity(total_rows * hasher.heads());
+        let decode = priority == ReadPriority::Decode && total_rows <= self.shape.decode_rows;
+        let pipeline = Arc::clone(if decode { &self.decode } else { &self.prefill });
+        pipeline.reclaim_copies()?;
+
         let mut masked = Vec::with_capacity(total_rows);
-        let mut next_tails = Vec::with_capacity(members.len());
-        for &(tail, tokens) in members {
-            let mut hist = Hy4EngramHistory(tail.to_vec());
-            hasher.hash(&mut hist, tokens, &mut row_ids)?;
-            ensure!(hist.0.len() == 2, "Hy4 Engram history width != 2");
-            next_tails.push([hist.0[0], hist.0[1]]);
-            masked.extend(tokens.iter().map(|&t| u8::from(hasher.is_masked(t))));
+        if let Some(first_hasher) = self.hashers.first() {
+            for &(_, tokens) in members {
+                masked.extend(tokens.iter().map(|&t| u8::from(first_hasher.is_masked(t))));
+            }
         }
-        let decoded = table.gather_decoded_bf16(&row_ids, priority)?;
-        ensure!(
-            decoded.len() == total_rows * hasher.heads() * ENGRAM_EMBED_WIDTH,
-            "Hy4 Engram batched decoded length mismatch"
-        );
-        let raw_bytes: Vec<u8> = decoded.iter().flat_map(|v| v.to_le_bytes()).collect();
-        Ok((raw_bytes, masked, next_tails))
+
+        let mut layers = BTreeMap::new();
+        for (layer_idx, &layer) in self.layer_ids.iter().enumerate() {
+            if !layer_span.contains(&layer) {
+                continue;
+            }
+            let hasher = &self.hashers[layer_idx];
+            let mut row_ids = Vec::with_capacity(total_rows * ENGRAM_HEADS);
+            for &(tail, tokens) in members {
+                let mut hist = Hy4EngramHistory(tail.to_vec());
+                hasher.hash(&mut hist, tokens, &mut row_ids)?;
+            }
+            let job = Hy4EngramJob {
+                layer_idx,
+                row_ids,
+                masked: masked.clone(),
+                priority,
+            };
+            let state = match pipeline.try_submit(job.clone(), layer_idx == 0)? {
+                Some(ticket) => LayerGather::Queued(ticket),
+                None => LayerGather::Pending(job),
+            };
+            layers.insert(layer, (layer_idx, state));
+        }
+
+        Ok(Hy4EngramWave {
+            tables: self.tables.clone(),
+            pipeline,
+            layers,
+            rows: total_rows,
+            decode,
+        })
     }
 
-    /// Log host-table row-cache statistics for diagnostics.
-    pub(crate) fn log_stats(&self, phase: &str) {
-        for (&layer, (_, table)) in &self.layers {
-            tracing::debug!(layer, phase, storage = ?table.storage(), rows = table.rows(), "Hy4 Engram table stats");
+    /// Reclaim completed H2D copies across both staging pipelines after stream drain.
+    pub(crate) fn drain(&self) -> Result<()> {
+        self.prefill.reclaim_copies()?;
+        self.decode.reclaim_copies()
+    }
+
+    /// Log interval Engram row-cache, look-ahead, and blocking-wait telemetry per layer.
+    pub(crate) fn log_stats(&self, event: &str) {
+        for (idx, table) in self.tables.iter().enumerate() {
+            let now = table.mapped().stats().snapshot();
+            let d = now.since(&self.logged[idx].replace(now));
+            if d.cache_hit_rows
+                + d.distinct_rows
+                + d.cache_wait_rows
+                + d.lookahead_rows
+                + d.stall_prefill_fallback_rows
+                + d.stall_decode_fallback_rows
+                == 0
+            {
+                continue;
+            }
+            tracing::info!(
+                table = %format!("hy4_engram.{}.fp8_strided", self.layer_ids[idx]),
+                layer = self.layer_ids[idx],
+                event,
+                cache_hit_rows = d.cache_hit_rows,
+                cache_wait_rows = d.cache_wait_rows,
+                distinct_rows = d.distinct_rows,
+                demand_rows = d.demand_rows,
+                demand_hit_rows = d.demand_hit_rows,
+                lookahead_rows = d.lookahead_rows,
+                prefill_fallback_rows = d.stall_prefill_fallback_rows,
+                prefill_pending_rows = d.stall_prefill_pending_rows,
+                decode_fallback_rows = d.stall_decode_fallback_rows,
+                decode_pending_rows = d.stall_decode_pending_rows,
+                device_rows = d.page_misses,
+                device_ms = d.miss_ns as f64 / 1e6,
+                consumer_steps = d.consumer_steps,
+                decode_steps = d.decode_steps,
+                stall_ms = d.stall_ns as f64 / 1e6,
+                decode_stall_ms = d.decode_stall_ns as f64 / 1e6,
+                stall_prefill_events = d.stall_prefill_events,
+                stall_prefill_ms = d.stall_prefill_ns as f64 / 1e6,
+                stall_decode_events = d.stall_decode_events,
+                stall_decode_ms = d.stall_decode_ns as f64 / 1e6,
+                "mapped table"
+            );
         }
     }
 }
