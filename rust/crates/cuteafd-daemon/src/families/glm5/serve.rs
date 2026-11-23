@@ -1353,7 +1353,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted, censored)).collect();
-        policy.observe(&outcomes);
+        // GLM 5.3's round time is its verify step, as its trace's `verify_ms` records.
+        policy.observe_timed(&outcomes, Some(history::RoundTiming { lane: tally.lane(),
+            round_us: (1e3 * verify_ms) as u64, draft_us: 0, verify_us: (1e3 * verify_ms) as u64,
+            context: starts.clone() }));
     }
     for (i, request) in active.iter().enumerate() {
         let proposal = &sequences[i][1..];

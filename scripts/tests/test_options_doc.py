@@ -411,6 +411,12 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == ["V4.1"]
                 assert default == "2"
                 assert "`DECODE_LANES=1`" in lever["enable"]
+            elif key == "DRAFT_POLICY":
+                # The lever is the opt-in `clamped` policy; `history` stays the default.
+                assert default == "history"
+                assert lever["families"] == COLUMNS
+                assert "`DRAFT_POLICY=clamped`" in lever["enable"]
+                assert "clamped) draft_policy_args=(--draft-policy clamped) ;;" in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
@@ -536,7 +542,7 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
 
 def test_every_family_accepts_the_shared_draft_policy_key():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert "DRAFT_POLICY must be history or off" in launcher
+    assert "DRAFT_POLICY must be history, clamped or off" in launcher
     assert "CUTEAFD_DRAFT_POLICY" not in launcher
     for removed in ("DRAFT_SURVIVAL_LENGTHS", "DRAFT_ROW_COST"):
         assert removed not in MATRIX and removed not in launcher

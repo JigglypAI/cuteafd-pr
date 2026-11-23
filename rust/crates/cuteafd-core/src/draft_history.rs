@@ -31,6 +31,29 @@ pub const FADE_ROUNDS: u64 = 3;
 /// above this; a copy position while its own probability is (#2460: one cut for
 /// every family and score source).
 pub const KEEP_CUT: f64 = 0.3;
+/// `DRAFT_POLICY=clamped` (TJ, 2026-11-23, "the fitted ratio rule"): the same
+/// calibrated product keep as `history`, but each round's cut is
+/// `clamp(K / (x + M), LO, HI)`, where `x` is the round's non-row time per
+/// request over its per-row time, learned online per context band from the
+/// engine's own round times (see [`RoundCost`]). Refit approved by TJ on
+/// 2026-11-23 over the #2460 fixed-7 replay of 2026-11-22
+/// (`~/.cache/cuteafd/speculation-dataset/2026-11-22/analysis4/refit.txt`,
+/// `refit_clamped.py`): full product sweep 0.1..0.9, measured-table pricing,
+/// 25/25/30/20 context mix, six scored families; score 0.9911 of the per-cell
+/// best cut, held-out (fit 4 families, score 2, 15 rotations) mean 0.9898.
+/// Replaces the first fit K = 3.8, M = 2, LO = 0.3, HI = 0.6 (sweep edge at
+/// 0.6). A refit changes these four.
+pub mod clamped {
+    pub const K: f64 = 3.4;
+    pub const M: f64 = 1.;
+    pub const LO: f64 = 0.3;
+    pub const HI: f64 = 0.7;
+    /// Rounds a context band needs before its line sets the cut (before that: [`super::KEEP_CUT`]).
+    pub const WARM_ROUNDS: u32 = 32;
+    // The fit's x: (N / requests) / e, with (N, e) the OLS line of round time
+    // against verify rows through the band's per-row-count medians.
+}
+
 /// Server rate of a neural position nobody has reached yet.
 pub const NEURAL_COLD_RATE: f64 = 1.;
 /// Server rate of an unreached copy position: below KEEP_CUT=0.3 so a
@@ -329,6 +352,95 @@ impl Request {
 const NEURAL: usize = 0;
 const COPY: usize = 1;
 
+/// The neural keep cut each round uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CutRule {
+    /// `history`: [`KEEP_CUT`] every round.
+    #[default]
+    Fixed,
+    /// `clamped`: `clamp(K / (x + M), LO, HI)` from the online round cost.
+    Clamped,
+}
+
+/// Context bands of the online round cost (committed context in tokens).
+pub const COST_BANDS: [usize; 4] = [2048, 12288, 49152, usize::MAX];
+
+fn band_of(context: usize) -> usize { COST_BANDS.iter().position(|&edge| context < edge).unwrap_or(COST_BANDS.len() - 1) }
+
+/// Online round cost per context band, as the clamped fit defines it (main,
+/// 2026-11-23, `analysis3/fit_clamped.py`): an ordinary least-squares line
+/// t = N + e*rows through the band's round-time table, one point per verify-row
+/// count. Each point is an exponentially decayed mean of that row count's
+/// recent round times, so the line follows the engine's current behaviour and
+/// common row counts do not outweigh rare ones. No time tables, no per-card
+/// constants. `x = (N / requests) / e`.
+#[derive(Clone, Debug)]
+pub struct RoundCost {
+    bands: Vec<[Point; COST_ROWS]>,
+    rounds: [u32; 4],
+}
+
+/// Row counts the table tracks (wider rounds share the last point).
+pub const COST_ROWS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Point {
+    /// Decayed sum of round seconds and decayed weight at this row count.
+    sum: f64,
+    weight: f64,
+}
+
+/// Weight a row count's earlier rounds keep per new round at that count.
+const COST_DECAY: f64 = 0.9;
+/// A row count enters the line once it has this much weight.
+const COST_POINT_WEIGHT: f64 = 2.;
+
+impl Default for RoundCost {
+    fn default() -> Self { Self { bands: vec![[Point::default(); COST_ROWS]; 4], rounds: [0; 4] } }
+}
+
+impl RoundCost {
+    /// One measured round of `rows` verify rows (anchors included) taking
+    /// `seconds`, at its requests' mean committed `context`.
+    pub fn observe(&mut self, context: usize, rows: usize, seconds: f64) {
+        if rows == 0 || !(seconds.is_finite() && seconds > 0.) { return; }
+        let band = band_of(context);
+        let point = &mut self.bands[band][rows.min(COST_ROWS) - 1];
+        point.sum = COST_DECAY * point.sum + seconds;
+        point.weight = COST_DECAY * point.weight + 1.;
+        self.rounds[band] = self.rounds[band].saturating_add(1);
+    }
+
+    /// (N, e) of the band's line, once warm and with a positive intercept and slope.
+    pub fn line(&self, context: usize) -> Option<(f64, f64)> {
+        let band = band_of(context);
+        if self.rounds[band] < clamped::WARM_ROUNDS { return None; }
+        let points: Vec<(f64, f64)> = self.bands[band].iter().enumerate()
+            .filter(|(_, p)| p.weight >= COST_POINT_WEIGHT)
+            .map(|(i, p)| ((i + 1) as f64, p.sum / p.weight)).collect();
+        if points.len() < 2 { return None; }
+        let n = points.len() as f64;
+        let (mx, my) = (points.iter().map(|p| p.0).sum::<f64>() / n, points.iter().map(|p| p.1).sum::<f64>() / n);
+        let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        if sxx <= 0. { return None; }
+        let e = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx;
+        let intercept = my - e * mx;
+        (e > 0. && intercept > 0. && e.is_finite() && intercept.is_finite()).then_some((intercept, e))
+    }
+
+    /// The round's non-row time per request over its per-row time.
+    pub fn ratio(&self, context: usize, requests: usize) -> Option<f64> {
+        let (intercept, e) = self.line(context)?;
+        Some(intercept / requests.max(1) as f64 / e)
+    }
+
+    /// The `clamped` cut for a round: [`KEEP_CUT`] until the band's line exists.
+    pub fn cut(&self, context: usize, requests: usize) -> f64 {
+        self.ratio(context, requests).map_or(KEEP_CUT,
+            |x| (clamped::K / (x + clamped::M)).clamp(clamped::LO, clamped::HI))
+    }
+}
+
 /// The policy and all of its state: one per serving process.
 #[derive(Clone, Debug)]
 pub struct DraftHistory {
@@ -338,6 +450,10 @@ pub struct DraftHistory {
     platt: Vec<Platt>,
     requests: HashMap<u64, Request>,
     stats: DraftHistoryStats,
+    rule: CutRule,
+    cost: RoundCost,
+    /// The neural keep cut of the round being planned.
+    round_cut: f64,
 }
 
 impl DraftHistory {
@@ -351,6 +467,7 @@ impl DraftHistory {
             server: [vec![Window::new(); spec.block], vec![Window::new(); spec.copy]],
             platt: if spec.head.scored() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
+            rule: CutRule::Fixed, cost: RoundCost::default(), round_cut: KEEP_CUT,
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
                 position_reached: vec![0; spec.block], position_accepted: vec![0; spec.block],
@@ -361,6 +478,26 @@ impl DraftHistory {
     }
 
     pub fn spec(&self) -> DrafterSpec { self.spec }
+
+    /// `DRAFT_POLICY=clamped`: the per-round cut follows the online round cost.
+    pub fn with_cut_rule(mut self, rule: CutRule) -> Self { self.rule = rule; self }
+    pub fn cut_rule(&self) -> CutRule { self.rule }
+    /// The neural keep cut the last planned round used.
+    pub fn round_cut(&self) -> f64 { self.round_cut }
+
+    /// Feed one measured round to the online cost (`clamped` only reads it).
+    pub fn observe_cost(&mut self, context: usize, rows: usize, seconds: f64) {
+        self.cost.observe(context, rows, seconds);
+    }
+
+    /// Set the round's cut before planning it: `context` is its requests' mean
+    /// committed context.
+    pub fn begin_round(&mut self, context: usize, requests: usize) {
+        self.round_cut = match self.rule {
+            CutRule::Fixed => KEEP_CUT,
+            CutRule::Clamped => self.cost.cut(context, requests),
+        };
+    }
     pub fn control(&self) -> DraftControl { self.control }
     pub fn stats(&self) -> &DraftHistoryStats { &self.stats }
 
@@ -404,7 +541,8 @@ impl DraftHistory {
             let entry = self.position(request, track, position);
             planned.push(entry);
             product = if track == NEURAL { product * entry.p } else { entry.p };
-            if product > KEEP_CUT { keep += 1; } else { break; }
+            let cut = if track == NEURAL { self.round_cut } else { KEEP_CUT };
+            if product > cut { keep += 1; } else { break; }
         }
         (planned, keep)
     }
@@ -459,10 +597,10 @@ impl DraftHistory {
                 entry.score = Some(calibrated);
             }
             if self.control == DraftControl::History {
-                let mut product = 1.;
+                let (mut product, cut) = (1., self.round_cut);
                 pending.keep = planned.iter().take_while(|entry| {
                     product *= entry.score.unwrap_or(0.);
-                    product > KEEP_CUT
+                    product > cut
                 }).count();
                 planned.truncate(pending.keep + 1);
             }
@@ -903,6 +1041,74 @@ mod tests {
         let first = &trace.requests[0].positions[0];
         assert!(first.calibrated.unwrap() < KEEP_CUT && first.score == first.calibrated);
         assert!((first.head.unwrap() - 0.9).abs() < 1e-6, "the raw score stays in the trace");
+    }
+
+    /// Rounds whose time is exactly `base + per_row * rows` at each listed row count.
+    fn feed(cost: &mut RoundCost, context: usize, base: f64, per_row: f64, rows: &[usize], repeats: usize) {
+        for _ in 0..repeats { for &r in rows { cost.observe(context, r, base + per_row * r as f64); } }
+    }
+
+    #[test]
+    fn round_cost_is_cold_until_warm_then_recovers_the_line_per_band() {
+        let mut cost = RoundCost::default();
+        // Cold: no line, the history cut.
+        assert_eq!((cost.ratio(0, 8), cost.cut(0, 8)), (None, KEEP_CUT));
+        // One row count alone never identifies a line, however many rounds.
+        feed(&mut cost, 0, 0.040, 0.002, &[64], 100);
+        assert_eq!(cost.cut(0, 8), KEEP_CUT);
+        // Two row counts, warm: N = 40 ms, e = 2 ms/row.
+        feed(&mut cost, 0, 0.040, 0.002, &[8, 32], 20);
+        let (intercept, slope) = cost.line(0).unwrap();
+        assert!((intercept - 0.040).abs() < 1e-9 && (slope - 0.002).abs() < 1e-9);
+        // x = (N / n) / e: 20 at C1, 2.5 at C8.
+        assert!((cost.ratio(0, 1).unwrap() - 20.).abs() < 1e-6 && (cost.ratio(0, 8).unwrap() - 2.5).abs() < 1e-6);
+        // Bands are independent: 128K is still cold.
+        assert_eq!(cost.cut(131_072, 8), KEEP_CUT);
+    }
+
+    #[test]
+    fn clamped_cut_is_k_over_x_plus_m_within_its_clamps() {
+        let mut cost = RoundCost::default();
+        feed(&mut cost, 40_000, 0.040, 0.002, &[8, 32, 64], 20);
+        let expect = |n: usize| (clamped::K / ((0.040 / n as f64) / 0.002 + clamped::M)).clamp(clamped::LO, clamped::HI);
+        for n in [1, 2, 4, 8, 16] { assert!((cost.cut(40_000, n) - expect(n)).abs() < 1e-9, "C{n}"); }
+        // C1: x = 20, 3.4 / 21 < LO, so the cut is LO. C16: x = 1.25, 3.4 / 2.25 > HI, so HI.
+        assert_eq!((cost.cut(40_000, 1), cost.cut(40_000, 16)), (clamped::LO, clamped::HI));
+        assert!(cost.cut(40_000, 4) > clamped::LO && cost.cut(40_000, 4) < clamped::HI);
+    }
+
+    #[test]
+    fn round_cost_follows_a_changed_regime() {
+        let mut cost = RoundCost::default();
+        feed(&mut cost, 0, 0.040, 0.002, &[8, 32], 40);
+        feed(&mut cost, 0, 0.040, 0.008, &[8, 32], 40);
+        // Forty rounds per point at decay 0.9 forget the old slope.
+        assert!((cost.line(0).unwrap().1 - 0.008).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clamped_keeps_by_the_same_product_against_the_round_cut() {
+        let spec = DrafterSpec { block: 4, head: HeadScore::Probability, copy: 0 };
+        let mut fixed = DraftHistory::new(spec, DraftControl::History);
+        let mut clamped = DraftHistory::new(spec, DraftControl::History).with_cut_rule(CutRule::Clamped);
+        let scores = [0.9, 0.8, 0.7, 0.6];
+        // Cold clamped is exactly history: cut 0.3, 0.9*0.8*0.7 = 0.504 > 0.3 keeps three.
+        for policy in [&mut fixed, &mut clamped] {
+            policy.begin_round(0, 8);
+            assert_eq!(policy.plan(&[(1, 4)], 64), [4]);
+            assert_eq!(policy.refine(1, 4, Some(&scores)), 4);
+            policy.observe(&[outcome(1, 4, 4)], false);
+        }
+        // Warm the cost so C8 lands on HI = 0.7: 0.9*0.8 = 0.72 > 0.7, *0.7 = 0.504 < 0.7.
+        for r in [8, 32, 64] { for _ in 0..20 { clamped.observe_cost(0, r, 0.010 + 0.002 * r as f64); } }
+        clamped.begin_round(0, 8);
+        assert_eq!(clamped.round_cut(), clamped::HI);
+        assert_eq!(clamped.plan(&[(1, 4)], 64), [4]);
+        assert_eq!(clamped.refine(1, 4, Some(&scores)), 3, "two kept plus the explore");
+        // history ignores the cost entirely.
+        for r in [8, 32, 64] { for _ in 0..20 { fixed.observe_cost(0, r, 0.010 + 0.002 * r as f64); } }
+        fixed.begin_round(0, 8);
+        assert_eq!(fixed.round_cut(), KEEP_CUT);
     }
 
     #[test]

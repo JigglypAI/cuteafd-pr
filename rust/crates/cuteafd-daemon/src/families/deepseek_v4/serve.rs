@@ -449,6 +449,7 @@ fn speculative_step(
             .min(reserved_drafts(a.placement.len, a.placement.units.len(), SOURCE_PAGE_TOKENS))
     }).collect();
     let native = shared.block();
+    let round_started = Instant::now();
     let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
     let depths = shared.plan(&requests, engine.decode_rows);
     // The narrowest installed block that covers the longest planned draft; the drafter's
@@ -493,6 +494,7 @@ fn speculative_step(
     ensure!(total_rows <= engine.decode_rows, "shared V4 verifier budget exceeded");
     let lengths: Vec<_> = sequences.iter().map(|rows| rows.len() - 1).collect();
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+    let round_starts = starts.clone();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
@@ -530,7 +532,9 @@ fn speculative_step(
     }).collect();
     let outcomes: Vec<_> = active.iter().zip(&sequences).zip(&outcomes).map(|((request, rows), &(accepted, censored))|
         history::outcome(request.ticket.id(), rows.len(), accepted, censored)).collect();
-    shared.observe(&outcomes);
+    shared.observe_timed(&outcomes, Some(history::RoundTiming { lane: 0,
+        round_us: round_started.elapsed().as_micros() as u64, draft_us: shape.draft_us as u64,
+        verify_us: shape.verify_us as u64, context: round_starts }));
     shape.drafts = sequences.iter().map(|rows| rows[1..].to_vec()).collect();
     Ok(finished)
 }
