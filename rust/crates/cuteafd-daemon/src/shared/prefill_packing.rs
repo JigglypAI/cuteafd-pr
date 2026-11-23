@@ -14,6 +14,14 @@ impl PackingMode {
     pub(crate) fn resolve(explicit: Option<Self>, packed_check: bool) -> Self {
         explicit.unwrap_or(if packed_check { Self::Exact } else { Self::Unrestricted })
     }
+
+    /// A family that attests no coordinator packed-route cap serves only
+    /// `unrestricted`; `exact` refuses by name instead of packing unchecked.
+    pub(crate) fn require_unrestricted(self, family: &str) -> Result<()> {
+        ensure!(self == Self::Unrestricted,
+            "{family} PREFILL_PACKING=exact is unsupported: no coordinator packed-route cap is attested; use unrestricted");
+        Ok(())
+    }
 }
 
 /// How a coordinator program receives rows in a packed pass. No implicit role:
@@ -218,6 +226,17 @@ pub(crate) fn member_outcomes(members: usize, pass: Result<Vec<Result<()>>>) -> 
 pub(crate) fn row_shares(rows: &[usize]) -> Vec<f64> {
     let total: usize = rows.iter().sum();
     rows.iter().map(|&r| if total == 0 { 1.0 / rows.len() as f64 } else { r as f64 / total as f64 }).collect()
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::PackingMode;
+    #[test]
+    fn uncapped_families_accept_only_unrestricted() {
+        assert!(PackingMode::Unrestricted.require_unrestricted("X").is_ok());
+        let error = PackingMode::Exact.require_unrestricted("X").unwrap_err().to_string();
+        assert!(error.contains("X PREFILL_PACKING=exact is unsupported"), "{error}");
+    }
 }
 
 #[cfg(test)]

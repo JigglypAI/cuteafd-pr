@@ -66,6 +66,16 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
         deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
     )
     serve_max = _line(res_max, "serve-hy4f --snapshot")
+    assert _flag(serve_max, "--prefill-packing") is None and _flag(serve_max, "--prefix-cache-mark-mib") is None
+    marked = _family_launch_result(
+        tmp_path / "marked", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+        keys_max + "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\n",
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    marked_serve, marked_plan = _line(marked, "serve-hy4f --snapshot"), _line(marked, "cuteafd plan")
+    assert _flag(marked_serve, "--prefill-packing") == "unrestricted"
+    assert _flag(marked_serve, "--prefix-cache-mark-mib") == _flag(marked_plan, "--prefix-cache-mark-mib") == "1024"
     assert (_flag(serve_max, "--device"), _flag(serve_max, "--split-device")) == ("0", "1")
     assert _flag(serve_max, "--core-view") == "original"
     assert _flag(serve_max, "--kv-cache") == "fp8"
@@ -110,6 +120,17 @@ def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path)
     assert _flag(pair_serve, "--peers") == _flag(serve, "--peers")
     assert _flag(pair_plan, "--speculator") == "dspark"
     assert "--dspark" in shlex.split(pair_serve)
+
+
+def test_inkling_packing_and_mark_budget_reach_plan_and_serve(tmp_path: Path) -> None:
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    keys = ("SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\n" + SIX)
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Small-MXFP8", keys,
+        physical_gpus=(0,), extra_args=("--wip", "inkling"), encoder_plan=PLANNED)
+    serve, plan = _line(result, "serve-inkling2 --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--prefill-packing") == "unrestricted"
+    assert _flag(serve, "--prefix-cache-mark-mib") == _flag(plan, "--prefix-cache-mark-mib") == "1024"
 
 
 @pytest.mark.parametrize("setting, enabled", [("", True), ("auto", True), ("off", False), ("dspark", True)])
@@ -194,6 +215,10 @@ def test_minimax_forwards_core_view_and_still_media_keys(tmp_path: Path) -> None
     assert _flag(serve, "--core-view") == _flag(plan, "--core-view") == "original"
     assert _flag(serve, "--vision-replicas") == _flag(plan, "--vision-replicas") == "2"
     assert _flag(serve, "--media-cache-bytes") == _flag(plan, "--media-cache-bytes") == "2GiB"
+    marked = _family_launch_result(tmp_path / "marked", config, "MiniMaxAI/MiniMax-M3.1-Flash",
+        keys + "PREFIX_CACHE_MARK_MIB=1024\n", extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    assert _flag(_line(marked, "serve-minimax --snapshot"), "--prefix-cache-mark-mib") == \
+        _flag(_line(marked, "cuteafd plan"), "--prefix-cache-mark-mib") == "1024"
 
 
 @pytest.mark.parametrize("gpus,placement", [(1, "auto"), (2, "layers"), (2, "heads")])

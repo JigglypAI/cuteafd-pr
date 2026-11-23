@@ -95,12 +95,6 @@ impl ServeArgs {
     }
 }
 
-fn check_prefill_packing(mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
-    ensure!(mode == crate::shared::prefill_packing::PackingMode::Unrestricted,
-        "Hy4-flash PREFILL_PACKING=exact is unsupported: no coordinator packed-route cap is attested; use unrestricted");
-    Ok(())
-}
-
 fn resolve_expert_package(native_lib: &Path, explicit: Option<&Path>, gpus: usize, catalog: &cuteafd_loader::OfficialV41Catalog) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -129,7 +123,7 @@ fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<&'static st
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("hy4_flash", args.max_sequences as u64)?;
-    check_prefill_packing(args.prefill_packing)?;
+    args.prefill_packing.require_unrestricted("Hy4-flash")?;
     ensure!(
         args.token_io.embed_placement == EmbedPlacement::Gpu && args.token_io.token_select == SelectPlacement::Device,
         "Hy4-flash serving requires GPU embedding and device token selection"
@@ -646,7 +640,7 @@ mod tests {
             let crate::cli::Commands::ServeHy4f(args) =
                 crate::cli::Cli::try_parse_from(base.iter().chain(extra))?.command else { anyhow::bail!("not serve-hy4f") };
             assert_eq!(args.prefill_packing, mode);
-            let checked = super::check_prefill_packing(args.prefill_packing);
+            let checked = args.prefill_packing.require_unrestricted("Hy4-flash");
             assert_eq!(checked.is_ok(), mode == PackingMode::Unrestricted);
             if let Err(error) = checked { assert!(error.to_string().contains("PREFILL_PACKING=exact")); }
         }

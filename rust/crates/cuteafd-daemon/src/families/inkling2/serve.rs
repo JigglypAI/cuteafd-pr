@@ -26,6 +26,8 @@ pub(crate) struct ServeArgs {
     #[arg(long)] pub model_id: Option<String>,
     #[arg(long)] pub prefill_rows: Option<usize>,
     #[arg(long, value_parser=clap::value_parser!(u8).range(1..=3))] pub prefill_waves: Option<u8>,
+    /// `exact` needs an attested coordinator route cap, which Inkling does not report yet.
+    #[arg(long, value_enum, default_value="unrestricted")] pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
@@ -47,6 +49,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use crate::shared::{qwen::scheduler::{self, Backend}, inventory::{InventoryPhase, RuntimeInventory}};
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeRequest, chat::inkling2::InklingEncoding};
     cuteafd_core::concurrency::validate("inkling2", args.max_sequences as u64)?;
+    args.prefill_packing.require_unrestricted("Inkling")?;
     ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "Inkling initial serving requires admitted GPU embedding and selection");
@@ -159,6 +162,12 @@ mod tests {
         let crate::cli::Commands::ServeInkling2(mut args) = crate::cli::Cli::try_parse_from(argv)?.command
             else { anyhow::bail!("Inkling command not parsed") };
         assert_eq!((args.max_context, args.max_sequences, args.peers.len()), (Some(0), 16, 6));
+        assert_eq!(args.prefill_packing, crate::shared::prefill_packing::PackingMode::Unrestricted);
+        let mut exact = argv.to_vec();
+        exact.extend(["--prefill-packing", "exact"]);
+        let crate::cli::Commands::ServeInkling2(exact) = crate::cli::Cli::try_parse_from(exact)?.command
+            else { anyhow::bail!("Inkling command not parsed") };
+        assert!(exact.prefill_packing.require_unrestricted("Inkling").is_err());
         crate::commands::bench::assert_resolved_family_seam("serve-inkling2", &[], || {
             args.prefix.resolve_entries(args.max_sequences);
             let prefill = args.prefill()?;
