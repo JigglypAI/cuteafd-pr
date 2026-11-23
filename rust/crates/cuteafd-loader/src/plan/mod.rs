@@ -3,6 +3,7 @@
 pub mod attention_precision;
 pub mod checkpoint;
 pub mod decode_lanes;
+pub mod decode_rows;
 pub mod deployment;
 pub mod experts;
 pub mod exlr8;
@@ -179,6 +180,8 @@ pub enum PlanError {
     UnsupportedOption { option: &'static str, value: u8, family: String, reason: &'static str },
     #[error("unsupported {option}={value} for {family}: {reason}")]
     UnsupportedValue { option: &'static str, value: String, family: String, reason: String },
+    #[error("unsupported --decode-rows={value} for {family} (supported up to {capacity}): {reason}")]
+    UnsupportedDecodeRows { value: u32, capacity: u32, family: String, reason: &'static str },
     #[error(transparent)]
     Checkpoint(#[from] anyhow::Error),
 }
@@ -188,6 +191,13 @@ pub enum PlanError {
 pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
     let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
     decode_lanes::resolve(descriptor, requested, concurrency)
+}
+
+/// Resolve the per-lane verify-row budget once at boot before layout or CUDA
+/// allocation ([`decode_rows::resolve`]).
+pub fn resolve_decode_rows(family: &str, request: decode_rows::DecodeRowsRequest) -> Result<u32, PlanError> {
+    let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
+    decode_rows::resolve(descriptor, request)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,6 +366,8 @@ pub struct PlanReport {
     pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
+    /// Resolved per-lane verify-row budget (`DECODE_ROWS`, default 64).
+    pub decode_rows: u32,
     /// Resolved attention QK/PV precision (`ATTENTION_PRECISION`); absent without a family.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention_precision: Option<attention_precision::Resolved>,
@@ -468,6 +480,10 @@ pub struct PlanOptions {
     pub fp8_prefill: fp8_prefill::Policy,
     /// None preserves each family's qualified decode-view default.
     pub decode_lanes: Option<u8>,
+    /// None (`auto`) resolves to 64 verify rows per lane.
+    pub decode_rows: Option<u32>,
+    /// Explicit `DRAFT_LENGTH` bound for `DECODE_ROWS` validation; None uses the family's native draft block.
+    pub draft_length: Option<u32>,
     pub attention_precision: attention_precision::AttentionPrecision,
     /// Host RAM cap for mapped tables: every table (rows and scales) when all fit,
     /// else the separate per-row scales when they fit; 0 keeps all mapped.
@@ -504,6 +520,8 @@ impl Default for PlanOptions {
             inventory_workspace_manifest: None,
             fp8_prefill: Default::default(),
             decode_lanes: None,
+            decode_rows: None,
+            draft_length: None,
             attention_precision: Default::default(),
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
@@ -1067,6 +1085,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         onboard_layers: None,
         max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
+        decode_rows: decode_rows::DEFAULT_DECODE_ROWS,
         attention_precision: None,
         cross_device_graph_kernels: false,
         prefill_transports: None,
@@ -1212,8 +1231,21 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     };
     report.family = Some(family.id().into());
     // The served concurrency (0 is the launcher's derived default), as serve resolves it.
-    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
-        options.layout.as_ref().map_or(2, |layout| layout.resolved_concurrency(family.id())))?;
+    let resolved_concurrency = options.layout.as_ref().map_or(16, |layout| layout.resolved_concurrency(family.id()));
+    let rtx_gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes, resolved_concurrency)?;
+    let requested_decode_rows = options.decode_rows.or_else(|| {
+        options.layout.as_ref()
+            .map(|layout| layout.decode_rows)
+            .filter(|&rows| rows != decode_rows::DEFAULT_DECODE_ROWS)
+    });
+    report.decode_rows = resolve_decode_rows(family.id(), decode_rows::DecodeRowsRequest {
+        requested: requested_decode_rows,
+        concurrency: resolved_concurrency,
+        decode_lanes: report.decode_lanes,
+        rtx_gpus,
+        draft_length: options.draft_length,
+    })?;
     report.attention_precision = Some(attention_precision::resolve(family, options.attention_precision)?);
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
@@ -1262,7 +1294,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     // Header screening uses the measured inventory too; exact per-rank admission
     // below decides fit. An explicit --spark-memory-cap always wins.
     let mut resolved = options.clone();
-    if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
+    if let Some(layout) = &mut resolved.layout {
+        layout.decode_lanes = report.decode_lanes;
+        layout.decode_rows = report.decode_rows;
+    }
     resolved.apply_spark_budget();
     let options = &resolved;
     report.spark_budget_bytes = options.maximum_spark_capacity();
@@ -1844,7 +1879,7 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
+    let _ = writeln!(out, "decode     {} lane(s), {} verify rows", report.decode_lanes, report.decode_rows);
     if let Some(precision) = &report.attention_precision {
         let _ = writeln!(out, "attention  prefill + decode {} ({})", precision.mode.name(), precision.reason);
     }

@@ -171,9 +171,8 @@ pub struct CacheOptions {
     pub glmf_index: GlmfIndexCache,
     /// Bytes of one GLM Flash KDA recurrent-state element: 4 (FP32) or 2 (`--kda-state bf16`).
     pub kda_state_bytes: u64,
-    /// Rows of a GLM Flash decode or verify step (`--decode-rows`, 64 or 128): its speculative
-    /// replay records and commit tables hold this many rows.
-    pub glmf_decode_rows: u64,
+    /// Per-lane verify/decode rows (`DECODE_ROWS` / `--decode-rows`, default 64).
+    pub decode_rows: u64,
 }
 
 impl Default for CacheOptions {
@@ -192,7 +191,7 @@ impl Default for CacheOptions {
             prefill_span_rows: 0,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
-            glmf_decode_rows: GLMF_DECODE_ROWS,
+            decode_rows: GLMF_DECODE_ROWS,
         }
     }
 }
@@ -1229,9 +1228,9 @@ mod tests {
             assert!(glm_flash_kda_replay_bytes_rows(&cfg, 45, 1, rows).is_err(), "{rows}");
         }
         // The family model passes the option through.
-        let wide = CacheOptions { glmf_decode_rows: GLMF_WIDE_DECODE_ROWS, ..Default::default() };
-        assert_eq!(CacheOptions::default().glmf_decode_rows, GLMF_DECODE_ROWS);
-        assert_eq!(wide.glmf_decode_rows, 128);
+        let wide = CacheOptions { decode_rows: GLMF_WIDE_DECODE_ROWS, ..Default::default() };
+        assert_eq!(CacheOptions::default().decode_rows, GLMF_DECODE_ROWS);
+        assert_eq!(wide.decode_rows, 128);
     }
 
     #[test]

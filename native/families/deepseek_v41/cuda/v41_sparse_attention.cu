@@ -1,4 +1,5 @@
 #include "cuteafd_v41_sparse_attention.h"
+#include "v41_capacity.h"
 #ifdef CUTEAFD_HAVE_V41_ATTENTION_AOT
 #include "cuteafd_v41_attention_aot_internal.h"
 #endif
@@ -438,7 +439,7 @@ template<int Heads=64> static int32_t launch_attention(const uint16_t* query,con
   if(status!=cudaSuccess)return status;
   const auto& v=*view;
 #ifdef CUTEAFD_HAVE_V41_ATTENTION_AOT
-  if(v.compressed==2 && partial && parts==10 && rows<=64 &&
+  if(v.compressed==2 && partial && parts==10 && rows<=CUTEAFD_V41_VOCAB_ROWS &&
       (window_width==0 || window_width==128) && aot_aligned(v) &&
       reinterpret_cast<uintptr_t>(partial)%16==0) {
     auto* bytes=reinterpret_cast<uint8_t*>(partial);
@@ -486,7 +487,7 @@ template<int Heads> static int32_t validate_batch(
     const int32_t* selected,uint16_t* output,int32_t rows,
     const cuteafd_v41_sparse_kv_t* host_views,const cuteafd_v41_sparse_kv_t* device_views,
     const uint64_t* begins,float* partial,uint64_t scratch_bytes,int32_t parts,int32_t compressed) {
-  if(rows<1 || rows>64 || !host_views || !begins || !partial || compressed<0 || compressed>2 ||
+  if(rows<1 || rows>CUTEAFD_V41_VOCAB_ROWS || !host_views || !begins || !partial || compressed<0 || compressed>2 ||
       parts!=(compressed?10:2))return cudaErrorInvalidValue;
   const uint64_t descriptor_bytes=uint64_t(rows)*sizeof(*device_views);
   if(!span(device_views,descriptor_bytes,8))return cudaErrorInvalidValue;
@@ -534,7 +535,7 @@ template<int Heads> static int32_t launch_batch(
     const cuteafd_v41_sparse_kv_t* device_views,void* stream,const uint64_t* begins,
     float* partial,int32_t parts,int32_t compressed) {
   // Contents were host-validated before upload/replay; never download metadata.
-  if(rows<1 || rows>64 || compressed<0 || compressed>2 || parts!=(compressed?10:2) ||
+  if(rows<1 || rows>CUTEAFD_V41_VOCAB_ROWS || compressed<0 || compressed>2 || parts!=(compressed?10:2) ||
       !device_views || !begins || !partial)return cudaErrorInvalidValue;
   return compressed==2?dispatch_batch<true,Heads>(query,sink,metadata,selected,output,rows,device_views,stream,begins,partial,parts):
       dispatch_batch<false,Heads>(query,sink,metadata,selected,output,rows,device_views,stream,begins,partial,parts);
@@ -546,7 +547,7 @@ extern "C" int32_t cuteafd_v41_sparse_attention_batch_aot(
     const cuteafd_v41_sparse_kv_t* device_views,void* stream,const uint64_t* begins,
     float* partial,int32_t parts,int32_t compressed) {
   // Host validation has checked every current descriptor before upload/replay.
-  if(rows<1 || rows>64 || compressed!=2 || parts!=10 || !query || !sink ||
+  if(rows<1 || rows>CUTEAFD_V41_VOCAB_ROWS || compressed!=2 || parts!=10 || !query || !sink ||
      !metadata || !selected || !output || !device_views || !begins || !partial ||
      reinterpret_cast<uintptr_t>(partial)%16)return cudaErrorInvalidValue;
   auto* bytes=reinterpret_cast<uint8_t*>(partial);
@@ -614,7 +615,7 @@ extern "C" int32_t cuteafd_v41_sparse_attention_heads32_batch_aot(
     const cuteafd_v41_sparse_kv_t* device_views,void* stream,const uint64_t* begins,
     float* partial,int32_t parts,int32_t compressed) {
   // Host validation has checked every current descriptor before upload/replay.
-  if(rows<1 || rows>64 || compressed!=2 || parts!=10 || !query || !sink ||
+  if(rows<1 || rows>CUTEAFD_V41_VOCAB_ROWS || compressed!=2 || parts!=10 || !query || !sink ||
      !metadata || !selected || !output || !device_views || !begins || !partial ||
      reinterpret_cast<uintptr_t>(partial)%16)return cudaErrorInvalidValue;
   auto* bytes=reinterpret_cast<uint8_t*>(partial);

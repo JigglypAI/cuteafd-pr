@@ -523,6 +523,13 @@ impl Family for Step5 {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "a second lane needs its own decode link, separate from the shared prefill link; low priority (#744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            3,
+            "Step-5 decode runtime currently caps verify rows at 64 (pending Step-5 port, #2184)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // Step-5 decode/verify steps send at most 64 rows (`rows.min(64)`).
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })

@@ -78,6 +78,7 @@ pub struct DeploymentSpec<'a> {
     pub prefill_unit_rows: u64,
     pub prefill_waves: u64,
     pub decode_lanes: u8,
+    pub decode_rows: u32,
     /// Graphs with kernel nodes on more than one coordinator GPU (see `PlanReport`).
     pub cross_device_graph_kernels: bool,
     pub prefill_span_rows: u64,
@@ -185,6 +186,7 @@ impl<'a> DeploymentSpec<'a> {
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),
             decode_lanes: report.decode_lanes,
+            decode_rows: report.decode_rows,
             cross_device_graph_kernels: report.cross_device_graph_kernels,
             prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
             prefill_reserve_rows: report.prefill_reserve_rows

@@ -119,6 +119,13 @@ impl Family for MiMo {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "measured: a second lane runs MiMo Pro at 0.91-0.93x (C4-C8; duplicated coordinator weight reads) and MiMo Flash at 0.66-0.73x (C4-C16) (#709, #723, #744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            15,
+            "MiMo coordinator decode programs cover 64 rows (missing mimo*_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u32 })
     }

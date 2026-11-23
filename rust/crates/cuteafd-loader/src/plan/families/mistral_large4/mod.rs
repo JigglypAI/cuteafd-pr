@@ -193,6 +193,13 @@ impl Family for MistralLarge4 {
             reason: "one lane until a two-lane A/B wins: top-4 of 128 wide (6144) experts makes each Spark \
                 decode wave short beside the 72-layer MLA core, little round trip to hide (predicted, #744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            7,
+            "Mistral Large 4 coordinator decode programs cover 64 rows (missing ml4*_m128 export)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { rows: DECODE_ROWS })
     }

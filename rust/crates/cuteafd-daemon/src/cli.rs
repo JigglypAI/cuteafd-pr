@@ -619,10 +619,13 @@ pub(crate) struct PlanArgs {
     /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_span_rows: u64,
-    /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
-    /// wide programs on one GPU): its decode workspace, token selector and replay records.
-    #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
-    pub(crate) decode_rows: u64,
+    /// Global decode/verify row budget for --layout: `auto` (64) or 1..=CONCURRENCY*(max_draft+1)
+    /// within the family's exported program capacity (`DECODE_ROWS`).
+    #[arg(long, default_value = "auto")]
+    pub(crate) decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
+    /// Fixed draft length cap (`DRAFT_LENGTH`) for validating `DECODE_ROWS` demand in --layout.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub(crate) draft_length: Option<u32>,
     /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
     #[arg(long, value_enum)]
     pub(crate) index_cache: Option<crate::families::glm5_flash::engine::IndexCache>,
@@ -1586,6 +1589,11 @@ pub(crate) struct NativeServeArgs {
     /// replaces the request with the resolved count before any allocation.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
+    /// Decode/verify row budget per lane: `auto` (64) or 1..=256 within
+    /// concurrency * (max_draft + 1) (`DECODE_ROWS`). Serve resolves this once
+    /// at boot before any allocation.
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Host RAM cap for preloading mapped tables: every table (rows and scales)
     /// when all fit and the runtime preloads rows (V4.1 Engram), else all separate
     /// per-row scales when they fit; 0 keeps all mapped.
@@ -1714,18 +1722,13 @@ pub(crate) struct NativeServeArgs {
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
 }
 
-/// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.
-fn plan_decode_rows(value: &str) -> Result<u64, String> {
-    match value {
-        "64" => Ok(64),
-        "128" => Ok(128),
-        _ => Err("64 or 128".to_string()),
-    }
-}
-
 impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && self.draft_length.draft_length.is_none()
+    }
+    /// Resolved decode/verify row budget (64 when `auto`/unset).
+    pub(crate) fn resolved_decode_rows(&self) -> u32 {
+        self.decode_rows.as_option().unwrap_or(cuteafd_core::V41_VERIFY_ROWS as u32)
     }
     /// Retained snapshots per bank: `--prefix-cache-entries`, or the concurrency-derived default.
     pub(crate) fn resolved_prefix_entries(&self) -> u32 {

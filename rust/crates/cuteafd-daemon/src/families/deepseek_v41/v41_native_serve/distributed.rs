@@ -25,7 +25,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // AOT kernels keep their full scratch; row storage follows live capacity.
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
+    let decode_rows = args.resolved_decode_rows();
     super::super::graph_policy::set_prefill_rows(args.prefill_batch_tokens)?;
+    super::super::graph_policy::set_decode_rows(decode_rows)?;
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     lib.cuda_set_device(0)?;
     let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
@@ -53,7 +55,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         prefill_shape.unit_cap);
     let slots = prefill_shape.waves;
-    let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
@@ -241,8 +242,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 )?,
             ))?,
             admission::scoped(d, "engram", || PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?))?,
-            admission::scoped(d, "target head", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
-                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?))?,
+            admission::scoped(d, "target head", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], capacity as usize,
+                DistributedTargetHead::device_bytes(capacity as usize, 64640)?))?,
             admission::scoped(d, "target taps", || devices[1]
                 .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?)))?,
             Duration::from_secs(120),
@@ -349,7 +350,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let snapshot_slots = super::prefix::Arenas::slots_for(&args);
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
-            &lib, &catalog, capacity, args.concurrency, lanes, draft_width, args.tp2_dspark_experts,
+            &lib, &catalog, capacity, decode_rows, args.concurrency, lanes, draft_width, args.tp2_dspark_experts,
             64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
@@ -372,7 +373,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     } };
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + usize::from(lanes) * ffn_bytes(decode_rows, decode_rows)?;
     admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
-        slots, prefill_reserve, lanes, ffn_arenas as u64)?;
+        slots, prefill_reserve, decode_rows, lanes, ffn_arenas as u64)?;
     // Both Spark transport lanes live on GPU1 and reserve one wave each, sized
     // by the physical rank count.
     let spark_ranks = expert_world;
@@ -470,7 +471,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         }
     }
     let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency, lanes)).transpose()?;
+        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, decode_rows, args.concurrency, lanes)).transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_length(args.draft_length)?;
     }
@@ -600,7 +601,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         let growth: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before.saturating_sub(after)).collect();
         tracing::info!(capture_ms=capture_started.elapsed().as_millis(), free_before_bytes=?before,
             free_after_bytes=?after, allocator_growth_bytes=?growth, target_passes=lanes,
-            exact_rows=cuteafd_core::V41_VERIFY_ROWS, index_width=512,
+            exact_rows=decode_rows, index_width=512,
             "V4.1 startup graphs warmed");
         memory_checkpoint("startup graphs warmed")?;
     }

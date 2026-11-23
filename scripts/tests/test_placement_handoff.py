@@ -111,6 +111,8 @@ v41_l2_prefetch=
 v41_engram_warm=off
 v41_decode_lanes=
 resolved_decode_lanes=2
+v41_decode_rows=
+resolved_decode_rows=64
 '''
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'

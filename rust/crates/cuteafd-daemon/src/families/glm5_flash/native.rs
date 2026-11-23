@@ -116,7 +116,7 @@ impl Admission {
         ensure!(resident.iter().zip(&canonical).all(|(a, b)| a.weights == b.weights && a.embedding == b.embedding),
             "Flash native runtime owners differ from shared planner residency");
         let charges = FlashCharges::from_manifest(&facts, cfg, &owners, args.prefill_rows,
-            args.prefill_waves, args.decode_rows, index.into(), manifest)?;
+            args.prefill_waves, args.program_decode_rows(), index.into(), manifest)?;
         Ok(Self { facts, metadata, dense, charges, resident })
     }
 

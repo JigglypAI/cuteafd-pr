@@ -200,7 +200,7 @@ def manifest(job_dir):
     job = json.loads((job_dir / 'job.json').read_text())
     result = json.loads((job_dir / 'result.json').read_text()) if (job_dir / 'result.json').is_file() else {}
     keep = ('MODEL_ID', 'MODEL_REVISION', 'SPECULATOR', 'SPECULATOR_MODEL_ID', 'CORE_VIEW', 'DRAFT_LENGTH',
-            'RTX_GPUS', 'SPARK_COUNT', 'GLM5_FLASH_DECODE_ROWS', 'COORDINATOR_DOCKER_INFERENCE')
+            'RTX_GPUS', 'SPARK_COUNT', 'DECODE_ROWS', 'COORDINATOR_DOCKER_INFERENCE')
     thermal, context_points = [], []
     for report in sorted(job_dir.glob('reports/**/report.json')):
         for panel in json.loads(report.read_text()).get('panels', []):

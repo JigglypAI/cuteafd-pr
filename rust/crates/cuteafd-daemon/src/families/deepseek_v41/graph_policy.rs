@@ -2,7 +2,22 @@
 use anyhow::{ensure, Result};
 mod spanning;
 
-pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
+static MAX_DECODE_ROWS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(cuteafd_core::V41_VERIFY_ROWS as u32);
+
+/// Maximum decode/verify row width admitted for this V4.1 serving instance.
+pub(super) fn max_decode_rows() -> u32 {
+    MAX_DECODE_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Startup: register the resolved verify-row cap before any graph bank or
+/// sparse-attention workspace is allocated.
+pub(super) fn set_decode_rows(rows: u32) -> Result<()> {
+    ensure!((1..=cuteafd_core::V41_VOCAB_ROWS as u32).contains(&rows),
+        "V4.1 decode rows must be in 1..={}, got {rows}", cuteafd_core::V41_VOCAB_ROWS);
+    MAX_DECODE_ROWS.store(rows, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
 
 /// Rows of one full prefill chunk. Above the decode bank a live request captures
 /// only this and the 128-row decoder replay, the two large shapes every long
@@ -37,7 +52,7 @@ pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
 }
 
 pub(super) fn captures_shape(rows: u32) -> bool {
-    large_shape_captured(rows, PREFILL_ROWS.get().copied())
+    large_shape_captured(rows, max_decode_rows(), PREFILL_ROWS.get().copied())
 }
 
 /// Only slot zero serves non-unit prompt, replay and continuation work.
@@ -63,8 +78,8 @@ pub(super) fn note_miss(shape: String, context: impl FnOnce() -> String) {
     crate::shared::decode_graph::note_eager("deepseek_v41", &shape, context);
 }
 
-fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
-    rows <= MAX_DECODE_ROWS || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
+fn large_shape_captured(rows: u32, max_decode: u32, prefill: Option<u32>) -> bool {
+    rows <= max_decode || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
         || prefill.is_none_or(|chunk| rows == chunk)
 }
 
@@ -205,15 +220,19 @@ mod tests {
 
     #[test]
     fn prefill_tail_chunks_execute_eagerly_while_decode_and_full_chunks_capture() {
-        for rows in [1, 6, 38, MAX_DECODE_ROWS] {
-            assert!(large_shape_captured(rows, Some(2048)));
+        let default_decode = cuteafd_core::V41_VERIFY_ROWS as u32;
+        for rows in [1, 6, 38, default_decode] {
+            assert!(large_shape_captured(rows, default_decode, Some(2048)));
         }
-        assert!(large_shape_captured(2048, Some(2048)));
-        assert!(large_shape_captured(128, Some(2048)));
-        for rows in [MAX_DECODE_ROWS + 1, 1982, 2047] {
-            assert!(!large_shape_captured(rows, Some(2048)));
+        assert!(large_shape_captured(2048, default_decode, Some(2048)));
+        assert!(large_shape_captured(128, default_decode, Some(2048)));
+        for rows in [default_decode + 1, 1982, 2047] {
+            assert!(!large_shape_captured(rows, default_decode, Some(2048)));
         }
-        assert!(large_shape_captured(1982, None));
+        assert!(large_shape_captured(128, 128, Some(2048)));
+        assert!(large_shape_captured(96, 128, Some(2048)));
+        assert!(!large_shape_captured(129, 128, Some(2048)));
+        assert!(large_shape_captured(1982, default_decode, None));
     }
 
 }

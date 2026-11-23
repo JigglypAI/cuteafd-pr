@@ -243,7 +243,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     flat = " ".join(opening.split())
     assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
             "&admitted_graphs.bootstraps, admitted_graphs.extra)?") in flat
-    assert "engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?" in opening
+    assert "engine.warm_decode_graphs(sequences.min(args.resolved_decode_rows()), speculation)?" in opening
     startup = opening.index("let result = with_startup_graphs(")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
     assert startup < opening.index("|| body(&engine)")

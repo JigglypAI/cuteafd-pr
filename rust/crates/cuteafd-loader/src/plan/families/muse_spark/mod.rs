@@ -197,6 +197,13 @@ impl Family for MuseSpark {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "new family on the shared lane structure; a second lane waits for a measured two-lane A/B (#744)" }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            64,
+            7,
+            "Muse Spark decode runtime currently caps verify rows at 64 (pending Muse port, #2184)",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // Decode/verify steps send at most 64 rows, as Kimi and Step-5.
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })

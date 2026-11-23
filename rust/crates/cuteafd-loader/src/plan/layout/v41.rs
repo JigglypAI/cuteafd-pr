@@ -65,9 +65,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // decode lanes (one or two) at decode width.
     let lanes = options.decode_lanes;
     ensure!(matches!(lanes, 1 | 2), "V4.1 runs one or two decode lanes");
+    let decode_rows = u64::from(options.decode_rows);
     let slots = usize::try_from(prefill.waves)?;
     let span = slots as u64 * rows;
-    let target = programs.target(v41::owners::DECODE_LANE_ROWS, lanes, span, rows, ranks, slots,
+    let target = programs.target(decode_rows, lanes, span, rows, ranks, slots,
         shape.concurrency, mode, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
@@ -103,7 +104,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, u64::from(lanes),
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(decode_rows, u64::from(lanes),
         rows, spark_ranks, slots, options.resolved_spark_reply_format(false))? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
@@ -113,7 +114,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
-        v41::owners::DECODE_LANE_ROWS, lanes)?;
+        decode_rows, lanes)?;
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;
@@ -124,14 +125,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         // The drafter always loads its full native block; DRAFT_LENGTH only caps what is verified.
         let width = cuteafd_core::MAX_DSPARK_PROPOSALS as u64;
         let dense = v41::weight_layout::draft_layout_from_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
-        let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, u64::from(lanes), width, ranks,
+        let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, decode_rows, shape.concurrency, u64::from(lanes), width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
             loader_peak: [bytes, 0], dense: Some(dense), ..Default::default() };
         if options.tp2_dspark_experts {
             let halves = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"))
                 .context("missing V4.1 TP2 dSpark allocation manifest")?)?;
-            draft.runtime = programs.dspark_tp2(&manifest, &halves, rows, shape.concurrency, u64::from(lanes), width, mode)?;
+            draft.runtime = programs.dspark_tp2(&manifest, &halves, rows, decode_rows, shape.concurrency, u64::from(lanes), width, mode)?;
             let resident = if catalog.mxfp4_scale_codes() {
                 native_expert_bytes(128, 5120, 1152)
             } else { v41::resident_bytes(5120, 1152, 128, false)? } * 3;
@@ -168,7 +169,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
     let mut reserves = Vec::new();
     let draft_rows = dspark.then(|| v41::owners::draft_rows(shape.concurrency, u64::from(lanes)));
-    let modules = programs.modules(v41::owners::DECODE_LANE_ROWS, rows, ranks, draft_rows)?;
+    let modules = programs.modules(decode_rows, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
         let arch = ArchContext::coordinator(total, None);

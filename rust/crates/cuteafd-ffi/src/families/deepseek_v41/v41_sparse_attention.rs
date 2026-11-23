@@ -285,13 +285,13 @@ impl V41SparseAttention<'_> {
         self.batch_validate.is_some() && self.batch_launch.is_some()
     }
     pub fn batch_descriptor_bytes(rows: usize) -> Result<usize> {
-        ensure!((1..=cuteafd_core::V41_VERIFY_ROWS).contains(&rows), "invalid sparse batch rows");
+        ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&rows), "invalid sparse batch rows");
         Ok(rows * 120)
     }
     /// Resolve required symbols at load, before any graph capture or readiness.
     pub fn validate_plan(&self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
         buffers: &[CuteafdDeviceBuffer]) -> Result<()> {
-        ensure!(plan.capacity_rows() <= cuteafd_core::V41_VERIFY_ROWS && self.supports_batch()
+        ensure!(plan.capacity_rows() <= cuteafd_core::V41_VOCAB_ROWS && self.supports_batch()
             && self.batch_aot_launch.is_some(),
             "V4.1 attention plan rows={} capacity={} heads={} requires BF16 AOT ten-part and native FP32 two-part batch kernels",
             plan.rows(), plan.capacity_rows(), self.heads);
@@ -335,7 +335,7 @@ impl V41SparseAttention<'_> {
         plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
     ) -> Result<V41SparseBatch> {
         ensure!(!requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS, "invalid sparse batch requests");
-        let limit = if plan.is_some() { cuteafd_core::V41_VERIFY_ROWS } else { 16 };
+        let limit = plan.map_or(16, |p| p.capacity_rows());
         ensure!(requests.iter().all(|(_, _, n)| (1..=limit).contains(n)), "sparse batch requires split rows");
         let rows: usize = requests.iter().map(|(_, _, n)| n).sum();
         let descriptor_bytes = Self::batch_descriptor_bytes(rows)?;

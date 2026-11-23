@@ -214,7 +214,7 @@ print(json.dumps(dict(report, resolved_settings=fake_resolved_settings(args, fam
     spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
                       audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
-    spark_admission="coordinator_authoritative", decode_lanes=1,
+    spark_admission="coordinator_authoritative", decode_lanes=1, decode_rows=64,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=selected, prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
