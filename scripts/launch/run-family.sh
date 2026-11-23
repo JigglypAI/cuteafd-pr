@@ -840,7 +840,7 @@ release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
-  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio off \
+  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --fp8-prefill "$(get FP8_PREFILL auto)" --vision "$VISION" --audio "$AUDIO" \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
