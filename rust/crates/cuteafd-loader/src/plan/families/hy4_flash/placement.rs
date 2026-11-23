@@ -227,7 +227,13 @@ pub(super) fn layout(
         );
         return empty(notes);
     }
-    if let Err(error) = input.checkpoint().validate_fp8_roles("hy4_flash", fp8_role) {
+    // Absorbed MLA keeps `kv_b_proj` unpacked as BF16 W_UK/W_UV in the target arena across all views;
+    // validate every FP8-executed core linear projection.
+    if let Err(error) = input.checkpoint().validate_fp8_roles_where(
+        "hy4_flash",
+        |name| !name.ends_with(".self_attn.kv_b_proj.weight"),
+        fp8_role,
+    ) {
         report.refuse_placement(
             format!("Hy4-flash fp8-compact validation refused: {error:#}"),
             "Ensure every fp8-compact core weight is a BF16 matrix with whole 128x128 blocks.",
