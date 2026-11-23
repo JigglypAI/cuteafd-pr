@@ -52,6 +52,39 @@ def _flag(line: str, flag: str) -> str | None:
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
 
 
+def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> None:
+    config = {
+        "model_type": "hy_v4_flash",
+        "num_hidden_layers": 42,
+        "mlp_layer_types": ["dense"] + ["sparse"] * 41,
+    }
+    # 0-Spark 2x RTX max (original)
+    keys_max = "SPARK_COUNT=0\nRTX_GPUS=2\nEXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=original\n"
+    res_max = _family_launch_result(
+        tmp_path / "max", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC", keys_max,
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve_max = _line(res_max, "serve-hy4f --snapshot")
+    assert (_flag(serve_max, "--device"), _flag(serve_max, "--split-device")) == ("0", "1")
+    assert _flag(serve_max, "--core-view") == "original"
+    assert _flag(serve_max, "--kv-cache") == "fp8"
+    assert _flag(serve_max, "--rtx-expert-layers") == "auto"
+    assert "--peers" not in shlex.split(serve_max)
+    # 1x RTX + 4 Sparks k6-compact
+    four = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
+    keys_s4 = "SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=k6-compact\n" + four
+    res_s4 = _family_launch_result(
+        tmp_path / "s4", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC", keys_s4,
+        physical_gpus=(0,), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 4},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve_s4 = _line(res_s4, "serve-hy4f --snapshot")
+    assert _flag(serve_s4, "--core-view") == "k6-compact"
+    assert _flag(serve_s4, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(4))
+    assert "--split-device" not in shlex.split(serve_s4)
+
+
 def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path) -> None:
     config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
     keys = "SPARK_COUNT=6\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + SIX

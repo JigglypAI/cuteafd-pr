@@ -683,6 +683,9 @@ pub(crate) struct LocalLane<'a> {
     pub(super) dsa_dump: Option<Rc<super::dsa_dump::DsaDump>>,
     pub(super) dsa_scores: Option<Rc<super::score_dump::ScoreDump>>,
     pub(super) dsa_keys: Option<Rc<super::key_dump::KeyDump>>,
+    /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): the shared append-only
+    /// selection dump, decode rows only, logical token ids.
+    pub(super) selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
 }
 
 #[derive(Clone, Copy)]
@@ -740,7 +743,7 @@ impl<'a> LocalLane<'a> {
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
             replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks],
-            capture: None, dsa_dump: None, dsa_scores: None, dsa_keys: None })
+            capture: None, dsa_dump: None, dsa_scores: None, dsa_keys: None, selection_dump: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -1127,7 +1130,7 @@ impl<'a> LocalLane<'a> {
     /// A diagnostic readback adds host-visible host copies inside the step,
     /// so it excludes every recorded stream.
     fn diagnostics_active(&self) -> bool {
-        self.dsa_dump.is_some() || self.dsa_scores.is_some() || self.dsa_keys.is_some()
+        self.dsa_dump.is_some() || self.dsa_scores.is_some() || self.dsa_keys.is_some() || self.selection_dump.is_some()
     }
 
     /// Run one step body through the bounded graph cache: replay a resident
@@ -1619,6 +1622,19 @@ impl<'a> LocalLane<'a> {
         }
     }
 
+    /// Diagnostic: a decode step's selected physical token slots, read back
+    /// with the row positions, causal lengths and page table the selector
+    /// used, as logical token ids (shared `CUTEAFD_DIAG_SELECTION_DUMP`). The
+    /// drain and copies live in `shared::selection_dump::read_paged`; unset
+    /// returns before touching the stream.
+    fn dump_selection(&self, layer: usize, rows: usize, indices: CuteafdDeviceBuffer, table_width: usize) -> Result<()> {
+        let Some(selection) = self.selection_dump.as_deref() else { return Ok(()) };
+        crate::shared::selection_dump::read_paged(selection, self.stream(), layer, rows, 2048, table_width, 64,
+            crate::shared::selection_dump::PagedBuffers { positions: self.lane.buffer("DSA positions")?,
+                lengths: self.lane.buffer("DSA selected lengths")?, frontiers: self.lane.buffer("DSA lengths")?,
+                table: self.lane.buffer("DSA page table")?, slots: indices })
+    }
+
     fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {
         let programs = &self.programs.mla[usize::from(self.layer(layer)?.attention
             == crate::shared::placement::layers::AttentionShare::Whole)];
@@ -1744,6 +1760,9 @@ impl<'a> LocalLane<'a> {
         super::dsa_dump::record_selected(self.dsa_dump.as_deref(), self.rank, stream, layer, batch.rows, || {
             Ok((self.lane.buffer("DSA positions")?, self.lane.buffer("DSA selected lengths")?, indices))
         })?;
+        if self.rank == 0 && batch.rows <= 64 {
+            self.dump_selection(layer, batch.rows, indices, table_width)?;
+        }
         if let Some(dump) = scores_dump {
             super::score_dump::record_scores(dump, self.rank, stream, layer, batch.rows, table_width,
                 batch.rows <= 64, || Ok(super::score_dump::ScoreBuffers {

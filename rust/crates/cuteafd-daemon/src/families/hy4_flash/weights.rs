@@ -94,6 +94,46 @@ impl Hy4EngramHost {
         let masked: Vec<u8> = tokens.iter().map(|&t| u8::from(hasher.is_masked(t))).collect();
         Ok((decoded, masked))
     }
+
+    /// Batched multi-sequence Engram lookup for one Engram layer.
+    /// Each entry is `(engram_tail, tokens)`. Returns concatenated BF16 `[total_rows, 16, 96]`
+    /// bytes, `masked [total_rows]` u8 flags, and the updated `[u32; 2]` tail per sequence.
+    pub(crate) fn lookup_batch(
+        &self,
+        layer: usize,
+        members: &[([u32; 2], &[u32])],
+        priority: ReadPriority,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<[u32; 2]>)> {
+        let (hasher, table) = self
+            .layers
+            .get(&layer)
+            .with_context(|| format!("layer {layer} is not a Hy4-flash Engram layer"))?;
+        let total_rows: usize = members.iter().map(|(_, t)| t.len()).sum();
+        let mut row_ids = Vec::with_capacity(total_rows * hasher.heads());
+        let mut masked = Vec::with_capacity(total_rows);
+        let mut next_tails = Vec::with_capacity(members.len());
+        for &(tail, tokens) in members {
+            let mut hist = Hy4EngramHistory(tail.to_vec());
+            hasher.hash(&mut hist, tokens, &mut row_ids)?;
+            ensure!(hist.0.len() == 2, "Hy4 Engram history width != 2");
+            next_tails.push([hist.0[0], hist.0[1]]);
+            masked.extend(tokens.iter().map(|&t| u8::from(hasher.is_masked(t))));
+        }
+        let decoded = table.gather_decoded_bf16(&row_ids, priority)?;
+        ensure!(
+            decoded.len() == total_rows * hasher.heads() * ENGRAM_EMBED_WIDTH,
+            "Hy4 Engram batched decoded length mismatch"
+        );
+        let raw_bytes: Vec<u8> = decoded.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Ok((raw_bytes, masked, next_tails))
+    }
+
+    /// Log host-table row-cache statistics for diagnostics.
+    pub(crate) fn log_stats(&self, phase: &str) {
+        for (&layer, (_, table)) in &self.layers {
+            tracing::debug!(layer, phase, storage = ?table.storage(), rows = table.rows(), "Hy4 Engram table stats");
+        }
+    }
 }
 
 /// One coordinator rank's packed target weights, RoPE tables, embedding and vocabulary head.

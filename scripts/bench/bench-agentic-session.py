@@ -21,6 +21,11 @@ it do. Contexts grow from ~8K to 60-100K tokens.
           real agent flow: compare a cache-on and a cache-off record run for session times.
   summary Prints the per-concurrency table of one or more result files.
 
+record --chain-tasks --target-context N works the four tasks back to back in one growing history
+per seed: when the model answers without tool calls the next task arrives as a user message (the
+repository resets after a full cycle), until a turn reaches N prompt + completion tokens or
+--max-turns. It reaches 32K-128K contexts with real tool results; each turn records its task.
+
 Per turn: TTFT (first reasoning, content or tool-call delta; scripts/tests/
 test_reasoning_stream_timing.py semantics), decode tok/s, prompt_cache_hit_tokens, prefill
 tok/s of the uncached suffix, tool-call validity, and whether the previous turn was reused
@@ -475,6 +480,64 @@ def record_session(args, seed: int, repeat: int) -> dict:
                 success=workspace.passing(task["tests"]), final_answer=not turns or turns[-1]["tool_calls"] == 0)
 
 
+CHAIN_NEXT = ("Thanks, that one is done. Next task in the same repository{reset}:\n\n{prompt}")
+CHAIN_RESET = (" (it has just been reset to its original state, so earlier fixes are gone; "
+               "re-read what you need)")
+
+
+def chain_session(args, seed: int, repeat: int) -> dict:
+    """One growing session that works the fixture tasks back to back (--chain-tasks).
+
+    When the model answers without tool calls, the next task's prompt is appended as a user
+    message in the same history (reasoning echoed as usual). Tasks cycle from `seed`; after a
+    full cycle the in-memory repository is reset, so every task has its bug again. Stops once a
+    turn's prompt reaches --target-context tokens, or at --max-turns."""
+    order = [TASKS[(seed + i) % len(TASKS)] for i in range(len(TASKS))]
+    workspace = Workspace()
+    messages = [{"role": "system", "content": system_prompt(workspace.files)},
+                {"role": "user", "content": order[0]["prompt"]}]
+    value = nonce(args.label + "/chain", seed, repeat)
+    turns, tasks, previous, index = [], [dict(task=order[0]["name"], cycle=0, first_turn=0)], None, 0
+    stop = "max_turns"
+    began = time.monotonic()
+    for turn in range(args.max_turns):
+        if args.deadline_s and time.monotonic() - began >= args.deadline_s:
+            stop = "deadline"
+            break
+        started = time.perf_counter()
+        result = stream_turn(args.base_url, request_body(args, with_nonce(messages, value), args.max_tokens), args.api_key)
+        metrics = turn_metrics(result, previous, turn, time.perf_counter() - started)
+        metrics.update(messages=len(messages), task_index=index, task=order[index % len(order)]["name"])
+        turns.append(metrics)
+        previous = metrics
+        assistant = assistant_message(result, turn, args.echo_reasoning == "on")
+        messages.append(assistant)
+        for call, sent in zip(result["calls"], assistant.get("tool_calls", [])):
+            output, _ = workspace.execute(call["name"], call["arguments"])
+            messages.append({"role": "tool", "tool_call_id": sent["id"], "content": output})
+        if args.progress is not None:
+            args.progress(dict(seed=seed, task="chain", chain=tasks, stop="in_progress", messages=messages, turns=turns))
+        print(f"[chain#{seed}] turn {turn} task {index}: prompt {metrics['prompt_tokens']} "
+              f"completion {metrics['completion_tokens']} calls {metrics['tool_calls']}", flush=True)
+        if (metrics["prompt_tokens"] or 0) + (metrics["completion_tokens"] or 0) >= args.target_context:
+            stop = "target_context"
+            break
+        if not result["calls"]:
+            task = order[index % len(order)]
+            tasks[-1].update(success=workspace.passing(task["tests"]), last_turn=turn)
+            index += 1
+            reset = index % len(order) == 0
+            if reset:
+                workspace = Workspace()
+            nxt = order[index % len(order)]
+            messages.append({"role": "user", "content": CHAIN_NEXT.format(reset=CHAIN_RESET if reset else "",
+                                                                          prompt=nxt["prompt"])})
+            tasks.append(dict(task=nxt["name"], cycle=index // len(order), first_turn=turn + 1))
+    return dict(seed=seed, task="chain", chain=tasks, stop=stop, target_context=args.target_context,
+                messages=messages, turns=turns, success=all(t.get("success") for t in tasks if "success" in t),
+                final_answer=not turns or turns[-1]["tool_calls"] == 0)
+
+
 def replay_session(args, session: dict, repeat: int) -> dict:
     value = nonce(args.label, session["seed"], repeat)
     turns, previous = [], None
@@ -563,9 +626,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
     for name in ("record", "replay"):
         p = sub.add_parser(name)
-        p.add_argument("--base-url", default="http://127.0.0.1:8000")
-        p.add_argument("--model", default=os.environ.get("CUTEAFD_API_MODEL", "default"))
+        p.add_argument("--base-url", default=os.environ.get("CUTEAFD_SMOKE_URL", "http://127.0.0.1:8000"),
+                       help="default: CUTEAFD_SMOKE_URL (a wip-cards --client hook), else http://127.0.0.1:8000")
+        p.add_argument("--model", default=os.environ.get("CUTEAFD_API_MODEL", "default"),
+                       help="'auto' asks the server's /v1/models for its served id")
         p.add_argument("--api-key")
+        p.add_argument("--api-key-file", type=Path, default=Path(os.environ["CUTEAFD_API_KEY_FILE"])
+                       if os.environ.get("CUTEAFD_API_KEY_FILE") else None,
+                       help="read the key from this file (default: CUTEAFD_API_KEY_FILE)")
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--label", default="agentic", help="nonce namespace (same label = same prompts)")
         p.add_argument("--concurrency", type=int, nargs="+", default=[1])
@@ -578,6 +646,12 @@ def main(argv: list[str] | None = None) -> int:
         if name == "record":
             p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3])
             p.add_argument("--max-turns", type=int, default=12)
+            p.add_argument("--chain-tasks", action="store_true",
+                           help="one growing session per seed that works the tasks back to back (see chain_session)")
+            p.add_argument("--target-context", type=int, default=None, metavar="N",
+                           help="with --chain-tasks: stop once prompt + completion reach N tokens")
+            p.add_argument("--deadline-s", type=float, default=None,
+                           help="with --chain-tasks: start no turn after this many seconds (the session so far is kept)")
         else:
             p.add_argument("--recording", type=Path, required=True)
             p.add_argument("--max-tokens-from", choices=["flag", "recording"], default="flag",
@@ -589,7 +663,27 @@ def main(argv: list[str] | None = None) -> int:
         for path in args.results:
             print(f"{path}:\n{render(json.loads(path.read_text())['summary'])}\n")
         return 0
+    if args.api_key is None and args.api_key_file is not None:
+        args.api_key = args.api_key_file.read_text().strip()
+    if args.mode == "record" and (args.target_context is not None) != args.chain_tasks:
+        parser.error("--chain-tasks and --target-context go together")
+    if args.mode == "record" and args.chain_tasks and args.target_context < 1024:
+        parser.error("--target-context must be at least 1024 tokens")
+    if args.model == "auto":
+        request = urllib.request.Request(args.base_url.rstrip("/") + "/v1/models",
+                                         headers={"Authorization": "Bearer " + args.api_key} if args.api_key else {})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            args.model = json.load(response)["data"][0]["id"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.progress = None
+    if args.mode == "record" and args.chain_tasks:
+        # Every turn rewrites the output, so a killed run still leaves its session.
+        def progress(session):
+            args.output.write_text(json.dumps(dict(mode="record", partial=True, sessions=[session], tools=TOOLS,
+                                                   model=args.model, label=args.label), indent=1) + "\n")
+        args.progress = progress
+    elif args.mode == "record" and args.deadline_s is not None:
+        parser.error("--deadline-s needs --chain-tasks")
     report = dict(mode=args.mode, base_url=args.base_url, model=args.model, label=args.label,
                   echo_reasoning=args.echo_reasoning, max_tokens=args.max_tokens, runs=[], started=time.time())
     if args.mode == "replay":
@@ -600,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         items = list(args.seeds)
         report["tools"] = TOOLS
-        run_one = lambda repeat: (lambda seed: record_session(args, seed, repeat))
+        record = chain_session if args.chain_tasks else record_session
+        run_one = lambda repeat: (lambda seed: record(args, seed, repeat))
     for repeat in range(args.repeats):
         for concurrency in args.concurrency:
             # Distinct nonces per repeat and concurrency: no run reuses an earlier run's prefixes.

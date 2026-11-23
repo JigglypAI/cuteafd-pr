@@ -34,7 +34,9 @@ fn decode_spans(widths: impl IntoIterator<Item = usize>, capacity: usize) -> Res
 }
 
 #[derive(Default)]
-pub(crate) struct Draft {anchor:Option<u32>}
+pub(crate) struct Draft {anchor:Option<u32>,
+    /// The current proposal's per-token candidate probabilities (empty unless read back).
+    confidence:Vec<f32>}
 impl scheduler::DraftState for Draft {
     fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
     fn close(&mut self, token: u32) {self.anchor=Some(token);}
@@ -338,7 +340,19 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
-    fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::None }
+    // The recurrent block dSpark has no trained confidence head (the checkpoint
+    // ships none); its per-token score is the target-head argmax probability,
+    // calibrated online like every other score.
+    fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
+        if self.execution.borrow().draft.is_some() { cuteafd_core::HeadScore::CandidateProbability }
+        else { cuteafd_core::HeadScore::None }
+    }
+    fn configure_draft_scores(&self, _traced: bool, scored: bool) {
+        if let Some(draft) = &self.execution.borrow().draft { draft.drafter.set_score_readback(scored); }
+    }
+    fn draft_head<'d>(&self, draft: &'d Draft) -> Option<&'d [f32]> {
+        (!draft.confidence.is_empty()).then_some(draft.confidence.as_slice())
+    }
     // Exact FIR verification owns one anchor plus the native seven drafts.
     fn draft_copies(&self) -> bool { false }
     fn prefill_draft(&self,p:&Placement,_:usize,_:&[u32],next:Option<u32>,state:&mut Draft)->Result<()>{
@@ -361,7 +375,11 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
                         execution.peer.as_ref().map(|peer| super::head::PeerHead { kernels: &peer.kernels, target: &peer.target }),
                         sequences,anchors)
                 })?;
-            for ((index,_,s),tokens) in selected.into_iter().zip(proposed){output[first+index]=tokens.tokens.into_iter().take(s.depth).collect();}
+            let placed=selected.into_iter().map(|(index,_,s)|(index,s.depth)).collect::<Vec<_>>();
+            for ((index,depth),tokens) in placed.into_iter().zip(proposed){
+                sequences[first+index].seq.confidence=tokens.confidence.into_iter().take(depth).collect();
+                output[first+index]=tokens.tokens.into_iter().take(depth).collect();
+            }
         }
         timing.steps+=1;timing.seconds+=start.elapsed().as_secs_f64();Ok(output)
     }

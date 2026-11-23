@@ -88,6 +88,7 @@ outside a matching WIP slot.
 
 | Model · quant | Config | Layout |
 | --- | --- | --- |
+| Hy4-flash · EXL3 K4 MUL1 MC (#2478) | [min](hy4-flash-exl3-k4-mc-min.config) · [max](hy4-flash-exl3-k4-mc-max.config) · [k8 max](hy4-flash-exl3-k4-mc-k8-max.config) · [k6 max](hy4-flash-exl3-k4-mc-k6-max.config) · [fp8 max](hy4-flash-exl3-k4-mc-fp8-max.config) · [1 RTX + 1 Spark](hy4-flash-exl3-k4-mc-1rtx-1spark.config) · [1 RTX + 4 Spark k6](hy4-flash-exl3-k4-mc-1rtx-4spark-k6.config) | WIP qualification 1 RTX / 2 RTX local (original, k8/k6/fp8 compact) and 1 RTX + 1/4 Sparks; MUL1 LatentMoE, automatic pool, media/speculation off |
 | Inkling 2 Small · native MXFP8 (#1930) | [min](inkling2-mxfp8-min.config) · [max](inkling2-mxfp8-max.config) | WIP qualification 1 RTX + 6 Sparks (min); 2 RTX + 4 Sparks (max, needs #2316); BF16 core, native W8A8 experts, automatic pool; media/speculation off |
 | Inkling 2 Small · official mixed NVFP4/MXFP8 (#1930) | [min](inkling2-nvfp4-min.config) | WIP qualification 1 RTX + 4 Sparks; automatic pool; media/speculation off |
 | Inkling 2 Small · EXL3 K4 MC original (#1930) | [min](inkling2-exl3-min.config) · [max](inkling2-exl3-max.config) | WIP qualification 1 RTX + 4 Sparks (min); 2 RTX + 4 Sparks (max, needs #2316); original BF16 core, automatic pool; media/speculation off |

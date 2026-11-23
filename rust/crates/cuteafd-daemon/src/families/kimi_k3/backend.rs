@@ -257,8 +257,8 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore {
         self.engine.native_draft().map_or(cuteafd_core::HeadScore::None, |d| d.common().score_source())
     }
-    fn configure_draft_scores(&self, enabled: bool) {
-        if let Some(d) = self.engine.native_draft() { d.common().configure_scores(enabled); }
+    fn configure_draft_scores(&self, traced: bool, scored: bool) {
+        if let Some(d) = self.engine.native_draft() { d.common().configure_scores(traced, scored); }
     }
     fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool)

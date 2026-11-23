@@ -871,6 +871,12 @@ fn boot_concurrency_full_plan_matrix() {
             let (dir, options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
             Case { family: "qwen3_5", label: "qwen3_5", dir, topologies: &[(1, 0)], concurrencies: ALL_CONCURRENCIES, manifest: None, base_options: Some(options) }
         }),
+        Box::new(|| {
+            let (dir, manifest) = families::hy4_flash::tests::concurrency_matrix_snapshot();
+            let mut options = wave_plan_options(dir.path(), 0);
+            options.attention_placement = None;
+            Case { family: "hy4_flash", label: "hy4_flash", dir, topologies: &[(2, 0), (1, 2)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
+        }),
     ];
 
     let queue = std::sync::Mutex::new(builders.into_iter());

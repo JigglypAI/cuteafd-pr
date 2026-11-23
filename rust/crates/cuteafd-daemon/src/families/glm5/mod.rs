@@ -1835,9 +1835,12 @@ impl Opened {
                 cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
                 charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE startup policy");
         }
+        if let Some(dump) = crate::shared::selection_dump::shared("glm5")? {
+            engine.attach_selection_dump(dump)?;
+        }
         // Current startup shapes are a best-effort prewarm list. Admission keeps
         // the entire graph reserve charged; measured warmup never shrinks it.
-        if engine.weights.layers.len() == self.cfg.layers
+        if engine.selection_dump.is_none() && engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;

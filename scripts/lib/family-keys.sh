@@ -132,7 +132,7 @@ EOF
   # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract
   # and Spark workers, no media or family modes yet; Step-5 takes an opt-in
   # MTP depth, Muse a DFlash2 drafter and its partial-reply format.
-  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark || "$1" == minimax_m3 || "$1" == inkling2 ]]; then
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark || "$1" == minimax_m3 || "$1" == inkling2 || "$1" == hy4_flash ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -178,6 +178,7 @@ EOF
     [[ "$1" != minimax_m3 ]] || printf '%s\n' RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE SPECULATION_TRACE
     [[ "$1" != inkling2 && "$1" != step5 && "$1" != kimi_k3 ]] || printf '%s\n' VISION_REPLICAS MEDIA_CACHE_BYTES
     [[ "$1" != inkling2 ]] || printf '%s\n' SPECULATION_TRACE DRAFT_POLICY DRAFT_KV_CACHE SPECULATOR_FP8 KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
+    [[ "$1" != hy4_flash ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -368,7 +369,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|muse_spark|minimax_m3|inkling2|qwen4|deepseek_v4|deepseek_v41) echo units ;;
+    step5|kimi_k3|muse_spark|minimax_m3|inkling2|hy4_flash|qwen4|deepseek_v4|deepseek_v41) echo units ;;
     glm5|glm5_flash|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac

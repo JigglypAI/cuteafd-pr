@@ -71,6 +71,16 @@ pub(crate) struct GoldenArgs {
     /// Optional path to `hy4f:exl3-k45-mul1` routed expert package directory.
     #[arg(long)]
     pub(crate) expert_package: Option<PathBuf>,
+    /// Exact prefix-restore gate: prefill `tokens[..P]`, capture, restore into a second slot,
+    /// assert 0 state bytes differ at P, and compare 1-token decode continuations.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) resume_at: Vec<usize>,
+    /// Number of decode tokens to compare past each `--resume-at` point.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) resume_rows: usize,
+    /// Exercise host-tier mark offload + promotion during `--resume-at`.
+    #[arg(long)]
+    pub(crate) resume_host: bool,
 }
 
 fn read_u32_bin(path: &Path) -> Result<Vec<u32>> {
@@ -238,12 +248,24 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         (None, tokens, window_dir)
     };
 
+    let max_resume = args
+        .resume_at
+        .iter()
+        .copied()
+        .max()
+        .map(|p| p + args.resume_rows)
+        .unwrap_or(0);
     let max_seq = selected_windows
         .as_ref()
         .map(|ws| ws.iter().map(|w| w.tokens.len()).max().unwrap_or(1))
-        .unwrap_or(raw_tokens.len());
+        .unwrap_or(raw_tokens.len())
+        .max(max_resume);
     let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
-    let max_pages = max_seq.div_ceil(64).max(16);
+    let max_pages = if !args.resume_at.is_empty() {
+        (max_seq.div_ceil(64) * 3 + 16).max(64)
+    } else {
+        max_seq.div_ceil(64).max(16)
+    };
 
     // Set process-wide routed-expert geometry BEFORE NativeLibrary::load so C++
     // `cuteafd_set_expert_hidden(1536)` configures `exl3_wire` and routed kernels.
@@ -312,19 +334,60 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             (0..devices.len()).map(|_| None).collect()
         };
 
-    let mut engine = Hy4Engine::new(
-        &devices,
-        &programs,
-        &checkpoint,
-        cfg.clone(),
-        args.kv_cache,
-        unit,
-        max_pages,
-        args.engram_bf16,
-        args.skip_routed_experts,
-        onboarded,
-    )?;
+    let mut engine = if !args.resume_at.is_empty() {
+        Hy4Engine::new_serving(
+            &devices,
+            &programs,
+            &checkpoint,
+            cfg.clone(),
+            args.kv_cache,
+            unit,
+            max_pages,
+            2,
+            max_pages * 64,
+            if args.resume_host { 2 } else { 4 },
+            args.engram_bf16,
+            args.skip_routed_experts,
+            onboarded,
+        )?
+    } else {
+        Hy4Engine::new(
+            &devices,
+            &programs,
+            &checkpoint,
+            cfg.clone(),
+            args.kv_cache,
+            unit,
+            max_pages,
+            args.engram_bf16,
+            args.skip_routed_experts,
+            onboarded,
+        )?
+    };
     engine.dump_dir = args.dump_dir.clone();
+
+    if !args.resume_at.is_empty() {
+        let mut tokens = if let Some(ws) = &selected_windows {
+            let mut joined = Vec::new();
+            for w in ws {
+                joined.extend_from_slice(&w.tokens);
+                if joined.len() >= max_resume {
+                    break;
+                }
+            }
+            joined
+        } else {
+            raw_tokens
+        };
+        if tokens.len() < max_resume && !tokens.is_empty() {
+            let base = tokens.clone();
+            while tokens.len() < max_resume {
+                tokens.extend_from_slice(&base);
+            }
+            tokens.truncate(max_resume);
+        }
+        return run_resume_check(&mut engine, &tokens, &args.resume_at, args.resume_rows, unit, args.resume_host);
+    }
 
     let vocab = cfg.vocab_size;
     if let Some(windows) = selected_windows {
@@ -584,6 +647,242 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             "hy4f-golden mean NLL={mean_nll:.6} ({nll_rows} scored rows); top-1 agreement={top1_matches}/{ref_rows}"
         );
     }
+    Ok(())
+}
+
+fn run_resume_check(
+    engine: &mut Hy4Engine<'_>,
+    tokens: &[u32],
+    points: &[usize],
+    resume_rows: usize,
+    unit_rows: usize,
+    use_host: bool,
+) -> Result<()> {
+    use super::cache::Hy4Placement;
+    use super::execution::HeadMode;
+    use crate::shared::prefill_pipeline::{sequence_units, Unit, UnitSegment};
+    use crate::shared::prefix::CudaCopyEngine;
+    use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
+    use cuteafd_loader::formats::mapped_table::ReadPriority;
+
+    ensure!(resume_rows > 0, "--resume-rows must be positive");
+    let library = engine.library();
+    let family = engine.prefix()?;
+    let layout = family.layout();
+    let host = if use_host {
+        let hcfg = cuteafd_hostcache::config::Config {
+            bytes: 2u64 << 30,
+            chunk_bytes: (256u64 << 20).max(layout.page_bytes as u64).max(layout.mark_bytes as u64),
+            min_tokens: 1,
+            max_tokens: u32::try_from(engine.max_context)?,
+            ..Default::default()
+        };
+        hcfg.validate()?;
+        let copy = CudaCopyEngine::registered_retained(library, vec![], family.snapshot_owners())?;
+        Some((hcfg, copy))
+    } else {
+        None
+    };
+    let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(
+        layout,
+        PrefixConfig {
+            entries: 4,
+            mark_slots: engine.mark_slots(),
+            keep_logits: true,
+            min_tokens: 1,
+        },
+        host,
+    )?;
+    let pad_id = engine.cfg.engram_pad_id;
+    let layers = engine.cfg.layers;
+    let vocab = engine.cfg.vocab_size;
+
+    let run_prefill = |engine: &mut Hy4Engine<'_>, placement: &mut Hy4Placement, slice: &[u32]| -> Result<Vec<f32>> {
+        let start = placement.len;
+        let mut units = sequence_units(slice.len(), unit_rows, 1, layers)?;
+        let last_idx = units.len() - 1;
+        for (i, u) in units.iter_mut().enumerate() {
+            let u_start = start + u.rows.start;
+            let u_end = start + u.rows.end;
+            u.rows = u_start..u_end;
+            u.segments = vec![UnitSegment {
+                sequence: 0,
+                rows: 0..u.rows.len(),
+                tokens: u_start..u_end,
+                prompt_end: i == last_idx,
+                snapshot: false,
+                head: i == last_idx,
+            }];
+        }
+        let mut next = [placement.clone()];
+        let mut last_logits = Vec::new();
+        engine.run_units(
+            &mut next,
+            &[slice],
+            &units,
+            ReadPriority::Prefill,
+            |u| if u.index == last_idx { HeadMode::LastPerSeq } else { HeadMode::None },
+            &mut |_, _, tile| {
+                last_logits = tile.to_host(library)?;
+                Ok(())
+            },
+        )?;
+        *placement = next.into_iter().next().unwrap();
+        Ok(last_logits)
+    };
+
+    let run_decode_step = |engine: &mut Hy4Engine<'_>, placement: &mut Hy4Placement, tok: u32| -> Result<Vec<f32>> {
+        let pos = placement.len;
+        let unit = Unit {
+            index: 0,
+            sequence: 0,
+            segments: vec![UnitSegment {
+                sequence: 0,
+                rows: 0..1,
+                tokens: pos..pos + 1,
+                prompt_end: false,
+                snapshot: false,
+                head: true,
+            }],
+            rows: 0..1,
+            layers: 0..layers,
+            slot: 0,
+            barrier: false,
+        };
+        let mut next = [placement.clone()];
+        let src = [tok];
+        let mut logits = Vec::new();
+        engine.run_units(
+            &mut next,
+            &[&src],
+            &[unit],
+            ReadPriority::Decode,
+            |_| HeadMode::Suffix(0),
+            &mut |_, _, tile| {
+                logits = tile.to_host(library)?;
+                Ok(())
+            },
+        )?;
+        *placement = next.into_iter().next().unwrap();
+        Ok(logits)
+    };
+
+    for &at in points {
+        ensure!(at > 0 && at + resume_rows <= tokens.len(), "--resume-at {at} + {resume_rows} exceeds {} tokens", tokens.len());
+        let cap = at + resume_rows + 16;
+        // 1) Straight prefill A of tokens[..at] on slot 0.
+        let mut p_a = cache
+            .admit_cold(&family, at, cap, |units| Hy4Placement::new(units, 0, pad_id))?
+            .placement;
+        let logits_p = run_prefill(engine, &mut p_a, &tokens[..at])?;
+        ensure!(logits_p.len() == vocab, "last-row logits len mismatch");
+        let state_a = engine.dump_state(&p_a)?;
+        ensure!(
+            cache.capture(&family, SnapshotKind::Prompt, &tokens[..at], &p_a, After::from_logits(&logits_p, true))?,
+            "--resume-at {at}: capture skipped"
+        );
+        if use_host {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while cache.stats().marks_in_use > 0 && std::time::Instant::now() < deadline {
+                cache.tick();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // 2) Restore B from PrefixCache into slot 1 (different slot + COW tail copy + mark restore).
+        let admitted_b = cache.admit(&family, &tokens[..at + resume_rows], cap, false, |units| {
+            Hy4Placement::new(units, 1, pad_id)
+        })?;
+        ensure!(admitted_b.resume == at, "--resume-at {at}: expected resume={at}, got {}", admitted_b.resume);
+        let mut p_b = admitted_b.placement;
+        p_b.set_engram_tail_from_prefix(&tokens[..at], pad_id);
+
+        // 3) Byte-exact state comparison across all ranks (DSA KV, DSA index, pending keys/counts, SWA-512 ring, Engram tail).
+        let state_b = engine.dump_state(&p_b)?;
+        let mut total_bytes = 0usize;
+        for (rank_idx, (sa, sb)) in state_a.iter().zip(&state_b).enumerate() {
+            total_bytes += sa.total_bytes();
+            let diffs = sa.diff(sb);
+            ensure!(
+                diffs.is_empty(),
+                "hy4f-golden --resume-at {at} rank {rank_idx} STATE MISMATCH: {}",
+                diffs.join("; ")
+            );
+        }
+
+        // 4) 1-token-at-a-time decode continuation comparison: A (straight) vs B (restored).
+        let mut max_abs_diff = 0.0f32;
+        let mut bitwise_eq = 0usize;
+        let mut top1_eq = 0usize;
+        let mut first_diff_step: Option<(usize, f32)> = None;
+        for step in 0..resume_rows {
+            let tok = tokens[at + step];
+            let la = run_decode_step(engine, &mut p_a, tok)?;
+            let lb = run_decode_step(engine, &mut p_b, tok)?;
+            if step == 0 {
+                let after_a = engine.dump_state(&p_a)?;
+                let after_b = engine.dump_state(&p_b)?;
+                for (rank_idx, (sa, sb)) in after_a.iter().zip(&after_b).enumerate() {
+                    let diffs = sa.diff(sb);
+                    if at + 1 <= 2048 {
+                        ensure!(
+                            diffs.is_empty(),
+                            "hy4f-golden --resume-at {at} rank {rank_idx} POST-STEP-1 STATE MISMATCH: {}",
+                            diffs.join("; ")
+                        );
+                    } else if !diffs.is_empty() {
+                        println!(
+                            "hy4f-golden --resume-at {at} (host={use_host}) rank {rank_idx} post-step-1 state diffs (>2048 DSA): {}",
+                            diffs.join("; ")
+                        );
+                    }
+                }
+            }
+            let mut step_max = 0.0f32;
+            let mut step_bits = true;
+            for (&a, &b) in la.iter().zip(&lb) {
+                if a.to_bits() != b.to_bits() {
+                    step_bits = false;
+                }
+                let d = (a - b).abs();
+                if d > step_max {
+                    step_max = d;
+                }
+            }
+            if step_max > max_abs_diff {
+                max_abs_diff = step_max;
+            }
+            if step_bits {
+                bitwise_eq += 1;
+            } else if first_diff_step.is_none() {
+                first_diff_step = Some((step, step_max));
+            }
+            let arg_a = la.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i).unwrap_or(0);
+            let arg_b = lb.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(i, _)| i).unwrap_or(0);
+            if arg_a == arg_b {
+                top1_eq += 1;
+            }
+        }
+        let st = cache.stats();
+        println!(
+            "hy4f-golden --resume-at {at} (host={use_host}, mark_promotions={}): state_bytes_diff=0/{total_bytes} cont_rows={resume_rows} max_abs_diff={max_abs_diff:.6e} bitwise_equal={bitwise_eq}/{resume_rows} top1={top1_eq}/{resume_rows} first_diff={first_diff_step:?}",
+            st.mark_promotions
+        );
+        if at + resume_rows <= 2048 {
+            ensure!(
+                max_abs_diff == 0.0,
+                "hy4f-golden --resume-at {at} (<2048 dense DSA): continuation not bit-exact (max_abs_diff={max_abs_diff:.6e}, first_diff={first_diff_step:?})"
+            );
+        }
+        cache.release(&family, &p_a.units)?;
+        cache.release(&family, &p_b.units)?;
+        let idle = cache.stats();
+        ensure!(
+            idle.pages - idle.pages_free == idle.pages_retained,
+            "hy4f-golden --resume-at {at}: idle page leak ({idle:?})"
+        );
+    }
+    println!("hy4f-golden --resume-at: PASS");
     Ok(())
 }
 

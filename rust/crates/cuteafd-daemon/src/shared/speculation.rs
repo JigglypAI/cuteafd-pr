@@ -56,7 +56,7 @@ mod tests {
             ("MiniMax", include_str!("../families/minimax_m3/backend.rs"), "HeadScore { cuteafd_core::HeadScore::Probability }"),
             ("Qwen dense", include_str!("../families/qwen3_5/serve.rs"), "self.drafter.is_some() { cuteafd_core::HeadScore::Probability }"),
             ("DeepSeek V4", include_str!("../families/deepseek_v4/serve.rs"), "engine.draft_block(), cuteafd_core::HeadScore::None"),
-            ("Inkling", include_str!("../families/inkling2/backend.rs"), "HeadScore { cuteafd_core::HeadScore::None }"),
+            ("Inkling", include_str!("../families/inkling2/backend.rs"), "draft.is_some() { cuteafd_core::HeadScore::CandidateProbability }"),
             ("Qwen Next", include_str!("../families/qwen4/engine.rs"), "head: HeadScore::None"),
         ] {
             assert!(source.contains(declaration), "{family} score source");

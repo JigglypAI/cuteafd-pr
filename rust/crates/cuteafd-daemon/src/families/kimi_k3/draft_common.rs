@@ -36,8 +36,8 @@ impl<'a> CommonDraft<'a> {
             Self::Block { .. } => cuteafd_core::HeadScore::Probability,
         }
     }
-    pub fn configure_scores(&self, enabled: bool) {
-        if let Self::Mla(d) = self { d.set_selector_readback(false, enabled); }
+    pub fn configure_scores(&self, traced: bool, scored: bool) {
+        if let Self::Mla(d) = self { d.set_selector_readback(traced, scored); }
     }
     pub fn is_windowed_block(&self) -> bool { matches!(self,Self::Block { draft,.. } if draft.cfg.window.is_some()) }
     pub fn tap_index(&self, layer: usize) -> Option<usize> { self.geometry().taps.iter().position(|&l| l == layer) }

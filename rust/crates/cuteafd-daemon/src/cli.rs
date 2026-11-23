@@ -257,6 +257,9 @@ pub(crate) enum Commands {
     /// Qualify Hy4-flash coordinator text forward, NLL/logits, Engram FP8/BF16, and unit exactness.
     #[command(hide = true)]
     Hy4fGolden(crate::families::hy4_flash::golden::GoldenArgs),
+    /// Serve Hy4-flash through the shared scheduler on 1x or 2x RTX (and Spark experts).
+    #[command(hide = true)]
+    ServeHy4f(crate::families::hy4_flash::serve::ServeArgs),
     /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
     #[command(hide = true)]
     ServeInkling2(crate::families::inkling2::serve::ServeArgs),
