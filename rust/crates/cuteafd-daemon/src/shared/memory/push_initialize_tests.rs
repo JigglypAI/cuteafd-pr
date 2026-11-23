@@ -523,7 +523,7 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
             hidden: 256,
             intermediate: 640,
             draft_stages: 0,
-            draft_experts: 0,
+            draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         };
         let mut metadata = Vec::new();
         for (name, n, k) in [("gate", 640, 256), ("up", 640, 256), ("down", 256, 640)] {

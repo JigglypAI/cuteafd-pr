@@ -206,7 +206,7 @@ mod tests {
             }
             write_snapshot(root.path(), &serde_json::json!({}), &weights, None);
             let tensors = Fp8ExpertTensors::read(root.path(), RoutedExpertShape { layers: 10, first_layer: 3,
-                experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0 })?;
+                experts: 1, topk, hidden, intermediate, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped })?;
             let mut info = Fp8MoeInfo { hidden, intermediate, slice: intermediate, experts: 1, topk, tp: 1,
                 wire_input: format == ExpertFormat::Mxfp8, nvfp4_input: false, swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0),
                 swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: Fp8MoeActivation::SiluBf16Product,

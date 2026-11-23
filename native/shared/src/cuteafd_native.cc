@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <nvtx3/nvToolsExt.h>
 
 #endif
 
@@ -1873,6 +1874,24 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_census_end(void* token) {
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "census CUDA unavailable");
 #endif
+}
+
+// NVTX ranges for benchmark phase attribution (header-only NVTX 3: without a
+// profiler attached these are a pointer check). Callers arm them only for
+// benchmark probes, so ordinary serving makes no calls.
+extern "C" cuteafd_status_t cuteafd_nvtx_range_push(const char* name) {
+  if (!name) { return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "NVTX range name is null"); }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  nvtxRangePushA(name);
+#endif
+  return ok();
+}
+
+extern "C" cuteafd_status_t cuteafd_nvtx_range_pop() {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  nvtxRangePop();
+#endif
+  return ok();
 }
 
 extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream) {

@@ -422,7 +422,15 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.media_cache_bytes = options.media_cache_bytes.unwrap_or((8 << 30).min(host.0 / 20));
         process.serving(&inputs, quota, geometry.chunk_bytes().min(quota), embedding, 0)?;
         process.spark_link(&inputs, checkpoint.spark_input_is_bf16())?;
-        process.push_host = glmf::admission::push_host_envelope(checkpoint, &cfg, ranks, Some(&catalog), exlr8)?;
+        process.push_required = match crate::push_load::namespace(&checkpoint.snapshot) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && error.raw_os_error().is_none() && checkpoint.snapshot.exists() => false,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some((_, metadata)) = exlr8.filter(|_| process.push_required) {
+            process.retained_expert_metadata = glmf::admission::retained_expert_metadata(&cfg, ranks, metadata)?;
+        }
         // The serving drafter loads FP8-packed (its default) as its own push group.
         process.draft_tp2 = draft_tp2;
         if let Some((_, _, path)) = draft_config.as_ref() {
@@ -433,11 +441,11 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 format!("glm5_flash/draft/{rank}"), [("explicit.weights".into(), usize::try_from(draft)?)]))
                 .collect::<anyhow::Result<_>>()?;
         }
-        process.draft_push = draft_config.as_ref().filter(|_| draft > 0 || !process.draft_tp2.is_empty()).map(|(config, _, path)|
-            glmf::admission::DraftPush::for_snapshot(path, config,
+        process.draft_push = draft_config.as_ref().filter(|_| draft > 0 || !process.draft_tp2.is_empty()).map(|(_, _, path)|
+            glmf::admission::DraftPush::for_snapshot(path,
                 options.glmf_draft_representation))
             .transpose()?.flatten().map(|push| push.for_tp(if options.tp2_dflash { 2 } else { 1 })).transpose()?;
-        if exlr8.is_none() && process.push_host.is_none() {
+        if exlr8.is_none() && !process.push_required {
             process.mount_load = Some(glmf::admission::mount_load(checkpoint, ranks)?);
         }
         if let Some((facts, metadata)) = exlr8 {
@@ -550,7 +558,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 .and_then(|moe| {
                     let geometry = cuteafd_core::ExpertGeometry { hidden: model.spec().hidden as u32,
                         experts: moe.experts as u32, topk: moe.top_k as u32,
-                        intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32 };
+                        intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32,
+                        activation: cuteafd_core::ExpertActivation::SiluClamp10 };
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
                         .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,

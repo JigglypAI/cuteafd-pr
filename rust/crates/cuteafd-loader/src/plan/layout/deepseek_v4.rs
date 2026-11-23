@@ -206,8 +206,7 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 placement = admitted.placement;
             }
         }
-        startup.add_experts(input.expert_catalog()?, shape.native_layers, &placement, options.tp2_dspark_experts)?;
-        Ok((placement, reserves, startup.notes()?, solved, prefix, solve_us, admissions))
+        Ok((placement, reserves, startup.notes(), solved, prefix, solve_us, admissions))
     })();
     match admitted {
         Ok((placement, reserves, startup_notes, solved, prefix, solve_us, admissions)) => {

@@ -1840,6 +1840,189 @@ STEP5_LAYOUTS = {"fp8-2rtx-6spark": 2, "nvfp4-1rtx-4spark": 1,
 STEP5_GEOMETRY = re.compile(r"Key \{ layer: (\d+), rows: (\d+), section: "
                             r"(Projection|Attention|Dense|Frontend|Shared|Finish) \}")
 
+HY4_LAYOUTS = {
+    "exl3-k4-mc-1rtx-0spark": 1,
+    "exl3-k4-mc-2rtx-0spark": 2,
+    "exl3-k4-mc-1rtx-spark": 1,
+    "exl3-k4-mc-2rtx-spark": 2,
+}
+HY4_GEOMETRY = re.compile(
+    r"Key \{ layer: (\d+), rows: (\d+), section: "
+    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish) \}"
+)
+
+
+def generate_hy4_flash(traces, layout):
+    """Whole replayed row geometries, per rank; never borrow another layout."""
+    if layout not in HY4_LAYOUTS:
+        raise ValueError(f"unknown Hy4-flash layout {layout!r}")
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") != 2:
+            raise ValueError("Hy4-flash requires GRAPH_TRACE schema_version=2")
+        device = int(trace["cache"]["device"])
+        sampled = int(trace["cache"]["sampled_at_ms"])
+        if device not in latest or sampled >= latest[device][0]:
+            latest[device] = (sampled, trace)
+    if len(latest) != HY4_LAYOUTS[layout]:
+        raise ValueError(f"{layout} requires {HY4_LAYOUTS[layout]} device traces")
+    rank_identities = []
+    for rank, device in enumerate(sorted(latest)):
+        _, trace = latest[device]
+        identities = {}
+        for graph in trace["graphs"]:
+            if graph["site"] != "hy4_flash.section":
+                continue
+            match = HY4_GEOMETRY.fullmatch(graph["shape"])
+            if match is None:
+                raise ValueError(f"cannot parse Hy4-flash identity: {graph['shape']!r}")
+            layer, rows, section = match.groups()
+            key = (int(layer), int(rows), section)
+            if key[0] > 42 or key[1] <= 0:
+                raise ValueError(f"unsupported Hy4-flash geometry {key}")
+            if int(graph.get("nodes") or 0) < 2 or graph.get("spans_devices", False):
+                raise ValueError(f"invalid local Hy4-flash section topology {key}")
+            capture = graph.get("capture_bytes")
+            if capture is None or int(capture) < 0:
+                raise ValueError(f"Hy4-flash section {key} lacks measured capture bytes")
+            if key in identities:
+                raise ValueError(f"duplicate Hy4-flash exact geometry {key} on device {device}")
+            identities[key] = graph
+        rank_identities.append(identities)
+    all_graphs = [(key, graph) for identities in rank_identities for key, graph in identities.items()]
+    rows = {key[1] for key, graph in all_graphs if qwen_replay(graph) >= 1}
+    if not rows:
+        raise ValueError("Hy4-flash layout has no replayed row geometries")
+    heat = {row: sum(qwen_replay(graph) for key, graph in all_graphs if key[1] == row) for row in rows}
+    hot = {
+        row: any(
+            sustained(graph)
+            or (int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2)
+            for key, graph in all_graphs
+            if key[1] == row and qwen_replay(graph) >= 1
+        )
+        for row in rows
+    }
+    ordered_rows = sorted(rows, key=lambda row: (not hot[row], -heat[row], row))
+    ranks = []
+    for rank, inventory in enumerate(rank_identities):
+        identities = {key: graph for key, graph in inventory.items() if key[1] in rows}
+        if {key[1] for key in identities} != rows:
+            raise ValueError(f"Hy4-flash rank {rank} lacks a selected row geometry")
+        total_measured = sum(int(g["capture_bytes"]) for g in identities.values())
+        if total_measured <= 0:
+            raise ValueError(f"Hy4-flash rank {rank} has no positive measured capture shares")
+        # CUDA allocates graph storage in 2 MiB slabs; completed_capture records per-section
+        # slab jumps (0 or 2 MiB), so sum(capture_bytes) is the exact physical arena cost of
+        # the selected set rather than multiplying a 2 MiB jump across zero-delta siblings.
+        amortized = math.ceil(total_measured / len(identities))
+        costs = {key: int(graph["capture_bytes"]) for key, graph in identities.items()}
+        entries = [
+            {
+                "rows": row,
+                "pin": hot[row],
+                "replay_hits": heat[row],
+                "capture_bytes": sum(costs[key] for key in identities if key[1] == row),
+                "sections": [
+                    {
+                        "layer": key[0],
+                        "section": key[2],
+                        "capture_bytes": costs[key],
+                        "replay_hits": qwen_replay(identities[key]),
+                    }
+                    for key in sorted(identities)
+                    if key[1] == row
+                ],
+            }
+            for row in ordered_rows
+        ]
+        ranks.append(
+            {
+                "rank": rank,
+                "reserve_base_bytes": packed(total_measured),
+                "reserve_extra_bytes": CHUNK,
+                "entries": entries,
+                "zero_replay_sibling_bytes": sum(
+                    costs[key] or amortized for key, graph in identities.items() if qwen_replay(graph) == 0
+                ),
+                "lazy_zero_replay_bytes": sum(
+                    int(graph["capture_bytes"]) for key, graph in inventory.items() if key[1] not in rows
+                ),
+            }
+        )
+    return {"schema_version": 1, "family": "hy4_flash", "layout": layout, "ranks": ranks}
+
+
+INKLING_GEOMETRY = re.compile(
+    r"Key \{ layer: (\d+), rows: (\d+), section: "
+    r"(WholeAttention|RankAttention|AfterAttention|Routes|ExpertFinish), mode: (Decode|Verify) \}"
+)
+
+
+def generate_inkling2(bands, layout, ranks):
+    """Each band is an isolated same-layout launch with its own exact cycle denominator.
+
+    A snapshot has cumulative hits, not concurrency. Supply one final snapshot per
+    device in a band and the number of target decode+verify cycles in that launch.
+    A donor re-key or ARC eviction can discard earlier hits: the retained counts
+    are lower bounds, suitable for conservative pins, not exact frequencies.
+    """
+    if not layout or ranks not in (1, 2) or not bands:
+        raise ValueError("Inkling needs --layout, --ranks 1|2, and one or more bands")
+    rank_costs = [{} for _ in range(ranks)]
+    rank_hits = [{} for _ in range(ranks)]
+    rank_pins = [set() for _ in range(ranks)]
+    seen_bands = set()
+    for band, cycles, traces in bands:
+        if not band or band in seen_bands or type(cycles) is not int or cycles <= 0:
+            raise ValueError(f"invalid or duplicate Inkling band {band!r}")
+        seen_bands.add(band)
+        ordered = sorted(traces, key=lambda t: int(t["cache"]["device"]))
+        if len(ordered) != ranks or len({int(t["cache"]["device"]) for t in ordered}) != ranks:
+            raise ValueError(f"Inkling band {band} needs one snapshot per rank")
+        for rank, trace in enumerate(ordered):
+            if trace.get("schema_version") != 2:
+                raise ValueError("Inkling needs GRAPH_TRACE schema_version=2")
+            seen = set()
+            for graph in trace["graphs"]:
+                if graph["site"] != "inkling2.section" or qwen_replay(graph) == 0:
+                    continue
+                match = INKLING_GEOMETRY.fullmatch(graph["shape"])
+                if match is None:
+                    raise ValueError(f"invalid Inkling graph identity {graph['shape']!r}")
+                layer, rows, section, mode = match.groups()
+                key = (int(layer), int(rows), section, mode)
+                if (not 0 <= key[0] < 48 or not 1 <= key[1] <= 64 or key in seen
+                        or int(graph.get("nodes") or 0) < 3 or graph.get("spans_devices", False)):
+                    raise ValueError(f"invalid or duplicate Inkling graph {key} on rank {rank}")
+                seen.add(key)
+                hits = qwen_replay(graph)
+                capture = graph.get("capture_bytes")
+                if not 0 < hits <= cycles or type(capture) is not int or capture < 0:
+                    raise ValueError(f"invalid Inkling capture/replay accounting for {key} in {band}")
+                rank_costs[rank][key] = max(capture, rank_costs[rank].get(key, 0))
+                rank_hits[rank][key] = rank_hits[rank].get(key, 0) + hits
+                if 2 * hits >= cycles:
+                    rank_pins[rank].add(key)
+    devices = []
+    for rank, (costs, hits, pins) in enumerate(zip(rank_costs, rank_hits, rank_pins)):
+        if not costs or not sum(costs.values()):
+            raise ValueError(f"Inkling rank {rank} needs measured replayed captures")
+        entries = [dict(layer=key[0], rows=key[1], section=key[2], mode=key[3], pin=key in pins,
+                        capture_bytes=costs[key], replay_hits=hits[key])
+                   for key in sorted(costs, key=lambda key: (key not in pins, -hits[key], key))]
+        devices.append(dict(rank=rank, reserve_base_bytes=packed(sum(costs.values())),
+                            reserve_extra_bytes=CHUNK, entries=entries))
+    return dict(schema_version=1, family="inkling2", layout=layout, ranks=devices)
+
+
+def inkling2_bands(specs):
+    """BAND:CYCLES=RANK0.json[,RANK1.json]; never infer bands from time windows."""
+    for spec in specs:
+        header, paths = spec.split("=", 1)
+        band, cycles = header.rsplit(":", 1)
+        yield band, int(cycles), [json.loads(Path(path).read_text()) for path in paths.split(",")]
+
 
 def generate_step5(traces, layout):
     """Whole replayed row geometries, per rank; never borrow another layout."""
@@ -1917,7 +2100,7 @@ def generate_step5(traces, layout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark", "step5")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark", "step5", "hy4_flash", "inkling2")))
     parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1927,14 +2110,14 @@ def main():
                         help="qwen4 resolved capture shape (owner count, Sparks attached)")
     parser.add_argument("--prefill-rows", type=int, help="V4.1 exact current full prefill chunk width")
     parser.add_argument("--trace", action="append", required=True,
-                        help="PATH, or LAYOUT=PATH for GLM Flash (repeatable)")
+                        help="PATH, LAYOUT=PATH for GLM Flash, or BAND:CYCLES=RANK0.json[,RANK1.json] for Inkling (repeatable)")
     parser.add_argument("--output", type=Path,
                         help="write the generated object here (one shape for qwen4, the list otherwise)")
     parser.add_argument("--merge", type=Path,
                         help="qwen4 only: install the generated shape into this prewarm list in place")
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
-    parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
+    parser.add_argument("--ranks", type=int, help="MiMo/Kimi/Inkling physical coordinator ranks")
     parser.add_argument("--variant", help="checkpoint variant: MiMo program/layers (mimof-48), Kimi core (bf16 or k6)")
     parser.add_argument("--onboard-layers", type=int, help="Muse resolved onboarded layer prefix")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
@@ -1963,8 +2146,14 @@ def main():
     elif args.family == "step5":
         if layout not in STEP5_LAYOUTS:
             parser.error("Step-5 requires its exact --layout")
+    elif args.family == "hy4_flash":
+        if layout not in HY4_LAYOUTS:
+            parser.error("Hy4-flash requires its exact --layout")
+    elif args.family == "inkling2":
+        if not layout or args.ranks not in (1, 2):
+            parser.error("Inkling requires its exact --layout and --ranks 1 or 2")
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41, kimi_k3 and step5 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41, kimi_k3, step5, hy4_flash and inkling2 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
@@ -1975,6 +2164,10 @@ def main():
                                    args.ranks, args.onboard_layers)
         elif args.family == "step5":
             result = generate_step5([json.loads(Path(path).read_text()) for path in args.trace], layout)
+        elif args.family == "hy4_flash":
+            result = generate_hy4_flash([json.loads(Path(path).read_text()) for path in args.trace], layout)
+        elif args.family == "inkling2":
+            result = generate_inkling2(list(inkling2_bands(args.trace)), layout, args.ranks)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,

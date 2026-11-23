@@ -61,9 +61,7 @@ fn native_catalog_groups(catalog: &crate::OfficialV41Catalog, family: &str,
     if !working.selected_ranks().contains(&rank) { return Ok(None); }
     let Some(tensors) = catalog.fp8() else { return Ok(None); };
     let shape = tensors.shape();
-    let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(shape.hidden)?,
-        experts: u32::try_from(shape.experts)?, topk: u32::try_from(shape.topk)?,
-        intermediate: u32::try_from(shape.intermediate)?, layers: u32::try_from(shape.layers)? };
+    let geometry = shape.geometry()?;
     let mut groups = Vec::new();
     let mut formats = Vec::new();
     for &layer in &working.spark_layers {
@@ -606,8 +604,7 @@ mod tests {
             let hidden = row["hidden"].as_u64().unwrap();
             let topk = row["topk"].as_u64().unwrap();
             let input = if row["bf16"].as_bool().unwrap() { 2 * hidden } else { hidden + hidden / 32 };
-            let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
-                experts: 1, intermediate: 1, layers: 1 };
+            let geometry = cuteafd_core::ExpertGeometry::from_wire_dims(hidden as u32, 1, topk as u32, 1, 1);
             for (index, compiled) in CENSUS_CAPACITIES.into_iter().enumerate() {
                 let rows = u64::from(compiled);
                 let exact = row["scratch"][index].as_u64().unwrap() + rows * (input + 8 * topk + 2 * hidden);
@@ -892,8 +889,7 @@ mod tests {
             let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).unwrap();
             let wire_routes = 4096 * (hidden + hidden / 32 + 8 * topk);
             assert_eq!(retained + wire_routes, expected, "{family}");
-            let geometry = cuteafd_core::ExpertGeometry { hidden: hidden as u32, topk: topk as u32,
-                experts: 1, intermediate: 1, layers: 1 };
+            let geometry = cuteafd_core::ExpertGeometry::from_wire_dims(hidden as u32, 1, topk as u32, 1, 1);
             let owner = exl3_owner_bytes(family, geometry, extent(4096, 4096), None).unwrap();
             assert!(owner.scratch + owner.io >= expected, "{family}");
         }

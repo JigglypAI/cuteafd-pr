@@ -654,7 +654,7 @@ pub(super) fn resolve_with_owners(
     #[cfg(test)]
     let host_memory = (1u64 << 40, 1u64 << 40);
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    let mut host = admission::HostFacts::prepare(&config,
+    let host = admission::HostFacts::prepare(&config,
         &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
         prefill, ranks, args.peers.len(), context, args.concurrency as u64,
         args.dspark, match args.prefix.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
@@ -667,24 +667,6 @@ pub(super) fn resolve_with_owners(
             .map(|tensor| tensor.metadata.byte_length).sum();
         retained.push(Owner::host(Category::Embedding, "embedding", bytes)
             .at(cuteafd_loader::placement::planner::Location::PINNED));
-    }
-    #[cfg(not(test))]
-    if catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none() {
-        use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
-        let owners = (0..ranks).map(|rank| WholeOwner { rank, budget: usize::MAX,
-            selections: (0..40).map(|layer| if ranks == 1 { ExpertLayer::BackboneFull { layer } }
-                else { ExpertLayer::BackboneTp2 { layer, rank } })
-                .chain((0..if args.dspark && ranks == 2 { 3 } else { 0 })
-                    .map(|stage| ExpertLayer::DsparkTp2 { stage, rank })).collect() }).collect();
-        let actual = CoordinatorExperts::Native { owners }.host_envelope(&catalog, ranks, &[])?;
-        host.push.validate_usage(&actual)?;
-        host.push.expert_bytes = actual.expert_bytes;
-        host.push.retained_bytes = actual.retained_bytes;
-        host.owners.retain(|owner| !owner.group.starts_with("coordinator push "));
-        for owner in host.push.allocations("v41.push")?.into_iter().filter(|owner| !owner.id.ends_with(".dense")) {
-            host.owners.push(Owner::host(owner.category, owner.group, owner.bytes)
-                .at(owner.location).with_lifetime(owner.lifetime));
-        }
     }
     retained.extend(host.owners.clone());
     allowances.extend(host.estimates.clone());

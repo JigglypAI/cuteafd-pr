@@ -140,6 +140,7 @@ pub struct Hy4Inputs {
     pub context: Context,
     pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
+    pub decode_rows: u32,
     pub sequences: u64,
     pub prefix_mark_slots: usize,
     pub targets: Vec<CoordinatorWeights>,
@@ -293,7 +294,7 @@ impl Hy4Inputs {
         HopSpec {
             storage: HopStorage::ReceiveSlots,
             row_bytes: (self.cfg.hc_mult * self.cfg.hidden * 2) as u64,
-            rows: self.prefill.rows.max(u64::from(DECODE_ROWS)),
+            rows: self.prefill.rows.max(u64::from(self.decode_rows)),
             lanes: LANES,
             entry_gpu: 0,
             head_gpu: self.head_gpu(),
@@ -533,7 +534,16 @@ impl Hy4Inputs {
         } else {
             1
         };
-        let decode_unit = UnitLayout::new(cfg, self.kv_format, DECODE_ROWS as usize, head_parts).map_err(refusal)?;
+        out.extend(buffer(
+            format!("hy4_flash.decode.{gpu}.mla_split_partials"),
+            location,
+            crate::families::hy4_flash::execution::mla_split_scratch_bytes(self.decode_rows as usize, head_parts) as u64,
+            Lifetime::TARGET,
+            Category::Workspace,
+            "Hy4-flash MLA split-K decode/verify partials",
+            maximum,
+        ));
+        let decode_unit = UnitLayout::new(cfg, self.kv_format, self.decode_rows as usize, head_parts).map_err(refusal)?;
         for (name, bytes) in decode_unit.buffers {
             out.extend(buffer(
                 format!("hy4_flash.decode.{gpu}.{name}"),
@@ -591,6 +601,7 @@ impl Hy4Inputs {
 
     fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let head = self.head_gpu();
+        // Also covers a full prefill scoring tile.
         let rows = u64::from(DECODE_ROWS);
         let mut out = Vec::new();
         for (name, bytes) in [
@@ -628,6 +639,8 @@ impl Recipe for Hy4Inputs {
             || self.spark.len() != self.routed.len() + 1
             || self.prefill.rows == 0
             || self.prefill.waves == 0
+            || !(1..=DECODE_ROWS).contains(&self.decode_rows)
+            || self.sequences > u64::from(self.decode_rows)
             || self.sequences == 0
         {
             return Err(invalid("invalid extent or empty domain"));
@@ -645,7 +658,7 @@ impl Recipe for Hy4Inputs {
                     location: Location::coordinator(head),
                     capacity: usize::try_from(self.sequences)
                         .map_err(|_| Refusal::Overflow("Hy4 selector"))?
-                        .max(DECODE_ROWS as usize),
+                        .max(self.decode_rows as usize),
                     vocab: self.cfg.vocab_size,
                     device_sampling: true,
                 },

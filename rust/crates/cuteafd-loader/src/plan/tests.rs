@@ -523,8 +523,8 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
         host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
     let spec = report.spec.as_ref().unwrap();
     let moe = spec.moe.as_ref().unwrap();
-    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
-        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
+    let geometry = ExpertGeometry::from_wire_dims(spec.hidden as u32, moe.experts as u32,
+        moe.top_k as u32, moe.intermediate as u32, spec.layers.len() as u32);
     let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
@@ -551,7 +551,8 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
     let geometry = ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     for rows in [64usize, 2048, 4096] {
         for waves in [1usize, 2, 3] {
             for input in [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode] {
@@ -3542,10 +3543,8 @@ fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
     assert_eq!(host.locations, [Location::HOST, Location::PINNED]);
     let owned = |ledger: &crate::plan::SolvedPhaseLedger, phase| ledger.phases.iter()
         .find(|row| row.budget == "coordinator host RAM" && row.phase == phase).unwrap().owned;
-    // Dense staging and push rings own the Load phase; pinned tables, logits
-    // and link storage own Ready.
-    let push = (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64;
-    assert!(owned(ledger, Phase::Load) >= push);
+    // Decode tables and logits are post-load. No checkpoint push staging is reserved.
+    assert_eq!(owned(ledger, Phase::Load), 0);
     assert!(owned(ledger, Phase::Ready) > 0);
     assert!(planned.memory_layout.unwrap().devices.iter().all(|device|
         device.items.iter().all(|item| item.group != "Spark egress")));
@@ -4265,7 +4264,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert_eq!(memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count(), working.spark_ranks);
         for device in memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark) {
             let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-                topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+                topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+                activation: cuteafd_core::ExpertActivation::SiluClamp10 };
             let io = working.rank_io(device.index as usize, geometry, 4096, checkpoint.spark_input_is_bf16(),
                 placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
                     alignment: 4096, endpoints: 1 }).unwrap();
@@ -4295,7 +4295,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             let link = placement::PreparedSparkLink::endpoint("glmf.spark", 0, placement::SparkEndpointOwners {
                 ranks: peers, geometry: cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32,
                     experts: cfg.experts as u32, topk: cfg.topk as u32,
-                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 },
+                    intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+                    activation: cuteafd_core::ExpertActivation::SiluClamp10 },
                 endpoint: cuteafd_core::SparkEndpoint { capacity: 4096,
                     ingress: if checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                         else { cuteafd_core::SparkIngress::Fp8K32 }, ring_depth: None, partial_reply_bytes: None },

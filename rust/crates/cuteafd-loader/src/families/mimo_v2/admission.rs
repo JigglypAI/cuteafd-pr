@@ -488,7 +488,8 @@ pub fn future_host_workspaces(cfg: &MimoV2Config, rows: usize, waves: usize, ran
     if spark_ranks > 0 {
         use cuteafd_core::{ExpertGeometry, SparkRings};
         let geometry = ExpertGeometry { hidden: u32::try_from(cfg.hidden)?, experts: u32::try_from(cfg.experts)?,
-            topk: u32::try_from(cfg.topk)?, intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+            topk: u32::try_from(cfg.topk)?, intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)?,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let endpoints = spark_endpoints(rows, expert_input)?;
         let mut ring = 0usize;
         let mut prefix = 0usize;

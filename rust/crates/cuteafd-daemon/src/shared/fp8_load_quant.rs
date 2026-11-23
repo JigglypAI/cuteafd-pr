@@ -53,6 +53,7 @@ pub(crate) struct GpuQuantizer<'a> {
 pub(crate) struct LoadKernels<'a> {
     library: &'a NativeLibrary,
     tables: Option<HostAllocation<'a>>,
+    push_device: Option<i32>,
 }
 
 impl<'a> GpuQuantizer<'a> {
@@ -66,7 +67,7 @@ impl<'a> GpuQuantizer<'a> {
     /// The pinned source buffer, at least `bytes` long, for the caller to fill
     /// with one tensor's BF16 rows before `quantize`.
     pub fn source_mut(&mut self, bytes: usize) -> Result<&mut [u8]> {
-        LoadKernels::grow(self.kernels.library, &mut self.source, bytes, "staging/fp8-load-quant")?;
+        LoadKernels::grow(self.kernels.library, &mut self.source, bytes, "staging/fp8-load-quant", None)?;
         Ok(&mut self.source.as_mut().context("pinned source")?.bytes_mut()[..bytes])
     }
 
@@ -119,14 +120,26 @@ impl<'a> LoadKernels<'a> {
         let (job, segment, _) = library.fp8_load_quant_abi()?;
         ensure!(job as usize == std::mem::size_of::<Job>() && segment as usize == std::mem::size_of::<Segment>(),
             "FP8 load quantization ABI differs from this daemon");
-        Ok(Self { library, tables: None })
+        Ok(Self { library, tables: None, push_device: None })
     }
 
-    fn grow(library: &'a NativeLibrary, slot: &mut Option<HostAllocation<'a>>, bytes: usize, scope: &'static str)
-        -> Result<()> {
+    pub fn for_push(library: &'a NativeLibrary, device: i32) -> Result<Self> {
+        Ok(Self { push_device: Some(device), ..Self::new(library)? })
+    }
+
+    pub fn push_device(&self) -> Option<i32> { self.push_device }
+
+    fn grow(library: &'a NativeLibrary, slot: &mut Option<HostAllocation<'a>>, bytes: usize, scope: &'static str, push_device: Option<i32>) -> Result<()> {
         if slot.as_ref().is_none_or(|a| a.buffer.bytes < bytes) {
             drop(slot.take());
-            *slot = Some(HostAllocation::new(library, bytes.max(1 << 20), crate::shared::memory::Tag::staging(scope))?);
+            let bytes = bytes.max(1 << 20);
+            *slot = Some(HostAllocation::new(library, bytes, crate::shared::memory::Tag::staging(scope))
+                .map_err(|source| match push_device {
+                    Some(device) => crate::shared::experts::rtx::push::PushStartupError::StagingAllocation {
+                        device, bytes, owner: scope, source,
+                    }.into(),
+                    None => source,
+                })?);
         }
         Ok(())
     }
@@ -148,7 +161,7 @@ impl<'a> LoadKernels<'a> {
         let scale_need = match target.kmajor { Some((scale_rows, row0)) => (kb - 1) * scale_rows + row0 + units, None => units * kb };
         ensure!(target.scales.bytes >= scale_need * 4, "quantized scales exceed their operand");
         let tables = quant_table_bytes(rows.len(), layout)?;
-        Self::grow(self.library, &mut self.tables, tables, "staging/fp8-load-quant")?;
+        Self::grow(self.library, &mut self.tables, tables, "staging/fp8-load-quant", self.push_device)?;
         let base = source.as_ptr();
         let table = self.tables.as_mut().context("pinned tables")?;
         let (segments, jobs) = table.bytes_mut().split_at_mut(std::mem::size_of::<Segment>() * units);
@@ -188,7 +201,7 @@ impl<'a> LoadKernels<'a> {
         use cuteafd_loader::formats::scale_codes::{plane_bytes, ScaleCodeError};
         ensure!(!targets.is_empty(), "no scale-code source rectangles");
         let bytes = scale_code_table_bytes(targets.len())?;
-        Self::grow(self.library, &mut self.tables, bytes, "staging/scale-code-jobs")?;
+        Self::grow(self.library, &mut self.tables, bytes, "staging/scale-code-jobs", self.push_device)?;
         let table = self.tables.as_mut().context("scale-code job table")?;
         table.bytes_mut()[..8].copy_from_slice(&u64::MAX.to_le_bytes());
         let jobs = table.bytes_mut()[8..].as_mut_ptr().cast::<V41ScaleCodeJob>();

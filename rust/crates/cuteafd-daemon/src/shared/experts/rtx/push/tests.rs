@@ -17,36 +17,6 @@ fn packed_head_push_delivers_transient_source_before_arena_pack() -> Result<()> 
 }
 
 #[test]
-#[ignore = "requires installed MiniMax headers; header-only, no CUDA or payload reads"]
-fn installed_minimax_recipe_push_envelope_matches_coordinator() -> Result<()> {
-    use cuteafd_loader::{families::minimax_m3::weight_layout::push_host_envelope as recipe_envelope,
-        placement::families::minimax_m3::ExpertBacking};
-    use crate::shared::experts::layer::ExpertLayer;
-    let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(||
-        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/huggingface"));
-    let model = home.join("hub/models--MiniMaxAI--MiniMax-M3.1-Flash");
-    let revision = std::fs::read_to_string(model.join("refs/main"))?;
-    let catalog = cuteafd_loader::read_expert_catalog(&model.join("snapshots").join(revision.trim()))?;
-    let tensors = catalog.fp8().context("MiniMax native expert headers absent")?;
-    let layer = tensors.shape().first_layer;
-    for gpus in [1, 2] {
-        let layers = [layer, layer + 1];
-        let backings = (0..gpus).map(|gpu| ExpertBacking::plan(tensors, &layers,
-            gpus, gpu, (1 - gpu) as i32)).collect::<Result<Vec<_>>>()?;
-        let budgets = backings.iter().map(|backing| backing.arena.bytes()).collect::<Vec<_>>();
-        let set = if gpus == 2 { CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets } }
-            else { CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
-                selections: layers.into_iter().map(|layer| ExpertLayer::BackboneFull { layer }).collect(),
-                budget: budgets[0] }] } };
-        let dense = vec![super::super::dense::HostStaging::default(); gpus];
-        assert_eq!(recipe_envelope(tensors, &backings, gpus)?, set.host_envelope(&catalog, gpus, &dense)?);
-        let empty = vec![None; gpus];
-        assert_eq!(recipe_envelope(tensors, &[], gpus)?, push_host_envelope(&empty, &dense)?);
-    }
-    Ok(())
-}
-
-#[test]
 fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
     for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
         let error = join_stage::<()>(7, 6, 0, stage, bytes,
@@ -134,10 +104,6 @@ fn whole_owners_preserve_checkpoint_shards_on_either_dense_rank() -> Result<()> 
                 assert_eq!((residency.world, residency.rank), (1, 0));
             }
         }
-        let refs = plans.iter().map(Option::as_ref).collect::<Vec<_>>();
-        let expert_host = plans[rank].as_ref().unwrap().host_bytes()?;
-        assert_eq!(CoordinatorExpertPlan::admit_host(&refs, &[], 128, 1 << 20, u64::MAX)?,
-            gpus * 128 * (1 << 20) + expert_host, "dense-only ranks retain their receive ring");
     }
     CoordinatorExperts::Whole { owners: vec![owner(0), owner(1)] }.validate_ranks(2)?;
     for owners in [vec![], vec![owner(2)], vec![owner(0), owner(0)],
@@ -168,18 +134,6 @@ fn exlr8_coordinator_plan_uses_actual_world_and_committed_native_inventory() -> 
             assert!(!checked.plan.entries.is_empty());
             assert!(checked.plan.entries.iter().all(|entry| entry.rank as usize == rank + 4));
         }
-    }
-    Ok(())
-}
-
-#[test]
-fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
-    for gpus in [1, 2] {
-        let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();
-        let peak = gpus * 128 * (1 << 20);
-        assert_eq!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64)?, peak);
-        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], 128, 1 << 20, peak as u64 - 1).is_err());
-        assert!(CoordinatorExpertPlan::admit_host(&plans.iter().map(Option::as_ref).collect::<Vec<_>>(), &[], usize::MAX, 2, u64::MAX).is_err());
     }
     Ok(())
 }
@@ -244,35 +198,7 @@ fn staging_uses_actual_sizes_and_charges_disconnected_transforms_in_full() -> Re
 }
 
 #[test]
-fn coordinator_host_admission_adds_dense_pools_and_exl3_validation_for_every_rank() -> Result<()> {
-    use crate::shared::experts::rtx::dense::{HostStaging, STEP_BYTES};
-    let root = tempfile::tempdir()?;
-    let (tensors, _) = qwen4_exl3(1, 4);
-    let tensors = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0."))
-        .collect::<Vec<_>>();
-    let mut config = qwen4_config(1);
-    config["text_config"]["num_experts"] = serde_json::json!(1);
-    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
-    write_snapshot(root.path(), &config, &tensors, None);
-    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-    for gpus in [1, 2] {
-        let plans = (0..gpus).map(|gpu| if gpus == 1 {
-            CoordinatorExpertPlan::whole(vec![catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 1, 0)?], usize::MAX)
-        } else { CoordinatorExpertPlan::new(&catalog, &[0], gpu, usize::MAX) }).collect::<Result<Vec<_>>>()?;
-        let owners = plans.iter().map(Some).collect::<Vec<_>>();
-        let dense = vec![HostStaging { staging_bytes: 12 * STEP_BYTES, largest_step: STEP_BYTES, table_bytes: 2 << 20 }; gpus];
-        let validation = plans.iter().map(|p| p.validation.bytes()).sum::<usize>();
-        assert!(validation > 0);
-        let peak = gpus * (128 * (1 << 20) + 12 * STEP_BYTES + (2 << 20)) + validation;
-        assert_eq!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64)?, peak);
-        assert!(CoordinatorExpertPlan::admit_host(&owners, &dense, 128, 1 << 20, peak as u64 - 1).is_err());
-    }
-    Ok(())
-}
-
-#[test]
-fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error() -> Result<()> {
-    use crate::shared::experts::rtx::dense::HostStaging;
+fn failed_planning_declines_peers_before_returning_a_typed_planning_error() -> Result<()> {
     let (first_driver, mut first) = control_pair()?;
     let (second_driver, mut second) = control_pair()?;
     let driver = std::thread::spawn(move || cuteafd_transport::worker_selection::push::coordinate(
@@ -283,9 +209,8 @@ fn host_admission_refusal_declines_peers_before_returning_a_typed_planning_error
         assert!(planned_offer(&mut second, Ok(()), Ok(offer))?.is_none());
         Ok(())
     });
-    let planned = CoordinatorExpertPlan::admit_host(&[None], &[HostStaging { staging_bytes: 8 << 20, largest_step: 1 << 20, table_bytes: 1 << 20 }],
-        128, 1 << 20, 128 << 20);
-    let offer = planned.as_ref().map(|_| unreachable!("staging must exceed this ring-only budget"))
+    let planned = Err::<(), _>(anyhow::anyhow!("malformed dense records"));
+    let offer = planned.as_ref().map(|_| unreachable!())
         .map_err(|error| format!("{error:#}"));
     let error = planned_offer(&mut first, planned, offer).unwrap_err();
     assert!(matches!(error.downcast_ref::<PushStartupError>(), Some(PushStartupError::Planning(_))));
@@ -1026,9 +951,9 @@ fn independent_expert_sets_share_one_ring_and_retire_separately() -> Result<()> 
     }).collect());
     selections.validate_ranks(1)?;
     let plans = selections.plans(&catalog, 0)?;
-    let envelope = selections.host_envelope(&catalog, 1, &[])?;
-    assert_eq!(envelope.expert_bytes, [plans.iter().map(|p| p.transient_host_bytes().unwrap() as u64).sum::<u64>()]);
-    assert_eq!(envelope.bytes()?, (128 << 20) + plans.iter().map(|p| p.host_bytes().unwrap() as u64).sum::<u64>());
+    let envelope = sets_host_envelope(&[plans.as_slice()], &[])?;
+    assert_eq!(envelope.expert, [plans.iter().map(|p| p.transient_host_bytes().unwrap() as u64).sum::<u64>()]);
+    assert_eq!(envelope.total, (128 << 20) + plans.iter().map(|p| p.host_bytes().unwrap() as u64).sum::<u64>());
     let device = Device { library: &library, id: 0 };
     let expected = (0..2).map(|layer| crate::shared::experts::exl3::Exl3Weights::load(&library, &catalog,
         BackboneFull { layer }, usize::MAX)).collect::<Result<Vec<_>>>()?;
@@ -1543,37 +1468,6 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
             }
         }
     }
-    Ok(())
-}
-
-#[test]
-fn admitted_push_host_checks_never_resample_capacity() -> Result<()> {
-    use cuteafd_loader::push_load::PushHostEnvelope;
-    let admitted = PushHostEnvelope::new(vec![2048, 4096], vec![8192, 16384], 128, 1 << 20)?;
-    let actual = PushHostEnvelope::new(vec![1024, 4096], vec![4096, 16384], 128, 1 << 20)?;
-    // The same pure envelope check is called by prepare and by receive before
-    // offers. No host-memory sampler exists on this admitted execution branch.
-    super::validate_push_host(Some(&admitted), &actual)?;
-    super::validate_push_host(Some(&admitted), &actual)?;
-    let mut excessive = actual.clone();
-    excessive.dense_bytes[1] += 1;
-    let error = super::validate_push_host(Some(&admitted), &excessive).unwrap_err();
-    assert!(matches!(error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
-        Some(cuteafd_loader::placement::planner::Refusal::Capacity { .. })));
-    let owners = admitted.allocations("push")?;
-    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), admitted.bytes()?);
-    assert!(owners.iter().all(|owner| owner.lifetime.first == cuteafd_loader::placement::planner::Phase::Load
-        && owner.lifetime.last == cuteafd_loader::placement::planner::Phase::Load));
-    let source = include_str!("../push.rs");
-    let sample = "mapped_preload::host_memory()";
-    assert_eq!(source.matches(sample).count(), 1, "only the unported adapter may sample");
-    for method in ["fn prepare_with_host(", "fn receive_with<"] {
-        let body = source.split(method).nth(1).expect("execution method exists");
-        assert!(body.contains("validate_push_host(host_envelope.as_ref(), &actual)?"));
-    }
-    let admitted_branch = source.split("fn validate_push_host(").nth(1).unwrap()
-        .split("/// Temporary adapter").next().unwrap();
-    assert!(admitted_branch.contains("Some(admitted) => Ok(admitted.validate_usage(actual)?)"));
     Ok(())
 }
 

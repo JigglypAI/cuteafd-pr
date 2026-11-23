@@ -304,6 +304,7 @@ impl FamilyModel for QwenModel {
             topk: moe.top_k as u32,
             intermediate: moe.intermediate as u32,
             layers: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         };
         if !geometry.same_shape(&cuteafd_core::ExpertGeometry::QWEN4) {
             return None;

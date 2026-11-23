@@ -212,21 +212,13 @@ fn run(args: GoldenArgs) -> Result<()> {
             Location::HOST, bytes, Lifetime::TARGET, Category::Workspace, "diagnostic layer download"),
             ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
     }
-    use crate::shared::{experts::rtx::{dense::HostStaging, push::{push_host_envelope, PushPolicy}},
+    use crate::shared::{experts::rtx::push::PushPolicy,
         token_io::{EmbedPlacement, TokenEmbedding}};
     use cuteafd_loader::placement::planner::{ByteCurve, Component, ComponentKind};
     let policy = PushPolicy::for_snapshot(view.snapshot())?;
-    let envelope = if policy == PushPolicy::Required {
-        // Every target operand is a direct native upload; no transform pool or
-        // retained index is needed, only this coordinator's receive ring.
-        let envelope = push_host_envelope(&[None], &[HostStaging::default()])?;
+    if policy == PushPolicy::Required {
         contract.components.retain(|component| !matches!(&component.kind,
             ComponentKind::Allocation { template, .. } if template.group == "target mount"));
-        for allocation in envelope.allocations("minimax.push")? {
-            let bytes = allocation.bytes;
-            contract.components.push(Component::allocation(allocation,
-                ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
-        }
         let bytes = u64::from(args.prefill_rows) * 4;
         let allocation = cuteafd_loader::placement::planner::Allocation::buffer(EMBEDDING_UPLOAD,
             cuteafd_loader::placement::planner::Location::PINNED, bytes, Lifetime::TARGET,
@@ -234,8 +226,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         contract.components.push(Component::allocation(allocation,
             ByteCurve::fixed(bytes, contract.maximum_pages), false, contract.maximum_pages));
         contract.add_driver_page_tables();
-        Some(envelope)
-    } else { None };
+    }
     let facts = admission::admit(&contract, sample.free_bytes, sample.total_bytes, host)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
@@ -248,10 +239,10 @@ fn run(args: GoldenArgs) -> Result<()> {
     let weight_load = crate::shared::memory::load_timing::Split::start();
     let target_load = crate::shared::memory::load_timing::Split::start();
     tracing::info!("MiniMax weight transaction start");
-    let (target, embedding): (TargetWeights<'_>, Option<TokenEmbedding<'_>>) = if let Some(envelope) = envelope {
+    let (target, embedding): (TargetWeights<'_>, Option<TokenEmbedding<'_>>) = if policy == PushPolicy::Required {
         ensure!(admission.coordinator_pushes(), "MiniMax target and Spark experts must join one push group");
         let (prepared, membership) = super::weights::push::prepare(&view, &catalog, &[device],
-            args.peers.len(), vec![], envelope, ||
+            args.peers.len(), vec![], ||
                 TargetWeights::load_with_embedding(device, &checkpoint, &weights, EmbedPlacement::Gpu))?;
         let pending = admission.start_with(&args.peers, membership)?;
         let ((target, embedding), experts) = prepared.receive(&catalog)?;

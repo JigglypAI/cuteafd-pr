@@ -88,6 +88,15 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
             ("muse_spark", 0, Some(cfg.layers - 1))
         }
+        // Hy4: dense prefix (layer 0), then direct MoE layers 1..=77; DFly2 drafter is dense.
+        "hy_v4_vl" => {
+            let cfg = crate::families::hy4::Hy4Config::from_hf(config)?;
+            let first = cfg.dense_layer.iter().position(|dense| !dense).unwrap_or(cfg.layers);
+            if cfg.dense_layer[first..].iter().any(|dense| *dense) {
+                bail!("unsupported hy4 MoE layer pattern: dense layer after a routed one");
+            }
+            ("hy4", first, Some(cfg.layers - 1))
+        }
         // Hy4-flash: dense prefix (layer 0), then LatentMoE layers 1..=41; DFly2 drafter is dense.
         "hy_v4_flash" => {
             let cfg = crate::families::hy4_flash::Hy4FlashConfig::from_hf(config)?;

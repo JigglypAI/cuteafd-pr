@@ -1137,6 +1137,14 @@ if args[1].name == "qwen38-exl3-min.config":
         assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
         let deployment = release_accepts_prefill(&output.stdout);
         assert_unique_deployment_devices(&deployment, name);
+        if let Some(items) = deployment["report"]["host_ledger"]["items"].as_array() {
+            for item in items {
+                let group = item["group"].as_str().unwrap_or_default().to_ascii_lowercase();
+                assert!(!group.contains("push") && group != "staging/coordinator-dense-status"
+                    && group != "staging/coordinator-expert-scales",
+                    "{name}: checkpoint push staging leaked into host admission: {item}");
+            }
+        }
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
         eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],

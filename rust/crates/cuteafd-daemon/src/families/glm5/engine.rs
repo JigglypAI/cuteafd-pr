@@ -1499,6 +1499,22 @@ impl<'a> GlmEngine<'a> {
     fn verify_device_hooked(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
+        Ok(self.verify_device_padded(sequences, tokens, experts, on_layer, None)?.0)
+    }
+
+    /// A serving verify step padded to `forced` rows instead of its natural bucket: the
+    /// benchmark's verify-timing probe. A forced bucket is one serving itself pads to at this
+    /// table width, at least the natural one, so no new graph geometry is captured.
+    pub(crate) fn verify_timing_device(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, forced: Option<usize>)
+        -> Result<(Option<DeviceLogits>, crate::shared::probe::verify_timing::Buckets)> {
+        self.verify_device_padded(sequences, tokens, experts, None, forced)
+    }
+
+    fn verify_device_padded(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, forced: Option<usize>)
+        -> Result<(Option<DeviceLogits>, crate::shared::probe::verify_timing::Buckets)> {
         use crate::shared::decode_graph::device::Cycle;
         let cycle = if sequences.iter().any(|(_, count)| *count > 1) { Cycle::Verify } else { Cycle::Decode };
         self.graphs.borrow_mut().cache_cycle(cycle);
@@ -1526,7 +1542,9 @@ impl<'a> GlmEngine<'a> {
                 tables.page_table.extend(std::iter::repeat_n(0, width - pages));
             }
         }
-        let bucket = glm_decode_row_bucket(rows, width)?;
+        let buckets = crate::shared::probe::verify_timing::checked_bucket(rows, forced,
+            |rows| Ok(glm_decode_row_bucket(rows, width)?))?;
+        let bucket = buckets.ran;
         self.pad_rows(&mut tables, bucket);
         let mut padded = tokens.to_vec();
         padded.resize(bucket, 0);
@@ -1536,7 +1554,7 @@ impl<'a> GlmEngine<'a> {
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
-        Ok(logits)
+        Ok((logits, buckets))
     }
 
     pub(crate) fn verify_explore_bucket(&self, rows: usize, min_end: usize, max_end: usize) -> usize {
@@ -1730,6 +1748,20 @@ impl<'a> GlmEngine<'a> {
         Some(Estimate { bytes: nodes.saturating_mul(node_rate).saturating_add(graph_rate),
             nodes: Some(nodes), node_rate, graph_rate, parallel_width: 1 })
     }
+
+    /// Drains both ranks' streams (the benchmark's verify-timing boundary).
+    pub(crate) fn synchronize(&self) -> Result<()> {
+        // SAFETY: the engine owns both ranks' streams.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        if self.peer.is_some() {
+            let stream = self.stream_of(1);
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        Ok(())
+    }
+
+    /// Serving replays captured decode graphs: startup warm-up finished.
+    pub(crate) fn production_replay_ready(&self) -> bool { self.graphs_warmed.get() }
 
     fn graph_boundary(&self) -> Result<()> {
         for rank in 0..self.ranks() {
@@ -2217,7 +2249,14 @@ impl<'a> GlmEngine<'a> {
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
-            self.replay_on(0, key, segment)?;
+            {
+                let _range = crate::shared::probe::verify_timing::range(Some(self.library), || match layer {
+                    Some(layer) if layer.dense => format!("L{index} attention+dense"),
+                    Some(_) => format!("L{index} attention+router"),
+                    None => "head".into(),
+                });
+                self.replay_on(0, key, segment)?;
+            }
             if let (Previous::Planes(_), None, Some((transport, _))) = (previous, &self.skip, experts.as_mut()) {
                 // The segment just queued reduced the previous layer's planes.
                 transport.exchange()?.consumed(0, self.stream)?;
@@ -2256,6 +2295,8 @@ impl<'a> GlmEngine<'a> {
                 Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
                     tables.exchange_rows, "m64")?),
                 Some(layer) => {
+                    let _range = crate::shared::probe::verify_timing::range(Some(self.library),
+                        || format!("L{index} experts exchange {}/{t}", tables.exchange_rows));
                     let (transport, _) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                     let waves = transport.exchange()?;

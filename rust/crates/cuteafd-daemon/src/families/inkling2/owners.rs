@@ -116,6 +116,8 @@ pub(crate) struct UnitOwner<'a> {
     decode_attention:bool,
 }
 impl<'a> UnitOwner<'a> {
+    pub(super) fn replaying(&self) -> bool { self.replay.get().is_some() }
+
     /// The caller retains replay storage through every queued convolution and commit.
     pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
         ensure!(replay.is_none_or(|(buffer,width)| width == 9216 + 2048 / self.layout.head_parts && buffer.device_id==self.stream.device.id
@@ -303,7 +305,7 @@ impl<'a> RequestOwners<'a> {
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
         let cache_layout = cuteafd_loader::families::inkling2::execution::CacheLayout::with_head_parts(cfg, sequences, pages, inputs.kv_format, inputs.gpus)?;
         let mark_slots = inputs.prefix_mark_slots;
-        let decode_layout = UnitLayout::serving_head_parts(cfg, 64, context, inputs.kv_format, sequences, inputs.gpus)?;
+        let decode_layout = UnitLayout::serving_decode(cfg, context, inputs.kv_format, sequences, inputs.gpus)?;
         let prefill_layout = UnitLayout::serving_head_parts(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences, inputs.gpus)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {
             let allocation = admitted.solved.facts.allocations.iter().find(|allocation| allocation.id == id)

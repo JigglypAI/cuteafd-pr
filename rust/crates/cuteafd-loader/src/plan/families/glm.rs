@@ -640,14 +640,15 @@ impl FamilyModel for GlmModel {
 
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let moe = self.spec.moe.as_ref()?;
+        let expected = if self.id == "glm5" { cuteafd_core::ExpertGeometry::GLM5 } else { cuteafd_core::ExpertGeometry::GLM5_FLASH };
         let geometry = cuteafd_core::ExpertGeometry {
             hidden: self.spec.hidden as u32,
             experts: moe.experts as u32,
             topk: moe.top_k as u32,
             intermediate: moe.intermediate as u32,
             layers: 0,
+            activation: expected.activation,
         };
-        let expected = if self.id == "glm5" { cuteafd_core::ExpertGeometry::GLM5 } else { cuteafd_core::ExpertGeometry::GLM5_FLASH };
         if !geometry.same_shape(&expected) {
             return None;
         }

@@ -561,12 +561,6 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpus, maximum_pages)?;
-    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpus, Some(&catalog), None, 0)? {
-        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
-            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
-            Component::allocation(owner, bytes, false, maximum_pages)
-        }));
-    }
     use crate::plan::encoder::{EncoderRequest, EncoderHardware, EncoderGpuBudget, EncoderSparkBudget, EncoderKind};
     let towers = towers(report, checkpoint);
     let (weights, encoder_scratch) = match towers.vision {
@@ -749,17 +743,10 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let maximum_pages = pool.maximum_tokens().div_ceil(page_tokens);
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpu_count, maximum_pages)?;
-    let largest_native = records.iter().flat_map(|record| &record.components)
-        .map(|component| component.source.bytes as u64).max().unwrap_or(0);
-    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpu_count, None,
-        Some(metadata), largest_native)? {
-        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
-            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
-            Component::allocation(owner, bytes, false, maximum_pages)
-        }));
-    }
+    additional.extend(retained_expert_metadata(&checkpoint.snapshot, &cfg, cfg.layers, gpu_count, metadata, maximum_pages)?);
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: geometry.native_frame_budget(
         u32::try_from(rows.max(glm::DECODE_ROWS))?).context("EXLR8 native frame geometry")?,
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };

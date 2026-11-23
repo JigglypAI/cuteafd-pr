@@ -417,6 +417,7 @@ impl MimoModel {
             topk: self.cfg.topk as u32,
             intermediate: self.cfg.moe_intermediate as u32,
             layers: 0,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped,
         };
         [(cuteafd_core::ExpertGeometry::MIMO_V2_FLASH,
             if self.cfg.program_family().ok() == Some("mimof") { "mimof" } else { "mimo" }),

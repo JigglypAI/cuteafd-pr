@@ -1448,6 +1448,47 @@ def test_sweep_rows_and_sweep_only_jobs(entry, tmp_path):
     assert row.get('C1') is None  # the baseline's C1 is a different measurement
 
 
+def test_verify_shapes_reach_every_job_alone_and_frame_nsys(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'none', '--verify-shapes', '4x8; 5,4x7;4x8@64', '--verify-context', '2048',
+        '--verify-repeats', '10', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert matrix['sweep_verify'] == dict(shapes=['4x8', '5,4x7', '4x8@64'], context=2048, repeats=10)
+    assert matrix['profile'] == 'panels:' and 'levels' not in matrix
+    for argv in (['--verify-shapes', '4x8', '--levels', '8'], ['--verify-shapes', '4x0x'], ['--verify-repeats', '3']):
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--state', str(tmp_path / 'bad'), '--panels', 'none', *argv, '--dry-run'])
+        with pytest.raises(SystemExit):
+            cards.main()
+    profiled = cards.generate({**entry, 'sweep_verify': dict(shapes=['4x8'])}, 'a', dict(instance='p', slot='s'), tmp_path,
+                              tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
+    assert profiled['entry']['window']['open']['argv'][-2:] == ['start', '--session=cuteafd-profile']
+
+
+def test_verify_sweep_rows_and_isolation_failure(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'sweep_verify': dict(shapes=['4x8', '5,4x7'])}, tmp_path)
+    sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
+    sweep.parent.mkdir(parents=True)
+    sample = lambda shape, r, b, ms: dict(shape=shape, real_rows=r, natural_bucket=b, bucket=b, contexts=[1024] * 8,
+        replay_ready=True, graphed=True, graph=dict(captures=0, misses=0, eager_runs=0), warmups=3,
+        verify_ms=[ms + 0.2, ms, ms + 0.1], select_ms=[0.3, 0.2, 0.4])
+    verify = dict(record=dict(family='glm5_flash', timing_scope='x', samples=[sample('4x8', 32, 32, 40.0), sample('5,4x7', 33, 64, 45.0)]),
+                  warm=dict(family='glm5_flash', timing_scope='x', samples=[]), isolation=dict(passed=True, reference_tokens=16,
+                  restored_cached_tokens=2000))
+    sweep.write_text(json.dumps({'points': [], 'verify': verify}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'pass', row
+    assert [(r['R'], r['B'], r['verify_ms'], r['select_ms'], r['contexts']) for r in row['verify_shapes']] == \
+        [(32, 32, 40.1, 0.3, [1024]), (33, 64, 45.1, 0.3, [1024])]
+    verify['isolation']['passed'] = False
+    sweep.write_text(json.dumps({'points': [], 'verify': verify}))
+    assert cards.summarize_job(job, 0)['status'] == 'failed'
+
+
 def test_binary_without_sweep_fields_is_refused(entry, tmp_path, monkeypatch):
     job = make(entry, tmp_path)
     monkeypatch.setattr(cards.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stderr='  v41 family=x set={}', stdout=''))
@@ -4511,3 +4552,17 @@ def test_serving_turn_is_bounded_by_its_jobs_budgets(entry, tmp_path, monkeypatc
     assert seen[0] == expected == cards.job_max_run(short)
     assert seen[1] == cards.job_max_run(short) + cards.job_max_run(long)
     assert cards.job_max_run(long) - cards.job_max_run(short) == 4800
+
+
+def test_summary_lists_graph_captures_per_timed_band(tmp_path):
+    bands = [dict(band='levels C1', available=True, captures=0, device_captures=0, misses=0, eager_runs=0, zero_captures=True),
+             dict(band='levels C16', available=True, captures=2, device_captures=1, misses=3, eager_runs=1, zero_captures=False),
+             dict(band='prefill 8192', available=False, reason='no start sample', zero_captures=None)]
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, graph_bands=bands)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert '## Graph Captures Per Timed Band' in text
+    assert '| c | candidate | 1 | levels C1 | 0 | 0 | 0 | 0 | yes |' in text
+    assert '| c | candidate | 1 | levels C16 | 2 | 1 | 3 | 1 | NO |' in text
+    assert 'unavailable: no start sample' in text
+    assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['graph_bands'] == bands

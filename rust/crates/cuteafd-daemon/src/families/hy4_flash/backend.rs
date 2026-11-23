@@ -118,6 +118,7 @@ pub(crate) struct Hy4Backend<'a> {
     library: &'a cuteafd_ffi::NativeLibrary,
     context: usize,
     concurrency: usize,
+    decode_rows: usize,
     unit_rows: usize,
     prefill_waves: usize,
     vocab: usize,
@@ -138,6 +139,7 @@ impl<'a> Hy4Backend<'a> {
         let library = engine.library();
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
+        let decode_rows = engine.decode_rows;
         let prefill_waves = engine.prefill_waves;
         let vocab = engine.cfg.vocab_size;
         let pad_id = engine.cfg.engram_pad_id;
@@ -152,6 +154,7 @@ impl<'a> Hy4Backend<'a> {
             library,
             context,
             concurrency,
+            decode_rows,
             unit_rows,
             prefill_waves,
             vocab,
@@ -195,13 +198,51 @@ impl<'a> Hy4Backend<'a> {
         check_writable(placement, tokens.len(), self.context, pool)
     }
 
-    fn decode(&self, sequences: &mut [(&mut Hy4Placement, &[u32])], speculative: bool, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+    /// Prewarm traced decode row geometries on disposable startup state before readiness.
+    /// Rank-local sites skip startup prewarm when `GRAPH_PREWARM=off` (`--graph-no-prewarm`)
+    /// and capture lazily on first use.
+    pub(crate) fn warm_decode_graphs(
+        &self,
+        layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
+    ) -> Result<()> {
+        let selected = cuteafd_loader::serving_capacity::hy4_graphs::selected_rows(
+            layout,
+            self.decode_rows.min(self.context),
+        )?;
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(
+            super::graph_sites::spans("hy4_flash.section", false),
+        ) else {
+            return Ok(());
+        };
+        let mut engine = self.engine.borrow_mut();
+        let warm_long = engine.max_pages >= 33 && engine.max_context > 2048;
+        let warm_pos = if warm_long { 2048 } else { 0 };
+        engine.warming_graphs(|engine| {
+            for &(rows, _) in &selected {
+                engine.warm_row_shape(rows, warm_pos)?;
+            }
+            Ok(())
+        })?;
+        tracing::info!(?layout, rows = ?selected, warm_long, "Hy4-flash graph prewarm completed on scratch state");
+        Ok(())
+    }
+
+    fn decode(
+        &self,
+        sequences: &mut [(&mut Hy4Placement, &[u32])],
+        speculative: bool,
+        pool: &RefPagePool,
+        allow_graphs: bool,
+    ) -> Result<Option<DeviceLogits>> {
         ensure!(!speculative, "Hy4 DFly2 speculative verify is not yet enabled");
         ensure!(
             !sequences.is_empty() && sequences.len() <= self.concurrency && self.pending.borrow().is_none(),
             "Hy4 decode requires admitted requests and prior commit"
         );
-        let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()), 64)?;
+        let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()), self.decode_rows)?;
         let total_rows = spans.last().context("Hy4 decode has no rows")?.end;
         let mut slots = BTreeSet::new();
         let mut segments = Vec::with_capacity(sequences.len());
@@ -234,17 +275,25 @@ impl<'a> Hy4Backend<'a> {
             barrier: false,
         };
         let mut logits = None;
-        self.engine.borrow_mut().run_units(
-            &mut placements,
-            &sources,
-            &[unit],
-            ReadPriority::Decode,
-            |_| HeadMode::Suffix(0),
-            &mut |_, _, tile| {
-                logits = Some(tile);
-                Ok(())
-            },
-        )?;
+        let mut engine = self.engine.borrow_mut();
+        let run = |engine: &mut Hy4Engine<'a>| {
+            engine.run_units(
+                &mut placements,
+                &sources,
+                &[unit],
+                ReadPriority::Decode,
+                |_| HeadMode::Suffix(0),
+                &mut |_, _, tile| {
+                    logits = Some(tile);
+                    Ok(())
+                },
+            )
+        };
+        if allow_graphs {
+            run(&mut engine)?;
+        } else {
+            engine.without_graphs(run)?;
+        }
         for ((placement, _), next) in sequences.iter_mut().zip(placements) {
             **placement = next;
         }
@@ -269,7 +318,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             max_context: self.context,
             slots: self.concurrency,
             prefill_rows: self.unit_rows,
-            decode_rows: 64,
+            decode_rows: self.decode_rows,
         }
     }
 
@@ -592,7 +641,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         speculative: bool,
         pool: &RefPagePool,
     ) -> Result<Option<DeviceLogits>> {
-        self.decode(sequences, speculative, pool)
+        self.decode(sequences, speculative, pool, true)
     }
 
     fn verify_device_ungraphed(
@@ -603,12 +652,12 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         pool: &RefPagePool,
     ) -> Result<Option<DeviceLogits>> {
         if kind == scheduler::UngraphedKind::Decode {
-            return self.decode(sequences, speculative, pool);
+            return self.decode(sequences, speculative, pool, false);
         }
         scoring_replay(
             sequences,
             speculative,
-            |sequences| self.decode(sequences, false, pool),
+            |sequences| self.decode(sequences, false, pool, false),
             |verified| self.accept(verified, false),
         )
     }
@@ -618,8 +667,9 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     }
 
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let mode = if self.engine.borrow().graphs_active() { "graphed" } else { "eager" };
         crate::shared::speculation_trace::Deferred::new(move || {
-            serde_json::json!({"kind": "hy4_flash", "rows": rows, "attention": "eager"})
+            serde_json::json!({"kind": "hy4_flash", "rows": rows, "attention": mode})
         })
     }
 

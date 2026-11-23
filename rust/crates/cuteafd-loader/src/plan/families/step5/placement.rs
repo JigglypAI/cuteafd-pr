@@ -167,7 +167,7 @@ pub(super) fn layout(
         peer_access: coordinators == 2,
     };
     let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
-            &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
+            &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, coordinators,
             crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_formats: opts.spark_reply_formats,
                 kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
         inventory,

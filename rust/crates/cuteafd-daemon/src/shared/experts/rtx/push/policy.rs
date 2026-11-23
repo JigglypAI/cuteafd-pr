@@ -11,6 +11,8 @@ pub(crate) enum PushPolicy {
 pub(crate) enum PushStartupError {
     #[error("cannot discover SparkNest namespace for {snapshot:?}: {source}")]
     Namespace { snapshot: PathBuf, #[source] source: std::io::Error },
+    #[error("cannot allocate {bytes} bytes of push staging on CUDA device {device} ({owner}): {source:#}")]
+    StagingAllocation { device: i32, bytes: usize, owner: &'static str, #[source] source: anyhow::Error },
     #[error("required push planning failed: {0:#}")]
     Planning(#[source] anyhow::Error),
     #[error("required coordinator push delivery failed: {0:#}")]

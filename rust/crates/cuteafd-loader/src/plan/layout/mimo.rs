@@ -587,8 +587,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         resident_weights, operation, budgets,
     }.prepare()?;
     match crate::push_load::namespace(&checkpoint.snapshot) {
-        Ok(_) => prepared.admit_push(&crate::placement::families::mimo_v2::push_host_envelope(
-            checkpoint, ranks, Some(input.expert_catalog()?))?)?,
+        Ok(_) => prepared.use_push(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
             && error.raw_os_error().is_none() && checkpoint.snapshot.exists() => {},
         Err(error) => return Err(error).context("MiMo SparkNest namespace discovery"),
@@ -673,13 +672,11 @@ mod tests {
             value.as_ptr().cast(), value.len(), 0) };
         anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
         let pushed = solve()?;
-        let envelope = crate::placement::families::mimo_v2::push_host_envelope(
-            input.checkpoint(), 2, Some(input.expert_catalog()?))?;
         let host_budget = pushed.budgets.iter().find(|budget| budget.locations.contains(&Location::PINNED))
             .context("host budget")?;
         let owned = |ledger: &crate::plan::SolvedPhaseLedger, phase| ledger.phases.iter()
             .find(|row| row.budget == host_budget.id && row.phase == phase).unwrap().owned;
-        assert_eq!(owned(&pushed, Phase::Load) - owned(&mounted, Phase::Load), envelope.bytes()?);
+        assert_eq!(owned(&pushed, Phase::Load), owned(&mounted, Phase::Load));
         assert_eq!(owned(&pushed, Phase::Ready), owned(&mounted, Phase::Ready));
         Ok(())
     }

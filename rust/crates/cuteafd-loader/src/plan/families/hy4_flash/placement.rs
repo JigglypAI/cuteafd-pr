@@ -13,7 +13,7 @@ use crate::families::hy4_flash::weight_layout::{fp8_role, target_arenas};
 use crate::families::hy4_flash::Hy4KvCache;
 use crate::formats::mapped_preload::MappedPlacement;
 use crate::placement::families::hy4_flash::{
-    self, Hy4Inputs, LocalBacking, LocalPackage, SparkCharge, DECODE_ROWS, HY4_FLASH, LANES,
+    self, Hy4Inputs, LocalBacking, LocalPackage, SparkCharge, HY4_FLASH, LANES,
 };
 use crate::placement::planner::{Baseline, Budget, Context, Device, Domain, Location, Operation, PrefillShape};
 use crate::placement::{ArchContext, LayerMode, Onboard, PoolFacts, PoolMemory, ResidentWeights, SparkWorkingSet};
@@ -456,7 +456,7 @@ pub(super) fn layout(
     let engram_shape = match Hy4EngramShape::new(
         shape.rows as usize,
         shape.waves as usize,
-        DECODE_ROWS as usize,
+        report.decode_rows as usize,
         cfg.engram_layers.len(),
     ) {
         Ok(s) => s,
@@ -511,7 +511,9 @@ pub(super) fn layout(
             arch,
             None,
         ).bytes);
-        let gr = match crate::placement::graph_reserve::resolve(None, gpu, false, 0, 0) {
+        let graph_layout = crate::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(gpus, ranks);
+        let (gr_base, gr_tail) = crate::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
+        let gr = match crate::placement::graph_reserve::current(gpu, false, gr_base, gr_tail) {
             Ok(resolved) => resolved.bytes,
             Err(error) => {
                 report.refuse_placement(format!("Hy4-flash graph reserve refused: {error}"), "Check GPU_GRAPH_RESERVE.");
@@ -556,6 +558,7 @@ pub(super) fn layout(
         context,
         pool,
         prefill: shape,
+        decode_rows: report.decode_rows,
         sequences,
         prefix_mark_slots,
         targets,

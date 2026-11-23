@@ -1,5 +1,6 @@
 //! Inkling arithmetic and operands on shared ownership/execution mechanisms.
 mod graph_sites;
+mod graphs;
 pub(crate) mod weights;
 pub(crate) mod owners;
 pub(crate) mod cache;

@@ -440,7 +440,12 @@ impl ContextLoad {
                 // Never retry failures sequentially: that would pretend a queued
                 // or rejected wide batch achieved the requested concurrency.
                 let before = occupancy(ctx.client);
+                let graph_before = common::phase_counters(ctx.client).graph;
                 let (results, samples) = measured_wave(ctx.client, bodies("timed"));
+                let graph_after = common::phase_counters(ctx.client).graph;
+                if let Some(graph) = common::graph_interval(graph_before.as_ref(), graph_after.as_ref()) {
+                    point["graph"] = graph;
+                }
                 let errors: Vec<_> = results
                     .iter()
                     .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))

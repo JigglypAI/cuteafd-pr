@@ -229,12 +229,6 @@ pub fn components(inputs: &V4Inputs, host: &V4Host, prefix: HostPrefixOwners, pa
         components.push(host_component("v4.host.embedding".into(), Location::PINNED, bytes.clone(),
             Lifetime::RESIDENT, Category::Embedding, "host embedding", maximum)?);
     }
-    // Dense startup staging and push rings exist only while weights load.
-    for (index, item) in inputs.weights.startup.host.iter().enumerate().filter(|(_, item)| item.bytes > 0) {
-        components.push(host_component(format!("v4.host.startup.{index}"), Location::PINNED,
-            ByteCurve::fixed(item.bytes, maximum), Lifetime { first: Phase::Load, last: Phase::Load },
-            Category::Staging, item.name, maximum)?);
-    }
     // Both links' pinned and host storage; their GPU intake is a fixed demand.
     if inputs.spark_ranks > 0 {
         for link in links(inputs)? {
@@ -262,7 +256,8 @@ pub fn links(inputs: &V4Inputs) -> Result<Vec<crate::placement::PreparedSparkLin
     let cfg = &inputs.cfg;
     let narrow = |value: usize| u32::try_from(value).map_err(|_| Refusal::Overflow("V4 Spark geometry"));
     let geometry = cuteafd_core::ExpertGeometry { hidden: narrow(cfg.dim)?, experts: narrow(cfg.n_routed_experts)?,
-        topk: narrow(cfg.n_activated_experts)?, intermediate: narrow(cfg.moe_inter_dim)?, layers: narrow(cfg.n_layers)? };
+        topk: narrow(cfg.n_activated_experts)?, intermediate: narrow(cfg.moe_inter_dim)?, layers: narrow(cfg.n_layers)?,
+        activation: cuteafd_core::ExpertActivation::SiluClamp10 };
     let endpoint = |name: &str, rows: u64, waves: u64, prefill: bool, reply| {
         PreparedSparkLink::endpoint(name, 0, SparkEndpointOwners { ranks: inputs.spark_ranks, geometry,
             endpoint: cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)

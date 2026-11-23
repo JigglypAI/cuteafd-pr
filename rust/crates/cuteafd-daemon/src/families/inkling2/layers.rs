@@ -26,6 +26,8 @@ pub(crate) struct Kernels<'a> {
     replay: BTreeMap<(usize, bool), cuteafd_ffi::fir_replay::Convolution<'a>>,
     pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
+    copy: cuteafd_ffi::V41PeerCopy<'a>,
+    widen_add: cuteafd_ffi::Bf16F32Add<'a>,
     quant: cuteafd_ffi::programs::Program<'a>,
     sms: usize,
     pub(super) draft_head: Option<DraftProjections<'a>>,
@@ -143,12 +145,38 @@ impl<'a> Kernels<'a> {
             local_decode: Attention::load_rank(programs, Kind::Local, Route::Decode, false, head_parts)?,
             global_decode: Attention::load_rank(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?, kv_format, head_parts,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
+            copy: programs.library().v41_peer_copy()?, widen_add: programs.library().bf16_f32_add()?,
             quant, compact: None, draft_head: None,
             sms: programs.library().sm_count()? as usize, producers, strided, replay })
     }
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
         self.producers.get(&op.rank_name(self.head_parts)?).context("Inkling producer not bound at startup")
     }
+    fn widen_zero(&self, owner: &impl UnitBuffers<'a>, src: Buffer, dst: Buffer, count: usize) -> Result<()> {
+        let stream = owner.stream();
+        // SAFETY: both routes use disjoint retained planes and the same +0 sum.
+        unsafe {
+            if owner.decode_attention() {
+                self.widen_add.launch(owner.buffer("decode_zero_bf16")?, src, dst, count, stream.raw)
+            } else {
+                stream.device.library.cuda_zero_bytes_async(dst, count * 4, stream.raw)?;
+                stream.device.library.cuda_accumulate_bf16_to_f32_async(src, dst, count, stream.raw)
+            }
+        }
+    }
+
+    fn copy_residual(&self, owner: &impl UnitBuffers<'a>, dst: Buffer, src: Buffer, bytes: usize) -> Result<()> {
+        let stream = owner.stream();
+        // SAFETY: retained F32 arena slots and their source planes are disjoint.
+        unsafe {
+            if owner.decode_attention() {
+                self.copy.launch_rows(dst, src, bytes, 1, bytes, bytes, stream.raw)
+            } else {
+                stream.device.library.copy_d2d_async(dst, src, bytes, stream.raw)
+            }
+        }
+    }
+
     pub fn norm(&self, owner: &impl UnitBuffers<'a>, input: Buffer, weight: Buffer, output: Buffer,
         value: bool, precision: Precision, rows: usize) -> Result<()> {
         // SAFETY: the family supplies disjoint admitted typed input/output views;
@@ -293,6 +321,10 @@ impl<'a> Kernels<'a> {
 pub(crate) fn routed_ffn<'a>(kernels: &Kernels<'a>, owner: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
     experts: &dyn Dispatcher, cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     prepare_routes(kernels, owner, target, cfg, layer, rows)?;
+    dispatch_experts(owner, experts, rows)
+}
+
+pub(crate) fn dispatch_experts<'a>(owner: &impl UnitBuffers<'a>, experts: &dyn Dispatcher, rows: usize) -> Result<()> {
     let input = owner.buffer(if experts.wire_input() { "expert_wire" } else { "projection_input" })?;
     experts.enqueue(input, owner.buffer("route_ids")?, owner.buffer("route_weights")?,
         owner.buffer("expert_output")?, rows, owner.stream())
@@ -376,9 +408,13 @@ pub(crate) fn attend_heads<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, ta
     unsafe {
         k.narrow.launch(b("q_clipped")?.ptr, b("q_bf16")?.ptr, rows*q_width, owner.stream().raw)?;
         k.narrow.launch(b("r_clipped")?.ptr, b("relative_source")?.ptr, rows*rel_width, owner.stream().raw)?;
-        l.cuda_zero_bytes_async(b("relative_input")?, rows*heads*64*2, owner.stream().raw)?;
-        // Disjoint source and destination; columns16..63 stay exact zero.
-        l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*heads, owner.stream().raw)?;
+        if owner.decode_attention() {
+            // Decode owns this plane for life; allocation zeroes the tail and nothing writes it.
+            k.copy.launch_rows(b("relative_input")?, b("relative_source")?, 16*2, rows*heads, 64*2, 16*2, owner.stream().raw)?;
+        } else {
+            l.cuda_zero_bytes_async(b("relative_input")?, rows*heads*64*2, owner.stream().raw)?;
+            l.copy_d2d_2d_async(b("relative_input")?, 64*2, b("relative_source")?, 16*2, 16*2, rows*heads, owner.stream().raw)?;
+        }
     }
     // A token contributes one independent relative row per local head. Bound each projection call
     // by its4096-row export without changing the ordered-K16 reduction.
@@ -401,14 +437,10 @@ pub(crate) fn project_heads<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, t
     cfg: &Inkling2Config, layer: usize, rows: usize) -> Result<()> {
     let q_width = cfg.heads / k.head_parts * cfg.head_dim;
     let b = |name: &str| owner.buffer(name);
-    let l = owner.stream().device.library;
-    // F32 gate producer consumes F32 attended values. Widen BF16 through a
-    // zeroed F32 destination before gating; no host data path.
+    k.widen_zero(owner, b("attended")?, b("q")?, rows*q_width)?;
     // SAFETY: q holds the local heads and is no longer read by attention;
     // it is safely reused as widened attention scratch on the same stream.
     unsafe {
-        l.cuda_zero_bytes_async(b("q")?, rows*q_width*4, owner.stream().raw)?;
-        l.cuda_accumulate_bf16_to_f32_async(b("attended")?, b("q")?, rows*q_width, owner.stream().raw)?;
         k.producer(Op::Gate { situ: false, precision: Precision::F32 })?.launch(&[b("q")?, b("gate")?, b("gate")?,
             b("q_clipped")?], rows, None, owner.stream().raw)?;
         k.narrow.launch(b("q_clipped")?.ptr, b("gated")?.ptr, rows*q_width, owner.stream().raw)?;
@@ -499,27 +531,23 @@ pub(crate) fn prepare_ffn_input<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
     let partial = b("partial")?;
-    let library = owner.stream().device.library;
     let stride = owner.layout().rows*cfg.hidden*4;
     let arena = b("residual_arena")?;
     if site.starts_block {
         // First layer of a block: freeze its incoming partial as a completed
         // value, use attention alone as the next partial for the MLP query.
-        // SAFETY: arena slots are disjoint retained views on the same stream.
-        unsafe {
-            library.copy_d2d_async(slice(arena, (site.attention_candidates-1)*stride, rows*cfg.hidden*4)?,
-                partial, rows*cfg.hidden*4, owner.stream().raw)?;
-            library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-                b("attention")?, rows*cfg.hidden*4, owner.stream().raw)?;
-        }
+        k.copy_residual(owner, slice(arena, (site.attention_candidates-1)*stride, rows*cfg.hidden*4)?,
+            partial, rows*cfg.hidden*4)?;
+        k.copy_residual(owner, slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
+            b("attention")?, rows*cfg.hidden*4)?;
     } else {
         // SAFETY: add writes an independent branch; the following copy publishes
         // the new partial candidate after its complete F32 sum.
         unsafe {
             k.add.launch(partial, b("attention")?, b("branch")?, rows*cfg.hidden, owner.stream().raw)?;
-            library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-                b("branch")?, rows*cfg.hidden*4, owner.stream().raw)?;
         }
+        k.copy_residual(owner, slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
+            b("branch")?, rows*cfg.hidden*4)?;
     }
     k.residual(owner, target.operand(&format!("model.llm.attn_res.mlp_queries.{index}"))?.buffer,
         partial, b("mixed")?, rows, 1, site.mlp_candidates, false)?;
@@ -537,16 +565,10 @@ pub(crate) fn join_experts<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, ta
     cfg: &Inkling2Config, index: usize, rows: usize) -> Result<()> {
     let site = residual_site(cfg, index)?;
     let b = |name: &str| owner.buffer(name);
-    let library = owner.stream().device.library;
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows*cfg.hidden*4;
     let partial = b("partial")?;
-    // SAFETY: expert BF16 output widens into an independently zeroed F32
-    // plane; no extra weight representation or host synchronization is used.
-    unsafe {
-        library.cuda_zero_bytes_async(b("mlp")?, rows*cfg.hidden*4, owner.stream().raw)?;
-        library.cuda_accumulate_bf16_to_f32_async(b("expert_output")?, b("mlp")?, rows*cfg.hidden, owner.stream().raw)?;
-    }
+    k.widen_zero(owner, b("expert_output")?, b("mlp")?, rows*cfg.hidden)?;
     k.convolution(owner, b("mlp")?, target.operand(&format!("model.llm.layers.{index}.mlp_sconv.weight"))?.buffer,
         b("mlp")?, b("mixed")?, "mlp_conv_history", cfg.hidden, false, rows)?;
     let base = if site.starts_block { b("attention")? } else { b("branch")? };
@@ -554,8 +576,7 @@ pub(crate) fn join_experts<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, ta
     // are unchanged, and only the final mutable arena slot is refreshed.
     unsafe {
         k.add.launch(base, b("mixed")?, partial, rows*cfg.hidden, owner.stream().raw)?;
-        library.copy_d2d_async(slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
-            partial, rows*cfg.hidden*4, owner.stream().raw)?;
     }
-    Ok(())
+    k.copy_residual(owner, slice(arena, (site.mlp_candidates-1)*stride, rows*cfg.hidden*4)?,
+        partial, rows*cfg.hidden*4)
 }

@@ -744,12 +744,12 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     // The joint solver can fit TP4 by moving 19 routed layers to the RTX pair.
-    // The KV target is not a floor: 501376 tokens still covers a 256K request.
+    // The KV target is not a floor: 510144 tokens still covers a 256K request.
     let tp4 = report(dir.path(), 2, 96, 4, None);
     assert!(tp4.wip_launchable() && tp4.native_serving_admitted, "{:?}", tp4.hints);
     assert_eq!(tp4.onboard_layers, Some(19));
     let memory = tp4.memory_layout.as_ref().unwrap();
-    assert_eq!(memory.pool_tokens, 501_376);
+    assert_eq!(memory.pool_tokens, 510_144);
     let sparks = memory.devices.iter().filter(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
     assert_eq!(sparks.len(), 4);
@@ -1131,7 +1131,8 @@ fn official_nvfp4_layer30_headers_keep_router_and_stacked_parameters_distinct() 
     let dir = tempfile::tempdir().unwrap();
     testing::write_snapshot(dir.path(), &config, &tensors, None);
     let shape = RoutedExpertShape { layers:91, first_layer:30, experts:352, topk:8,
-        hidden:4096, intermediate:1536, draft_stages:0, draft_experts:0 };
+        hidden:4096, intermediate:1536, draft_stages:0, draft_experts:0,
+        activation: cuteafd_core::ExpertActivation::SiluPostClamp7 };
     let selected = [30].into_iter().collect();
     let catalog = Fp8ExpertTensors::read_layers(dir.path(), shape, &selected).unwrap();
     assert_eq!(catalog.format(), ExpertFormat::Nvfp4);

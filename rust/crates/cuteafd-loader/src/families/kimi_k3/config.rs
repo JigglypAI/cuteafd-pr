@@ -264,7 +264,8 @@ impl KimiK3Config {
 
     pub fn expert_geometry(&self) -> cuteafd_core::ExpertGeometry {
         cuteafd_core::ExpertGeometry { hidden: self.latent as u32, experts: self.experts as u32, topk: self.topk as u32,
-            intermediate: self.moe_intermediate as u32, layers: self.layers as u32 }
+            intermediate: self.moe_intermediate as u32, layers: self.layers as u32,
+            activation: cuteafd_core::ExpertActivation::Situ4_25 }
     }
 
     /// MLA latent record per token per layer (BF16 `kv_lora + rope` values).

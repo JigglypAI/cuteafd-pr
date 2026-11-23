@@ -70,6 +70,8 @@ pub struct RoutedExpertShape {
     /// MTP draft stages and their routed experts (0 when the draft is dense).
     pub draft_stages: usize,
     pub draft_experts: usize,
+    /// Routed-expert activation / SwiGLU clamp class.
+    pub activation: cuteafd_core::ExpertActivation,
 }
 
 impl RoutedExpertShape {
@@ -90,6 +92,7 @@ impl RoutedExpertShape {
             intermediate: text.moe_intermediate_size,
             draft_stages: text.num_nextn_predict_layers,
             draft_experts: text.dspark_n_routed_experts,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
         }
     }
 
@@ -101,6 +104,7 @@ impl RoutedExpertShape {
             topk: narrow(self.topk)?,
             intermediate: narrow(self.intermediate)?,
             layers: narrow(self.layers)?,
+            activation: self.activation,
         })
     }
 }
@@ -923,7 +927,7 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         let cfg = crate::families::inkling2::Inkling2Config::from_hf(config)?;
         let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0,
             experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate,
-            draft_stages: 0, draft_experts: 0 };
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::Situ4_25 };
         if config["quantization_config"]["quant_method"] == "exl3" {
             return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
         }
@@ -936,7 +940,8 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "MiniMax M3 routed layer set is not contiguous");
         return fp8_catalog(snapshot, RoutedExpertShape { layers: end, first_layer,
             experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden,
-            intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 });
+            intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SwigluOai7 });
     }
     if kimi_catalog_config(config) {
         return read_kimi_expert_catalog(snapshot, config, checkpoint);
@@ -969,7 +974,8 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         let end = cfg.moe[..cfg.layers].iter().rposition(|&moe| moe).unwrap() + 1;
         ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
         let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
-            topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
+            topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluPostClamp7 };
         if crate::plan::families::step5::exl3::is_exl3(checkpoint) {
             // K4 experts with K6 tails: the shared two-tier package exl3-step5-k46.
             return exl3_catalog_or_read(snapshot, shape, &[4, 6], checkpoint_arg);
@@ -978,6 +984,30 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
             &(first_layer..end).collect())?;
         return Ok(OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
+    }
+    if config["model_type"] == "hy_v4_vl" {
+        let cfg = crate::families::hy4::Hy4Config::from_hf(config)?;
+        cfg.release_geometry()?;
+        let first_layer = cfg.dense_layer.iter().position(|&dense| !dense)
+            .context("Hy4 config has no routed layers")?;
+        let end = cfg.dense_layer.iter().rposition(|&dense| !dense).unwrap() + 1;
+        ensure!(cfg.dense_layer[first_layer..end].iter().all(|&dense| !dense),
+            "Hy4 routed layer set is not contiguous");
+        let shape = RoutedExpertShape {
+            layers: end,
+            first_layer,
+            experts: cfg.experts,
+            topk: cfg.topk,
+            hidden: cfg.hidden,
+            intermediate: cfg.moe_intermediate,
+            draft_stages: 0,
+            draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
+        };
+        let is_exl3 = config["quantization_config"]["quant_method"] == "exl3"
+            || checkpoint.is_some_and(|c| c.contains_tensor(&format!("model.layers.{first_layer}.mlp.experts.0.gate_proj.trellis")));
+        ensure!(is_exl3, "Hy4 expert catalog supports EXL3 MUL1 checkpoints; BF16 fused experts have no Spark/RTX package");
+        return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
     }
     if config["model_type"] == "hy_v4_flash" {
         let cfg = crate::families::hy4_flash::Hy4FlashConfig::from_hf(config)?;
@@ -996,6 +1026,7 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
             intermediate: cfg.moe_intermediate,
             draft_stages: 0,
             draft_experts: 0,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
         };
         let is_exl3 = config["quantization_config"]["quant_method"] == "exl3"
             || checkpoint.is_some_and(|c| c.contains_tensor(&format!("model.layers.{first_layer}.mlp.experts.0.gate_proj.trellis")));
@@ -1045,7 +1076,7 @@ fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value,
     ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "Kimi routed layers must follow dense layers");
     let shape = RoutedExpertShape { layers: cfg.layers, first_layer, experts: cfg.experts,
         topk: cfg.topk, hidden: cfg.latent, intermediate: cfg.moe_intermediate,
-        draft_stages: 0, draft_experts: 0 };
+        draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::Situ4_25 };
     let catalog = if let Some(checkpoint) = checkpoint {
         deepseek_v4_exl3_catalog_input(snapshot, &checkpoint.weight_map, shape, &[2, 3], Some(checkpoint))?
     } else {
@@ -1069,7 +1100,7 @@ fn read_muse_spark_expert_catalog(snapshot: &Path, config: &serde_json::Value,
          the BF16 release's fused [256, ...] expert tensors have no expert package");
     let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
         topk: cfg.topk, hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate,
-        draft_stages: 0, draft_experts: 0 };
+        draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     // muse:exl3-k45 (uniform K4 publishes with the adjacent empty K5 tier).
     exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint)
 }
@@ -1082,7 +1113,8 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
     checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     // The geometry from the coordinator's own config readers, so the Spark
     // ranks and serve-glm / serve-glmf agree on the routed layers.
-    let (dense, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+    let is_flash = config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next");
+    let (dense, shape) = if is_flash {
         let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(config)?;
         (cfg.dense.clone(), (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
     } else {
@@ -1102,6 +1134,11 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         intermediate,
         draft_stages: 0,
         draft_experts: 0,
+        activation: if is_flash {
+            cuteafd_core::ExpertActivation::SiluClamp10
+        } else {
+            cuteafd_core::ExpertActivation::SiluUnclamped
+        },
     };
     let format = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
         Some(view) => crate::plan::checkpoint::CheckpointFormat::detect_view(view)?,
@@ -1158,7 +1195,8 @@ pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<O
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config)?;
     ensure!(stages > 0 && stages <= cfg.mtp_layers, "Qwen MTP role requests {stages} stages, config provides {}", cfg.mtp_layers);
     let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
-        topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+        topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     let layers = (cfg.layers..cfg.layers + stages).collect();
     let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
     for layer in layers { fp8.for_layer(layer)?; }
@@ -1178,6 +1216,7 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         intermediate: cfg.moe_intermediate,
         draft_stages: 0,
         draft_experts: 0,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped,
     };
     if let Some(catalog) = nvfp4_catalog(snapshot, config, shape)? {
         return Ok(catalog);
@@ -1217,6 +1256,7 @@ fn read_mistral_large4_expert_catalog(snapshot: &Path, config: &serde_json::Valu
         // The bundled mtp_dspark drafter is dense: no draft experts.
         draft_stages: 0,
         draft_experts: 0,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped,
     };
     match config["quantization_config"]["quant_method"].as_str() {
         Some("exl3") => exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint),
@@ -1249,6 +1289,7 @@ fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         intermediate: cfg.moe_intermediate,
         draft_stages: 0,
         draft_experts: 0,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped,
     })
 }
 
@@ -1318,6 +1359,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
         intermediate,
         draft_stages: 0,
         draft_experts: 0,
+        activation: cuteafd_core::ExpertActivation::SiluClamp10,
     };
     let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
@@ -1395,6 +1437,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
             intermediate,
             draft_stages,
             draft_experts,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
         },
         snapshot: snapshot.to_path_buf(),
         tensors,
@@ -1707,7 +1750,8 @@ mod tests {
             let catalog = OfficialV41Catalog { source: CatalogSource::Legacy, reader: Default::default(), exl3_arena_bytes: Default::default(),
                 format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
                 config: None, experts: RoutedExpertShape { layers: 8, first_layer: 0, experts: 2,
-                    topk: 1, hidden, intermediate, draft_stages: 0, draft_experts: 0 },
+                    topk: 1, hidden, intermediate, draft_stages: 0, draft_experts: 0,
+                    activation: cuteafd_core::ExpertActivation::SiluClamp10 },
                 snapshot: dir.path().into(), tensors, exl3: None, nvfp4: None, fp8: None };
             for world in 2..=8 { for layer in 0..world {
                 let mut reconstructed = originals.values().map(|bytes| vec![0u8; bytes.len()]).collect::<Vec<_>>();

@@ -259,7 +259,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     }
     let mut execution = super::engine::Execution::new(link, requests, head,
         targets.next().context("Inkling lead target absent")?, lead_kernels,
-        local, cfg.clone(), inputs.graph_reserve[0],
+        local, cfg.clone(),
         inputs.experts.iter().map(|layer| inkling2::ingress(layer.storage)).collect())?;
     if let Some(peer_stream) = &peer_stream {
         use crate::shared::peer_split::{PeerExchange, RankDevice};
@@ -274,7 +274,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
             let width = cuteafd_loader::shared::vocabulary::shard(cfg.vocab_size,128,1)?.len();
             peer_kernels.draft_head=Some(peer_stream.device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs,&[(cfg.hidden,width)],64)?))?);
         }
-        execution.peer = Some(super::engine::Peer { graphs: super::engine::DecodeGraphs::new(&requests, 1, inputs.graph_reserve[1])?, exchange, requests,
+        execution.peer = Some(super::engine::Peer { graphs: None, exchange, requests,
             target: targets.next().context("Inkling peer target absent")?, kernels: peer_kernels });
     }
     ensure!(targets.next().is_none() && kernels.next().is_none(), "Inkling rank inventory not fully bound");
@@ -323,7 +323,17 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
         }
     }
     super::admission::reconcile_requests(&admitted.solved, &inputs, &inventory.receipts)?;
-    execution.prewarm()?;
+    // Attach after every persistent target/draft owner is resident, so the
+    // graph controller starts from the same non-graph allocation baseline.
+    use super::graphs::DecodeGraphs;
+    use cuteafd_loader::serving_capacity::inkling2_graphs;
+    let attach = |rank, stream: &crate::shared::memory::device::Stream<'a>| {
+        let policy = inkling2_graphs::policy(rank, inputs.gpus)?;
+        ensure!(inputs.graph_reserve[rank] == policy.bytes, "Inkling graph cache disagrees with admission");
+        DecodeGraphs::new(stream, rank, policy)
+    };
+    execution.graphs = attach(0, &execution.requests.decode.stream)?;
+    if let Some(peer) = &mut execution.peer { peer.graphs = attach(1, &peer.requests.decode.stream)?; }
     // Runtime backends now retain the same code sampled before weights.
     drop(module_pins); drop(exl3_modules);
     phase.log("inkling2 request owners and transport bootstrap");

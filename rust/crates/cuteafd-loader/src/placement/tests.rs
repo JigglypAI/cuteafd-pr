@@ -395,7 +395,7 @@ fn v4_dense_startup_retains_weights_beside_step_scratch() {
     let startup = StartupInventory { device: vec![
         StartupItem { rank: 0, name: "weights/coordinator-dense", bytes: 12 * GIB },
         StartupItem { rank: 0, name: "staging/coordinator-dense-device", bytes: scratch },
-    ], host: vec![StartupItem { rank: 0, name: "weight-push", bytes: 128 * 1024 * 1024 }] };
+    ] };
     let mut req = request(1, 12 * GIB + scratch - 1, 40, 4, Onboard::Layers(0));
     req.startup = startup.device_phases(1).unwrap();
     assert!(matches!(solve(&req), Err(PlacementError::StartupPeak { required, available, .. })

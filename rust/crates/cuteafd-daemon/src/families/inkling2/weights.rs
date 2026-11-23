@@ -64,8 +64,6 @@ impl<'a> PendingTarget<'a> {
             Ok(())
         };
         for (rank, target) in inputs.targets.iter().enumerate() { check(rank, &target.execution_arena()?)?; }
-        let envelope = inputs.push_host.get(admitted.onboard).and_then(Option::as_ref)
-            .context("Inkling target transaction has no admitted push host owners")?.clone();
         let backings = match &inputs.local {
             cuteafd_loader::placement::families::inkling2::LocalPackage::Installed { backings } =>
                 backings.get(admitted.onboard).context("Inkling selected expert prefix missing")?.as_slice(),
@@ -97,7 +95,7 @@ impl<'a> PendingTarget<'a> {
         })?;
         records.extend(media.records());
         let dense = crate::shared::experts::rtx::dense::plan_records(view.snapshot(), records, &devices, inputs.spark_ranks)?;
-        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog), inputs.gpus, experts, envelope)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view(view, Some(catalog), inputs.gpus, experts)?;
         Ok((Self { targets, draft, push, dense, devices, sparks: inputs.spark_ranks, media }, (streams, ranks)))
     }
 

@@ -150,6 +150,9 @@ pub struct Entry {
     /// Cold C1 prose cells with explicit contexts and corpus seeds (default seed 4242).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_c1: Option<crate::sweep::C1Options>,
+    /// Warmed verify-only exact-shape timing (`crate::sweep_verify`) instead of decode levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_verify: Option<crate::sweep_verify::VerifyOptions>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +536,7 @@ impl Entry {
             prefill_purge: self.prefill_purge.clone().or_else(|| defaults.prefill_purge.clone()),
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             sweep_c1: self.sweep_c1.clone().or_else(|| defaults.sweep_c1.clone()),
+            sweep_verify: self.sweep_verify.clone().or_else(|| defaults.sweep_verify.clone()),
             baseline: self.baseline.or(defaults.baseline),
             matched_panel_window: self.matched_panel_window.or(defaults.matched_panel_window),
             window: self.window.clone().or_else(|| defaults.window.clone()),
@@ -553,6 +557,11 @@ impl Entry {
     /// entry resolving GPU0 alone still locks only GPU0 (#2364).
     fn exclusive(&self) -> bool {
         self.exclusive.unwrap_or(self.family.as_deref() == Some("deepseek_v41"))
+    }
+
+    /// Whether a client-side sweep runs (decode levels, prefill lengths or verify shapes).
+    fn sweeps(&self) -> bool {
+        self.levels.is_some() || self.prefill_lengths.is_some() || self.sweep_verify.is_some()
     }
 
     /// API port from ADDR (default 8000).
@@ -1028,6 +1037,11 @@ fn save_state(path: &Path, state: &BTreeMap<String, Outcome>) -> Result<()> {
 
 /// `post_load_c1` runs after the widest level; `post_load_repeat` replays the levels C1.
 fn check_post_load(entry: &Entry) -> Result<()> {
+    if let Some(options) = &entry.sweep_verify {
+        options.validate().with_context(|| format!("{}: sweep_verify", entry.name))?;
+        anyhow::ensure!(entry.levels.is_none() && entry.prefill_lengths.is_none() && entry.sweep_c1.is_none()
+            && entry.post_load_c1 != Some(true), "{}: sweep_verify runs alone (no levels, prefill lengths or C1 sweep)", entry.name);
+    }
     if let Some(options) = &entry.sweep_c1 {
         options.validate()?;
         anyhow::ensure!(entry.levels.as_deref() == Some(&[1]) && entry.prefill_lengths.is_none()
@@ -1078,8 +1092,8 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             crate::sweep::parse_lengths(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         }
         check_post_load(&entry)?;
-        if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
-            bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
+        if entry.window.is_some() && !entry.sweeps() {
+            bail!("{}: window needs levels, prefill_lengths or sweep_verify (it frames the sweep's timed requests)", entry.name);
         }
         if (entry.prefill_repeat == Some(true) || entry.prefill_purge.is_some() || entry.prefill_idle_seconds.is_some()) && entry.prefill_lengths.is_none() {
             bail!("{}: prefill_repeat, prefill_purge and prefill_idle_seconds need prefill_lengths", entry.name);
@@ -1125,13 +1139,14 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     check_nested_holds(&pending)?;
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 matched_panel_window={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 matched_panel_window={} sweep_verify={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.lossless_concurrency.unwrap_or(1), e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), serde_json::json!(e.panel_config), e.fabric.unwrap_or(true),
-                WORKER_STOP, e.matched_panel_window.unwrap_or(false), e.set);
+                WORKER_STOP, e.matched_panel_window.unwrap_or(false),
+                e.sweep_verify.as_ref().map_or("-".into(), |v| serde_json::json!(v).to_string()), e.set);
         }
         return Ok(());
     }
@@ -1273,10 +1288,32 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
                         pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
                 }
             }
+            if let Some(line) = o.sweep.as_ref().and_then(|sweep| graph_band_line(&sweep.graph_bands)) {
+                out.push_str(&format!("\nGraph captures {}: {line}\n", e.name));
+            }
             for caveat in &o.caveats { out.push_str(&format!("\nNote {}: {caveat}\n",e.name)); }
         }
     }
     out
+}
+
+/// One summary line for a sweep's timed graph bands: all capture-free, or
+/// each band that captured or had no comparable counters.
+fn graph_band_line(bands: &[Value]) -> Option<String> {
+    if bands.is_empty() { return None; }
+    let flagged: Vec<String> = bands.iter().filter(|band| band["zero_captures"] != true).map(|band| {
+        if band["available"] == true {
+            format!("{} {} process / {} device-cache captures", band["band"].as_str().unwrap_or("?"),
+                band["captures"], band["device_captures"])
+        } else {
+            format!("{} unavailable ({})", band["band"].as_str().unwrap_or("?"), band["reason"].as_str().unwrap_or("?"))
+        }
+    }).collect();
+    Some(if flagged.is_empty() {
+        format!("all {} timed bands capture-free", bands.len())
+    } else {
+        format!("{} of {} timed bands not capture-free: {}", flagged.len(), bands.len(), flagged.join("; "))
+    })
 }
 
 /// Every entry serves an API key: its own API_KEY_FILE, else `<state>/api-key`
@@ -1653,7 +1690,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         // An explicit CUTEAFD_API_KEY wins; otherwise the key file this launch serves.
         let api_key = std::env::var("CUTEAFD_API_KEY").ok().or_else(|| config.get("API_KEY_FILE")
             .and_then(|file| std::fs::read_to_string(file).ok()).map(|key| key.trim().to_string()).filter(|k| !k.is_empty()));
-        let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
+        let sweeping = entry.sweeps();
         let (prelude, prelude_path) = {
             let key = api_key.as_deref().map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
             let mut client = crate::client::Client::new(&url, None, Arc::new(AtomicBool::new(false))).with_api_key(key);
@@ -1680,7 +1717,9 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
                 idle_seconds: entry.prefill_idle_seconds.unwrap_or(0.0),
                 purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
-            let sweep = if let Some(options) = &entry.sweep_c1 {
+            let sweep = if let Some(options) = &entry.sweep_verify {
+                crate::sweep::run_verify_windowed(&url, api_key.as_deref(), options, entry.fabric.unwrap_or(true), open)
+            } else if let Some(options) = &entry.sweep_c1 {
                 crate::sweep::run_c1_windowed(&url, api_key.as_deref(), options,
                     entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open)
             } else {
@@ -1895,6 +1934,18 @@ pub fn describe(matrix: &Matrix) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn graph_band_line_names_only_bands_that_captured() {
+        use serde_json::json;
+        assert_eq!(super::graph_band_line(&[]), None);
+        let clean = json!({"band": "levels C1", "available": true, "captures": 0, "device_captures": 0, "zero_captures": true});
+        assert_eq!(super::graph_band_line(&[clean.clone(), clean.clone()]).unwrap(), "all 2 timed bands capture-free");
+        let dirty = json!({"band": "levels C16", "available": true, "captures": 3, "device_captures": 1, "zero_captures": false});
+        let gone = json!({"band": "prefill 8192", "available": false, "reason": "no start sample", "zero_captures": null});
+        assert_eq!(super::graph_band_line(&[clean, dirty, gone]).unwrap(),
+            "2 of 3 timed bands not capture-free: levels C16 3 process / 1 device-cache captures; prefill 8192 unavailable (no start sample)");
+    }
+
+    #[test]
     fn release_smoke_entries_all_serve_an_api_key() {
         use super::*;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -1933,6 +1984,26 @@ mod tests {
         entry.levels = Some(vec![1]);
         entry.prefill_lengths = Some(vec![8192]);
         assert!(check_post_load(&entry).is_err());
+    }
+
+    #[test]
+    fn verify_shape_sweep_merges_round_trips_and_runs_alone() {
+        let options: crate::sweep_verify::VerifyOptions = serde_json::from_value(serde_json::json!({
+            "shapes": ["4x8", "5,4x7", "4x8@64"], "context": 2048, "repeats": 10})).unwrap();
+        let defaults = Entry { sweep_verify: Some(options.clone()), ..Entry::default() };
+        let mut entry = Entry { name: "verify".into(), ..Entry::default() }.merged(&defaults);
+        assert_eq!(entry.sweep_verify, Some(options));
+        assert!(entry.sweeps(), "a window may frame the verify sweep");
+        check_post_load(&entry).unwrap();
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["sweep_verify"]["shapes"], serde_json::json!(["4x8", "5,4x7", "4x8@64"]));
+        assert_eq!(serde_json::from_value::<Entry>(value).unwrap().sweep_verify, entry.sweep_verify);
+        entry.levels = Some(vec![8]);
+        assert!(check_post_load(&entry).is_err(), "decode levels and verify shapes do not share a sweep");
+        entry.levels = None;
+        entry.sweep_verify.as_mut().unwrap().repeats = 0;
+        assert!(check_post_load(&entry).is_err());
+        assert!(serde_json::to_value(Entry::default()).unwrap().get("sweep_verify").is_none());
     }
 
     #[test]

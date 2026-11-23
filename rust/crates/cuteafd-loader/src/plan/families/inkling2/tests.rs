@@ -331,14 +331,6 @@ fn installed_local_native_owners_use_shared_workspace_requests_once() -> anyhow:
     assert!(backings[0].is_empty());
     assert_eq!(backings[1].len(), 2, "one homogeneous group per physical rank");
     assert_eq!(backings[4].len(), 4, "mixed formats retain two independently retired backends per rank");
-    let host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[4], 2)?;
-    assert_eq!(host.dense_bytes, [0, 0], "raw dense delivery and device transpose need no staged host transform");
-    assert_eq!(host.retained_bytes, [0, 0]);
-    assert_eq!(host.slots, cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64);
-    assert_eq!(host.slot_bytes, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64);
-    assert!(host.expert_bytes.iter().all(|&bytes| bytes > 0), "native dynamic scalar validation is explicit");
-    let empty_host = crate::families::inkling2::weight_layout::push_host_envelope(&catalog, &backings[0], 2)?;
-    assert_eq!(empty_host.expert_bytes, [0, 0]);
     for gpu in 0..2 {
         let workspace = backings[4].iter().filter(|backing| backing.gpu == gpu)
             .flat_map(|backing| &backing.workspace).map(|(_, bytes)| bytes).sum::<u64>();
@@ -776,7 +768,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, device_sampling: true,
             expert_usage: None, resident_weight_limit: None,
             mount: targets.iter().map(|t| t.mount_load(&checkpoint).unwrap()).collect(),
-            push_host: vec![None; routed.len()+1] };
+            push_required: false };
         let request = shared::request(inputs.context, None, crate::placement::Onboard::Auto, prefill,
             crate::placement::planner::Operation::Serving, None, Default::default());
         let contract = inputs.prepare(&request).unwrap();
@@ -822,8 +814,12 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             for (prefix, rows) in std::iter::once((format!("inkling2.decode.{gpu}"), 64usize))
                 .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
                 let parts = if gpus == 2 && placement == AttentionPlacement::Heads { 2 } else { 1 };
-                let expected = crate::families::inkling2::execution::UnitLayout::serving_head_parts(
-                    &cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts).unwrap();
+                use crate::families::inkling2::execution::UnitLayout;
+                let expected = if prefix.starts_with("inkling2.decode.") {
+                    UnitLayout::serving_decode(&cfg, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts)
+                } else {
+                    UnitLayout::serving_head_parts(&cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts)
+                }.unwrap();
                 let actual = contract.components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(gpu as u8) => template.id.strip_prefix(&format!("{prefix}."))
                         .filter(|name| *name != "uploads")

@@ -440,7 +440,7 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
     const MIB: u64 = 1 << 20;
     let at_4096 = match family {
         "mimo_v2" => 146 * MIB,
-        "glm5" => 1001 * MIB,
+        "glm5" | "hy4" => 1001 * MIB,
         "glm5_flash" => 569 * MIB,
         "deepseek_v41" | "deepseek_v4" => 208 * MIB,
         "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES,
@@ -1135,11 +1135,11 @@ pub(crate) fn spark_slices(report: &PlanReport, model: &dyn super::FamilyModel, 
 
 /// The routed experts' Spark geometry.
 pub(crate) fn spark_geometry(model: &dyn super::FamilyModel) -> Option<cuteafd_core::ExpertGeometry> {
-    model.spec().moe.as_ref().map(|moe| cuteafd_core::ExpertGeometry {
-        hidden: model.spec().hidden as u32, experts: moe.experts as u32,
-        topk: moe.top_k as u32, intermediate: moe.intermediate as u32,
-        layers: model.spec().layers.len() as u32,
-    })
+    model.spec().moe.as_ref().map(|moe| cuteafd_core::ExpertGeometry::from_wire_dims(
+        model.spec().hidden as u32, moe.experts as u32,
+        moe.top_k as u32, moe.intermediate as u32,
+        model.spec().layers.len() as u32,
+    ))
 }
 
 /// The Spark ranks of `report.placement`: host footprint, routed slices and
@@ -1695,9 +1695,11 @@ pub(crate) fn spark_host_transport(report: &PlanReport, options: &LayoutOptions,
     let spec = report.spec.as_ref().context("Spark host transport without a model spec")?;
     let family = report.family.as_deref().unwrap_or("");
     let moe = spec.moe.as_ref().context("Spark layout without MoE geometry")?;
-    let geometry = ExpertGeometry { hidden: u32::try_from(spec.hidden)?, experts: u32::try_from(moe.experts)?,
-        topk: u32::try_from(moe.top_k)?, intermediate: u32::try_from(moe.intermediate)?,
-        layers: u32::try_from(spec.layers.len())? };
+    let mut geometry = ExpertGeometry::from_wire_dims(u32::try_from(spec.hidden)?, u32::try_from(moe.experts)?,
+        u32::try_from(moe.top_k)?, u32::try_from(moe.intermediate)?, u32::try_from(spec.layers.len())?);
+    if family == "hy4" {
+        geometry.activation = cuteafd_core::ExpertActivation::SiluClamp10;
+    }
     let v4_decode = (family == "deepseek_v4").then(|| options.workspace_manifest.as_deref().or_else(|| {
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)

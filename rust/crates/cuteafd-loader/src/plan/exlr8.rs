@@ -1364,7 +1364,7 @@ mod tests {
         let metadata = residency::MetadataInput::open(root.path(), "k4")?;
         let programs = exlr8::glm_admission_programs();
         let geometry = cuteafd_core::ExpertGeometry { hidden: 6144, intermediate: 2048,
-            experts: 256, topk: 8, layers: 2 };
+            experts: 256, topk: 8, layers: 2, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         for world in [1, 4, 6, 8] {
             for activations in [PrefillActivations::A16, PrefillActivations::A8] {
                 let executions = admit_family("glm5", &SparkBackend::Exlr8.exports(), None, 2752, 3)?;

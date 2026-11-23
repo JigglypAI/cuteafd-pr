@@ -43,7 +43,8 @@ pub struct ProcessOwners {
     pub shared_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     /// Drafter backings indexed by coordinator home (sharded only for TP2).
     pub draft_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
-    pub push_host: Option<crate::push_load::PushHostEnvelope>,
+    pub push_required: bool,
+    pub retained_expert_metadata: Vec<u64>,
     /// The drafter's standalone push group, after the target group has committed.
     pub draft_push: Option<DraftPush>,
     /// Fixed rank-local GQA owners, not a movable single-home drafter.
@@ -55,7 +56,7 @@ pub struct ProcessOwners {
 /// one-step device scratch the W8A16 packs read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftPush {
-    pub host: crate::push_load::PushHostEnvelope,
+    ranks: usize,
     pub device_scratch: u64,
 }
 
@@ -63,44 +64,32 @@ impl DraftPush {
     /// Header-only, or None outside a push namespace. Every staged step is one
     /// contiguous row window of one file, none overlapping, so the runtime
     /// `HostStaging` bound is min(total, ring windows + one frontier step).
-    pub fn for_snapshot(snapshot: &std::path::Path, config: &serde_json::Value,
+    pub fn for_snapshot(snapshot: &std::path::Path,
         representation: crate::families::glm5::draft_representation::GlmDraftRepresentation)
         -> anyhow::Result<Option<Self>> {
-        use anyhow::Context;
         match crate::push_load::namespace(snapshot) {
             Ok(_) => {},
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
                 && error.raw_os_error().is_none() && snapshot.exists() => return Ok(None),
             Err(error) => return Err(error.into()),
         }
-        let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
-        let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
         let step = crate::shared::dense_read::STEP_BYTES as u64;
         let fp8 = representation == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only;
-        let matrices = if fp8 { draft_matrix_bytes(config)? } else { Vec::new() };
-        let total = matrices.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
-            .context("Flash draft push staging overflow")?;
-        let largest = matrices.iter().copied().max().unwrap_or(0).min(step);
-        let window = slot.checked_add(2 * largest).and_then(|n| n.checked_mul(slots))
-            .and_then(|n| n.checked_add(largest)).context("Flash draft push staging overflow")?;
-        Ok(Some(Self { host: crate::push_load::PushHostEnvelope::new(vec![0], vec![total.min(window)], slots, slot)?,
-            device_scratch: if fp8 { step } else { 0 } }))
+        Ok(Some(Self { ranks: 1, device_scratch: if fp8 { step } else { 0 } }))
     }
 
     pub fn for_tp(mut self, ranks: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(matches!(ranks, 1 | 2), "DFlash push rank count");
-        self.host = crate::push_load::PushHostEnvelope::new(vec![0; ranks],
-            vec![self.host.dense_bytes[0]; ranks], self.host.slots, self.host.slot_bytes)?;
+        self.ranks = ranks;
         Ok(self)
     }
 
     /// Recipe owners on draft home `gpu`, alive only while the drafter loads.
     pub fn allocations(&self, gpu: u8) -> Result<Vec<p::Allocation>, p::Refusal> {
         let lifetime = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::DraftLoad };
-        let mut owners = self.host.allocations(&format!("glmf.draft.push.{gpu}"))?;
-        for owner in &mut owners { owner.lifetime = lifetime; }
+        let mut owners = Vec::new();
         if self.device_scratch > 0 {
-            for rank in 0..self.host.expert_bytes.len() {
+            for rank in 0..self.ranks {
                 let rank = gpu + rank as u8;
                 owners.push(p::Allocation::buffer(format!("glmf.draft.push.scratch.{rank}"), p::Location::coordinator(rank),
                     self.device_scratch, lifetime, Category::Staging, "draft push step scratch"));
@@ -108,26 +97,6 @@ impl DraftPush {
         }
         Ok(owners)
     }
-}
-
-/// BF16 source bytes of each FP8-packed drafter matrix (concatenated parts together).
-fn draft_matrix_bytes(config: &serde_json::Value) -> anyhow::Result<Vec<u64>> {
-    use crate::families::glm5::draft_representation::{draft_geometry, is_dspark};
-    let shapes = if is_dspark(config) {
-        let c = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
-        let (h, q, kv, inter) = (c.hidden, c.heads * c.head_dim, c.kv_heads * c.head_dim, c.intermediate);
-        let layer = [(h, q + 2 * kv), (q, h), (h, 2 * inter), (inter, h)];
-        std::iter::once((c.taps.len() * h, h)).chain((0..c.layers).flat_map(|_| layer)).collect::<Vec<_>>()
-    } else {
-        let (g, _) = draft_geometry(config).map_err(|error| anyhow::anyhow!("{error}"))?;
-        let (h, q, kv) = (g.hidden as usize, (g.heads * g.head_dim) as usize, (g.kv_heads * g.head_dim) as usize);
-        let (conv, inter) = (4 * h / g.conv_group as usize, g.intermediate as usize);
-        let layer = [(h, conv), (h, conv), (h, q + 2 * kv), (q, h), (h, 2 * inter), (inter, h)];
-        [(g.taps as usize * h, h), (h, g.selector_rank as usize)].into_iter()
-            .chain((0..g.layers).flat_map(|_| layer)).collect()
-    };
-    shapes.into_iter().map(|(k, n)| k.checked_mul(n).and_then(|n| n.checked_mul(2))
-        .map(|bytes| bytes as u64).ok_or_else(|| anyhow::anyhow!("Flash draft matrix overflow"))).collect()
 }
 
 /// The same native reader extents are checked by the admitted executor.
@@ -221,7 +190,7 @@ impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_rank_caps: Vec::new(), physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
-            target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
+            target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_required: false, retained_expert_metadata: vec![],
             draft_push: None, draft_tp2: vec![] }
     }
 
@@ -298,7 +267,8 @@ impl ProcessOwners {
     pub fn spark_link(&mut self, i: &GlmfInputs<'_>, bf16: bool) -> Result<(), p::Refusal> {
         if i.spark_ranks == 0 { return Ok(()); }
         let geometry = cuteafd_core::ExpertGeometry { hidden: i.cfg.hidden as u32, experts: i.cfg.experts as u32,
-            topk: i.cfg.topk as u32, intermediate: i.cfg.moe_intermediate as u32, layers: i.cfg.layers as u32 };
+            topk: i.cfg.topk as u32, intermediate: i.cfg.moe_intermediate as u32, layers: i.cfg.layers as u32,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10 };
         self.links.push(PreparedSparkLink::endpoint("glmf.spark", 0, SparkEndpointOwners {
             ranks: i.spark_ranks, geometry, endpoint: cuteafd_core::SparkEndpoint {
                 capacity: u32::try_from(i.prefill_rows.max(i.decode_rows)).map_err(|_| p::Refusal::Overflow("Flash wire rows"))?,
@@ -332,56 +302,14 @@ pub fn mount_load(checkpoint: &crate::plan::Checkpoint, ranks: usize)
         .map(|tensor| &tensor.meta), ranks)
 }
 
-/// Header-only estimate shared by offline planning and live startup. Exact
-/// selected DenseArena records validate against this receipt before offers;
-/// they never resample capacity or run a second solve.
-pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmNextConfig,
-    ranks: usize, catalog: Option<&crate::OfficialV41Catalog>,
-    native: Option<(&crate::plan::exlr8::native::DenseFacts,
-        &crate::plan::exlr8::residency::MetadataInput)>) -> anyhow::Result<Option<crate::push_load::PushHostEnvelope>> {
-    use anyhow::{Context, ensure};
-    match crate::push_load::namespace(&checkpoint.snapshot) {
-        Ok(_) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            && error.raw_os_error().is_none() && checkpoint.snapshot.exists() => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    ensure!((1..=2).contains(&ranks), "Flash push rank count");
-    let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
-    let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
-    let mut largest = checkpoint.tensors.iter().filter(|tensor|
-        !tensor.meta.name.contains(".experts.")).map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
-    if let Some((facts, _)) = native {
-        largest = largest.max(facts.records.iter().flat_map(|record| &record.components)
-            .map(|component| component.source.bytes as u64).max().unwrap_or(0));
-    }
-    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
-    let mut expert = vec![0u64; ranks];
-    let mut retained = vec![0u64; ranks];
-    for rank in 0..ranks {
-        if let Some((_, metadata)) = native {
-            for layer in (0..cfg.layers).filter(|&layer| !cfg.dense[layer]) {
-                let plan = metadata.plan(layer, ranks, rank, crate::plan::exlr8::residency::ExpertSet::Routed)?;
-                expert[rank] = expert[rank].max(plan.descriptor_host_bytes()? as u64);
-                retained[rank] = retained[rank].checked_add(plan.host_bytes() as u64)
-                    .context("Flash retained expert metadata overflow")?;
-            }
-        } else if let Some(manifest) = catalog.and_then(|catalog| catalog.exl3()) {
-            for layer in (0..cfg.layers).filter(|&layer| !cfg.dense[layer]) {
-                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
-                let bytes = plan.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4;
-                expert[rank] = expert[rank].checked_add(bytes).context("Flash validation image overflow")?;
-            }
-        } else {
-            // Native FP8 post-Done checks use bounded widening chunks and the
-            // checkpoint's scalar/input vectors, not the routed weight image.
-            expert[rank] = catalog.into_iter().flat_map(|catalog| catalog.tensors()).filter(|tensor|
-                tensor.metadata.name.ends_with("input_scale") || tensor.metadata.name.ends_with("weight_scale_2"))
-                .map(|tensor| tensor.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
-                .context("Flash FP8 input scratch overflow")?.max(2 << 20);
-        }
-    }
-    Ok(Some(crate::push_load::PushHostEnvelope::with_retained(expert, vec![dense; ranks], retained, slots, slot)?))
+/// Persistent EXLR8 source/index metadata, separate from temporary push staging.
+pub fn retained_expert_metadata(cfg: &GlmNextConfig, ranks: usize,
+    metadata: &crate::plan::exlr8::residency::MetadataInput) -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    (0..ranks).map(|rank| (0..cfg.layers).filter(|&layer| !cfg.dense[layer]).try_fold(0u64, |sum, layer| {
+        let plan = metadata.plan(layer, ranks, rank, crate::plan::exlr8::residency::ExpertSet::Routed)?;
+        sum.checked_add(plan.host_bytes() as u64).context("Flash retained expert metadata overflow")
+    })).collect()
 }
 
 pub struct GlmfRecipe {
@@ -408,7 +336,6 @@ pub struct PreparedGlmf<'a> {
     sms: usize,
     native_load: Option<NativeLoad>,
     mount_load: Option<crate::shared::dense_read::MountLoad>,
-    push_host: Option<crate::push_load::PushHostEnvelope>,
     encoders: Vec<crate::plan::encoder::EncoderPlacement>,
 }
 
@@ -419,7 +346,6 @@ pub struct AdmittedGlmf {
     pub solved: p::ResolvedPlan,
     pub native_load: Option<NativeLoad>,
     pub mount_load: Option<crate::shared::dense_read::MountLoad>,
-    pub push_host: Option<crate::push_load::PushHostEnvelope>,
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
 }
 
@@ -850,7 +776,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }
     for owner in process.allocations.iter().cloned().chain(process.native_load.iter()
-        .flat_map(|load| load.allocations(process.push_host.is_some())))
+        .flat_map(|load| load.allocations(process.push_required)))
         .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount")))
         .chain(head.source.clone()) {
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
@@ -887,18 +813,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
         }
     }
-    if let Some(envelope) = &process.push_host {
-        for owner in envelope.allocations("glmf.push")? {
-            let curve = p::ByteCurve::fixed(owner.bytes, maximum);
-            if owner.id.ends_with(".dense") {
-                contract.components.push(p::Component { activation: p::Activation::always(), bytes: curve,
-                    kind: p::ComponentKind::Allowance(p::Allowance { location: owner.location,
-                        bytes: owner.bytes, lifetime: owner.lifetime,
-                        source: format!("{}: header-derived dense staging upper estimate", owner.id), assumed: true }) });
-            } else {
-                contract.components.push(p::Component::allocation(owner, curve, false, maximum));
-            }
-        }
+    for (rank, &bytes) in process.retained_expert_metadata.iter().enumerate().filter(|(_, bytes)| **bytes > 0) {
+        let owner = p::Allocation::buffer(format!("glmf.expert-metadata.{rank}"), p::Location::HOST,
+            bytes, p::Lifetime::RESIDENT, Category::Staging, "coordinator EXLR8 expert metadata");
+        contract.components.push(p::Component::allocation(owner, p::ByteCurve::fixed(bytes, maximum), false, maximum));
     }
     let spark_activation = p::Activation { clauses: counts.iter().enumerate()
         .filter(|(_, n)| **n < routed.len()).map(|(option, _)|
@@ -1162,7 +1080,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
     Ok(PreparedGlmf { pool, started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
-        native_load: process.native_load, mount_load: process.mount_load, push_host: process.push_host, encoders: process.encoders })
+        native_load: process.native_load, mount_load: process.mount_load, encoders: process.encoders })
 }
 
 fn hop_spec(i: &GlmfInputs<'_>) -> HopSpec {
@@ -1237,7 +1155,7 @@ impl PreparedGlmf<'_> {
             graph_reserve = ?graphs.charged, prewarm_shapes = graphs.shapes, layout = %prepared.layout,
             "Flash recipe preparation, search and exact reconciliation completed");
         Ok(AdmittedGlmf { placement, graphs, working, solved,
-            native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
+            native_load: self.native_load, mount_load: self.mount_load, encoder })
     }
 }
 
@@ -1587,8 +1505,7 @@ mod tests {
     fn draft_push_owners_charge_draft_loading_only_on_the_selected_home() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 1, 96 << 30);
-        let host = crate::push_load::PushHostEnvelope::new(vec![0], vec![6 << 20], 128, 1 << 20).unwrap();
-        let draft = DraftPush { host: host.clone(), device_scratch: 32 << 20 };
+        let draft = DraftPush { ranks: 1, device_scratch: 32 << 20 };
         let solve = |push: Option<DraftPush>| {
             let mut process = measured_process((512 << 30, 512 << 30), 8 << 30);
             process.draft_push = push;
@@ -1598,34 +1515,21 @@ mod tests {
         let owners = pushed.facts.allocations.iter().filter(|a| a.id.starts_with("glmf.draft.push.")).collect::<Vec<_>>();
         assert!(mount.facts.allocations.iter().all(|a| !a.id.starts_with("glmf.draft.push.")));
         assert_eq!(owners.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            ["glmf.draft.push.0.0.ring", "glmf.draft.push.0.0.dense", "glmf.draft.push.scratch.0"]);
+            ["glmf.draft.push.scratch.0"]);
         let draft_load = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::DraftLoad };
         assert!(owners.iter().all(|a| a.lifetime == draft_load));
-        let host_bytes = host.bytes().unwrap();
-        assert_eq!(owners.iter().filter(|a| a.location == p::Location::PINNED).map(|a| a.bytes).sum::<u64>(), host_bytes);
+        assert!(owners.iter().all(|a| a.location == p::Location::coordinator(0)));
         let phase = |plan: &p::ResolvedPlan, budget: &str, phase| plan.phases.iter()
             .find(|row| row.budget == budget && row.phase == phase).map(|row| row.owned).unwrap();
         assert_eq!(phase(&pushed, "coordinator host RAM", p::Phase::DraftLoad),
-            phase(&mount, "coordinator host RAM", p::Phase::DraftLoad) + host_bytes);
+            phase(&mount, "coordinator host RAM", p::Phase::DraftLoad));
         for at in [p::Phase::Load, p::Phase::Ready] {
             assert_eq!(phase(&pushed, "coordinator host RAM", at), phase(&mount, "coordinator host RAM", at));
         }
         // A BF16 drafter stages nothing; FP8 packs read one bounded device window.
-        let bf16 = DraftPush { host: crate::push_load::PushHostEnvelope::new(vec![0], vec![0], 128, 1 << 20).unwrap(),
+        let bf16 = DraftPush { ranks: 1,
             device_scratch: 0 };
         assert!(bf16.allocations(0).unwrap().iter().all(|a| !a.id.contains("scratch") && !a.id.ends_with(".dense")));
-    }
-
-    #[test]
-    fn flash_draft_matrices_bound_their_fp8_pack_windows() {
-        let dflash: serde_json::Value = serde_json::json!({"hidden_size": 4096, "intermediate_size": 12288,
-            "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
-            "vocab_size": 154880, "dflash_config": {"target_layer_ids": [1, 2, 3, 4, 5], "conv_group_size": 16,
-                "selector_rank": 256, "block_size": 8}});
-        let matrices = draft_matrix_bytes(&dflash).unwrap();
-        assert_eq!(matrices.len(), 2 + 5 * 6);
-        assert_eq!(matrices[0], 5 * 4096 * 4096 * 2);
-        assert_eq!(*matrices.iter().max().unwrap(), 4096 * 2 * 12288 * 2);
     }
 
     #[test]

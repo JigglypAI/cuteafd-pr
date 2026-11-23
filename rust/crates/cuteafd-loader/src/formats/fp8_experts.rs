@@ -1366,7 +1366,7 @@ mod tests {
             payloads.insert(name.clone(), payload);
         }
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
-            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let tensors = Fp8ExpertTensors::read(root.path(), shape)?.for_coordinator();
         assert_eq!(tensors.format(), ExpertFormat::Mxfp8);
         assert_eq!(tensors.format().package_name("inkling2"), "fp8-inkling2-mxfp8");
@@ -1428,7 +1428,7 @@ mod tests {
         use crate::plan::testing::{mxfp8, write_snapshot};
         let root = tempfile::tempdir()?;
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
-            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         assert!(shape.geometry()?.family().is_none());
         let mut headers = Vec::new();
         for expert in 0..shape.experts {
@@ -1504,7 +1504,7 @@ mod tests {
         use crate::plan::testing::{mxfp8, write_snapshot};
         let root = tempfile::tempdir()?;
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
-            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 640, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let mut headers = Vec::new();
         for (projection, n, k) in [("gate", 640, 128), ("up", 640, 128), ("down", 128, 640)] {
             headers.extend(mxfp8(&format!("model.layers.0.mlp.experts.0.{projection}_proj"), n, k));
@@ -1519,6 +1519,7 @@ mod tests {
         let mut unknown = catalog(ExpertFormat::Mxfp8, 2304);
         unknown.shape.hidden = 4608;
         unknown.shape.experts = 384;
+        unknown.shape.activation = cuteafd_core::ExpertActivation::Situ4_25;
         assert_eq!(unknown.shape.geometry()?.family(), Some("inkling2"));
         assert!(unknown.exact_storage_policy(4).is_none());
         assert_eq!(unknown.rank_range_with(4, 0, Slicing::Blocks(32))?, (0, 576));
@@ -1615,7 +1616,7 @@ mod tests {
             std::fs::OpenOptions::new().write(true).open(root.path().join(shard))?.write_all_at(&payload, meta.byte_offset)?;
         }
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
-            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 256, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let tensors = Fp8ExpertTensors::read(root.path(), shape)?.for_coordinator();
         assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
         assert!(tensors.dynamic_nvfp4());
@@ -1661,7 +1662,7 @@ mod tests {
 
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
-            draft_stages: 0, draft_experts: 0 };
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, dynamic_nvfp4: false, format, package_family: None,
             tensors: Arc::new(HashMap::new()), source_pitches: Default::default(), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
@@ -1799,7 +1800,7 @@ mod tests {
         use crate::plan::testing::{t, write_snapshot};
         let dir = tempfile::tempdir()?;
         let shape = RoutedExpertShape { layers: 2, first_layer: 0, experts: 2, topk: 1,
-            hidden: 128, intermediate: 1536, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 1536, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let mut fixture = Vec::new();
         for layer in 0..2 {
             for projection in Fp8Projection::ALL {
@@ -1885,7 +1886,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
             let shape = RoutedExpertShape { layers: 2, first_layer: 0, experts: 1, topk: 1,
-                hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+                hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
             let mut map = BTreeMap::new();
             let mut tensors = Vec::new();
             for p in Fp8Projection::ALL {
@@ -2036,7 +2037,7 @@ mod tests {
         }
         write_snapshot(dir, &serde_json::json!({}), &tensors, None);
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts, topk: 1, hidden, intermediate,
-            draft_stages: 0, draft_experts: 0 };
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         Fp8ExpertTensors::read(dir, shape).unwrap()
     }
 
@@ -2076,7 +2077,7 @@ mod tests {
             "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized", "group_size":16}});
         write_snapshot(dir.path(), &config, &headers, None);
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 3, topk: 1,
-            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
         let write = |expert: usize, projection: Fp8Projection, value: f32| {
             let name = tensors.activation_scale_name(&tensors.name(0, expert, projection));
@@ -2122,7 +2123,7 @@ mod tests {
             "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized", "group_size":16}});
         write_snapshot(dir.path(), &config, &headers, None);
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 1, topk: 1,
-            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
         assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
         tensors.validate_layer(0).unwrap();
@@ -2231,7 +2232,7 @@ mod tests {
             (ExpertFormat::Mxfp4, false), (ExpertFormat::Nvfp4, false), (ExpertFormat::Bf16, false)] {
             let dir = tempfile::tempdir()?;
             let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1, hidden: 256,
-                intermediate: 640, draft_stages: 0, draft_experts: 0 };
+                intermediate: 640, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
             let mut fixtures = Vec::new();
             for expert in 0..shape.experts {
                 for (projection, n, k) in [("gate", shape.intermediate, shape.hidden),
@@ -2302,7 +2303,7 @@ mod tests {
         use crate::plan::testing::{mxfp4, write_snapshot};
         let dir = tempfile::tempdir()?;
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
-            hidden: 256, intermediate: 2048, draft_stages: 0, draft_experts: 0 };
+            hidden: 256, intermediate: 2048, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         let mut fixtures = Vec::new();
         for expert in 0..shape.experts {
             for (projection, n, k) in [("gate", 2048, 256), ("up", 2048, 256), ("down", 256, 2048)] {
@@ -2394,7 +2395,7 @@ mod tests {
         for intermediate in [640, 2048] {
             let root = tempfile::tempdir()?;
             let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2,
-                topk: 1, hidden: 256, intermediate, draft_stages: 0, draft_experts: 0 };
+                topk: 1, hidden: 256, intermediate, draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
             let fixtures = (0..shape.experts).flat_map(|expert| {
                 [("gate", intermediate, 256), ("up", intermediate, 256), ("down", 256, intermediate)]
                     .into_iter().flat_map(move |(projection, n, k)|

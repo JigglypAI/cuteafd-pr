@@ -66,6 +66,7 @@ _hw_spec.loader.exec_module(hwlock)
 # Profilers that wrap a serving process (PROFILE on the coordinator, PROFILE_SPARK
 # on Spark workers), and their report suffix.
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
+VERIFY_SHAPE = re.compile(r'\d+(x\d+)?(,\d+(x\d+)?)*(@\d+)?')
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
 # LAN-only build seeds: compile, export and seal Spark slots, never serve. They have
@@ -457,8 +458,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                 worker = f"cuteafd-spark-expert-{hosts[rank]}-{resolved['expert_port']}"
                 sessions.append(['ssh', '-o', 'BatchMode=yes', hosts[rank], 'docker', 'exec', worker, '/usr/local/cuda/bin/nsys'])
         if sessions:
-            if not (entry.get('levels') or entry.get('prefill_lengths')):
-                raise ValueError(card + ': PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep; pass --levels or --prefill-lengths')
+            if not sweeping(entry):
+                raise ValueError(card + ': PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep; pass --levels, --prefill-lengths or --verify-shapes')
             # A cold window drops the clean page cache first, so the profiled
             # timed wave reads cold (warm-up already ran before the window).
             purge = [cold_purge_argv(cold_hosts)] if cold_hosts else []
@@ -510,7 +511,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry.update(name=label, config=str(base), set=values, gpus=gpus, sparks=hosts, run_args=run_args)
     job = dict(card=card, arm=arm_name, repeat=repeat, simulated=bool(simulated), state=str(dest), entry=entry, metadata=metadata, probes=probes, expected_pool=expected_pool, trace=bool(trace))
     hook = [sys.executable, str(Path(__file__).resolve())]
-    if 'census' in values.get('PROFILE', '').split(',') and (entry.get('levels') or entry.get('prefill_lengths')):
+    if 'census' in values.get('PROFILE', '').split(',') and sweeping(entry):
         sample = dict(argv=hook + ['--census-final-sample', str(dest / 'job.json')], timeout_s=180, required=True)
         window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
         previous = window.get('close')
@@ -652,6 +653,11 @@ def serving_locks(jobs):
 JOB_DRIVER_SLACK_S = 600
 
 
+def sweeping(entry):
+    """Whether smoke runs a client-side sweep: decode levels, prefill lengths or verify shapes."""
+    return bool(entry.get('levels') or entry.get('prefill_lengths') or entry.get('sweep_verify'))
+
+
 def job_max_run(job):
     """Seconds one job may hold the serving turn: smoke's launch and run budget
     (timeout_s + run_timeout_s + 120 s, the observer's bound), every hook's own
@@ -659,7 +665,7 @@ def job_max_run(job):
     entry = job['entry']
     run = int(entry.get('run_timeout_s', 900))
     bound = int(entry.get('timeout_s', 900)) + run + 120
-    if (entry.get('levels') or entry.get('prefill_lengths')) and entry.get('profile') != 'panels:':
+    if sweeping(entry) and entry.get('profile') != 'panels:':
         bound += run  # panels and a sweep: smoke bounds only the panels by run_timeout_s
     hooks = [entry.get('prelaunch'), entry.get('precheck'), *(entry.get('window') or {}).values()]
     bound += sum(int(hook['timeout_s']) for hook in hooks if hook)
@@ -2226,6 +2232,19 @@ def timing_instrumentation(job):
             'profiling': bool(profiles), 'source': 'launch configuration'}
 
 
+def verify_rows(verify):
+    """One summary row per verify shape: R, B, medians and graph state."""
+    rows = []
+    for sample in (verify.get('record') or {}).get('samples', []):
+        timed = sorted(sample.get('verify_ms') or [])
+        select = sorted(sample.get('select_ms') or [])
+        rows.append(dict(shape=sample['shape'], R=sample['real_rows'], B=sample['bucket'], natural_B=sample['natural_bucket'],
+                         verify_ms=statistics.median(timed) if timed else None, select_ms=statistics.median(select) if select else None,
+                         verify_min_ms=timed[0] if timed else None, repeats=len(timed), graphed=sample.get('graphed'),
+                         graph=sample.get('graph'), contexts=sorted(set(sample.get('contexts') or []))))
+    return rows
+
+
 def summarize_job(job, exit_code):
     dest = Path(job['state'])
     row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
@@ -2255,7 +2274,7 @@ def summarize_job(job, exit_code):
         for message in found:
             fail(row, message)
     launched = outcome.get('launch_s') is not None or bool(reports)
-    sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels') or job['entry'].get('prefill_lengths'))
+    sweep_only = job['entry'].get('profile') == 'panels:' and sweeping(job['entry'])
     readiness_only = job['entry'].get('profile') == 'panels:' and job['entry'].get('baseline') is False and not sweep_only
     if (sweep_only or readiness_only) and not reports:
         pass  # No server-side profile ran; the sweep or the probes carry the results.
@@ -2357,7 +2376,7 @@ def summarize_job(job, exit_code):
                     fail(row, 'DRAFT_LENGTH ignored: launch has no speculator', 'measurement')
     sweeps = [p for p in (dest / 'reports').glob('**/sweep.json')
               if not job.get('grouped') or p.parent.name.endswith('-' + job['entry']['name']) or p.parent.name == job['entry']['name']]
-    if job['entry'].get('levels') or job['entry'].get('prefill_lengths'):
+    if sweeping(job['entry']):
         if len(sweeps) != 1:
             fail(row, f'expected one sweep.json, found {len(sweeps)}')
         else:
@@ -2369,6 +2388,11 @@ def summarize_job(job, exit_code):
                 key = (f"sustained C{point['c']}" if point['phase'] == 'sustained' else
                        'post-load C1' if point['phase'] == 'post_load' else f"sweep C{point['c']}")
                 row[key] = point['aggregate_tok_s']
+            verify = sweep.get('verify')
+            if verify:
+                row['verify_shapes'] = verify_rows(verify)
+                if not (verify.get('isolation') or {}).get('passed'):
+                    fail(row, f"verify timing isolation failed: {verify.get('isolation')}", 'measurement')
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
                 row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
@@ -2378,6 +2402,7 @@ def summarize_job(job, exit_code):
                                        if p.get('mapped_tables')},
                                     **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
                                        if p.get('mapped_tables')}}
+            row['graph_bands'] = sweep.get('graph_bands', [])
     row['peaks'] = peaks(dest)
     row['spark_memory'] = spark_memory_report(dest)
     row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
@@ -2702,6 +2727,16 @@ def write_summary(state, rows, arms):
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
         pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
         text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
+    if any(r.get('graph_bands') for r in rows):
+        # Steady state captures no graphs (AGENTS.md): every timed band should be capture-free.
+        text += '## Graph Captures Per Timed Band\n\n/v1/stats read just before and after each timed band.\n\n'
+        text += '| Card | Arm | Repeat | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free |\n| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |\n'
+        for r in rows:
+            for band in r.get('graph_bands', []):
+                free = {True: 'yes', False: 'NO'}.get(band.get('zero_captures'), 'unavailable: ' + str(band.get('reason')))
+                text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], band.get('band'), band.get('captures'),
+                                                   band.get('device_captures'), band.get('misses'), band.get('eager_runs'), free])) + ' |\n'
+        text += '\n'
     if any(r.get('spark_memory') for r in rows):
         text += '## Spark Host Memory\n\nHost /proc/meminfo; no Spark CUDA context. Sampled phase labels, not exact wave boundaries. Minima are bytes.\n\n'
         text += '| Card | Arm | Repeat | Rank | Host | Phase | Samples | Minimum MemAvailable bytes |\n| --- | --- | ---: | ---: | --- | --- | ---: | ---: |\n'
@@ -3414,6 +3449,11 @@ def main():
                         'log-prob rows of both arms for these cases over generated tokens START..END (e.g. code-2,code-5:70-90) '
                         'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
+    parser.add_argument('--verify-shapes', metavar='SHAPES', help='warmed verify-only exact-shape timing instead of a decode sweep: '
+                        '";"-separated per-request row shapes, e.g. "4x8;5,4x7;8x8;4x8@64" (C8 at R=32/33/64 and R=32 forced to '
+                        'bucket 64); composes with PROFILE=nsys (the window frames the timed pass). See docs/wip-cards.md')
+    parser.add_argument('--verify-context', type=int, metavar='N', help='--verify-shapes history tokens per request (default 1024)')
+    parser.add_argument('--verify-repeats', type=int, metavar='N', help='--verify-shapes timed repeats per shape (default 20)')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
                         '(default 192); longer runs give profiled waves more decode steps at every width, and 0 omits '
@@ -3593,17 +3633,31 @@ def main():
         if not parts or not all(x.isdigit() and 1 <= int(x) <= 256 for x in parts) or len(set(map(int, parts))) != len(parts):
             parser.error('--context-levels takes distinct concurrency levels in 1..256, e.g. 1,8,16')
         context_levels = [int(x) for x in parts]
+    verify = None
+    if (args.verify_context is not None or args.verify_repeats is not None) and not args.verify_shapes:
+        parser.error('--verify-context and --verify-repeats need --verify-shapes')
+    if args.verify_shapes:
+        if args.levels or args.prefill_lengths:
+            parser.error('--verify-shapes runs alone: drop --levels and --prefill-lengths')
+        shapes = [shape.strip() for shape in args.verify_shapes.split(';') if shape.strip()]
+        if not shapes or not all(VERIFY_SHAPE.fullmatch(shape) for shape in shapes):
+            parser.error('--verify-shapes takes ";"-separated shapes like 4x8;5,4x7;4x8@64')
+        verify = dict(shapes=shapes)
+        if args.verify_context is not None:
+            verify['context'] = args.verify_context
+        if args.verify_repeats is not None:
+            verify['repeats'] = args.verify_repeats
     if args.client and (args.panels is None or args.panels.strip() != 'none'):
         parser.error('--client needs --panels none')
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not (levels or prefill_lengths or args.probe or args.client):
-            parser.error('--panels none runs nothing without --levels, --prefill-lengths, --probe or --client')
+        if not selection and not (levels or prefill_lengths or verify or args.probe or args.client):
+            parser.error('--panels none runs nothing without --levels, --prefill-lengths, --verify-shapes, --probe or --client')
         profile = 'panels:' + selection
         listed = requested_panels(profile, binary=panel_binary(args.binary, arms))
         for card in cards:
             card['profile'] = profile
-            if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
+            if (listed or not (levels or prefill_lengths or verify)) and 'baseline' not in listed:
                 card['baseline'] = False  # Explicit panels alone, or a probe-only readiness run; list baseline to keep it.
     try:
         panel_config = dict(parse_panel_config(text) for text in args.panel_config)
@@ -3648,6 +3702,8 @@ def main():
                 card['prefill_idle_seconds'] = args.prefill_idle_seconds
             if args.prefill_repeat:
                 card['prefill_repeat'] = True
+        if verify:
+            card['sweep_verify'] = verify
         if levels:
             card['levels'] = levels
             if args.sweep_tokens is not None:
@@ -3827,7 +3883,7 @@ def main():
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
         (['context_suffix'] if args.context_suffix is not None else []) + \
-        (['panel_config'] if panel_config else []) + \
+        (['panel_config'] if panel_config else []) + (['sweep_verify'] if verify else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {(j['launcher']['repo'], bool(j['entry'].get('matched_panel_window'))): j for j in reversed(jobs)}.values():
         requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])

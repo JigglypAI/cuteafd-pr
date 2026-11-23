@@ -397,46 +397,22 @@ impl NativeLoad {
     }
 }
 
-/// Selected dense and expert push owners, charged before the complete recipe solve.
-pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmDsaConfig,
-    layers: usize, ranks: usize, catalog: Option<&crate::OfficialV41Catalog>,
-    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>, largest_native: u64)
-    -> anyhow::Result<Option<crate::push_load::PushHostEnvelope>> {
-    use anyhow::{ensure, Context};
-    if super::local_physical::LocalStorage::for_snapshot(&checkpoint.snapshot)?
-        == super::local_physical::LocalStorage::Mount { return Ok(None); }
-    ensure!((1..=2).contains(&ranks) && layers <= cfg.layers, "GLM push identity");
-    let largest = checkpoint.tensors.iter().filter(|t| !t.meta.name.contains(".experts.")
-        && !t.meta.name.starts_with("experts.")).map(|t| t.meta.byte_length).max().unwrap_or(0).max(largest_native);
-    let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
-    let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
-    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
-    let mut expert = vec![0u64; ranks];
-    let mut retained = vec![0u64; ranks];
-    for rank in 0..ranks {
-        for layer in cfg.first_moe_layer..layers {
-            if let Some(metadata) = metadata {
-                let plan = metadata.plan(layer, ranks, rank, crate::plan::exlr8::residency::ExpertSet::Routed)?;
-                expert[rank] = expert[rank].max(plan.descriptor_host_bytes()? as u64);
-                retained[rank] = retained[rank].checked_add(plan.host_bytes() as u64)
-                    .context("GLM retained push metadata overflow")?;
-            } else {
-                let catalog = catalog.context("GLM push experts require a catalog or selected EXLR8 metadata")?;
-                if let Some(manifest) = catalog.exl3() {
-                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
-                    expert[rank] = expert[rank].checked_add(plan.loads.iter()
-                        .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
-                        .context("GLM push validation overflow")?;
-                } else {
-                    expert[rank] = catalog.tensors().iter().filter(|t| t.metadata.name.ends_with("input_scale")
-                        || t.metadata.name.ends_with("weight_scale_2"))
-                        .map(|t| t.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
-                        .context("GLM native push scratch overflow")?.max(2 << 20);
-                }
-            }
-        }
-    }
-    Ok(Some(crate::push_load::PushHostEnvelope::with_retained(expert, vec![dense; ranks], retained, slots, slot)?))
+/// EXLR8 expert source/index metadata retained after loading.
+pub fn retained_expert_metadata(snapshot: &std::path::Path, cfg: &GlmDsaConfig,
+    layers: usize, ranks: usize, metadata: &crate::plan::exlr8::residency::MetadataInput,
+    maximum: u64) -> anyhow::Result<Vec<Component>> {
+    use anyhow::Context;
+    if super::local_physical::LocalStorage::for_snapshot(snapshot)?
+        == super::local_physical::LocalStorage::Mount { return Ok(vec![]); }
+    (0..ranks).map(|rank| {
+        let bytes = (cfg.first_moe_layer..layers).try_fold(0u64, |sum, layer| {
+            let plan = metadata.plan(layer, ranks, rank, crate::plan::exlr8::residency::ExpertSet::Routed)?;
+            sum.checked_add(plan.host_bytes() as u64).context("GLM retained expert metadata overflow")
+        })?;
+        let owner = Allocation::buffer(format!("glm.expert-metadata.{rank}"), Location::HOST,
+            bytes, Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Staging, "coordinator EXLR8 expert metadata");
+        Ok(Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum))
+    }).collect()
 }
 
 /// Target owners assembled from the same physical plans consumed by the loaders.
@@ -859,7 +835,8 @@ pub fn production_links(cfg: &GlmDsaConfig, ranks: usize, prefill: PrefillShape,
     use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
     if ranks == 0 { return Ok((None, None)); }
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
-        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32,
+        activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     let endpoint = |name, shape: PrefillShape, prefill, reply| PreparedSparkLink::endpoint(name, 0,
         SparkEndpointOwners { ranks, geometry, endpoint: cuteafd_core::SparkEndpoint {
             capacity: u32::try_from(shape.rows).map_err(|_| Refusal::Overflow("GLM transport rows"))?,

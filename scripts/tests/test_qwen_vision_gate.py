@@ -99,7 +99,8 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     # The buckets are the startup graph set's, shared with admission and the planner.
     assert "QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS" in engine
     assert int(re.search(r"pub\(crate\) const FP8_HEAD_ROWS: usize = (\d+);", engine).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
-    assert "_HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)" in qwen
+    assert "cap = FP8_DECODE_ROWS if max_rows is None else int(max_rows)" in qwen
+    assert "_HeadFp8(vocab, h, max_rows=cap)" in qwen
     tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body
               if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
               and node.targets[0].id in ("DECODE_TMA_TILES", "SKINNY_TILES_BY_ROWS")}

@@ -582,7 +582,8 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     let budget = ledger.budgets.iter().find(|budget| budget.id == "host").unwrap();
     assert_eq!(budget.locations, [Location::HOST, Location::PINNED]);
     let load = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Load).unwrap();
-    assert!(load.owned > 0 && load.opaque >= 4 << 30, "both estimated dense ranks are Load owners");
+    assert!(load.owned > 0);
+    assert_eq!(load.opaque, 1536 << 20, "ordinary host allowance, without push staging");
     let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
     assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
     assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
@@ -614,15 +615,6 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         pinned.extend(mount.allocations(&format!("muse.native.load.{gpu}")).into_iter()
             .filter(|owner| owner.location == Location::PINNED));
     }
-    let catalog = input.expert_catalog().unwrap();
-    let manifest = catalog.exl3().unwrap();
-    let validation = (0..2).map(|gpu| (0..placement.onboard_layers).map(|layer|
-        manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, gpu).unwrap().loads.iter()
-            .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4).sum()).collect();
-    // Dense staging is an estimated allowance, not a physical pinned root.
-    let push = crate::push_load::PushHostEnvelope::new(validation, vec![0; 2],
-        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).unwrap();
-    pinned.extend(push.allocations("muse.push").unwrap().into_iter().filter(|owner| owner.location == Location::PINNED));
     for gpu in 0..2 {
         let id = format!("rtx{gpu}");
         let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")
@@ -644,7 +636,7 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         assert_eq!(placement.items[gpu].iter().filter(|item|
             item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
     }
-    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
+    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 26 << 30));
     let direct = input.plan(&options).unwrap();
     let counted = input.plan_spark_count(&options, 6, Some(6)).unwrap();
     assert!(!direct.fits && !counted.fits);

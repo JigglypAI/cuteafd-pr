@@ -678,7 +678,7 @@ fn worker(
             "V4.1 Spark admission did not select required push");
         coordinator_push::plan_whole(&args.snapshot, &catalog,
             crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
-            records.as_ref().context("V4.1 required dense push records")?, &selected, expert_world, pool.host.push.clone())
+            records.as_ref().context("V4.1 required dense push records")?, &selected, expert_world)
     })?;
     let (coordinator, ranks) = match coordinator {
         Some((planned, ranks)) => (Some(planned), ranks),

@@ -515,10 +515,9 @@ mod source_format_tests {
         assert_eq!(selected.fingerprint(), view.fingerprint());
         assert_eq!(selected.snapshot(), view.snapshot());
         if installed {
-            use crate::shared::experts::rtx::push::{CoordinatorPush, push_host_envelope};
-            let envelope = push_host_envelope(&[None], &[])?;
-            let (_push, streams, _ranks) = CoordinatorPush::prepare_view_admitted(
-                view, Some(catalog), 1, None, envelope)?;
+            use crate::shared::experts::rtx::push::CoordinatorPush;
+            let (_push, streams, _ranks) = CoordinatorPush::prepare_view(
+                view, Some(catalog), 1, None)?;
             assert_eq!(streams.len(), 1);
         }
         Ok(())
@@ -1089,7 +1088,7 @@ fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
     let shape = cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
         experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
-        draft_stages: 0, draft_experts: 0 };
+        draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::SiluUnclamped };
     cuteafd_core::set_expert_geometry(shape.geometry()?)
         .map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
@@ -1256,12 +1255,11 @@ impl Opened {
                 &preflight.placement.expert_ranges, &preflight.working_set.rtx_layers,
                 preflight.expert_resident_bytes, devices.len())?;
             let view = self.checkpoint.view.as_ref().context("MiMo push requires selected checkpoint view")?;
-            let envelope = preflight.push_host.clone().context("MiMo push host receipt")?;
             let prepared = if sparks == 0 {
-                (CoordinatorPush::prepare_alone_view_admitted(view, self.catalog.as_ref(), devices.len(), experts, envelope)?, None)
+                (CoordinatorPush::prepare_alone_view(view, self.catalog.as_ref(), devices.len(), experts)?, None)
             } else {
-                let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view,
-                    self.catalog.as_ref(), devices.len(), experts, envelope)?;
+                let (push, streams, ranks) = CoordinatorPush::prepare_view(view,
+                    self.catalog.as_ref(), devices.len(), experts)?;
                 (push, Some((streams, ranks)))
             };
             Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))
@@ -1272,7 +1270,8 @@ impl Opened {
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
                 experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
-                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
+                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)?,
+                activation: cuteafd_core::ExpertActivation::SiluUnclamped };
             let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
             // Decode and prefill bind distinct endpoints on one owner.
             let catalog = self.catalog.as_ref().context("MiMo Spark admission requires routed expert headers")?;

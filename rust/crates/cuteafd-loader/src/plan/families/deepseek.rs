@@ -395,6 +395,7 @@ impl DeepSeekModel {
             topk: moe.top_k as u32,
             intermediate: moe.intermediate as u32,
             layers: self.spec.layers.len() as u32,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
         }
         .family()
     }

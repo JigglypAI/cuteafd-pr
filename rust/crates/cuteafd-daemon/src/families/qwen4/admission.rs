@@ -107,13 +107,11 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &Qwen4Config,
     catalog: Option<&cuteafd_loader::OfficialV41Catalog>, layers: usize, mtp: bool,
     manifest: Option<&serde_json::Value>, context: cuteafd_loader::placement::planner::Context,
-    media: &crate::shared::experts::rtx::dense::Records,
     inventory: &crate::shared::inventory::RuntimeInventory) -> Result<(usize, qwen4::QwenHost, ExpertAdmission)> {
     use anyhow::{ensure, Context};
     use cuteafd_core::memory_layout::{Basis, Category};
     use cuteafd_loader::families::qwen4::{resident::Qwen4Representation, weight_layout};
     use cuteafd_loader::placement::Demand;
-    use crate::shared::experts::rtx::push::PushPolicy;
     let rows = args.prefill_wave_rows().max(super::engine::DECODE_ROWS);
     ensure!(args.shared_only || args.expert_window.is_none(),
         "Qwen placement requires resident experts; diagnostic expert paging is not admitted");
@@ -135,7 +133,6 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         future.push(Demand::new(0, Category::Staging, "FP8 projection load staging",
             cuteafd_loader::shared::dense_read::STEP_BYTES as u64, Basis::Exact));
     }
-    let mut window_push = Vec::new();
     let draft = if mtp && !args.shared_only {
         qwen4::dual_draft_demands(catalog.context("Qwen MTP expert catalog")?, &args.native_lib, rows as u64)?
     } else { Vec::new() };
@@ -147,25 +144,9 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         future.extend(shared);
     } else { future.extend(draft); }
     if let Some(experts) = &mut experts { experts.remap_devices(&[args.device])?; }
-    // Push host state is bounded by the largest candidate; only the admitted
-    // prefix is ever allocated or read by the receiver.
-    if let Some(catalog) = catalog.filter(|_| !args.shared_only) {
-        let policy = PushPolicy::for_snapshot(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?;
-        if let Some(envelope) = policy.plan(|| {
-            super::hybrid::push_plan(catalog, &(0..layers).collect::<Vec<_>>(), 1, rows, args, None)?
-                .context("Qwen routed push candidate")?.host_envelope(catalog, 1, &[])
-        })? { window_push.push(("qwen.host.push.routed", envelope)); }
-    }
-    let policy = PushPolicy::for_snapshot(&args.snapshot)?;
-    if let Some(envelope) = policy.plan(|| {
-        let staging = dual_dense_staging(checkpoint, cfg, &vec![0; layers], mtp,
-            args.fp8_decode, args.mtp_fp8_head, media, [args.device, args.device])?;
-        Ok(cuteafd_loader::push_load::PushHostEnvelope::new(vec![0], vec![staging[0]],
-            cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
-    })? { window_push.push(("qwen.host.push.dense", envelope)); }
     let host_embedding = if embedding == 0 { weight_layout::embedding_table_bytes(checkpoint)? as u64 } else { 0 };
     let host = host_owners(args, cfg, layers, mtp, 1, sparks,
-        checkpoint.spark_input_is_bf16(), ple.map(|p| p.0), host_embedding, window_push)?;
+        checkpoint.spark_input_is_bf16(), ple.map(|p| p.0), host_embedding)?;
     let admission = inputs(args, cfg, layers, mtp, manifest, ple, 0)?;
     let sample = inventory.gpus.first().context("Qwen pre-weight sample")?;
     let code = if catalog.is_some_and(|catalog| catalog.exl3().is_some()) { "exl3" }
@@ -259,19 +240,16 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
 /// Live coordinator host owners for one route, from the engine arguments and
 /// the same formulas the offline plan uses, against one host sample that
 /// credits this process's own anonymous memory (every host owner it already
-/// holds is charged once by the recipe). `push` names the admitted push
-/// receive envelopes that will be prepared after the solve.
+/// holds is charged once by the recipe).
 pub(super) fn host_owners(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, mtp: bool, owners: usize,
-    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64,
-    push: Vec<(&'static str, cuteafd_loader::push_load::PushHostEnvelope)>)
+    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64)
     -> Result<qwen4::QwenHost> {
     host_owners_with_memory(args, cfg, layers, mtp, owners, spark_ranks, spark_bf16, ple_row_bytes,
-        host_embedding, push, cuteafd_loader::formats::mapped_preload::host_memory_before_process()?)
+        host_embedding, cuteafd_loader::formats::mapped_preload::host_memory_before_process()?)
 }
 
 fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, mtp: bool, owners: usize,
-    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64,
-    push: Vec<(&'static str, cuteafd_loader::push_load::PushHostEnvelope)>, memory: (u64, u64))
+    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64, memory: (u64, u64))
     -> Result<qwen4::QwenHost> {
     use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, mtp_pinned_logits_bytes, pinned_logits_bytes, scoring_logits_bytes};
     let (total, available) = memory;
@@ -299,7 +277,8 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         let intake_rows = if waves == 1 { unit_rows } else { shape.units().slot_rows() };
         let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(cfg.hidden)?,
             experts: u32::try_from(cfg.experts)?, topk: u32::try_from(cfg.topk)?,
-            intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+            intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)?,
+            activation: cuteafd_core::ExpertActivation::SiluUnclamped };
         cuteafd_loader::serving_capacity::spark_host_transport(geometry,
             cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), spark_ranks, false, true,
             spark_bf16, unit_rows, intake_rows, waves, None)?
@@ -314,7 +293,7 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         loaded_media_cache: args.planner_media_cache_bytes,
         host_embedding,
         table_reactor: cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(usize::from(mapped)) as u64,
-        preloaded_tables: 0, spark, push,
+        preloaded_tables: 0, spark,
     })
 }
 
@@ -402,7 +381,8 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
 /// quantization in 128-row windows, the FP8 head and MTP on owner 0, BF16 to
 /// FP32 widening), split by the same window rules, bounded by the same
 /// `HostStaging::for_steps` the receiving rank applies, plus its job table.
-/// The executor validates the recorded ranks against this before offers.
+/// The test compares this independent construction with the recorded ranks.
+#[cfg(test)]
 pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &Qwen4Config,
     owners: &[usize], mtp: bool, fp8_decode: bool, fp8_head: bool,
     media: &crate::shared::experts::rtx::dense::Records, devices: [i32; 2]) -> Result<[u64; 2]> {
@@ -481,12 +461,6 @@ pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, 
         out[rank] = u64::try_from(HostStaging::for_steps(steps[rank].iter().map(Vec::as_slice), tables[rank])?.bytes()?)?;
     }
     Ok(out)
-}
-
-/// The dual coordinator push group's receive envelope (two GPUs, dense only).
-pub(super) fn dual_push_envelope(dense: [u64; 2]) -> Result<cuteafd_loader::push_load::PushHostEnvelope> {
-    Ok(cuteafd_loader::push_load::PushHostEnvelope::new(vec![0, 0], dense.to_vec(),
-        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
 }
 
 #[cfg(test)]
@@ -1040,7 +1014,7 @@ mod tests {
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
-                    host_embedding, Vec::new(), cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
+                    host_embedding, cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?, encoders: Default::default() })?;
             assert_eq!(solved.pool_policy, report.phase_ledger.as_ref().unwrap().pool_policy);
             // The layout target is uniform; an automatic pool then grows into memory.
             assert_eq!(solved.pool_policy.as_ref().unwrap().target(), 2 << 20);
@@ -1144,7 +1118,7 @@ mod tests {
                     // owners and their mapped-buffer page tables.
                     host: {
                         let mut host = super::host_owners_with_memory(&args, &cfg, cfg.layers, false, 1, 0,
-                            false, None, 0, Vec::new(),
+                            false, None, 0,
                             cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram)?;
                         host.table_reactor = cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(
                             report.mapped_placement.mapped) as u64;
@@ -1203,7 +1177,7 @@ mod tests {
                     args.peers = (sparks > 0).then(|| (0..sparks).map(|rank| format!("host{rank}:9000")).collect::<Vec<_>>().join(","));
                     let owners = if sparks == 0 { requested_gpus } else { 1 };
                     let host = super::host_owners_with_memory(&args, &cfg, 4, mtp,
-                        owners, sparks, false, None, 0, Vec::new(), (1 << 40, 1 << 40))?;
+                        owners, sparks, false, None, 0, (1 << 40, 1 << 40))?;
                     let expected = if sparks > 0 && mtp { cfg.vocab_size as u64 * 4 } else { 0 };
                     assert_eq!(host.mtp_pinned_logits, expected);
                     assert_eq!(host.pinned_logits, owners as u64 * 65 * cfg.vocab_size as u64 * 4);
@@ -1298,11 +1272,6 @@ mod dual_push_tests {
                 anyhow::ensure!(actual == charged[rank],
                     "GPU{rank} recorded staging {actual} B differs from the header charge {} B", charged[rank]);
             }
-            let envelope = dual_push_envelope(charged)?;
-            let actual = crate::shared::experts::rtx::push::push_host_envelope(&[None, None],
-                &[0, 1].map(|rank| RankLayout::new(records.operands.clone(), records.steps.clone(), rank)
-                    .map(|layout| layout.host_staging)).into_iter().collect::<anyhow::Result<Vec<_>>>()?)?;
-            anyhow::ensure!(envelope == actual, "dual envelope differs from the recorded ranks");
             drop(model);
             arms += 1;
         }

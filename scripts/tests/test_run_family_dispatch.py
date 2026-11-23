@@ -5893,6 +5893,24 @@ def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag
     assert "CUTEAFD_GRAPH_DONOR_COLD_LAG" not in result.stderr
 
 
+@pytest.mark.parametrize("overrides,donate,lag", [
+    ("", True, "8"),
+    ("GRAPH_DONOR_ALWAYS=off\n", False, None),
+    ("GRAPH_DONOR_COLD_LAG=16\n", True, "16"),
+])
+def test_inkling_graph_donors_default_to_qualified_lag(tmp_path, overrides, donate, lag):
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    result = _family_launch_result(tmp_path, config, "test/inkling",
+        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + overrides)
+    assert result.returncode == 0, result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if "serve-inkling2" in line and "--snapshot" in line))
+    assert ("--graph-donor-always" in serve) == donate
+    assert ("--graph-donor-cold-lag" in serve) == (lag is not None)
+    if lag is not None:
+        assert serve[serve.index("--graph-donor-cold-lag") + 1] == lag
+
+
 @pytest.mark.parametrize("lag,donor,error", [
     ("16", "off", "requires GRAPH_DONOR_ALWAYS=on"),
     ("-1", "on", "must be a non-negative integer"),

@@ -1984,7 +1984,6 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
             Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
-            Option<cuteafd_loader::push_load::PushHostEnvelope>,
             Option<cuteafd_loader::shared::dense_read::MountLoad>,
             cuteafd_loader::placement::planner::ResolvedPlan)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -2177,9 +2176,11 @@ impl Opened {
             host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;
         process.spark_link(&inputs, self.checkpoint.spark_input_is_bf16())?;
         process.native_load = native_admission.map(|native| native.load_owners(&self.cfg)).transpose()?;
-        process.push_host = admission::admission::push_host_envelope(&headers, &self.cfg, devices.len(),
-            self.experts.as_ref(),
-            native_admission.map(|native| (&native.facts, &native.metadata)))?;
+        process.push_required = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&headers.snapshot)?
+            == crate::shared::experts::rtx::push::PushPolicy::Required;
+        if let Some(native) = native_admission.filter(|_| process.push_required) {
+            process.retained_expert_metadata = admission::admission::retained_expert_metadata(&self.cfg, devices.len(), &native.metadata)?;
+        }
         process.draft_tp2 = draft_tp2;
         if let Some(path) = &args.draft {
             process.draft(path,
@@ -2187,7 +2188,7 @@ impl Opened {
                 devices.len(), args.tp2_dflash)?;
         }
         process.draft_push = self.draft_push(args)?;
-        if native_admission.is_none() && process.push_host.is_none() {
+        if native_admission.is_none() && !process.push_required {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
         }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
@@ -2201,7 +2202,7 @@ impl Opened {
             "GLM Flash placement has no matching movable executor");
         placement::draft::require_home(&placement, "GLM Flash",
             if remote_draft { &[0, 1] } else { &[0] })?;
-        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host,
+        Ok((placement, graphs, working, host_config, admitted.native_load,
             admitted.mount_load, admitted.solved))
     }
 
@@ -2458,7 +2459,7 @@ impl Opened {
         let remote_draft = false;
         cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
         let (placement, admitted_graphs, working, admitted_host, admitted_native_load,
-            admitted_push_host, admitted_mount_load, admitted_plan) = admitted;
+            admitted_mount_load, admitted_plan) = admitted;
         if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
         // The shared Ready and first-request reconciliation captures read this
         // input; without it both stages early-return as unavailable.
@@ -2694,7 +2695,8 @@ impl Opened {
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
                 else { cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
                     experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
-                    intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
+                    intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)?,
+                    activation: cuteafd_core::ExpertActivation::SiluClamp10 } };
             let capacity = u32::try_from(args.expert_rows())?;
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
@@ -2712,9 +2714,8 @@ impl Opened {
                 push_policy.plan(|| {
                     ensure!(admission.coordinator_pushes(), "native Flash Spark admission did not select required push");
                     let planned = plan_native(peers.len())?;
-                    let (push, streams, ranks) = CoordinatorPush::prepare_admitted(
-                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?,
-                        admitted_push_host.clone().context("Flash push host receipt")?)?;
+                    let (push, streams, ranks) = CoordinatorPush::prepare(
+                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?)?;
                     native_push = Some((push, peers.len(), planned));
                     Ok((streams, ranks))
                 })?
@@ -2724,8 +2725,7 @@ impl Opened {
                     ensure!(admission.coordinator_pushes(), "GLM Flash Spark admission did not select required push");
                     let experts = expert_plan()?;
                     let planned = plan_dense(peers.len())?;
-                    let prepared = CoordinatorPush::prepare_admitted(&args.snapshot, self.experts.as_ref(), gpus, experts,
-                        admitted_push_host.clone().context("Flash push host receipt")?)?;
+                    let prepared = CoordinatorPush::prepare(&args.snapshot, self.experts.as_ref(), gpus, experts)?;
                     Ok((prepared, planned))
                 })?
             } else { None };
@@ -2738,9 +2738,8 @@ impl Opened {
             if native_admission.is_some() {
                 native_push = push_policy.plan(|| {
                     let planned = plan_native(0)?;
-                    let push = CoordinatorPush::prepare_alone_view_admitted(
-                        &self.view, self.experts.as_ref(), gpus, native_push_experts()?,
-                        admitted_push_host.clone().context("Flash push host receipt")?)?;
+                    let push = CoordinatorPush::prepare_alone_view(
+                        &self.view, self.experts.as_ref(), gpus, native_push_experts()?)?;
                     Ok((push, 0, planned))
                 })?;
             }
@@ -2748,8 +2747,7 @@ impl Opened {
                 coordinator_push = push_policy.plan(|| {
                     let experts = expert_plan()?;
                     let planned = plan_dense(0)?;
-                    let push = CoordinatorPush::prepare_alone_view_admitted(&self.view, self.experts.as_ref(), gpus, experts,
-                        admitted_push_host.clone().context("Flash push host receipt")?)?;
+                    let push = CoordinatorPush::prepare_alone_view(&self.view, self.experts.as_ref(), gpus, experts)?;
                     Ok((push, 0, devices.clone(), planned))
                 })?;
             }
@@ -3102,7 +3100,6 @@ impl Opened {
         let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
         // Admitted standalone push group of the drafter's own GPU, after the target
         // group committed; priming (RemoteDflash::new) reads only committed weights.
-        let admitted = self.draft_push(args)?.map(|draft| draft.host);
         let drafter = if let Some(exchange) = exchange {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             ensure!(prepared.is_none(), "TP2 DFlash cannot use a remote single-home drafter");
@@ -3113,8 +3110,8 @@ impl Opened {
             let file = read.join_dflash()?;
             let devices = [args.device, exchange.device(1)].map(|id|
                 crate::shared::memory::device::Device { library: &self.library, id });
-            dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone_admitted(snapshot,
-                &devices, admitted, || {
+            dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone(snapshot,
+                &devices, || {
                     let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &devices.map(|d| d.id))?;
                     DflashDrafter::load_tp2_with(&self.library, programs, target_projection, snapshot, file,
                         slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
@@ -3129,7 +3126,7 @@ impl Opened {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
-            let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
+            let draft = crate::shared::experts::rtx::push::load_alone(snapshot, &[device], ||
                 device.own(|| {
                     let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &[device.id])?;
                     DflashDrafter::load_with(&self.library, programs, crate::shared::speculation::dflash::TargetProjection::Native, snapshot, file, prepared.stream.raw,
@@ -3139,7 +3136,7 @@ impl Opened {
             dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared, target_projection)?)
         } else {
             let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
-            crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
+            crate::shared::experts::rtx::push::load_alone(snapshot, &[device], ||
                 dspark::Drafter::load(&self.library, programs, target_projection, snapshot, stream, slots, batch,
                     embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                     args.draft_linear, args.draft_kv_cache, read))?
@@ -3167,8 +3164,7 @@ impl Opened {
     fn draft_push(&self, args: &EngineArgs)
         -> Result<Option<cuteafd_loader::placement::families::glm5_flash::admission::DraftPush>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
-        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-        cuteafd_loader::placement::families::glm5_flash::admission::DraftPush::for_snapshot(snapshot, &config,
+        cuteafd_loader::placement::families::glm5_flash::admission::DraftPush::for_snapshot(snapshot,
             cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8))?
             .map(|push| push.for_tp(if args.tp2_dflash { 2 } else { 1 })).transpose()
     }

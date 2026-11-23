@@ -535,7 +535,13 @@ impl Step {
                     let bytes = self.bytes();
                     ensure!(bytes > 0 && bytes % 8 == 0 && dst.bytes >= bytes / 2,
                         "I64 narrowing outside its operands");
-                    let status = HostAllocation::new(library, 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-status"))?;
+                    let status = HostAllocation::new(library, 4,
+                        Tag::staging("staging/coordinator-dense-status")).map_err(|source| match kernels.push_device() {
+                            Some(device) => super::super::push::PushStartupError::StagingAllocation {
+                                device, bytes: 4, owner: "narrowing status", source,
+                            }.into(),
+                            None => source,
+                        })?;
                     let alias = library.cuda_host_buffer_device_alias(status.buffer)?;
                     // SAFETY: pinned staging, aligned status and I32 destination
                     // remain live through the drain before status is inspected.

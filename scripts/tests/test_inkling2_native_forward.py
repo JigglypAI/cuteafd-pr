@@ -55,10 +55,12 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     prefill = (FAMILY/'prefill.rs').read_text()
     assert 'for member in members(unit)' in prefill
     assert 'owner.packed_metadata(' in prefill
-    assert 'layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
-    assert 'layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())' in prefill
+    assert 'layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, rows)' in prefill
+    assert 'layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, rows)' in prefill
     assert 'unit.reply_origins()' in prefill
-    assert 'layers::routed_ffn(self.kernels, owner,' in prefill
+    local = prefill.split('fn local_ffn(')[1].split('fn send_experts(')[0]
+    assert local.index('self.prepare_routes(layer, unit)?') < local.index('layers::dispatch_experts(owner,')
+    assert local.index('layers::dispatch_experts(owner,') < local.index('self.join(layer, unit)')
     assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
     assert 'self.head.embed_unit(' in prefill
     assert 'probe::head_spans(unit.rows.len(), 64)' in prefill
@@ -77,7 +79,7 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'Whole::load(' not in resident and 'load_whole_weights(' not in resident
     push = weights.split('pub fn record_push(')[1].split('pub fn operand(')[0]
     assert 'Finish::PaddedTranspose' in push
-    assert 'CoordinatorPush::prepare_view_admitted' in weights
+    assert 'CoordinatorPush::prepare_view(' in weights
     assert 'PushPolicy::Required.committed(received)' in weights
     assert 'load_while_admitting(Some(pending)' in weights
     assert 'dense.operand(' in push and 'dense.finish(' in push

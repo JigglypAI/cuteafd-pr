@@ -3854,9 +3854,31 @@ impl<'a> GlmfEngine<'a> {
         self.decode_step(sequences, tokens, None, false, None, Some(media), true)
     }
 
+    /// A serving verify step (speculative when any sequence verifies drafts) padded to `forced`
+    /// rows instead of its natural bucket: the benchmark's verify-timing probe. A forced bucket is
+    /// one serving itself pads to, at least the natural one, so no new graph geometry is captured.
+    pub(crate) fn verify_timing_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
+        forced: Option<usize>) -> Result<(Option<DeviceLogits>, crate::shared::probe::verify_timing::Buckets)> {
+        let spec = sequences.iter().any(|(_, rows)| *rows > 1);
+        let rows = sequences.iter().map(|(_, rows)| rows).sum();
+        ensure!(forced.is_none() || self.use_graphs, "a forced verify bucket needs captured graphs (graphs are off)");
+        let buckets = crate::shared::probe::verify_timing::checked_bucket(rows, forced,
+            |rows| Ok(self.serving_decode_rows(rows, spec)))?;
+        let logits = self.decode_step_padded(sequences, tokens, None, spec, None, None, false, Some(buckets.ran))?;
+        Ok((logits, buckets))
+    }
+
     fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>, eager: bool) -> Result<Option<DeviceLogits>> {
+        self.decode_step_padded(sequences, tokens, on_layer, spec, trace, media, eager, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_step_padded(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>, eager: bool,
+        forced: Option<usize>) -> Result<Option<DeviceLogits>> {
         let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= self.decode_rows && tokens.len() == rows,
@@ -3898,7 +3920,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
-        let bucket = if graphed { self.serving_decode_rows(rows, spec) } else { rows };
+        ensure!(forced.is_none() || graphed, "a forced verify bucket runs only through captured graphs");
+        let bucket = if graphed { forced.unwrap_or_else(|| self.serving_decode_rows(rows, spec)) } else { rows };
         if spec {
             // The step records at its programs' capacity; the commit that follows reads that many rows.
             self.replay_rows.set(replay_rows_of(decode_cap(bucket)));
@@ -4465,7 +4488,14 @@ impl<'a> GlmfEngine<'a> {
                     Ok(())
                 }
             };
-            if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
+            {
+                let _range = crate::shared::probe::verify_timing::range(Some(self.library), || match layers.get(index) {
+                    Some(layer) if layer.dense => format!("L{index} attention+dense"),
+                    Some(_) => format!("L{index} attention"),
+                    None => "head".into(),
+                });
+                if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
+            }
             // Outside capture: every replay queues its matching peer landing.
             if index == layers.len() {
                 if let Some(w1) = w1 { self.replicate_terminal(w, w1, 0, t)?; }
@@ -4500,6 +4530,8 @@ impl<'a> GlmfEngine<'a> {
                     // A padded step's real rows run the router, the expert wire and the shared expert
                     // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
                     // padding tail of the decode workspace's `delta` is cleared after the expert work.
+                    let _range = crate::shared::probe::verify_timing::range(Some(self.library),
+                        || format!("L{index} moe {}/{t}", tables.real_rows));
                     crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
                         self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true,
                             &[Span { first: 0, rows: real }], w1)
@@ -5197,7 +5229,9 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
         decode: bool, spans: &[Span], prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
-        self.moe_front(w, index, layer, t, rows, cap, spans)?;
+        use crate::shared::probe::verify_timing::range;
+        { let _range = range(Some(self.library), || "router".into()); self.moe_front(w, index, layer, t, rows, cap, spans)?; }
+        let _range = range(Some(self.library), || "experts".into());
         self.moe_experts(w, index, layer, t, rows, cap, decode, prepared_peer)
     }
 
@@ -5370,6 +5404,7 @@ impl<'a> GlmfEngine<'a> {
                 let mut transport = transport.borrow_mut();
                 let exchange = transport.exchange()?;
                 let wave = self.spark_send(w, index, t, decode, exchange, None, shared)?;
+                let _range = crate::shared::probe::verify_timing::range(Some(self.library), || "exchange wait".into());
                 return self.spark_land(w, t, exchange, wave);
             }
         }

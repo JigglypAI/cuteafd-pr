@@ -32,34 +32,6 @@ pub fn production_links(gpu: u8, ranks: usize, lanes: u64, prefill: PrefillShape
         true, true, SparkIntakeCandidates::Probed, replies.prefill(false), Lifetime::TARGET)).collect()
 }
 
-/// Complete #1329 K6 max push bound was 9,606,907,904 B across both
-/// ranks; the split is unknown. Reserve 10 GiB independently on each rank
-/// until the shared push log supplies exact per-rank dense bounds.
-pub const PUSH_DENSE_BYTES_PER_RANK: u64 = 10 << 30;
-
-pub fn push_host_envelope(cfg: &crate::families::kimi_k3::config::KimiK3Config, gpus: usize)
-    -> Result<crate::push_load::PushHostEnvelope, Refusal> {
-    // EXL3 validation has one four-byte MCG scalar per expert projection.
-    // Any selected local prefix is bounded by the complete routed inventory.
-    let validation = (cfg.dense.iter().filter(|dense| !**dense).count() as u64)
-        .checked_mul(cfg.experts as u64).and_then(|bytes| bytes.checked_mul(3 * 4))
-        .ok_or(Refusal::Overflow("Kimi push EXL3 validation"))?;
-    crate::push_load::PushHostEnvelope::new(vec![validation; gpus],
-        vec![PUSH_DENSE_BYTES_PER_RANK; gpus], 128, 1 << 20)
-}
-
-pub fn selected_push_host_envelope(cfg: &crate::families::kimi_k3::config::KimiK3Config,
-    core: &crate::families::kimi_k3::core::CoreInventory, gpus: usize)
-    -> Result<crate::push_load::PushHostEnvelope, Refusal> {
-    let mut envelope = push_host_envelope(cfg, gpus)?;
-    if let Some(largest) = core.largest_selected_dense_bytes {
-        let dense = crate::push_load::admitted_push_envelope(largest, envelope.slots as usize,
-            envelope.slot_bytes)?;
-        envelope.dense_bytes.fill(dense);
-    }
-    Ok(envelope)
-}
-
 pub fn native_load_owners(core: &crate::families::kimi_k3::core::CoreInventory,
     gpus: usize, maximum: u64) -> anyhow::Result<Vec<Component>> {
     Ok(core.native_mount_load(gpus)?.allocations("kimi.native_attention.load").into_iter()
@@ -67,23 +39,6 @@ pub fn native_load_owners(core: &crate::families::kimi_k3::core::CoreInventory,
             false, maximum)).collect())
 }
 
-pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: u64)
-    -> Result<Vec<Component>, Refusal> {
-    Ok(envelope.allocations("kimi.push")?.into_iter().map(|owner| {
-        if owner.id.ends_with(".dense") {
-            Component { activation: Activation::always(), bytes: ByteCurve::fixed(owner.bytes, maximum),
-                kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes: owner.bytes,
-                    lifetime: owner.lifetime, assumed: true,
-                    source: if envelope.dense_bytes.iter().all(|&bytes| bytes == PUSH_DENSE_BYTES_PER_RANK) {
-                        format!("{} estimated: #1329 K6 max smoke 2026-11-06 complete push 9,606,907,904 B; per-rank split unknown", owner.id)
-                    } else {
-                        format!("{} estimated: selected dense headers and bounded shared push windows; actual records validate before load", owner.id)
-                    } }) }
-        } else {
-            Component::allocation(owner.clone(), ByteCurve::fixed(owner.bytes, maximum), false, maximum)
-        }
-    }).collect())
-}
 
 /// Local-only routed execution still needs startup/lifetime hardware qualification.
 pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
@@ -1481,42 +1436,6 @@ mod tests {
             recipe.fixed = vec![invalid];
             assert!(recipe.prepare(&single()).is_err());
         }
-    }
-
-    #[test]
-    fn push_host_load_peak_is_admitted_without_reducing_ready_retention() {
-        let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(
-            &crate::plan::testing::kimi_k3_config()).unwrap();
-        let envelope = push_host_envelope(&cfg, 1).unwrap();
-        assert_eq!(envelope.dense_bytes, vec![10 << 30]);
-        assert_eq!(envelope.expert_bytes[0], cfg.dense.iter().filter(|dense| !**dense).count() as u64
-            * cfg.experts as u64 * 12);
-        let mut recipe = recipe();
-        let owners = push_host_owners(&envelope, recipe.maximum_pages).unwrap();
-        assert!(owners.iter().any(|component| matches!(&component.kind,
-            ComponentKind::Allowance(owner) if owner.assumed && owner.lifetime.last == Phase::Load)));
-        recipe.owners.extend(owners);
-        recipe.owners.push(host_prefix_owner(1024, recipe.maximum_pages));
-        let mut budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
-        let mut host = host_budget(32 << 30, 32 << 30);
-        host.headroom = 0;
-        host.logical_bytes = envelope.bytes().unwrap() + 1024;
-        budgets.push(host);
-        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
-        // The retained prefix joins at Ready; Load holds only the push staging.
-        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(1024));
-        assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(envelope.bytes().unwrap()));
-        // Load owns the push staging alone; one byte below its exact threshold refuses.
-        budgets.last_mut().unwrap().logical_bytes -= 1024 + 1;
-        let refusal = recipe.admit(single(), budgets).unwrap_err();
-        let limiting = match &refusal {
-            Refusal::FullContextShortfall { limiting, .. } => limiting.as_ref(),
-            other => other,
-        };
-        assert!(matches!(limiting, Refusal::Capacity { phase: Phase::Load, .. }), "{refusal:?}");
-        let mut actual = envelope.clone();
-        actual.dense_bytes[0] += 1;
-        assert!(matches!(envelope.validate_usage(&actual), Err(Refusal::Capacity { .. })));
     }
 
     #[test]

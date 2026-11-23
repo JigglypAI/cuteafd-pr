@@ -10,6 +10,8 @@ pub(crate) mod backend;
 pub(crate) mod cache;
 pub(crate) mod execution;
 pub(crate) mod golden;
+mod graph_sites;
+pub(crate) mod graphs;
 pub(crate) mod native;
 pub(crate) mod programs;
 pub(crate) mod serve;
