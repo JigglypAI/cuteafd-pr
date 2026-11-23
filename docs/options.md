@@ -1029,7 +1029,8 @@ no external observer, request probes, admission adjustment or automatic allowanc
 
 `CUTEAFD_KIMI_DSA_DUMP`, `CUTEAFD_KIMI_DSA_SCORES` and `CUTEAFD_KIMI_DSA_KEYS`
 are private coordinator-only Kimi K3.1 diagnostics for the DSA index route, not launch
-configuration keys; pass them through `golden-run --arm-env`.
+configuration keys; pass them through `golden-run --arm-env`. Only golden runs
+attach them: a serving engine logs a warning and ignores a stray variable.
 `CUTEAFD_KIMI_DSA_DUMP=DIR` writes every launched layer's post-selector token
 indices to `DIR/layer-NN.bin` (`KDSA0001`, one record per batch row),
 and `CUTEAFD_KIMI_DSA_DUMP_FROM=N` restricts records to engine positions at or
