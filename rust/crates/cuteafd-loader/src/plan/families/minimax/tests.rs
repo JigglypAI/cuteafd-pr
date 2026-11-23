@@ -836,7 +836,7 @@ fn recipe_inputs(gpus: usize, ranks: usize) -> crate::placement::families::minim
         &vec![96 << 30; gpus], Context::automatic(1 << 20), None);
     MiniMaxInputs { cfg: release, gpus, split_wire: Some(crate::families::minimax_m3::execution::WirePrecision::Bf16), attention,
         spark_ranks: ranks, context: Context::automatic(1 << 20),
-        pool, prefill, sequences: 16, targets: targets.clone(), owners: owners.clone(),
+        pool, prefill, decode_rows: 64, sequences: 16, targets: targets.clone(), owners: owners.clone(),
         manifest, routed: routed.clone(),
         expert_backings: (0..=routed.len()).map(|count| if count == 0 { Vec::new() } else {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
@@ -1979,7 +1979,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         coordinator: Coordinator::Planned { cards: vec![CoordinatorCard {
             physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
         attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
-        spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill,
+        spark_ranks: 4, spark_bytes: 100 << 30, prefill: expected.prefill, decode_rows: 64,
         context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
         host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64, drafter:None,
         replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
@@ -2092,7 +2092,7 @@ fn explicit_and_auto_heads_public_layouts_are_executable() {
             coordinator: Coordinator::Measured { samples: vec![(96 << 30, 96 << 30, 95 << 30); 2], loaded_code: vec![0; 2] },
             attention, split_wire: plan::layout::LayoutOptions::default().minimax_split_wire, physical_devices: &[0, 1],
             spark_ranks: 4, spark_bytes: 100 << 30, spark_rank_bytes: vec![],
-            prefill: crate::placement::planner::PrefillShape { rows: 1024, waves: 3 }, context_tokens: 32768,
+            prefill: crate::placement::planner::PrefillShape { rows: 1024, waves: 3 }, decode_rows: 64, context_tokens: 32768,
             pool_tokens: Some(32768), sequences: 16, host: (512 << 30, 480 << 30), host_cache_bytes: Some(0),
             prefix_entries: 64, drafter: None, replies: Default::default(),
             head: crate::placement::planner::serving::BlasHead::Gemm, expert_usage: false,

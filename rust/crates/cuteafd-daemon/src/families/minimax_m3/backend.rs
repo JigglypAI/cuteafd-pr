@@ -681,6 +681,7 @@ mod tests {
                 attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?
                     .unwrap_or(cuteafd_loader::placement::AttentionPlacement::Heads),
                 prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
+                decode_rows: args.decode_rows.as_option().unwrap_or(64),
                 sequences: 4, context_tokens: 0, pool_tokens: None,
                 onboard: args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
                 prefix: &args.prefix, expert_usage: args.expert_usage,

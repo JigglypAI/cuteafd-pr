@@ -46,6 +46,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires = "split_device")] decode: bool,
     /// Exercise the same bounded captured split-decode sections as serving.
     #[arg(long, requires = "decode")] decode_graphs: bool,
+    /// Per-step decode/verify row budget (default 64; 128 exercises multi-row `_m128` verify).
+    #[arg(long, default_value_t = 64)] decode_rows: u32,
     #[arg(long, default_value_t = 1024)] prefill_rows: u32,
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
     /// Validate checkpoint/reference/export headers without starting CUDA or peers.
@@ -360,7 +362,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         manifest_path: &args.manifest, manifest: Arc::clone(&manifest), coordinator,
         attention: Some(attention), split_wire: Some(wire), physical_devices: &devices,
         spark_ranks: args.peers.len(), spark_bytes: 100 << 30,
-        prefill: PrefillShape { rows: u64::from(args.prefill_rows), waves: u64::from(args.prefill_waves) },
+        prefill: PrefillShape { rows: u64::from(args.prefill_rows), waves: u64::from(args.prefill_waves) }, decode_rows: args.decode_rows,
         context_tokens: u64::from(tokens), pool_tokens: Some(u64::from(tokens).div_ceil(64) * 64), sequences: 1,
         host, host_cache_bytes: Some(0), prefix_entries: 1, drafter:None, replies: Default::default(),
         head: crate::shared::target_head::TargetHead::configured().blas_head(true), expert_usage: false,
@@ -374,7 +376,8 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             Operation::Serving, None, Default::default()))?;
         return Ok(());
     }
-    ensure!(args.peers.len() == 4, "MiniMax split golden qualifies four real Spark ranks");
+    ensure!(matches!(args.peers.len(), 4 | 6),
+        "MiniMax split golden supports four or six real Spark ranks (2+4, 2+6)");
     ensure!(!args.save_logits.try_exists()? && args.save_logits.parent().is_some_and(Path::is_dir),
         "MiniMax split logits output needs an existing parent and new directory");
     cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
@@ -408,7 +411,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     let waves = usize::from(args.prefill_waves);
     let exports = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports();
     let executions = cuteafd_loader::plan::spark_executions::admit_family("minimax_m3", &exports,
-        None, u64::from(args.prefill_rows), waves as u64)?;
+        (args.decode_rows > 64).then_some(args.decode_rows), u64::from(args.prefill_rows), waves as u64)?;
     let model = ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, rings, 1, executions)?;
     let spark_admission = SparkAdmission::plan_view(&view, ExpertGeometry::MINIMAX_M3, Some(&catalog),
         &SparkWorkingSet { rtx_layers: vec![], spark_layers: inputs.routed.clone(), spark_ranks: args.peers.len(),
@@ -443,7 +446,7 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
         "reference_manifest_sha256":fidelity_dataset::MINIMAX_M3_MANIFEST_SHA256,
         "native_lib":args.native_lib,"manifest_sha256":digest(&std::fs::read(&args.manifest)?),
         "split_devices":devices,"attention_placement":args.attention_placement,"wire":args.wire,
-        "serving_execution":true,"decode":args.decode,"prefill_rows":args.prefill_rows,
+        "serving_execution":true,"decode":args.decode,"decode_rows":args.decode_rows,"prefill_rows":args.prefill_rows,
         "prefill_waves":args.prefill_waves,"diagnostic_wire_not_qualified":true});
     std::fs::create_dir(&args.save_logits)?;
     let mut records = Vec::new();
@@ -484,15 +487,46 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
             }
             Ok(())
         }, taps.as_mut())?;
-        for position in first_decode..count {
-            let request = [ServingRequest { identity: identity as u64 + 1, kind: cuteafd_transport::ExpertV2SourceKind::Decode,
-                placement: &mut placement, start: position, tokens: &window.tokens[position..position + 1], heads: position..position + 1 }];
-            let logits = execution.decode(&owners.storage, &cfg, &schedule, &request,
-                &mut owners.graphs.borrow_mut(), args.decode_graphs)?;
+        let decode_step = if args.decode_rows > 64 { args.decode_rows as usize } else { 1 };
+        let mut position = first_decode;
+        while position < count {
+            let chunk = (count - position).min(decode_step);
+            let mut placements = (0..chunk).map(|row| Placement {
+                len: position + row, ..placement.clone()
+            }).collect::<Vec<_>>();
+            let requests = placements.iter_mut().enumerate().map(|(row, p)| ServingRequest {
+                identity: identity as u64 + 1,
+                kind: cuteafd_transport::ExpertV2SourceKind::Decode,
+                placement: p,
+                start: position + row,
+                tokens: &window.tokens[position + row..position + row + 1],
+                heads: position + row..position + row + 1,
+            }).collect::<Vec<_>>();
+            let logits = {
+                let mut graphs = owners.graphs.borrow_mut();
+                let logits = execution.decode(&owners.storage, &cfg, &schedule, &requests,
+                    &mut graphs, args.decode_graphs)?;
+                if args.decode_graphs {
+                    for graph in graphs.iter_mut() { graph.tick(); }
+                    if graphs.iter().any(|graph| graph.needs_boundary()) {
+                        // SAFETY: execution.decode drained every rank; captured storage pins
+                        // survive this joined device-controller observation.
+                        unsafe { crate::shared::decode_graph::device::observe_completed(&library, |visit| {
+                            for graph in graphs.iter_mut() { graph.visit(visit)?; }
+                            Ok(())
+                        })?; }
+                        for graph in graphs.iter_mut() { graph.observed(); }
+                    }
+                }
+                logits
+            };
             let values = logits.to_host(&library)?;
-            if let Some(raw) = &mut raw { raw.row(position + 1, &values)?; }
-            probe.row(position + 1, &values);
-            placement.len = position + 1;
+            for (row, row_logits) in values.chunks_exact(cfg.vocab_size).enumerate() {
+                if let Some(raw) = &mut raw { raw.row(position + row + 1, row_logits)?; }
+                probe.row(position + row + 1, row_logits);
+            }
+            position += chunk;
+            placement.len = position;
         }
         let record = probe.record();
         ensure!(record.error.is_none(), "MiniMax split row dump failed: {:?}", record.error);
@@ -508,6 +542,9 @@ fn run_split(args: GoldenArgs, view: CheckpointView, checkpoint: Checkpoint,
     }
     execution.drain(&owners.storage)?;
     if args.decode_graphs {
+        for graph in owners.graphs.borrow_mut().iter_mut() {
+            graph.cycle(crate::shared::decode_graph::device::Cycle::Other);
+        }
         let snapshots = crate::shared::decode_graph::device::snapshots();
         for &device in &devices {
             let snapshot = snapshots.iter().find(|snapshot| snapshot.device == device)
@@ -652,7 +689,9 @@ mod tests {
         assert!(parse_args(&["--wire", "bf16"]).is_err());
         assert!(parse_args(&["--decode-graphs"]).is_err());
         let graphed = parse_args(&["--split-device", "1", "--wire", "fp32", "--decode", "--decode-graphs"])?;
-        assert!(graphed.decode && graphed.decode_graphs);
+        assert!(graphed.decode && graphed.decode_graphs && graphed.decode_rows == 64);
+        let wide = parse_args(&["--split-device", "1", "--wire", "fp32", "--decode", "--decode-graphs", "--decode-rows", "128"])?;
+        assert_eq!(wide.decode_rows, 128);
         for (name, expected) in [("bf16", WirePrecision::Bf16), ("fp32", WirePrecision::F32)] {
             let args = parse_args(&["--device", "3", "--split-device", "1", "--wire", name,
                 "--attention-placement", "layers"])?;

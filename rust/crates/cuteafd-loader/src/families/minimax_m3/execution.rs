@@ -284,7 +284,7 @@ impl MsaPrograms {
             (Mode::IndexDecode, decode_rows, max_context.div_ceil(64)),
             (Mode::IndexPrefill, prefill_rows, max_context.div_ceil(64)),
             (Mode::AttentionDecode, decode_rows, decode_rows),
-            (Mode::AttentionExtend, prefill_rows, decode_rows),
+            (Mode::AttentionExtend, prefill_rows, decode_rows.min(64)),
         ];
         let entries = manifest["programs"]
             .as_array()
@@ -292,7 +292,7 @@ impl MsaPrograms {
         let mut specs = Vec::new();
         let mut layouts = Vec::new();
         for (mode, rows, extent) in expected {
-            let name = if heads { mode.heads_name() } else { mode.name() };
+            let name = if heads { mode.heads_name_for_rows(decode_rows) } else { mode.name_for_rows(decode_rows) };
             let refusal = |detail| Refusal::MissingExport {
                 export: name.into(),
                 geometry: if heads { "MiniMax native MSA 32Q/2KV/D128, top16/block128" }
@@ -1054,6 +1054,42 @@ mod tests {
         let mut config = cfg();
         config.heads = 32;
         assert!(MsaPrograms::resolve(&config, &manifest, 16, 2048, 2049).is_err());
+    }
+
+    #[test]
+    fn wide_128_decode_selects_m128_stems_while_keeping_extend_batch_64() {
+        let mut wide = manifest();
+        for (src_name, dst_name, mode, heads) in [
+            ("minimax_index_decode", "minimax_index_decode_m128", Mode::IndexDecode, 4u32),
+            ("minimax_attention_decode", "minimax_attention_decode_m128", Mode::AttentionDecode, 4u32),
+        ] {
+            let mut entry = wide["programs"].as_array().unwrap().iter()
+                .find(|e| e["name"] == src_name).unwrap().clone();
+            let extent = if mode == Mode::IndexDecode {
+                entry["geometry"]["max_pages"].as_u64().unwrap() as u32
+            } else { 128 };
+            let layout = Layout::new(mode, 128, extent).unwrap();
+            entry["name"] = json!(dst_name);
+            entry["capacity_rows"] = json!(128);
+            entry["geometry"]["max_rows"] = json!(128);
+            if mode == Mode::AttentionDecode { entry["geometry"]["max_batch"] = json!(128); }
+            entry["scratch_bytes_at_capacity"]["scratch"] = json!(layout.scratch);
+            for p in entry["pointers"].as_array_mut().unwrap() {
+                if p["name"] == "q2k_indices" { p["shape"] = json!(format!("[{heads},128,16]")); }
+                if p["name"] == "scratch" { p["shape"] = json!(format!("[{}]", layout.scratch)); }
+            }
+            wide["programs"].as_array_mut().unwrap().push(entry);
+        }
+        let (programs, specs) = MsaPrograms::resolve(&cfg(), &wide, 128, 2048, 2049).unwrap();
+        assert_eq!(specs[0].name, "minimax_index_decode_m128");
+        assert_eq!(specs[2].name, "minimax_attention_decode_m128");
+        assert_eq!(specs[3].name, "minimax_attention_extend");
+        assert_eq!(programs.layouts[0].rows, 128);
+        assert_eq!(programs.layouts[2].rows, 128);
+        assert_eq!(programs.layouts[3].extent, 64);
+        let (_, narrow_specs) = MsaPrograms::resolve(&cfg(), &wide, 64, 2048, 2049).unwrap();
+        assert_eq!(narrow_specs[0].name, "minimax_index_decode");
+        assert_eq!(narrow_specs[2].name, "minimax_attention_decode");
     }
     #[test]
     fn owners_keep_compiled_strides_padding_and_independent_backing_tails() {

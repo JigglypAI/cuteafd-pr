@@ -62,13 +62,15 @@ impl<P> Drop for Graphs<'_, P> {
     }
 }
 
+const MINIMAX_ROW_BUCKETS: [usize; 5] = [1, 4, 16, 64, 128];
+
 /// Project the admitted sites onto ordinary decode rows without inventing sites
 /// for a particular placement. The admitted endpoint itself is always included.
 pub(crate) fn bootstrap_keys(rank: usize, capacity: usize, sites: &[(usize, Op)]) -> Result<Vec<Key>> {
-    ensure!(rank < 2 && (1..=64).contains(&capacity), "MiniMax graph bootstrap geometry");
+    ensure!(rank < 2 && (1..=128).contains(&capacity), "MiniMax graph bootstrap geometry");
     let unique = sites.iter().copied().collect::<HashSet<_>>();
     ensure!(unique.len() == sites.len(), "MiniMax duplicate graph site");
-    let mut rows = decode_graph::ROW_BUCKETS.into_iter().filter(|&rows| rows <= capacity).collect::<Vec<_>>();
+    let mut rows = MINIMAX_ROW_BUCKETS.into_iter().filter(|&rows| rows <= capacity).collect::<Vec<_>>();
     if rows.last() != Some(&capacity) { rows.push(capacity); }
     Ok(sites.iter().flat_map(|&(layer, op)| rows.iter().map(move |&rows|
         Key { rank, layer, rows, op })).collect())
@@ -77,7 +79,7 @@ pub(crate) fn bootstrap_keys(rank: usize, capacity: usize, sites: &[(usize, Op)]
 impl<'a, P> Graphs<'a, P> {
     pub(crate) fn new(stream: Rc<Stream<'a>>, pins: Rc<P>, rank: usize, layers: usize,
         capacity: usize, sites: &[(usize, Op)], config: Config) -> Result<Self> {
-        ensure!(rank < 2 && layers > 0 && (1..=64).contains(&capacity)
+        ensure!(rank < 2 && layers > 0 && (1..=128).contains(&capacity)
             && sites.iter().all(|&(layer, _)| layer < layers), "MiniMax graph admitted geometry");
         let unique = sites.iter().copied().collect::<HashSet<_>>();
         ensure!(unique.len() == sites.len(), "MiniMax duplicate graph site");
@@ -97,7 +99,7 @@ impl<'a, P> Graphs<'a, P> {
 
     pub(crate) fn row_key(&self, live: usize) -> Result<usize> {
         ensure!((1..=self.capacity).contains(&live), "MiniMax graph rows exceed admitted decode owner");
-        Ok(decode_graph::row_bucket(live).min(self.capacity))
+        Ok(MINIMAX_ROW_BUCKETS.into_iter().find(|&bucket| bucket >= live).unwrap_or(live).min(self.capacity))
     }
     pub(crate) fn bootstrap(&self) -> Result<Vec<Key>> {
         let mut sites = self.sites.iter().copied().collect::<Vec<_>>();
@@ -228,7 +230,7 @@ mod tests {
     #[test]
     fn bootstrap_is_bounded_placement_agnostic_and_unpinned() -> Result<()> {
         let sites = [(0, Op::Attention), (3, Op::Ffn), (3, Op::Router), (3, Op::JoinRouted)];
-        for capacity in [1, 3, 16, 64] {
+        for capacity in [1, 3, 16, 64, 128] {
             for rank in [0, 1] {
                 let keys = bootstrap_keys(rank, capacity, &sites)?;
                 assert!(keys.iter().all(|key| key.rank == rank && key.rows <= capacity
@@ -239,7 +241,7 @@ mod tests {
         }
         assert!(bootstrap_keys(2, 64, &sites).is_err());
         assert!(bootstrap_keys(0, 0, &sites).is_err());
-        assert!(bootstrap_keys(0, 65, &sites).is_err());
+        assert!(bootstrap_keys(0, 129, &sites).is_err());
         assert!(bootstrap_keys(0, 64, &[(0, Op::Ffn), (0, Op::Ffn)]).is_err());
         Ok(())
     }

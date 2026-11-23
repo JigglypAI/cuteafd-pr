@@ -68,6 +68,28 @@ impl Mode {
             Self::AttentionExtend => "minimax_attention_extend_h32",
         }
     }
+    pub fn name_for_rows(self, decode_rows: u32) -> &'static str {
+        if decode_rows > 64 {
+            match self {
+                Self::IndexDecode => "minimax_index_decode_m128",
+                Self::AttentionDecode => "minimax_attention_decode_m128",
+                _ => self.name(),
+            }
+        } else {
+            self.name()
+        }
+    }
+    pub fn heads_name_for_rows(self, decode_rows: u32) -> &'static str {
+        if decode_rows > 64 {
+            match self {
+                Self::IndexDecode => "minimax_index_decode_h2_m128",
+                Self::AttentionDecode => "minimax_attention_decode_h32_m128",
+                _ => self.heads_name(),
+            }
+        } else {
+            self.heads_name()
+        }
+    }
     fn mode(self) -> &'static str {
         match self {
             Self::IndexDecode | Self::AttentionDecode => "decode",
@@ -141,7 +163,11 @@ impl Layout {
     pub fn kv_heads(self) -> u32 { self.kv_heads }
     pub fn query_heads(self) -> u32 { 16 * self.kv_heads }
     pub fn name(self) -> &'static str {
-        if self.kv_heads == 2 { self.mode.heads_name() } else { self.mode.name() }
+        if self.kv_heads == 2 {
+            self.mode.heads_name_for_rows(self.rows)
+        } else {
+            self.mode.name_for_rows(self.rows)
+        }
     }
     fn with_heads(mode: Mode, rows: u32, extent: u32, kv_heads: u32) -> Result<Self> {
         if rows == 0 || extent == 0 || rows > i32::MAX as u32 || extent > i32::MAX as u32 {
@@ -293,6 +319,10 @@ impl Layout {
         out
     }
     pub fn from_spec(spec: &ProgramSpec) -> Result<Self> {
+        let (base_name, wide_decode) = match spec.name.strip_suffix("_m128") {
+            Some(base) => (base, true),
+            None => (spec.name.as_str(), false),
+        };
         let mode = [
             Mode::IndexDecode,
             Mode::IndexPrefill,
@@ -300,7 +330,10 @@ impl Layout {
             Mode::AttentionExtend,
         ]
         .into_iter()
-        .find(|mode| spec.name == mode.name() || spec.name == mode.heads_name())
+        .find(|mode| {
+            (!wide_decode || matches!(mode, Mode::IndexDecode | Mode::AttentionDecode))
+                && (base_name == mode.name() || base_name == mode.heads_name())
+        })
         .ok_or_else(|| invalid("unknown program name"))?;
         let g = &spec.geometry;
         let field = |name: &str| {
@@ -309,10 +342,14 @@ impl Layout {
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| invalid(format!("geometry.{name}")))
         };
-        let kv_heads = if spec.name == mode.heads_name() { 2 } else { 4 };
+        let kv_heads = if base_name == mode.heads_name() { 2 } else { 4 };
+        let max_rows = field("max_rows")?;
+        if wide_decode && max_rows != 128 {
+            return Err(invalid("wide _m128 decode program must have max_rows=128"));
+        }
         let layout = Self::with_heads(
             mode,
-            field("max_rows")?,
+            max_rows,
             field(if mode.index() {
                 "max_pages"
             } else {
@@ -607,7 +644,7 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1746);
+        assert_eq!(entries.len(), 1750);
         let dense_slices = [
             "exlr8_dense_mxfp8_k6144_n4096_s1_a8",
             "exlr8_dense_mxfp8_k6144_n256_s1_a8",
@@ -674,11 +711,15 @@ mod tests {
         assert_eq!(partition, vec![
             ("minimax_attention_decode", "msa"),
             ("minimax_attention_decode_h32", "msa"),
+            ("minimax_attention_decode_h32_m128", "msa"),
+            ("minimax_attention_decode_m128", "msa"),
             ("minimax_attention_extend", "msa"),
             ("minimax_attention_extend_h32", "msa"),
             ("minimax_index_cache_gather", "gather"),
             ("minimax_index_decode", "msa"),
             ("minimax_index_decode_h2", "msa"),
+            ("minimax_index_decode_h2_m128", "msa"),
+            ("minimax_index_decode_m128", "msa"),
             ("minimax_index_prefill", "msa"),
             ("minimax_index_prefill_h2", "msa"),
             ("minimax_index_producer", "producer"),
@@ -700,11 +741,11 @@ mod tests {
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1746);
+        assert_eq!(programs.names().count(), 1750);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1746 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
+        println!("validated 1750 installed stems; MiniMax: 12 MSA, 10 Producer, 4 Forward, 1 gather");
         Ok(())
     }
 
@@ -1092,6 +1133,12 @@ impl<'a> Msa<'a> {
     }
     pub fn bind_heads(programs: &'a Programs<'a>, mode: Mode) -> Result<Self> {
         Self::bind_name(programs, mode.heads_name())
+    }
+    pub fn bind_for_rows(programs: &'a Programs<'a>, mode: Mode, decode_rows: u32) -> Result<Self> {
+        Self::bind_name(programs, mode.name_for_rows(decode_rows))
+    }
+    pub fn bind_heads_for_rows(programs: &'a Programs<'a>, mode: Mode, decode_rows: u32) -> Result<Self> {
+        Self::bind_name(programs, mode.heads_name_for_rows(decode_rows))
     }
     fn bind_name(programs: &'a Programs<'a>, name: &str) -> Result<Self> {
         let spec = programs

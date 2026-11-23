@@ -30,6 +30,7 @@ pub(crate) struct Options<'a> {
     pub split_wire: super::dense::PartialPrecision,
     pub attention_placement: cuteafd_loader::placement::AttentionPlacement,
     pub prefill: PrefillShape,
+    pub decode_rows: u32,
     pub sequences: u64,
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
@@ -138,9 +139,10 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
             cuteafd_loader::placement::planner::EmbeddingHome::Device(0))?
             .into_iter().map(|rank| rank.target).collect::<Vec<_>>()
     } else { CoordinatorWeights::plan(checkpoint, cfg, 1, &vec![0; cfg.layers])? };
+    let decode_cap = if options.decode_rows == 0 { 64 } else { options.decode_rows };
     let queries = if options.draft {
         let draft = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(&checkpoint.snapshot.join("dspark"))?;
-        options.sequences.checked_mul((draft.block + 1) as u64).context("MiniMax query rows overflow")?.min(64)
+        options.sequences.checked_mul((draft.block + 1) as u64).context("MiniMax query rows overflow")?.min(u64::from(decode_cap))
     } else { options.sequences };
     let capacity = RequestCapacity::with_queries(options.sequences, options.prefill.rows, queries)?;
     let context = if options.context_tokens == 0 { cfg.max_position as u64 } else { options.context_tokens };
@@ -165,9 +167,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         let gpu = physical.iter().position(|&device| device == id).context("MiniMax sampled rank missing")?;
         let device = devices[gpu];
         programs.load_matching(|name| names.contains(name))?;
-        let bind = if heads { Kernels::bind_heads } else if gpus == 2 { Kernels::bind_split } else { Kernels::bind };
+        let bind = if heads { Kernels::bind_heads_for_decode } else if gpus == 2 { Kernels::bind_split_for_decode } else { Kernels::bind_for_decode };
         native.push(bind(device, programs, &manifest, cfg, &targets[gpu],
-            capacity.execution_rows(), u32::try_from(context)?)?);
+            capacity.decode.rows, capacity.execution_rows(), u32::try_from(context)?)?);
         if gpus == 2 { library.peer_exchange_initialize()?; library.peer_abort_initialize()?; }
         if may_onboard && matches!(local, LocalPackage::Installed { .. }) {
             expert_modules.push(fp8::Fp8Modules::load(&package, None, &cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?)?);
@@ -200,13 +202,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         coordinator: Coordinator::Measured { samples: vec![], loaded_code: vec![] },
         attention: Some(options.attention_placement), split_wire: Some(options.split_wire), physical_devices: &physical,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
-        prefill: options.prefill, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
+        prefill: options.prefill, decode_rows: decode_cap, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
         prefix_entries: options.prefix.prefix_cache_entries as u64,
-        drafter: if options.draft { Some(cuteafd_loader::formats::block_dspark::NativeDsparkLayout::new(
+        drafter: if options.draft { Some(cuteafd_loader::formats::block_dspark::NativeDsparkLayout::new_with_decode_rows(
             &checkpoint.snapshot.join("dspark"),options.sequences as usize,options.prefill.rows as usize,
             options.prefill.waves as usize,library.sm_count()? as usize,options.prefix.prefix_cache_entries,
-            options.prefix.prefix_cache_mark_mib as u64 * (1 << 20),options.prefix.host_cache_bytes.enabled())?) } else { None }, replies,
+            options.prefix.prefix_cache_mark_mib as u64 * (1 << 20),options.prefix.host_cache_bytes.enabled(), decode_cap as usize)?) } else { None }, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();

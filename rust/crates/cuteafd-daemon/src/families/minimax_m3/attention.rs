@@ -30,18 +30,26 @@ pub(crate) struct Kernels<'a> {
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_heads(device, programs, manifest, cfg, rows, context, HeadLayout::Whole)
+        Self::bind_geometry(device, programs, manifest, cfg, rows.min(64), rows, context, HeadLayout::Whole)
+    }
+    pub fn bind_for_decode(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, decode_rows: u32, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_geometry(device, programs, manifest, cfg, decode_rows, rows, context, HeadLayout::Whole)
     }
     pub fn bind_heads(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
-        Self::bind_geometry(device, programs, manifest, cfg, rows, context, layout)
+        Self::bind_geometry(device, programs, manifest, cfg, rows.min(64), rows, context, layout)
+    }
+    pub fn bind_heads_for_decode(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, decode_rows: u32, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
+        Self::bind_geometry(device, programs, manifest, cfg, decode_rows, rows, context, layout)
     }
     fn bind_geometry(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
-        cfg: &MiniMaxM3Config, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
+        cfg: &MiniMaxM3Config, decode_rows: u32, rows: u32, context: u32, layout: HeadLayout) -> Result<Self> {
         ensure!(std::ptr::eq(device.library, programs.library()), "MiniMax attention library differs");
         let (msa_layout, msa) = match layout {
-            HeadLayout::Whole => MsaPrograms::resolve(cfg, manifest, rows.min(64), rows, context)?,
-            HeadLayout::Narrow => MsaPrograms::resolve_heads(cfg, manifest, rows.min(64), rows, context)?,
+            HeadLayout::Whole => MsaPrograms::resolve(cfg, manifest, decode_rows, rows, context)?,
+            HeadLayout::Narrow => MsaPrograms::resolve_heads(cfg, manifest, decode_rows, rows, context)?,
         };
         let (producer_layout, producers) = match layout {
             HeadLayout::Whole => ProducerPrograms::resolve(manifest, rows)?,
@@ -56,8 +64,8 @@ impl<'a> Kernels<'a> {
             HeadLayout::Narrow => (32, 2, producers::Kind::IndexHeads, forward::Kind::KvPackHeads),
         };
         let bind_msa = |mode| match layout {
-            HeadLayout::Whole => Msa::bind(programs, mode),
-            HeadLayout::Narrow => Msa::bind_heads(programs, mode),
+            HeadLayout::Whole => Msa::bind_for_rows(programs, mode, decode_rows),
+            HeadLayout::Narrow => Msa::bind_heads_for_rows(programs, mode, decode_rows),
         };
         for expected in msa.iter().chain(&producers).chain(&forward) {
             let actual = programs.spec(&expected.name)?;

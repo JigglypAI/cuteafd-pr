@@ -233,9 +233,9 @@ impl Family for MiniMaxM3 {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            128,
             7,
-            "MiniMax coordinator decode programs cover 64 rows (missing minimax_*_m128 export)",
+            "MiniMax coordinator decode programs cover up to 128 rows (minimax_*_decode_m128; missing _m256 export)",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

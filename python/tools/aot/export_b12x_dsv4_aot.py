@@ -384,7 +384,7 @@ def geometry_context(name: str, requested: int) -> int:
     return min(requested, checkpoint[1]) if checkpoint else requested
 
 
-def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: int):
+def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: int, *, wide_decode_rows: int = 128):
     from functools import partial
     from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
     from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
@@ -407,6 +407,19 @@ def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: in
         params = dict(max_rows=rows, max_batch=decode_rows, mode=mode, query_heads=32, kv_heads=2)
         result.append((f"attention_{mode}_h32", "minimax_attention", params,
                        partial(compile_minimax_attention_aot, **params)))
+    if wide_decode_rows > decode_rows:
+        r = int(wide_decode_rows)
+        for suffix, op, compiler, params in (
+            (f"index_decode_m{r}", "minimax_index", compile_minimax_index_aot,
+             dict(max_rows=r, max_pages=max_pages, mode="decode")),
+            (f"attention_decode_m{r}", "minimax_attention", compile_minimax_attention_aot,
+             dict(max_rows=r, max_batch=r, mode="decode")),
+            (f"index_decode_h2_m{r}", "minimax_index", compile_minimax_index_aot,
+             dict(max_rows=r, max_pages=max_pages, mode="decode", heads=2)),
+            (f"attention_decode_h32_m{r}", "minimax_attention", compile_minimax_attention_aot,
+             dict(max_rows=r, max_batch=r, mode="decode", query_heads=32, kv_heads=2)),
+        ):
+            result.append((suffix, op, params, partial(compiler, **params)))
     return result
 
 

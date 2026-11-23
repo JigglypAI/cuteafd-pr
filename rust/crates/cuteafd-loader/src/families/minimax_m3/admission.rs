@@ -71,6 +71,7 @@ pub struct FactsRequest<'a> {
     pub spark_bytes: u64,
     pub spark_rank_bytes: Vec<u64>,
     pub prefill: PrefillShape,
+    pub decode_rows: u32,
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
@@ -350,9 +351,15 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let ingress = spark_ingress(request.catalog, cfg, &routed, &request.manifest)
         .map_err(|error| refused(format!("MiniMax Spark ingress inventory refused: {error:#}"),
             "Provide every routed expert's input_global_scale header and value."))?;
+    let decode_cap = if request.decode_rows == 0 { 64 } else { request.decode_rows };
+    if decode_cap > shared::MAX_DECODE_ROWS {
+        return Err(refused(format!("MiniMax decode rows {decode_cap} exceeds {}", shared::MAX_DECODE_ROWS),
+            "Use --decode-rows 1..=128."));
+    }
     let decode_rows=match &request.drafter {
-        Some(draft) => u32::try_from(draft.verify_rows).map_err(|_| refused("MiniMax verify rows overflow","Use supported concurrency/draft width."))?,
-        None => shared::spark_verify_rows(request.sequences,0).map_err(|error| refused(error.to_string(),"Use supported concurrency."))?,
+        Some(draft) => u32::try_from(draft.verify_rows).map_err(|_| refused("MiniMax verify rows overflow","Use supported concurrency/draft width."))?.min(decode_cap),
+        None if decode_cap > 64 => decode_cap,
+        None => shared::spark_verify_rows_capped(request.sequences, 0, decode_cap).map_err(|error| refused(error.to_string(),"Use supported concurrency."))?,
     };
     let spark = spark_charges_for_rows(request.checkpoint, request.catalog, &routed, ranks, shape,decode_rows, ingress.ingress)
         .map_err(|error| refused(format!("MiniMax Spark inventory refused: {error:#}"),
@@ -419,7 +426,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         refused(format!("invalid KV pool policy: {error}"), "Set KV min <= target <= max."))?;
     Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, attention, split_wire: request.split_wire, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        pool, prefill: shape, sequences: request.sequences, targets, owners,
+        pool, prefill: shape, decode_rows: decode_cap, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
         spark_ingress: ingress,
         spark_reply_formats: request.replies, drafter: request.drafter.as_ref().map(|native| shared::Drafter {

@@ -431,7 +431,7 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     assert custom[0][3]() == dict(max_rows=16, max_pages=33, mode="decode")
     assert custom[1][3]() == dict(max_rows=2048, max_pages=33, mode="prefill")
     assert custom[3][3]() == dict(max_rows=2048, max_batch=16, mode="extend")
-    assert [(suffix, op, params, thunk()) for suffix, op, params, thunk in custom[4:]] == [
+    assert [(suffix, op, params, thunk()) for suffix, op, params, thunk in custom[4:8]] == [
         ("index_decode_h2", "minimax_index",
          dict(max_rows=16, max_pages=33, mode="decode", heads=2),
          dict(max_rows=16, max_pages=33, mode="decode", heads=2)),
@@ -444,6 +444,20 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
         ("attention_extend_h32", "minimax_attention",
          dict(max_rows=2048, max_batch=16, mode="extend", query_heads=32, kv_heads=2),
          dict(max_rows=2048, max_batch=16, mode="extend", query_heads=32, kv_heads=2)),
+    ]
+    assert [(suffix, op, params, thunk()) for suffix, op, params, thunk in custom[8:]] == [
+        ("index_decode_m128", "minimax_index",
+         dict(max_rows=128, max_pages=33, mode="decode"),
+         dict(max_rows=128, max_pages=33, mode="decode")),
+        ("attention_decode_m128", "minimax_attention",
+         dict(max_rows=128, max_batch=128, mode="decode"),
+         dict(max_rows=128, max_batch=128, mode="decode")),
+        ("index_decode_h2_m128", "minimax_index",
+         dict(max_rows=128, max_pages=33, mode="decode", heads=2),
+         dict(max_rows=128, max_pages=33, mode="decode", heads=2)),
+        ("attention_decode_h32_m128", "minimax_attention",
+         dict(max_rows=128, max_batch=128, mode="decode", query_heads=32, kv_heads=2),
+         dict(max_rows=128, max_batch=128, mode="decode", query_heads=32, kv_heads=2)),
     ]
     producers = namespace["minimax_producer_programs"](2048)
     assert len(producers) == 10
@@ -472,6 +486,8 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
                                   "minimax_attention_decode", "minimax_attention_extend",
                                   "minimax_index_decode_h2", "minimax_index_prefill_h2",
                                   "minimax_attention_decode_h32", "minimax_attention_extend_h32",
+                                  "minimax_index_decode_m128", "minimax_attention_decode_m128",
+                                  "minimax_index_decode_h2_m128", "minimax_attention_decode_h32_m128",
                                   "minimax_norm_rope_h64", "minimax_norm_rope_h4",
                                   "minimax_index_producer", "minimax_oai_split_i3072",
                                   "minimax_oai_split_i12288", "minimax_norm_rope_h32",

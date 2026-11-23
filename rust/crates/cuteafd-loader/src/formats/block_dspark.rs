@@ -29,11 +29,17 @@ pub struct NativeDsparkLayout {
 impl NativeDsparkLayout {
     pub fn new(snapshot:&Path, slots:usize, prefill_rows:usize, waves:usize, sms:usize,
         prefix_entries:usize, mark_budget:u64, host_prefix:bool) -> anyhow::Result<Self> {
+        Self::new_with_decode_rows(snapshot, slots, prefill_rows, waves, sms, prefix_entries, mark_budget, host_prefix, 64)
+    }
+
+    pub fn new_with_decode_rows(snapshot:&Path, slots:usize, prefill_rows:usize, waves:usize, sms:usize,
+        prefix_entries:usize, mark_budget:u64, host_prefix:bool, max_verify_rows:usize) -> anyhow::Result<Self> {
         use anyhow::{ensure,Context};
         use crate::families::glm5::draft_representation::GlmDraftRepresentation;
         let cfg = BlockDsparkConfig::read(snapshot)?;
         ensure!(cfg.dialect == DsparkDialect::MiniMax && slots > 0 && supports_sequences(slots)
-            && prefill_rows > 0 && prefill_rows <= 4096 && waves > 0 && waves <= 4,
+            && prefill_rows > 0 && prefill_rows <= 4096 && waves > 0 && waves <= 4
+            && max_verify_rows > 0 && max_verify_rows <= 128,
             "native block drafter capacity differs from checkpoint");
         ensure!((cfg.hidden,cfg.heads,cfg.kv_heads,cfg.head_dim,cfg.intermediate,cfg.layers,cfg.block,cfg.vocab)
             == (6144,64,4,128,12288,5,7,200064) && cfg.taps == [3,17,31,45,59]
@@ -69,7 +75,7 @@ impl NativeDsparkLayout {
         add("workspace.attention".into(),usize::try_from(crate::serving_capacity::draft_attention_workspace_bytes(
             slots as u64,cfg.kv_heads as u64,(cfg.heads / cfg.kv_heads * cfg.block).div_ceil(32) as u64,
             (window + cfg.block) as u64,cfg.head_dim as u64,sms as u64)?)?);
-        let verify_rows = slots.checked_mul(cfg.block + 1).context("native verify rows overflow")?.min(64);
+        let verify_rows = slots.checked_mul(cfg.block + 1).context("native verify rows overflow")?.min(max_verify_rows);
         add("verify.logits".into(),verify_rows * cfg.vocab * 4);
         add("verify.taps".into(),verify_rows * taps * h * 2);
         for slot in 0..waves {
