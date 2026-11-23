@@ -24,7 +24,7 @@ pub const VERIFY_ROWS: usize = 64;
 /// restage metadata (Q4); every such group needs its own source until read.
 #[allow(clippy::too_many_arguments)]
 pub fn upload_shape(rows: usize, decode: bool, pages: usize, pools: usize, ple_rows: usize,
-    layers: usize, units: usize, spark: bool, mtp: bool, ple_ids: bool)
+    layers: usize, units: usize, spark: bool, mtp: bool, ple_ids: bool, packed_decode_tables: bool)
     -> anyhow::Result<crate::shared::token_table::UploadShape> {
     use anyhow::Context;
     let tables = StepTableBytes::new(rows, decode, pages, pools, ple_rows)?;
@@ -56,6 +56,11 @@ pub fn upload_shape(rows: usize, decode: bool, pages: usize, pools: usize, ple_r
             // independently queued call retains twelve immutable source ranges.
             shape.fragment(12, rows.saturating_sub(1))?;
         }
+    }
+    if decode && packed_decode_tables {
+        // Commit/normalization may leave the previous round's sources live.
+        // Charge one pack's worst-case refill of the borrowed decode planes.
+        shape.append(&[tables.page_table, tables.pool_table], 1)?;
     }
     Ok(shape)
 }
@@ -151,14 +156,14 @@ mod kv_record_tests {
     fn retained_source_schedule_covers_units_and_live_verify_rows() -> anyhow::Result<()> {
         use super::{upload_shape, mtp_upload_shape, VERIFY_ROWS};
         use crate::shared::token_table::{UploadCursor, UploadShape};
-        let plain = upload_shape(4096, false, 16384, 4096, 16, 48, 3, true, false, false)?;
+        let plain = upload_shape(4096, false, 16384, 4096, 16, 48, 3, true, false, false, false)?;
         assert_eq!(plain.bytes, 143_572_992);
         assert_eq!(plain.capacity_bytes()?, 143_638_512);
-        assert_eq!(plain, upload_shape(4096, false, 16384, 4096, 16, 48, 3, true, true, false)?,
+        assert_eq!(plain, upload_shape(4096, false, 16384, 4096, 16, 48, 3, true, true, false, false)?,
             "separate MTP workspace must not duplicate source charges on target");
-        let one = upload_shape(4096, false, 16384, 4096, 16, 48, 1, true, false, false)?;
+        let one = upload_shape(4096, false, 16384, 4096, 16, 48, 1, true, false, false, false)?;
         assert_eq!(plain.bytes, 3 * one.bytes, "diagnostic wave1 still uses per-hook tables");
-        let decode = upload_shape(VERIFY_ROWS, true, 16384, 4096, 16, 48, 0, true, true, false)?;
+        let decode = upload_shape(VERIFY_ROWS, true, 16384, 4096, 16, 48, 0, true, true, false, true)?;
         let mut cursor = UploadCursor::new(decode)?;
         let planes = |rows: usize| [rows * 8, rows * 12, rows * 12, rows * 8, rows * 4,
             rows * 4, rows * 8, rows * 4, rows * 16384 * 4, rows * 4096 * 4];
@@ -171,7 +176,9 @@ mod kv_record_tests {
                 assert!(cursor.reserve(bytes)?.is_some());
             }
         }
-        assert!(cursor.reserve(16)?.is_none(), "charge has exactly the scheduler source-fence count");
+        assert!(cursor.reserve(planes(VERIFY_ROWS)[8])?.is_some());
+        assert!(cursor.reserve(planes(VERIFY_ROWS)[9])?.is_some());
+        assert!(cursor.reserve(16)?.is_none(), "decode plus next packed upload saturates the fence count");
         let mut expected = UploadShape::default();
         let mut prefill_planes = planes(4096);
         prefill_planes[8] = 16384 * 4;
@@ -200,7 +207,7 @@ mod kv_record_tests {
             }
         }
         assert!(cursor.reserve(16)?.is_none());
-        let mut local = UploadCursor::new(upload_shape(rows, false, rows, rows, 0, 48, 0, false, true, false)?)?;
+        let mut local = UploadCursor::new(upload_shape(rows, false, rows, rows, 0, 48, 0, false, true, false, false)?)?;
         for bytes in planes(rows, rows, rows).into_iter().take(10).chain([rows * 4]) {
             assert!(local.reserve(bytes)?.is_some());
         }

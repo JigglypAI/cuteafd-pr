@@ -151,6 +151,32 @@ pub(crate) struct Limits {
     pub taps: Option<usize>,
 }
 
+/// Capacity of contiguous record and index page-table planes, in entries
+/// (not physical KV pages). Sharing a KV page does not share its table entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableBudget(pub [usize; 2]);
+
+impl TableBudget {
+    fn append(self, offset: [usize; 2], entries: [usize; 2]) -> Option<[usize; 2]> {
+        let end = [offset[0].checked_add(entries[0])?, offset[1].checked_add(entries[1])?];
+        (end[0] <= self.0[0] && end[1] <= self.0[1]).then_some(end)
+    }
+
+    pub(crate) fn fits(self, tables: impl IntoIterator<Item = [usize; 2]>) -> bool {
+        tables.into_iter().try_fold([0; 2], |offset, entries| self.append(offset, entries)).is_some()
+    }
+
+    pub(crate) fn offsets(self, tables: impl IntoIterator<Item = [usize; 2]>) -> Result<Vec<[usize; 2]>> {
+        let mut end = [0; 2];
+        tables.into_iter().map(|entries| {
+            let offset = end;
+            end = self.append(offset, entries).ok_or_else(||
+                anyhow::anyhow!("packed page-table metadata exceeds its admitted capacity {:?}", self.0))?;
+            Ok(offset)
+        }).collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Segment {
     pub first: usize,

@@ -317,6 +317,10 @@ impl Qwen4Placement {
         self.units.extend_from_slice(units);
     }
 
+    pub(super) fn packed_table_entries(&self) -> [usize; 2] {
+        [self.pages.len(), self.pool_pages.len()]
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -781,7 +785,7 @@ struct Workspace<'a> {
     slots: Dev<'a>,
     seq_first: Dev<'a>,
     local_seq_first: Option<Dev<'a>>,
-    table_view: Cell<Option<(usize, usize, usize)>>,
+    table_view: Cell<Option<usize>>,
     pool_slots: Dev<'a>,
     cache_lengths: Dev<'a>,
     page_table: Dev<'a>,
@@ -826,9 +830,18 @@ struct Workspace<'a> {
     _head_workspace: Dev<'a>,
 }
 
+/// Address pair for a sequence's contiguous metadata. The caller borrows its
+/// workspace through submission; the engine retains that workspace through drain.
+#[derive(Clone, Copy)]
+pub(super) struct AttentionTables {
+    pages: *mut c_void,
+    pools: *mut c_void,
+    width: usize,
+}
+
 impl Workspace<'_> {
     fn row_table(&self, buffer: &Dev<'_>, width: usize) -> *mut c_void {
-        buffer.buffer.ptr.wrapping_byte_add(self.table_view.get().map_or(0, |v| v.0) * width)
+        buffer.buffer.ptr.wrapping_byte_add(self.table_view.get().unwrap_or(0) * width)
     }
 
     fn first_table(&self) -> *mut c_void {
@@ -837,10 +850,12 @@ impl Workspace<'_> {
         } else { self.seq_first.buffer.ptr }
     }
 
-    fn page_table(&self, pool: bool) -> *mut c_void {
-        let offset = self.table_view.get().map_or(0, |v| if pool { v.2 } else { v.1 });
-        let buffer = if pool { &self.pool_table } else { &self.page_table };
-        buffer.buffer.ptr.wrapping_byte_add(offset * 4)
+    fn attention_tables(&self, [page_offset, pool_offset]: [usize; 2], width: usize) -> AttentionTables {
+        AttentionTables {
+            pages: self.page_table.buffer.ptr.wrapping_byte_add(page_offset * size_of::<i32>()),
+            pools: self.pool_table.buffer.ptr.wrapping_byte_add(pool_offset * size_of::<i32>()),
+            width,
+        }
     }
 
     fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
@@ -1384,7 +1399,7 @@ impl<'a> Qwen4Engine<'a> {
                 let logits = if decode { DECODE_ROWS } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
                     if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
-                    self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits)?;
+                    self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits, self.gdn_banks.len() == 1)?;
                 let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
                 for (kind, bytes) in [("staging", host.staging), ("pinned-logits", host.logits)] {
                     if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
@@ -1802,6 +1817,8 @@ impl<'a> Qwen4Engine<'a> {
     /// observe the graph boundary a capture in the step may have opened.
     /// TP2 and Spark layouts hold peer or Spark waits that only the terminal
     /// abort words can release, so they refuse and retire as before (#1842).
+    /// Packed metadata pressure is earlier: at most one ordered table copy
+    /// has issued, and its upload fence precedes this stream's drain.
     fn cancel_submission(&self, kind: crate::shared::experts::rtx::pair::Recovery) -> Result<()> {
         use crate::shared::experts::rtx::pair::Recovery;
         if kind == Recovery::HostGather {
@@ -2001,7 +2018,7 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
                 units, self.has_sparks(), self.weights.mtp.is_some(),
-                self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows)?
+                self.ple.as_ref().map(|ple| ple.mapped()).is_none(), logit_rows, self.gdn_banks.len() == 1)?
         };
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
         Ok(Workspace {
@@ -2386,22 +2403,50 @@ impl<'a> Qwen4Engine<'a> {
         })
     }
 
+    pub(super) fn packed_table_budget(&self) -> crate::shared::prefill_packing::TableBudget {
+        // Admission charges DECODE_ROWS full-pool metadata rows. A sequence can
+        // use no more than one such row, regardless of shared physical pages.
+        crate::shared::prefill_packing::TableBudget([DECODE_ROWS * self.pages, DECODE_ROWS * self.pool_pages])
+    }
+
     pub(crate) fn prefill_packed(&self, sequences: &mut [crate::shared::qwen::scheduler::PrefillSeq<'_,
         Qwen4Placement, super::speculate::MtpSeq>],
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> crate::shared::prefill_packing::MemberOutcome)
         -> Result<Vec<Result<()>>> {
+        // Capacity refusal is request-local. The scheduler applies these bounds
+        // before forming the group; direct callers must also check before any
+        // mutation, CUDA submission, or terminal guard.
+        let limits = self.packed_limits().context("Qwen packing requires one attention owner")?;
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+            .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &limits)?;
+        let offsets = self.packed_table_budget().offsets(sequences.iter().map(|s| s.placement.packed_table_entries()))?;
+        ensure!(sequences.iter().enumerate().all(|(i, s)| s.start == s.placement.len
+            && !sequences[..i].iter().any(|p| p.placement.slot == s.placement.slot)),
+            "Qwen packed frontier or state-slot alias");
         crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
-            ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(), "packed Qwen requires one attention owner");
-            let limits = self.packed_limits().context("Qwen packing limits")?;
-            let segments = crate::shared::prefill_packing::plan(&sequences.iter()
-                .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &limits)?;
+            ensure!(self.execution_stream() == self.gdn_banks[0].stream,
+                "Qwen packed tables must share the decode execution stream");
+            // A sole lane issues all readers and writers in this stream's order.
+            // Exclusively borrow the decode owner through target + MTP submission;
+            // verify cannot submit reentrantly from a head callback. Captured
+            // pointers stay fixed and step_inner rewrites both planes before replay.
+            let mut decode = self.decode_workspace.try_borrow_mut()?;
+            if decode.is_none() { *decode = Some(self.workspace(DECODE_ROWS, true, DECODE_ROWS)?); }
+            let decode = decode.as_ref().context("Qwen packed decode metadata owner")?;
+            let (mut pages, mut pools) = (Vec::new(), Vec::new());
+            for s in sequences.iter() {
+                pages.extend_from_slice(&s.placement.pages);
+                pools.extend_from_slice(&s.placement.pool_pages);
+            }
+            // Only the borrowed owner stages the page IDs. If the previous
+            // sources have not retired, fail this pack before touching state,
+            // PLE or Spark. A first successful upload can still be in flight.
+            self.stage_table(decode, &decode.page_table, &pages).map_err(packed_upload_error)?;
+            self.stage_table(decode, &decode.pool_table, &pools).map_err(packed_upload_error)?;
             let mut tables: Vec<StepTables> = Vec::with_capacity(sequences.len());
             for (i, s) in sequences.iter_mut().enumerate() {
-                ensure!(s.start == s.placement.len && !tables.iter().any(|t| t.slots.first() == Some(&s.placement.slot)),
-                    "Qwen packed frontier or state-slot alias");
                 if s.start == 0 { self.start(s.placement)?; }
-                let mut table = StepTables { page_table: s.placement.pages.clone(), pool_table: s.placement.pool_pages.clone(),
-                    page_width: s.placement.pages.len(), ..Default::default() };
+                let mut table = StepTables { page_width: s.placement.pages.len(), ..Default::default() };
                 self.rows(s.placement, s.tokens, 0, &mut table)?;
                 ensure!(table.positions.len() == segments[i].rows, "Qwen packed rows differ");
                 tables.push(table);
@@ -2415,9 +2460,9 @@ impl<'a> Qwen4Engine<'a> {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false); w.terminal_valid.set(false);
             self.last_stream_offset.set(0);
             let mut all = StepTables::default();
-            let mut views = Vec::with_capacity(tables.len());
+            let views = offsets.into_iter().zip(&tables).map(|(offsets, table)|
+                decode.attention_tables(offsets, table.page_width)).collect::<Vec<_>>();
             for (s, t) in segments.iter().zip(&tables) {
-                views.push((s.first, all.page_table.len(), all.pool_table.len()));
                 all.positions.extend_from_slice(&t.positions);
                 all.rope_positions.extend_from_slice(&t.rope_positions);
                 all.block_rope_positions.extend_from_slice(&t.block_rope_positions);
@@ -2426,12 +2471,8 @@ impl<'a> Qwen4Engine<'a> {
                 all.seq_first.extend(std::iter::repeat_n(s.first as i32, s.rows));
                 all.pool_slots.extend_from_slice(&t.pool_slots);
                 all.cache_lengths.extend_from_slice(&t.cache_lengths);
-                all.page_table.extend_from_slice(&t.page_table);
-                all.pool_table.extend_from_slice(&t.pool_table);
                 all.ple_ids.extend_from_slice(&t.ple_ids);
             }
-            ensure!(all.page_table.len() <= self.pages && all.pool_table.len() <= self.pool_pages,
-                "packed member page tables exceed the admitted pool");
             w.table_view.set(None);
             let all = Arc::new(all);
             self.stage_step_tables(w, &all)?;
@@ -2480,7 +2521,7 @@ impl<'a> Qwen4Engine<'a> {
             w.row_offset.set(0);
             let outcomes = result?;
             drop(workspace);
-            super::speculate::prefill_packed(self, sequences, &segments)?;
+            super::speculate::prefill_packed(self, sequences, &segments, &views)?;
             Ok(outcomes)
         })
     }
@@ -2526,6 +2567,9 @@ impl<'a> Qwen4Engine<'a> {
 
     fn verify_step(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>,
         spec: bool, graphs: bool) -> Result<Option<DeviceLogits>> {
+        // A packed head callback cannot re-enter decode before the pack's MTP
+        // has submitted its last read of the borrowed planes.
+        drop(self.decode_workspace.try_borrow()?);
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS, "decode step of {rows} rows");
         let mut tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
@@ -2663,6 +2707,19 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn mtp_step(&self, decode: bool, groups: &[MtpGroup<'_>], source: MtpSource, heads: &[usize],
         tokens: MtpTokens<'_>, output: MtpOut) -> Result<(Vec<(u32, f32)>, Option<Vec<f32>>)> {
+        self.mtp_step_with_tables(decode, groups, source, heads, tokens, output, None)
+    }
+
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub(super) fn mtp_step_with_tables(&self, decode: bool, groups: &[MtpGroup<'_>], source: MtpSource,
+        heads: &[usize], tokens: MtpTokens<'_>, output: MtpOut, packed: Option<AttentionTables>)
+        -> Result<(Vec<(u32, f32)>, Option<Vec<f32>>)> {
+        if packed.is_some() {
+            ensure!(!decode && self.gdn_banks.len() == 1 && self.execution_stream() == self.gdn_banks[0].stream
+                && self.decode_workspace.try_borrow().is_err(), "Qwen MTP requires the packed decode-table lease");
+        } else if decode {
+            drop(self.decode_workspace.try_borrow()?);
+        }
         let mtp = self.weights.mtp.as_ref().context("MTP is not loaded (--mtp)")?;
         let (kv, keys, blocks) = self.mtp_kv.as_ref().context("MTP pools")?;
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
@@ -2684,8 +2741,10 @@ impl<'a> Qwen4Engine<'a> {
             tables.page_width = tables.page_stride;
         } else {
             ensure!(groups.len() == 1, "a prefill-shaped MTP step takes one sequence");
-            tables.page_table = groups[0].placement.pages.clone();
-            tables.pool_table = groups[0].placement.pool_pages.clone();
+            if packed.is_none() {
+                tables.page_table = groups[0].placement.pages.clone();
+                tables.pool_table = groups[0].placement.pool_pages.clone();
+            }
             tables.page_width = groups[0].placement.pages.len();
         }
         for group in groups {
@@ -2787,7 +2846,8 @@ impl<'a> Qwen4Engine<'a> {
             &[rows])?;
         // The embedding branch joins every stream (unit injection), then the attention site.
         self.post_pre(w, dst, &mtp.layer, "attn", rows)?;
-        self.attend(w, &mtp.layer, kv.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, &tables)?;
+        let pages = packed.unwrap_or_else(|| w.attention_tables([0; 2], tables.page_width));
+        self.attend(w, &mtp.layer, kv.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, &tables, pages)?;
         self.post_pre(w, dst ^ 1, &mtp.layer, "mlp", rows)?;
         self.moe(w, self.cfg.layers, &mtp.layer, t, rows, decode)?;
         let mut out = dst;
@@ -3659,14 +3719,22 @@ impl<'a> Qwen4Engine<'a> {
         tables: &StepTables) -> Result<()> {
         let cache = self.kv[index].as_ref().context("full attention layer without a record pool")?;
         let (keys, blocks) = self.index[index].as_ref().context("full attention layer without an index cache")?;
-        self.attend(w, layer, cache.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, tables)
+        let pages = w.attention_tables([0; 2], tables.page_width);
+        self.attend(w, layer, cache.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, tables, pages)
+    }
+
+    fn packed_full(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar,
+        tables: &StepTables, pages: AttentionTables) -> Result<()> {
+        let cache = self.kv[index].as_ref().context("full attention layer without a record pool")?;
+        let (keys, blocks) = self.index[index].as_ref().context("full attention layer without an index cache")?;
+        self.attend(w, layer, cache.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, "m4096", tables, pages)
     }
 
     /// Full attention of `layer` over the record pool `cache`, raw index keys
     /// `keys` and pooled block keys `blocks` (a target layer's or the MTP layer's).
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
-        blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
+        blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables, pages: AttentionTables) -> Result<()> {
         let mut pointers = vec![("x", w.live(&w.x, self.cfg.hidden * 2))];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
@@ -3680,15 +3748,15 @@ impl<'a> Qwen4Engine<'a> {
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.row_table(&w.positions, 8)), ("index_cache", blocks),
-                ("page_table", w.page_table(true)), ("output_indices", w.blocks.buffer.ptr),
+                ("page_table", pages.pools), ("output_indices", w.blocks.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Scalar::I32(tables.pool_stride as i32)])?;
         }
         self.run("qwen4_index_expand", &[("positions", w.row_table(&w.positions, 8)), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
         self.run(&format!("qwen4_{}_{cap}", self.kv_stem("sparse_gqa")), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
-            ("positions", w.row_table(&w.positions, 8)), ("page_table", w.page_table(false)),
+            ("positions", w.row_table(&w.positions, 8)), ("page_table", pages.pages),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32),
+            &[rows, Scalar::I32(pages.width as i32), Scalar::I32(tables.page_stride as i32),
                 Scalar::I32(self.attention_plan.rows() as i32)])?;
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr)];
         pointers.extend(Self::projection(layer, "w_o")?);
@@ -3941,7 +4009,7 @@ struct PackedHooks<'e, 'w, 't, 'a, 'r, 'n> {
     w: &'w Workspace<'a>,
     tables: &'t [StepTables],
     segments: &'t [crate::shared::prefill_packing::Segment],
-    views: &'t [(usize, usize, usize)],
+    views: &'t [AttentionTables],
     transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
     cur: usize,
     entered: bool,
@@ -3982,11 +4050,11 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
         }
         let layer = &self.engine.weights.layers[index];
         for ((s, table), &view) in self.segments.iter().zip(self.tables).zip(self.views) {
-            self.w.row_offset.set(s.first); self.w.position.set(s.start); self.w.table_view.set(Some(view));
+            self.w.row_offset.set(s.first); self.w.position.set(s.start); self.w.table_view.set(Some(s.first));
             let n = Scalar::I32(s.rows as i32);
             match layer.attention {
                 Qwen4Attention::Gdn => self.engine.gdn(self.w, index, layer, n, "m4096", false)?,
-                Qwen4Attention::Full => self.engine.full(self.w, index, layer, n, "m4096", table)?,
+                Qwen4Attention::Full => self.engine.packed_full(self.w, index, layer, n, table, view)?,
             }
         }
         self.aggregate();
@@ -4202,6 +4270,15 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         })
     }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+}
+
+fn packed_upload_error(error: anyhow::Error) -> anyhow::Error {
+    use crate::shared::experts::rtx::pair::{RecoverableStepError, Recovery};
+    if error.is::<crate::shared::token_table::UploadPressure>() {
+        RecoverableStepError::new(Recovery::PackedMetadata, error.to_string()).into()
+    } else {
+        error
+    }
 }
 
 fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_context: usize) -> Result<()> {
@@ -4585,6 +4662,26 @@ mod packed_route_fixture {
             engine.library.copy_d2h(&mut bytes, buffer)?;
             Ok(bytes)
         }).collect()
+    }
+
+    #[test]
+    fn shared_128k_prefix_uses_physical_units_once_and_fits_decode_metadata() -> Result<()> {
+        let shared = 131_072 / UNIT_ROWS;
+        let members = 16;
+        let private = 3;
+        let pool = 1_122_560 / UNIT_ROWS;
+        let entries = [(shared + private) * UNIT_PAGES, shared + private];
+        assert_eq!((shared + members * private) * UNIT_ROWS, 143_360);
+        assert!(shared + members * private < pool && members * (shared + private) > pool);
+        let old = crate::shared::prefill_packing::TableBudget([pool * UNIT_PAGES, pool]);
+        assert!(!old.fits(std::iter::repeat_n(entries, members)));
+        let decode = crate::shared::prefill_packing::TableBudget([DECODE_ROWS * pool * UNIT_PAGES, DECODE_ROWS * pool]);
+        let offsets = decode.offsets(std::iter::repeat_n(entries, members))?;
+        assert_eq!(offsets[15], [15 * entries[0], 15 * entries[1]]);
+        let shape = super::super::admission::StepTableBytes::new(DECODE_ROWS, true, pool * UNIT_PAGES, pool, 0)?;
+        assert_eq!(shape.page_table + shape.pool_table, 5_612_800);
+        assert!(members * (entries[0] + entries[1]) * size_of::<i32>() < shape.page_table + shape.pool_table);
+        Ok(())
     }
 
     #[test]

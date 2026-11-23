@@ -27,6 +27,9 @@ pub(crate) enum Recovery {
     /// step may hold device-local work; only an owner set with no peer or
     /// Spark work in flight can drain it without terminal abort words.
     HostGather,
+    /// Only ordered metadata copies may have been queued; no request state or
+    /// peer/Spark submission has started.
+    PackedMetadata,
 }
 
 /// The only request-local failure a submission body can raise. Any other

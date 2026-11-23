@@ -1788,9 +1788,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
             let units = if ranks > 0 && options.prefill_waves > 1 { usize::try_from(options.prefill_waves)? } else { 0 };
             let mtp = cfg.mtp_layers > 0 && options.native_mtp_layers > 0;
             let prefill = upload_shape(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES,
-                cfg.ple_rows(), cfg.layers, units, ranks > 0, mtp, ple_ids)?;
+                cfg.ple_rows(), cfg.layers, units, ranks > 0, mtp, ple_ids, false)?;
             let decode = upload_shape(VERIFY_ROWS, true, pages, pages / QWEN_UNIT_PAGES,
-                cfg.ple_rows(), cfg.layers, 0, ranks > 0, mtp, ple_ids)?;
+                cfg.ple_rows(), cfg.layers, 0, ranks > 0, mtp, ple_ids, options.rtx_bytes.len() == 1)?;
             let separate_mtp = if units > 0 && mtp { mtp_upload_shape(usize::try_from(unit_rows)?,
                 pages, pages / QWEN_UNIT_PAGES, units)?.capacity_bytes()? } else { 0 };
             staging = prefill.capacity_bytes()?.checked_add(decode.capacity_bytes()?).and_then(|n| n.checked_add(separate_mtp))
