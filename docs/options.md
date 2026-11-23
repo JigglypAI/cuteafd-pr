@@ -1026,9 +1026,10 @@ at the family's native unit, as ascending logical ids: GLM 5.3 and Kimi tokens (
 records only full-indexer layers), GLM Flash 4-token pools, V4.1 compressed rows (2
 tokens at layers 2/8/14, 1 from 20), MiniMax 128-token blocks per KV head (`block * 4 +
 head`). `CUTEAFD_DIAG_SELECTION_DUMP_FROM=N` drops rows before engine position `N`.
-It refuses attached CUDA graphs (run with `GPU_GRAPH_RESERVE=0`; GLM Flash and GLM 5.3
-skip startup graph prewarm while it is set) and context attention placement (use
-`heads` or whole). `scripts/bench/sparse_selection_study.py` reads the files (#2576).
+It refuses attached CUDA graphs and context attention placement (use `heads` or
+whole). GLM 5.3 and GLM Flash skip startup graph prewarm and Kimi serves without
+startup graphs while it is set; V4.1 needs `GPU_GRAPH_RESERVE=0` to keep its index
+selection eager (GLM Flash refuses that key, #2586). `scripts/bench/sparse_selection_study.py` reads the files (#2576).
 Unset: no drain, no copy, no behavior change.
 
 `CUTEAFD_DIAG_PEER_WAIT=1` is a private coordinator-only diagnostic for every
