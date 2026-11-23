@@ -5983,6 +5983,19 @@ def test_graph_exact_rows_rejects_invalid_and_other_families(tmp_path):
     assert "unused configuration key" in unused.stderr
 
 
+def test_graph_exact_rows_allows_donor_cold_lag_override(tmp_path):
+    glmf = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+            "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, glmf, "test/glmf",
+                                   "RTX_GPUS=2\nGRAPH_EXACT_ROWS=on\nGRAPH_DONOR_COLD_LAG=16\n")
+    assert result.returncode == 0, result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if "serve-glmf" in line and "--snapshot" in line))
+    assert "--graph-exact-rows=on" in serve
+    idx = serve.index("--graph-donor-cold-lag")
+    assert serve[idx + 1] == "16"
+
+
 @pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])
 @pytest.mark.parametrize("kv", ["bf16", "fp8"])
 def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv):

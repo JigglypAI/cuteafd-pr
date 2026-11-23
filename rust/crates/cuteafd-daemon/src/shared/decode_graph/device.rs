@@ -82,6 +82,8 @@ impl std::hash::Hash for Identity {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool { *value == 0 }
+
 #[derive(Default, Clone, Copy, Debug, serde::Serialize)]
 pub(crate) struct Counters {
     pub hits: u64,
@@ -95,6 +97,15 @@ pub(crate) struct Counters {
     pub hot_guard_skips: u64,
     pub updates_soft: u64,
     pub updates_hard: u64,
+    /// Cumulative wall-clock nanoseconds spent in successful cold-donor updates
+    /// (from update ticket acquisition through host source capture,
+    /// `cudaGraphExecUpdate` and donor rekey).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub update_ns: u64,
+    /// Cumulative wall-clock nanoseconds spent inside the driver
+    /// `cudaGraphExecUpdate` call of successful donor updates.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub update_exec_ns: u64,
     pub donor_rekeys: u64,
     pub update_failures: u64,
     pub no_cold_donor_soft: u64,
@@ -222,6 +233,7 @@ struct UpdateRequest {
     estimate: Option<Estimate>,
     hard: bool,
     pinned: bool,
+    started: Instant,
 }
 
 const OOM_RETRY_MISSES: u16 = 256;
@@ -1485,7 +1497,7 @@ impl DeviceCache {
         }
         self.next_id += 1;
         let id = self.next_id;
-        self.update_requests.insert(id, UpdateRequest { identity, site, estimate, hard, pinned });
+        self.update_requests.insert(id, UpdateRequest { identity, site, estimate, hard, pinned, started: Instant::now() });
         Some(id)
     }
 
@@ -1607,7 +1619,10 @@ impl DeviceCache {
             return None;
         };
         let exec = self.native_graphs[&donor].exec;
-        if !update(exec).unwrap_or_else(|error| { tracing::warn!(%error, "cold graph update failed"); false }) {
+        let exec_started = Instant::now();
+        let accepted = update(exec).unwrap_or_else(|error| { tracing::warn!(%error, "cold graph update failed"); false });
+        let exec_ns = exec_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if !accepted {
             invalidate(exec);
             self.remove_drained(&[donor]);
             self.counters.entry(request.site.cycle).or_default().update_failures += 1;
@@ -1673,13 +1688,18 @@ impl DeviceCache {
         self.sync_inventory(id);
         self.identity_generation += 1;
         self.trim_ghosts();
+        let total_ns = request.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let counters = self.counters.entry(request.site.cycle).or_default();
         counters.misses += 1;
         counters.donor_rekeys += 1;
         if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
+        counters.update_ns = counters.update_ns.saturating_add(total_ns);
+        counters.update_exec_ns = counters.update_exec_ns.saturating_add(exec_ns);
         let counters = self.update_sites.entry(request.site.name).or_default().entry(request.site.cycle).or_default();
         counters.donor_rekeys += 1;
         if request.hard { counters.updates_hard += 1 } else { counters.updates_soft += 1 }
+        counters.update_ns = counters.update_ns.saturating_add(total_ns);
+        counters.update_exec_ns = counters.update_exec_ns.saturating_add(exec_ns);
         Some(transferred)
     }
 
@@ -2771,7 +2791,7 @@ mod tests {
         cache.next_id += 1;
         let id = cache.next_id;
         cache.update_requests.insert(id, UpdateRequest { identity: key, site: site(Preference::Capture),
-            estimate: None, hard: cache.charged >= cache.reserve, pinned: false });
+            estimate: None, hard: cache.charged >= cache.reserve, pinned: false, started: Instant::now() });
         cache.register_native(id, 0, vec![3, 7, 11]);
         id
     }
@@ -2930,6 +2950,9 @@ mod tests {
         assert_eq!(cache.records[&donor].list, Some(List::RecentGhost));
         assert!(cache.records[&donor].last_used.is_some());
         assert_eq!(cache.counters[&Cycle::Decode].updates_soft, 1);
+        assert!(cache.counters[&Cycle::Decode].update_ns > 0);
+        assert!(cache.counters[&Cycle::Decode].update_ns >= cache.counters[&Cycle::Decode].update_exec_ns);
+        assert_eq!(cache.update_sites["test"][&Cycle::Decode].update_ns, cache.counters[&Cycle::Decode].update_ns);
         assert_eq!(cache.pending_destroy, 0);
         assert_eq!(cache.counters[&Cycle::Decode].evictions, 0);
         let _ = cache.miss(key(1), site(Preference::Capture), None, false);
