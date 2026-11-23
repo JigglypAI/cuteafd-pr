@@ -26,7 +26,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let mut options = PlanOptions {
         fp8_prefill: args.fp8_prefill.clone(),
         decode_lanes: args.decode_lanes,
-        decode_rows: args.decode_rows,
+        decode_rows: args.decode_rows.as_option(),
         draft_length: args.draft_length,
         attention_precision: args.attention.attention_precision,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
@@ -338,7 +338,7 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     configured!(prefill_waves, "PREFILL_WAVES");
     if !args.explicit_settings.contains("decode_rows") {
         if let Some(value) = get("DECODE_ROWS") {
-            args.decode_rows = cuteafd_loader::plan::decode_rows::parse_setting(value)
+            args.decode_rows = value.parse()
                 .map_err(|error| anyhow::anyhow!("DECODE_ROWS: {error}"))?;
         }
     }
@@ -2097,7 +2097,7 @@ mod tests {
             context_tokens: Some(262144),
             prefill_rows: 0, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
-            decode_rows: None, draft_length: None,
+            decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting::AUTO, draft_length: None,
             index_cache: Some(crate::families::glm5_flash::engine::IndexCache::Keys),
             replay_records: Some(crate::cli::PlanReplayRecords::Own),
             concurrency: 8,

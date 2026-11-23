@@ -621,8 +621,8 @@ pub(crate) struct PlanArgs {
     pub(crate) prefill_span_rows: u64,
     /// Global decode/verify row budget for --layout: `auto` (64) or 1..=CONCURRENCY*(max_draft+1)
     /// within the family's exported program capacity (`DECODE_ROWS`).
-    #[arg(long, default_value = "auto", value_parser = cuteafd_loader::plan::decode_rows::parse_setting)]
-    pub(crate) decode_rows: Option<u32>,
+    #[arg(long, default_value = "auto")]
+    pub(crate) decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Fixed draft length cap (`DRAFT_LENGTH`) for validating `DECODE_ROWS` demand in --layout.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub(crate) draft_length: Option<u32>,
@@ -1592,8 +1592,8 @@ pub(crate) struct NativeServeArgs {
     /// Decode/verify row budget per lane: `auto` (64) or 1..=256 within
     /// concurrency * (max_draft + 1) (`DECODE_ROWS`). Serve resolves this once
     /// at boot before any allocation.
-    #[arg(long, default_value = "auto", value_parser = cuteafd_loader::plan::decode_rows::parse_setting)]
-    pub decode_rows: Option<u32>,
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Host RAM cap for preloading mapped tables: every table (rows and scales)
     /// when all fit and the runtime preloads rows (V4.1 Engram), else all separate
     /// per-row scales when they fit; 0 keeps all mapped.
@@ -1728,7 +1728,7 @@ impl NativeServeArgs {
     }
     /// Resolved decode/verify row budget (64 when `auto`/unset).
     pub(crate) fn resolved_decode_rows(&self) -> u32 {
-        self.decode_rows.unwrap_or(cuteafd_core::V41_VERIFY_ROWS as u32)
+        self.decode_rows.as_option().unwrap_or(cuteafd_core::V41_VERIFY_ROWS as u32)
     }
     /// Retained snapshots per bank: `--prefix-cache-entries`, or the concurrency-derived default.
     pub(crate) fn resolved_prefix_entries(&self) -> u32 {

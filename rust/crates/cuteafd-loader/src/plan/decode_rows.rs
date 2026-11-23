@@ -70,6 +70,43 @@ pub struct DecodeRowsRequest {
     pub draft_length: Option<u32>,
 }
 
+/// CLI/config setting for `DECODE_ROWS` / `--decode-rows`: `auto` or an explicit positive count.
+///
+/// Wrapped as a newtype rather than `Option<u32>` so clap's derive macro parses
+/// `"auto"` and integers directly through `FromStr` without treating `Option`
+/// as an absent flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeRowsSetting(pub Option<u32>);
+
+impl DecodeRowsSetting {
+    pub const AUTO: Self = Self(None);
+
+    pub const fn explicit(rows: u32) -> Self {
+        Self(Some(rows))
+    }
+
+    pub const fn as_option(self) -> Option<u32> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for DecodeRowsSetting {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_setting(value).map(Self)
+    }
+}
+
+impl std::fmt::Display for DecodeRowsSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(rows) => write!(f, "{rows}"),
+            None => f.write_str("auto"),
+        }
+    }
+}
+
 /// Parse a `DECODE_ROWS` / `--decode-rows` spelling: `"auto"` or a positive integer.
 pub fn parse_setting(value: &str) -> Result<Option<u32>, String> {
     let trimmed = value.trim();

@@ -161,14 +161,14 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     let decode_rows = cuteafd_loader::plan::resolve_decode_rows(
         "deepseek_v41",
         cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
-            requested: args.decode_rows,
+            requested: args.decode_rows.as_option(),
             concurrency: u64::from(args.concurrency),
             decode_lanes: lanes,
             rtx_gpus: args.rtx_gpus as usize,
             draft_length: if args.dspark { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
         },
     )?;
-    args.decode_rows = Some(decode_rows);
+    args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(decode_rows);
     cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     Ok(lanes)
 }
@@ -986,10 +986,15 @@ const SCORING_ROWS: usize = 48;
 struct ScoringPlan {
     path: crate::shared::probe::ScorePath,
     rows: usize,
+    max_decode_rows: usize,
 }
 
 impl ScoringPlan {
     fn new(spec: &cuteafd_api::openai::probe::ProbeSpec) -> Result<Self> {
+        Self::with_decode_limit(spec, SCORING_ROWS)
+    }
+
+    fn with_decode_limit(spec: &cuteafd_api::openai::probe::ProbeSpec, max_decode_rows: usize) -> Result<Self> {
         use crate::shared::probe::ScorePath;
         let path = ScorePath::parse(spec.score_path.as_deref(), ScorePath::Prefill)?;
         let rows = match path {
@@ -999,16 +1004,16 @@ impl ScoringPlan {
             }
             ScorePath::Decode => {
                 let rows = spec.verify_rows.unwrap_or(8);
-                ensure!((1..=SCORING_ROWS).contains(&rows),
-                    "unsupported probe verify_rows={rows} for deepseek_v41; supports 1..={SCORING_ROWS}");
+                ensure!((1..=max_decode_rows).contains(&rows),
+                    "unsupported probe verify_rows={rows} for deepseek_v41; supports 1..={max_decode_rows}");
                 rows
             }
         };
-        Ok(Self { path, rows })
+        Ok(Self { path, rows, max_decode_rows })
     }
 
-    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize) -> Result<Self> {
-        let mut plan = Self::new(spec)?;
+    fn for_probe(spec: &cuteafd_api::openai::probe::ProbeSpec, chunk_rows: usize, max_decode_rows: usize) -> Result<Self> {
+        let mut plan = Self::with_decode_limit(spec, max_decode_rows)?;
         if plan.path == crate::shared::probe::ScorePath::Prefill && spec.score_positions.is_some() {
             // Sparse scoring keeps the head bounded while exercising the actual prefill geometry.
             ensure!(chunk_rows > 0, "prefill scoring capacity is zero");
@@ -1023,7 +1028,11 @@ impl ScoringPlan {
             && probe.spec.score_positions.is_some();
         let mut rows: Vec<usize> = (0..step.len())
             .filter(|&row| !sparse || probe.wants(step.start + row + 1)).collect();
-        ensure!(rows.len() <= SCORING_ROWS, "scored prefill selection exceeds target head capacity");
+        let head_cap = match self.path {
+            crate::shared::probe::ScorePath::Prefill => SCORING_ROWS,
+            crate::shared::probe::ScorePath::Decode => self.max_decode_rows,
+        };
+        ensure!(rows.len() <= head_cap, "scored selection exceeds target head capacity ({head_cap})");
         if rows.is_empty() { rows.push(step.len() - 1); }
         Ok(rows)
     }
@@ -1069,7 +1078,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, retained: Option<RetainedScores>, shape: PrefillShape, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    let plan = ScoringPlan::for_probe(&probe.spec, shape.rows)?;
+    let plan = ScoringPlan::for_probe(&probe.spec, shape.rows, super::graph_policy::max_decode_rows() as usize)?;
     ensure!((1..tokens.len()).contains(&from), "scoring needs at least two tokens");
     probe.selected_score_path(plan.path.name());
     let (decode_pass, decode_transport) = decode_lane;
@@ -1262,23 +1271,31 @@ mod scoring_tests {
     fn sparse_prefill_uses_backbone_capacity_without_changing_decode_head_indices() {
         let spec = ProbeSpec { score_path: Some("prefill".into()),
             score_positions: Some(vec![101, 1100, 2048]), ..ProbeSpec::default() };
-        let plan = ScoringPlan::for_probe(&spec, 2048).unwrap();
+        let plan = ScoringPlan::for_probe(&spec, 2048, SCORING_ROWS).unwrap();
         assert_eq!(plan.rows, 2048);
         let probe = Probe::new(spec.clone());
         assert_eq!(plan.head_rows(&probe, &(100..2148)).unwrap(), vec![0, 999, 1947]);
         assert_eq!(plan.head_rows(&probe, &(2148..4196)).unwrap(), vec![2047]);
-        assert!(ScoringPlan::for_probe(&spec, 0).is_err());
+        assert!(ScoringPlan::for_probe(&spec, 0, SCORING_ROWS).is_err());
         let too_many = Probe::new(ProbeSpec { score_positions: Some((101..150).collect()),
             ..spec.clone() });
         assert!(plan.head_rows(&too_many, &(100..2148)).is_err());
 
         let decode_spec = ProbeSpec { score_path: Some("decode".into()),
             verify_rows: Some(8), ..spec };
-        let decode = ScoringPlan::for_probe(&decode_spec, 2048).unwrap();
+        let decode = ScoringPlan::for_probe(&decode_spec, 2048, SCORING_ROWS).unwrap();
         assert_eq!(decode.rows, 8);
         assert_eq!(decode.head_rows(&Probe::new(decode_spec), &(100..108)).unwrap(),
             (0..8).collect::<Vec<_>>());
-        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048).unwrap().rows, 48);
+        assert_eq!(ScoringPlan::for_probe(&ProbeSpec::default(), 2048, SCORING_ROWS).unwrap().rows, 48);
+
+        let wide_spec = ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(128), ..ProbeSpec::default() };
+        let wide = ScoringPlan::for_probe(&wide_spec, 2048, 128).unwrap();
+        assert_eq!(wide.rows, 128);
+        assert_eq!(wide.head_rows(&Probe::new(wide_spec), &(100..228)).unwrap().len(), 128);
+        assert!(ScoringPlan::for_probe(&ProbeSpec { score_path: Some("decode".into()),
+            verify_rows: Some(129), ..ProbeSpec::default() }, 2048, 128).is_err());
     }
 
     #[test]

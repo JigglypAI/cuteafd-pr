@@ -173,14 +173,14 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let verify_rows = cuteafd_loader::plan::resolve_decode_rows(
         "glm5_flash",
         cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
-            requested: args.engine.decode_rows,
+            requested: args.engine.decode_rows.as_option(),
             concurrency: max_sequences as u64,
             decode_lanes: 1,
             rtx_gpus: 1 + usize::from(args.engine.split_device.is_some()),
             draft_length: if args.engine.draft.is_some() { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
         },
     )?;
-    args.engine.decode_rows = Some(verify_rows);
+    args.engine.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(verify_rows);
     cuteafd_bench::context::set_resolved("decode-rows", &verify_rows.to_string());
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
@@ -1055,7 +1055,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
-                    DECODE_ROWS, probe::verify_rows(&job.probe), true, &mut placement,
+                    verify_rows, probe::verify_rows(&job.probe), true, &mut placement,
                     |placement, chunk, rows, position| {
                         offer()?;
                         if rows > 1 {

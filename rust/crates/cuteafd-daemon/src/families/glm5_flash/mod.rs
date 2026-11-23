@@ -132,8 +132,8 @@ pub(crate) struct EngineArgs {
     pub prefill_rows: usize,
     /// Global decode/verify row budget (`DECODE_ROWS`): `auto` (64), or 1..=128 on one GPU
     /// (steps above 64 rows run the wide `_m128` programs; steps up to 64 keep `_m64`).
-    #[arg(long, default_value = "auto", value_parser = cuteafd_loader::plan::decode_rows::parse_setting)]
-    pub decode_rows: Option<u32>,
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Numerical decode/verify reduction rows, independent of execution capacity.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
@@ -961,9 +961,9 @@ mod draft_cli_tests {
     /// on one GPU; a head split is refused before any checkpoint or native work.
     #[test]
     fn decode_rows_default_to_64_and_take_128_on_one_gpu() {
-        assert_eq!(parse(&[]).decode_rows, None);
+        assert_eq!(parse(&[]).decode_rows, cuteafd_loader::plan::decode_rows::DecodeRowsSetting::AUTO);
         assert_eq!(parse(&[]).resolved_decode_rows(), engine::DECODE_ROWS);
-        assert_eq!(parse(&["--decode-rows", "auto"]).decode_rows, None);
+        assert_eq!(parse(&["--decode-rows", "auto"]).decode_rows, cuteafd_loader::plan::decode_rows::DecodeRowsSetting::AUTO);
         let wide = parse(&["--decode-rows", "128"]);
         assert_eq!(wide.resolved_decode_rows(), engine::WIDE_DECODE_ROWS);
         check_options(&wide).unwrap();
@@ -1077,7 +1077,7 @@ mod draft_cli_tests {
         for (prefill, decode, capacity) in [(32, 64, 64), (64, 128, 128), (128, 128, 128), (256, 64, 256)] {
             let mut args = parse(&["--peers", "127.0.0.1:19441"]);
             args.prefill_rows = prefill;
-            args.decode_rows = Some(decode as u32);
+            args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(decode as u32);
             args.prefill_waves = 3;
             assert_eq!(args.expert_rows(), capacity);
             for bf16 in [false, true] {
@@ -1689,7 +1689,7 @@ impl EngineArgs {
 
     /// Resolved verify-row budget (64 when `auto`/unset).
     pub(crate) fn resolved_decode_rows(&self) -> usize {
-        self.decode_rows.map_or(engine::DECODE_ROWS, |rows| rows as usize)
+        self.decode_rows.as_option().map_or(engine::DECODE_ROWS, |rows| rows as usize)
     }
 
     /// Compiled coordinator decode program bucket covering `resolved_decode_rows()` (64 or 128).
