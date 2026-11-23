@@ -166,8 +166,8 @@ fn add_bf16(
     Ok(())
 }
 
-/// Named scratch planes shared by planning and allocation. One request block
-/// runs at a time; target taps are indexed by slot and by provisional row.
+/// Named scratch for all admitted request blocks. Target taps are indexed by
+/// slot and provisional row; one latent staging slab is reused across layers.
 pub fn workspace(
     cfg: &Hy4DflyConfig,
     text: &Hy4FlashConfig,

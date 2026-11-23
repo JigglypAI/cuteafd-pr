@@ -1016,6 +1016,23 @@ fn run_resume_check(
                 let tail = &expected[expected.len().saturating_sub(2)..];
                 ensure!(p_a.engram_tail.ends_with(tail) && p_b.engram_tail.ends_with(tail),
                     "DFly2 rejected rows advanced Engram state");
+                if step == 0 {
+                    // Compare the same committed taps, in singleton and two-member
+                    // schedules, with distinct anchors and a different depth per member.
+                    let members = [&p_a, &p_b].into_iter().enumerate().map(|(i, p)| {
+                        super::draft::Member { slot: p.slot, pos: p.len,
+                            bonus: if i == 0 { tok } else { (tok + 1) % vocab as u32 }, depth: 5 - i * 2 }
+                    }).collect::<Vec<_>>();
+                    let separate = members.iter().map(|m| engine.draft_batch(std::slice::from_ref(m))
+                        .map(|mut batch| batch.pop().expect("singleton DFly2 output")))
+                        .collect::<Result<Vec<_>>>()?;
+                    let together = engine.draft_batch(&members)?;
+                    let matches = together == separate;
+                    if at + 1 <= 2048 {
+                        ensure!(matches, "DFly2 batched proposals differ from singleton: {together:?} vs {separate:?}");
+                    }
+                    println!("hy4f-golden DFly2 batch at {at}: proposal ids match={matches}");
+                }
             }
             if step == 0 || (dfly2 && step <= 2) {
                 let after_a = engine.dump_state(&p_a)?;
