@@ -477,13 +477,16 @@ case "$(get GRAPH_PREWARM on)" in
   off) graph_policy_args+=(--graph-no-prewarm) ;;
   *) release_die 'GRAPH_PREWARM must be on or off' ;;
 esac
-graph_donor_always="$(get GRAPH_DONOR_ALWAYS off)"
+local donor_default=off cold_lag_default=0
+[[ "$family" != inkling2 ]] || donor_default=on
+graph_donor_always="$(get GRAPH_DONOR_ALWAYS "$donor_default")"
 case "$graph_donor_always" in
   on) graph_policy_args+=(--graph-donor-always) ;;
   off) ;;
   *) release_die 'GRAPH_DONOR_ALWAYS must be on or off' ;;
 esac
-graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"
+if [[ "$family" == inkling2 && "$graph_donor_always" == on ]]; then cold_lag_default=8; fi
+graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG "$cold_lag_default")"
 [[ "$graph_donor_cold_lag" =~ ^[0-9]+$ ]] || release_die 'GRAPH_DONOR_COLD_LAG must be a non-negative integer'
 if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
   [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
@@ -493,6 +496,13 @@ if [[ "$family" == qwen3_5 ]]; then
   case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
     off) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
+    *) release_die "DECODE_GRAPHS must be on or off" ;;
+  esac
+fi
+if [[ "$family" == inkling2 ]]; then
+  case "$(get DECODE_GRAPHS on)" in
+    on) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
+    off) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
@@ -2610,6 +2620,13 @@ audio_encoder_hash=""
     case "$(get DECODE_GRAPHS on)" in
       on) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
       off) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
+      *) release_die "DECODE_GRAPHS must be on or off" ;;
+    esac
+  fi
+  if [[ "$family" == inkling2 ]]; then
+    case "$(get DECODE_GRAPHS on)" in
+      on) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
+      off) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
       *) release_die "DECODE_GRAPHS must be on or off" ;;
     esac
   fi

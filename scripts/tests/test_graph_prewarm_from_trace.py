@@ -2373,3 +2373,38 @@ def test_hy4_flash_selects_replayed_rows_prices_siblings_and_rejects_bad_topolog
     bad["graphs"][0]["nodes"] = 1
     with pytest.raises(ValueError, match="invalid local Hy4-flash section topology"):
         MODULE.generate_hy4_flash([bad], "exl3-k4-mc-1rtx-0spark")
+
+
+def inkling_graph_trace(device, decode_hits, verify_hits):
+    return {"schema_version": 2, "cache": {"device": device, "charged": 40 << 20}, "graphs": [
+        {"site": "inkling2.section", "shape": f"Key {{ layer: 0, rows: {rows}, section: RankAttention, mode: {mode} }}",
+         "hits": hits, "nodes": 22, "capture_bytes": cost, "spans_devices": False}
+        for rows, mode, hits, cost in [(1, "Decode", decode_hits, 2 << 20), (8, "Verify", verify_hits, 1 << 20),
+                                       (7, "Verify", 0, 1 << 20)]
+    ]}
+
+
+def test_inkling_pins_only_half_of_a_real_band_and_prices_replayed_shapes():
+    result = MODULE.generate_inkling2([
+        ("C1", 10, [inkling_graph_trace(5, 5, 4), inkling_graph_trace(2, 4, 4)]),
+        ("C16", 20, [inkling_graph_trace(2, 7, 9), inkling_graph_trace(5, 1, 10)]),
+    ], "exl3-original-tp2-spark", 2)
+    low, high = result["ranks"]
+    assert low["rank"] == 0 and high["rank"] == 1
+    for rank in (low, high):
+        assert rank["reserve_base_bytes"] == 4 << 20
+        assert rank["reserve_extra_bytes"] == 2 << 20
+        assert {e["rows"] for e in rank["entries"]} == {1, 8}
+    assert not any(e["pin"] for e in low["entries"])
+    assert all(e["pin"] for e in high["entries"])
+
+
+def test_inkling_rejects_missing_ranks_or_inflated_and_spanning_hits():
+    with pytest.raises(ValueError, match="one snapshot per rank"):
+        MODULE.generate_inkling2([("C1", 10, [inkling_graph_trace(0, 2, 2)])], "tp2", 2)
+    with pytest.raises(ValueError, match="accounting"):
+        MODULE.generate_inkling2([("C1", 10, [inkling_graph_trace(0, 11, 0)])], "tp1", 1)
+    spanning = inkling_graph_trace(0, 2, 2)
+    spanning["graphs"][0]["spans_devices"] = True
+    with pytest.raises(ValueError, match="invalid or duplicate"):
+        MODULE.generate_inkling2([("C1", 10, [spanning])], "tp1", 1)

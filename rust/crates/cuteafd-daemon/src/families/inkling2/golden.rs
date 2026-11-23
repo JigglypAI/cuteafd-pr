@@ -34,6 +34,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, value_delimiter=',')] pub width_invariance: Vec<usize>,
     /// Compare every accepted prefix's live KV/FIR state and next-cycle logits.
     #[arg(long, requires="width_invariance")] pub commit_invariance: bool,
+    /// Compare repeated exact-width graph replays from the same prompt state.
+    #[arg(long, requires="width_invariance", conflicts_with="commit_invariance")] pub graph_parity: bool,
     #[arg(long, default_value_t=64)] pub prefill: usize,
     #[arg(long, value_delimiter=',')] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,

@@ -814,8 +814,12 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
             for (prefix, rows) in std::iter::once((format!("inkling2.decode.{gpu}"), 64usize))
                 .chain((0..prefill.waves).map(|slot| (format!("inkling2.unit.{gpu}.{slot}"), prefill.rows as usize))) {
                 let parts = if gpus == 2 && placement == AttentionPlacement::Heads { 2 } else { 1 };
-                let expected = crate::families::inkling2::execution::UnitLayout::serving_head_parts(
-                    &cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts).unwrap();
+                use crate::families::inkling2::execution::UnitLayout;
+                let expected = if prefix.starts_with("inkling2.decode.") {
+                    UnitLayout::serving_decode(&cfg, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts)
+                } else {
+                    UnitLayout::serving_head_parts(&cfg, rows, 1 << 20, inputs.kv_format, inputs.sequences as usize, parts)
+                }.unwrap();
                 let actual = contract.components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(gpu as u8) => template.id.strip_prefix(&format!("{prefix}."))
                         .filter(|name| *name != "uploads")

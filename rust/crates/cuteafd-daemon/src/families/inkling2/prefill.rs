@@ -1,5 +1,5 @@
 //! Family arithmetic on the shared causal unit executor; no private schedule.
-use super::{experts::Dispatcher, layers::{self, Kernels}, owners::UnitBuffers, weights::TargetWeights};
+use super::{experts::Dispatcher, graphs::{self, DecodeGraphs, Mode, Section}, layers::{self, Kernels}, owners::UnitBuffers, weights::TargetWeights};
 use crate::shared::prefill_pipeline::{run_prefill_units, sequence_units, FfnRoute, PrefillHooks, Unit};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_loader::families::inkling2::Inkling2Config;
@@ -100,7 +100,7 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
 
 pub(crate) struct PeerUnits<'s, 'a> {
     pub exchange: &'s crate::shared::peer_split::PeerExchange<'a>,
-    pub graphs: Option<&'s mut super::engine::DecodeGraphs<'a>>,
+    pub(super) graphs: Option<&'s mut DecodeGraphs<'a>>,
     pub kernels: &'s Kernels<'a>,
     pub target: &'s TargetWeights<'a>,
     pub cache: &'s super::cache::CacheBank<'a>,
@@ -109,13 +109,15 @@ pub(crate) struct PeerUnits<'s, 'a> {
 }
 
 impl<'a> PeerUnits<'_, 'a> {
-    fn attention(&mut self, kernels: &Kernels<'a>, lead_graphs: Option<&mut super::engine::DecodeGraphs<'a>>,
-        lead: &impl UnitBuffers<'a>, target: &TargetWeights<'_>,
+    fn attention(&mut self, kernels: &Kernels<'a>, lead_graphs: Option<&mut DecodeGraphs<'a>>,
+        lead: &super::owners::PackedLayerUnit<'_, 'a>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, layer: usize, unit: &Unit, members: &[super::owners::PackedMember]) -> Result<()> {
         use crate::shared::peer_split::DIRECT;
         let peer = &self.owners[unit.slot];
         let rows = unit.rows.len();
         let bytes = rows * cfg.hidden * 4;
+        let mode = if lead.unit.replaying() { Mode::Verify } else { Mode::Decode };
+        let mut lead_graphs = lead_graphs;
         let input = layers::mix_attention_input(kernels, lead, target, cfg, layer, rows)?;
         let source = if layer == 0 { "partial" } else if cfg.local[layer] { "mixed" } else { "global_mixes" };
         let dst = peer.buffer(source)?;
@@ -137,25 +139,29 @@ impl<'a> PeerUnits<'_, 'a> {
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
         // Both ranks consume rank-local KV and write an F32 output partial.
         self.exchange.on(1, || {
-            layers::attend_heads(self.kernels, &peer_state, self.target, cfg, layer, rows, dst)?;
-            let work = || layers::project_heads(self.kernels, &peer_state, self.target, cfg, layer, rows);
-            if let Some(graphs) = &mut self.graphs { graphs.project(layer, rows, work) } else { work() }
+            graphs::local(self.graphs.as_deref_mut(), peer_state.stream(), layer, rows, Section::RankAttention, mode, || {
+                layers::attend_heads(self.kernels, &peer_state, self.target, cfg, layer, rows, dst)?;
+                layers::project_heads(self.kernels, &peer_state, self.target, cfg, layer, rows)
+            })
         })?;
         self.exchange.push(1, 0, peer.buffer("branch")?.ptr, bytes)?;
-        layers::attend_heads(kernels, lead, target, cfg, layer, rows, input)?;
-        let work = || layers::project_heads(kernels, lead, target, cfg, layer, rows);
-        if let Some(graphs) = lead_graphs { graphs.project(layer, rows, work)?; } else { work()?; }
+        graphs::local(lead_graphs.as_deref_mut(), lead.stream(), layer, rows, Section::RankAttention, mode, || {
+            layers::attend_heads(kernels, lead, target, cfg, layer, rows, input)?;
+            layers::project_heads(kernels, lead, target, cfg, layer, rows)
+        })?;
         self.exchange.wait(0, 0)?;
         let remote = cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.exchange.recv(0, 0)?,
             bytes, device_id: lead.stream().device.id, flags: 0 };
         let reduced = kernels.reduce_heads(lead, layers::output_weight(target, layer)?, remote, rows, cfg.hidden)?;
-        layers::finish_attention(kernels, lead, target, cfg, layer, rows, reduced)?;
-        layers::prepare_ffn_input(kernels, lead, target, cfg, layer, rows)
+        graphs::local(lead_graphs, lead.stream(), layer, rows, Section::AfterAttention, mode, || {
+            layers::finish_attention(kernels, lead, target, cfg, layer, rows, reduced)?;
+            layers::prepare_ffn_input(kernels, lead, target, cfg, layer, rows)
+        })
     }
 }
 
 pub(crate) struct Stateful<'s, 'a> {
-    pub graphs: Option<&'s mut super::engine::DecodeGraphs<'a>>,
+    pub(super) graphs: Option<&'s mut DecodeGraphs<'a>>,
     pub peer: Option<PeerUnits<'s, 'a>>,
     pub kernels: &'s Kernels<'a>,
     pub owners: &'s [super::owners::UnitOwner<'a>],
@@ -196,13 +202,24 @@ impl Stateful<'_, '_> {
                     member.tokens, &placement.units, self.cache.layout.pool_pages)? })
         }).collect()
     }
+    fn prepare_routes(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let owner = &self.owners[unit.slot];
+        let rows = unit.rows.len();
+        graphs::local(self.graphs.as_deref_mut(), &owner.stream, layer, rows, Section::Routes, Mode::Decode, || {
+            layers::prepare_routes(self.kernels, owner, self.target, self.cfg, layer, rows)
+        })
+    }
     fn join(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let owner = &self.owners[unit.slot];
         let members = self.packed_members(unit)?;
         let state = super::owners::PackedLayerUnit { unit: owner, cache: self.cache, layer, members: &members,
             uploads: std::cell::RefCell::new(&mut self.uploads[unit.slot]) };
         self.io.stage(layer,"experts",unit,owner)?;
-        layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+        let rows = unit.rows.len();
+        let mode = if owner.replaying() { Mode::Verify } else { Mode::Decode };
+        graphs::local(self.graphs.as_deref_mut(), state.stream(), layer, rows, Section::ExpertFinish, mode, || {
+            layers::join_experts(self.kernels, &state, self.target, self.cfg, layer, rows)
+        })?;
         self.io.stage(layer,"exit",unit,owner)
     }
 }
@@ -245,21 +262,26 @@ impl PrefillHooks for Stateful<'_, '_> {
         if let Some(peer) = &mut self.peer {
             peer.attention(self.kernels, self.graphs.as_deref_mut(), &state, self.target, self.cfg, layer, unit, &members)?;
         } else {
-            layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, unit.rows.len())?;
+            let rows = unit.rows.len();
+            let mode = if owner.replaying() { Mode::Verify } else { Mode::Decode };
+            graphs::local(self.graphs.as_deref_mut(), state.stream(), layer, rows, Section::WholeAttention, mode, || {
+                layers::begin_layer(self.kernels, &state, self.target, self.cfg, layer, rows)
+            })?;
         }
         self.io.stage(layer,"attention",unit,owner)
     }
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        self.prepare_routes(layer, unit)?;
         let owner = &self.owners[unit.slot];
-        layers::routed_ffn(self.kernels, owner, self.target, self.local[layer].as_ref(), self.cfg, layer, unit.rows.len())?;
+        layers::dispatch_experts(owner, self.local[layer].as_ref(), unit.rows.len())?;
         self.join(layer, unit)
     }
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
         use crate::shared::{experts::staging::RouteStaging, spark_waves};
         use cuteafd_transport::ExpertV2SourceKind;
+        self.prepare_routes(layer, unit)?;
         let owner = &self.owners[unit.slot];
         let rows = unit.rows.len();
-        layers::prepare_routes(self.kernels, owner, self.target, self.cfg, layer, rows)?;
         let identity = *self.next_identity;
         ensure!(identity > 0, "Inkling Spark request identity is zero");
         *self.next_identity = identity.checked_add(1).context("Inkling Spark identity exhausted")?;

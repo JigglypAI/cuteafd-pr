@@ -348,10 +348,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        // Initial TP2 reserve for the bounded private decode epilogues. No
-        // graph ever captures the peer exchange or paged attention state.
-        let base = if gpus == 2 && placement == crate::placement::AttentionPlacement::Heads { 256 << 20 } else { 0 };
-        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, 0)
+        graph_reserve.push(crate::serving_capacity::inkling2_graphs::policy(gpu, gpus)
             .map_err(|error| refused(format!("Inkling 2 graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
