@@ -340,7 +340,7 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
     timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("policy.observe(&outcomes)")
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("policy.observe_timed(&outcomes,")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
     assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in engine
