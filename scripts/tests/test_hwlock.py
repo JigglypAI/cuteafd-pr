@@ -167,28 +167,26 @@ def test_maxq_lock_uses_the_standard_flock_path(lockdir):
             handle.close()
 
 
-def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
-    # The LAN-only seeds' leases sort after every serving lock, and each seed's
-    # GPU-export turn after every lease: a build holds its lease when it queues
-    # for the export, so the turn must come later in the one canonical order.
+def test_lan_seed_locks_are_known_and_ordered_after_serving():
+    # The LAN-only seeds' leases sort after every serving lock.
     assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
-    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'maxq')
-    assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
-        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
+    assert hwlock.ORDER[-3:] == ('kakapo', 'cassowary', 'maxq')
+    assert hwlock.canonical(['kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
+        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary']
     assert hwlock.canonical(['maxq', 'gpu0']) == ['gpu0', 'maxq']
 
 
 def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):
     monkeypatch.setattr(hwlock, 'LOCK_DIR', lockdir)
-    busy = spawn(lockdir, 'kakapo-export', 5.0, lockdir / 'busy')
+    busy = spawn(lockdir, 'kakapo', 5.0, lockdir / 'busy')
     try:
         wait_for(lockdir / 'busy')
         calls = []
         with pytest.raises(hwlock.Cancelled):
-            with hwlock.hold(['kakapo-export'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
+            with hwlock.hold(['kakapo'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
                 pytest.fail('a cancelled waiter never holds the lock')
         assert not list((lockdir / 'hwq').glob('*.ticket')) or all(
-            'kakapo-export' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
+            'kakapo' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
     finally:
         busy.wait(timeout=10)
 

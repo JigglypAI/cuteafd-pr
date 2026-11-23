@@ -19,6 +19,10 @@ def main():
     a=p.parse_args()
     os.environ['B12X_COMPILE_DISK_CACHE']='0'
     os.environ['B12X_COMPILE_MEMORY_CACHE']='0'
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target('sm120')
     from b12x.moe._shared.v41_router import compile_v41_router_scores_aot, V41_ROUTER_SKINNY_MAX_ROWS
     a.output_dir.mkdir(parents=True,exist_ok=True)
     manifest_path=a.output_dir/'v41_router.json'
@@ -42,6 +46,8 @@ def main():
         print(f'exported {label}',flush=True)
     lock=_pinned_sparkinfer.LOCK_DATA
     manifest_path.write_text(json.dumps(dict(schema=1,sparkinfer=lock,variants=variants),indent=2)+'\n')
+    if torch.cuda.is_initialized():
+        raise RuntimeError('offline V4.1 router export initialized CUDA')
 
 
 if __name__=='__main__':

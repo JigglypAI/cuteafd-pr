@@ -175,10 +175,8 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    result = subprocess.run(['bash', '-c', setup + helpers + '\nwip_capped_export() { shift; printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator all "$state_dir/source-staging"'], capture_output=True, text=True,
+    result = subprocess.run(['bash', '-c', setup + helpers + '\nbuild_coordinator all "$state_dir/source-staging"'], capture_output=True, text=True,
                             env={**os.environ, 'HOME': str(tmp_path / 'home'), 'PATH': f'{tools}:{os.environ["PATH"]}',
                                  'TRACE': str(trace)})
     assert result.returncode == 0, result.stderr
@@ -187,7 +185,7 @@ CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 
 def test_native_cache_hit_takes_no_gpu_turn(tmp_path):
     stdout, lines = _wip_coordinator(tmp_path, hit=True)
-    assert 'native cache hit, no GPU turn' in stdout
+    assert 'WIP coordinator export: native cache hit' in stdout
     assert not any(line.startswith('turn ') for line in lines)
     native = [line for line in lines if line.endswith('/wip/output/coordinator native')]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
@@ -195,22 +193,17 @@ def test_native_cache_hit_takes_no_gpu_turn(tmp_path):
 
 def test_incomplete_native_cache_entry_falls_through_to_rebuild(tmp_path):
     stdout, lines = _wip_coordinator(tmp_path, hit=True, incomplete=True)
-    assert 'native cache hit, no GPU turn' not in stdout
-    assert 'done by capped' in stdout and 'capped' in lines
+    assert 'WIP coordinator export: native cache hit' not in stdout
+    assert 'WIP coordinator export: CPU export' in stdout
     assert not any('CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in line for line in lines)
 
 
-def test_native_cache_miss_probes_capped_without_queueing(tmp_path):
+def test_native_cache_miss_runs_cpu_export_without_gpu_lock(tmp_path):
     stdout, lines = _wip_coordinator(tmp_path, hit=False)
-    assert 'done by capped' in stdout
-    assert 'capped' in lines
+    assert 'WIP coordinator export: CPU export' in stdout
+    native = [line for line in lines if line.endswith('/wip/output/coordinator native')]
+    assert len(native) == 1 and 'CUDA_VISIBLE_DEVICES=' in native[0]
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
-
-
-def test_native_cache_miss_with_every_export_cached_takes_no_gpu_turn(tmp_path):
-    stdout, lines = _wip_coordinator(tmp_path, hit=False, exports_cached=True)
-    assert 'every export restored from the export cache, no GPU turn' in stdout
-    assert 'capped' not in lines and not any(line.startswith('turn ') for line in lines)
 
 
 def test_native_store_moves_entries_between_instance_and_host_store(tmp_path):
@@ -404,7 +397,7 @@ def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypa
     assert 'build.lock' not in text and 'wip.sh --slot s --role both' in text
     assert arms['cand']['build_slot'] is True
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
-    assert "if build_role == 'both' and arm['build_lock_mode'] != 'native-phase':" in source
+    assert "if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build':" in source
     wip = (ROOT / 'wip.sh').read_text()
     assert 'build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe' in wip
 

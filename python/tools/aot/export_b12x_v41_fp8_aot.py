@@ -98,6 +98,9 @@ def dispatch_header(output: Path, manifest: dict) -> None:
 def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None:
     os.environ['B12X_COMPILE_DISK_CACHE'] = '0'
     os.environ['B12X_COMPILE_MEMORY_CACHE'] = '0'
+    from b12x._lib.aot_target import describe_target
+
+    describe_target('sm120')
     import torch
     from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot
     from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
@@ -204,6 +207,8 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
             artifacts[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     manifest['artifacts'] = artifacts
     (output / 'v41_fp8.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    if torch.cuda.is_initialized():
+        raise RuntimeError('offline V4.1 FP8 export initialized CUDA')
 
 
 def main() -> None:

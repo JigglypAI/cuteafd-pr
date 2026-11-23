@@ -96,7 +96,7 @@ def test_v41_launch_uses_cdi_for_coordinator_and_exports_helpers_to_workers():
 def test_no_legacy_gpus_flag_in_launchers():
     for name in ('build.sh', 'run.sh', 'wip.sh', 'scripts/launch/run-family.sh', 'scripts/build/cuteafd-dev.sh',
                  'scripts/bench/wip-cards.py', 'scripts/bench/golden-run.py', 'scripts/bench/ab-spark-intake.sh',
-                 'scripts/bench/glm5/ab-glm-weighted.sh', 'scripts/build/export-remote.sh', 'scripts/build/verify-nvfp4-modelopt-container.sh',
+                 'scripts/bench/glm5/ab-glm-weighted.sh', 'scripts/build/verify-nvfp4-modelopt-container.sh',
                  'scripts/build/configure-docker-nvidia-runtime.sh', 'quantization/deploy_workers.py',
                  'quantization/launch_quantization.py'):
         text = (ROOT / name).read_text()

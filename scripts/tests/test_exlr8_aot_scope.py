@@ -99,8 +99,6 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     assert coordinator.count('${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"}') == 2  # build + finalize
     assert "${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'}" in expert  # quoted remote build command
     assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e' in wip
-    # The remote-export env file carries every CUTEAFD_* -e of the coordinator build.
-    assert "grep -E '^CUTEAFD_[A-Z0-9_]+='" in wip
     finalize = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
     assert 'if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then' in finalize
     assert 'programs-check --native-lib' in finalize and '--exlr8-role' in finalize

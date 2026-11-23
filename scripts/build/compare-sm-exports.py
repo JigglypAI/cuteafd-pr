@@ -890,10 +890,23 @@ def worker(payload):
     os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
-    from b12x._lib.compile_pool import _initialize_worker
     capability = worker_capability(payload)
-    _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
-                       payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
+    try:
+        from b12x._lib.aot_target import describe_target
+    except ImportError:
+        from b12x._lib.compile_pool import _initialize_worker
+        _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
+                           payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
+    else:
+        l2_bytes = (96 << 20) if capability == (12, 0) and payload["sms"] == 170 else None
+        describe_target(
+            capability,
+            device_uuid="sm-export-comparison",
+            product_name="sm-export-comparison",
+            sm_count=payload["sms"],
+            l2_cache_size=l2_bytes,
+            preserve_existing=False,
+        )
     import torch
     import importlib.metadata
     toolchain = {name: importlib.metadata.version(name) for name in ("torch", "triton", "nvidia-cutlass-dsl")}
@@ -929,9 +942,10 @@ def worker(payload):
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
         if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_aot.py"):
-            # Standalone exporters initialize a one-SM offline target themselves.
+            # Older baselines initialize a one-SM offline target via compile_pool.
             # Retain this worker's synthetic target so the comparison is meaningful.
             from b12x._lib import compile_pool
+            previous_init = compile_pool._initialize_worker
             def retain_target(ordinal, capability, *_):
                 if ordinal != 0 or capability != (12, 0):
                     raise ValueError("standalone exporter changed the comparison target")
@@ -939,7 +953,7 @@ def worker(payload):
             try:
                 runpy.run_path(str(path), run_name="__main__")
             finally:
-                compile_pool._initialize_worker = _initialize_worker
+                compile_pool._initialize_worker = previous_init
         else:
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,

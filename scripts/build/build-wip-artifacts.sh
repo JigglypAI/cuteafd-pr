@@ -159,7 +159,7 @@ mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"
 export CUTEAFD_WIP_HOST_ISA_RESOLVED="${host_isas[*]}"
 [[ "$phase" == native || "$phase" == export ]] || cuteafd_build_cache_cargo_offline "$source_dir/rust/Cargo.toml"
-if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-off}" == on || "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
+if [[ "$phase" == native || "$phase" == export ]] && ! cuteafd_compiler_cache_check_cmake_compilers "$build_dir/native"; then
   # Copied configure metadata can name a different compiler shim. Objects and
   # AOT outputs remain reusable; only the stale configure identity is discarded.
   rm -f "$build_dir/native/CMakeCache.txt"
@@ -197,9 +197,8 @@ if [[ -z "$wip_previous_fingerprint" || "$wip_previous_native" != "$wip_native_f
 fi
 wip_current_fingerprint="$wip_rust_fingerprint $wip_native_fingerprint"
 
-if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
-  renice -n 19 -p "$$" >/dev/null
-else
+renice -n 19 -p "$$" >/dev/null 2>&1 || true
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
   unset CARGO_BUILD_JOBS
 fi
 [[ -n "${RUST_TEST_THREADS:-}" ]] || unset RUST_TEST_THREADS
@@ -368,9 +367,10 @@ if [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" 
 else
   export CUTEAFD_EXPORT_CACHE=off
 fi
-# One process budget shared by variant workers across all Ninja package jobs.
+# One process budget shared by CPU variant workers across all Ninja package jobs.
+export CUDA_VISIBLE_DEVICES=""
+export NVIDIA_VISIBLE_DEVICES=void
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
-export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
 mapfile -t native_build_args < <(cuteafd_native_build_args)
 cmake --build "$build_dir/native" -- "${native_build_args[@]}"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"

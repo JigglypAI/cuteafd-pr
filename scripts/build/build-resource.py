@@ -3,9 +3,8 @@
 
 A LAN-only build seed (LAN_SEEDS: GB10, 10 GbE, never serves) admits several
 builds at once: a shared SEED.lock umbrella plus one exclusive SEED.build.N.lock
-per counting slot, min(cores/6, MiB/32768) of them. The slots cover Cargo and the
-other CPU phases only; wip.sh takes the seed's exclusive GPU-export turn
-(hwlock SEED-export) around the native export inside the lease. With --balance an
+per counting slot, min(cores/6, MiB/32768) of them. Both Cargo and CPU-only AOT
+exports run inside the counting lease with no GPU-export turn. With --balance an
 automatic seed takes the LAN seed with the fewest held slots (the named --host on
 a tie), then --fallback (rhea/moa under their exclusive locks). --pick prints that
 choice without waiting or holding anything (wip.sh's early seed placement).
@@ -13,9 +12,7 @@ choice without waiting or holding anything (wip.sh's early seed placement).
 from __future__ import annotations
 
 import argparse
-import contextlib
 import fcntl
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -27,13 +24,6 @@ import time
 # Keep in sync with release_lan_seed_hosts (scripts/lib/release-common.sh) and
 # scripts/hw/hwlock.py LAN_SEEDS.
 LAN_SEEDS = ('kakapo', 'cassowary')
-
-
-def _hwlock():
-    spec = importlib.util.spec_from_file_location('cuteafd_hwlock', Path(__file__).resolve().parents[1] / 'hw/hwlock.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def capacity(cores: int, memory_mib: int) -> int:
@@ -120,32 +110,6 @@ def publish_grant(path: Path, grant: dict):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-
-
-def take_export_turn(stack: contextlib.ExitStack, directory: Path, host: str, args, cancelled,
-                     handles: list | None = None) -> str:
-    """The seed's GPU-export turn for this lease: the fair hwlock SEED-export lock
-    on a LAN seed, whose counting lease admits other builds; a seed under an
-    exclusive lock (rhea, moa) is already ours. Drop the plain-flocked SEED.lock
-    umbrella before queueing in hwlock so a fair-queued job wanting both SEED and
-    SEED-export cannot deadlock with this turn; the counting slot stays held.
-    Tells wip.sh through export-granted or export-failed; the turn is held in
-    `stack` until export-done or teardown."""
-    started = time.monotonic()
-    if host in LAN_SEEDS:
-        while handles and len(handles) > 1:
-            handles.pop(0).close()
-        hwlock = _hwlock()
-        hwlock.LOCK_DIR = directory
-        try:
-            stack.enter_context(hwlock.hold([f'{host}-export'], args.wait, f'GPU export on {host}', cancelled=cancelled))
-        except hwlock.Cancelled:
-            return 'cancelled'
-        except TimeoutError as error:
-            (args.lease_dir / 'export-failed').write_text(str(error))
-            return 'failed'
-    publish_grant(args.lease_dir / 'export-granted', {'host': host, 'waited_s': round(time.monotonic() - started)})
-    return 'held'
 
 
 def main():
@@ -238,7 +202,6 @@ def main():
     if handles is None:
         return
     fd = None
-    export_turn = contextlib.ExitStack()
     try:
         if stopping or not owner_alive(args.owner, start):
             return
@@ -249,7 +212,6 @@ def main():
         fd = os.open(args.lease_dir / 'release', os.O_RDONLY | os.O_NONBLOCK)
         # No lease expiry: each phase has its own terminating timeout. Stop
         # the instance's build container before *any* mutex release.
-        export_state = 'idle'
         while not stopping and owner_alive(args.owner, start):
             try:
                 released = os.read(fd, 1)
@@ -257,14 +219,6 @@ def main():
                 released = b''
             if released:
                 break
-            if export_state == 'idle' and (args.lease_dir / 'export-request').exists():
-                export_state = take_export_turn(export_turn, directory, host, args,
-                                                lambda: stopping or not owner_alive(args.owner, start), handles)
-                if export_state == 'cancelled':
-                    break
-            elif export_state == 'held' and (args.lease_dir / 'export-done').exists():
-                export_turn.close()  # the export's ssh returned: nothing of it runs on the GPU
-                export_state = 'done'
             time.sleep(0.2)
         if args.container and (args.lease_dir / 'active').exists():
             while True:
@@ -279,12 +233,11 @@ def main():
                     continue
                 if result.returncode == 0:
                     break
-                # Fail closed: an unreachable host is not proof that CUDA stopped.
+                # Fail closed: an unreachable host is not proof that the container stopped.
                 time.sleep(60)
     finally:
         if fd is not None:
             os.close(fd)
-        export_turn.close()
         for handle in handles:
             handle.close()
 

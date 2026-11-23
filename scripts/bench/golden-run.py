@@ -37,9 +37,8 @@ Spark's GB10 GPU instead of raptor, from each arm's sealed Spark leg (the spark-
 slot `./wip.sh --role both|expert` seals) in HOST's own WIP root, where wip.sh seals a
 seed's leg and copies it to the serving Sparks. HOST is a build seed, kakapo or cassowary
 (approved for single-Spark kernel work; off the fabric), or a pool Spark when its lock is
-free. Locks: a seed's build umbrella and GPU-export turn (SEED, SEED-export: no build
-lease, seed encode or export shares the GPU), a pool Spark's serving lock (sparks for
-ostrich/dodo/emu/kiwi, rhea, moa). The container runs the slot's sealed dev image and
+free. Locks: a seed's build umbrella (SEED: no build lease or seed encode shares the host),
+a pool Spark's serving lock (sparks for ostrich/dodo/emu/kiwi, rhea, moa). The container runs the slot's sealed dev image and
 aarch64 artifacts with the same source tree, mounts, environment and working directory
 as raptor, plus `--device nvidia.com/gpu=all`, the serving identity and a memory cap
 (--memory-bytes, else CUTEAFD_DEV_MEMORY, else 16g, swap equally), bounded by an
@@ -608,9 +607,8 @@ def worker_command(state, arm, rank, record):
 
 # --sm121-host: the build seeds (off the fabric, approved for single-Spark kernel
 # work) and the pool Sparks. A seed's GPU is guarded by its counting build lease
-# umbrella (SEED.lock, shared by Cargo leases and seed-hosted GPU encodes) and its
-# GPU-export turn (SEED-export): both are taken, so no build, encode or export
-# shares the GPU. A pool Spark takes its serving lock, so no card runs beside it.
+# umbrella (SEED.lock, shared by build leases and exclusive for seed-hosted GPU
+# runs). A pool Spark takes its serving lock, so no card runs beside it.
 SM121_HOSTS = ('kakapo', 'cassowary', *HOST_LOCKS)
 DEFAULT_SM121_MEMORY = '16g'
 SM121_SCRATCH = 'golden-sm121'  # under ~/.cache/cuteafd/builds/TASK/ on the Spark; removed after the turn
@@ -619,7 +617,7 @@ SM121_SCRATCH = 'golden-sm121'  # under ~/.cache/cuteafd/builds/TASK/ on the Spa
 def sm121_locks(host):
     if host not in SM121_HOSTS:
         raise ValueError(f'--sm121-host {host} is not a GB10 Spark ({", ".join(SM121_HOSTS)})')
-    return hwlock.canonical([host, f'{host}-export'] if host in hwlock.LAN_SEEDS else [HOST_LOCKS[host]])
+    return hwlock.canonical([host] if host in hwlock.LAN_SEEDS else [HOST_LOCKS[host]])
 
 
 def sm121_memory(memory_bytes):

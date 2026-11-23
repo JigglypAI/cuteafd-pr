@@ -477,12 +477,10 @@ These apply to every agent and are also in `AGENTS.md`.
 - **Disk:** builds fill raptor's root NVMe fast (`builds/` reached 1.4 TB and
   crashed runs with "No space left on device"). Delete Cargo `target*` and
   release staging when a task finishes; check `df -h /` before large builds.
-- **AOT exports outside the locks:** CuTe/Triton exporters query the device
-  at compile time, so the export container needs a GPU, but not a lock.
-  Pin it to an idle RTX (≤512 MiB used, bounded wait), watchdog its
-  memory, and on a Spark export only when no serving container runs and
-  ≥100 GiB CUDA memory is free. Log host, GPU and time so a concurrent
-  measurement can be explained.
+- **AOT exports run on CPU without locks:** CuTe DSL and Triton AOT exporters
+  run CPU-only (`CUDA_VISIBLE_DEVICES=""`) using `b12x._lib.aot_target.describe_target`
+  and never touch a GPU or take a hardware lock. Build-slot admission and
+  host-wide CPU worker caps keep concurrent builds from starving serving runs.
 - **Root:** run privileged commands directly as
   `agent-sudo -n --agent-context "<why>" <command>` with the whole command
   visible. A wrapper script under sudo (`sudo python profile.py`) is flagged by

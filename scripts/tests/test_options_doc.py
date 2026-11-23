@@ -66,7 +66,7 @@ def family_keys(family: str) -> set[str]:
     )
     assert result.returncode == 0, result.stderr
     # release_reject_unused_keys always allows the shared site/build keys.
-    return set(result.stdout.split()) | {"CUTEAFD_EXPORT_HOST", "WIP_BUILD_SEED"}
+    return set(result.stdout.split()) | {"WIP_BUILD_SEED"}
 
 
 def tables(lines: list[str]):

@@ -1457,7 +1457,7 @@ def test_sm121_command_runs_the_spark_leg_under_the_seed_locks(sm121_env, monkey
             return self.inner.__exit__(*exc)
     monkeypatch.setattr(golden.hwlock, 'hold', Hold)
     assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--env', 'K=V', '--', *SELFTEST]) == 0
-    assert order == [['kakapo', 'kakapo-export']]
+    assert order == [['kakapo']]
     assert at_release == [({}, False)]  # container and Spark scratch gone before the locks
     host, argv = sm121_run(env)
     assert host == 'kakapo' and not runs(dict(env, log=env['tmp'] / 'none.log'))
@@ -1482,7 +1482,7 @@ def test_sm121_command_runs_the_spark_leg_under_the_seed_locks(sm121_env, monkey
     assert record['slot_root'] == f'kakapo:{leg}' and record['toolchain'] == 'tc1'
     assert record['source_commit'] == 'c0ffee' and record['memory'] == '16g'
     summary = (out.parents[1] / 'summary.md').read_text()
-    assert 'SM121 host kakapo (NVIDIA GB10), memory cap 16g, locks kakapo,kakapo-export' in summary
+    assert 'SM121 host kakapo (NVIDIA GB10), memory cap 16g, locks kakapo' in summary
 
 
 @pytest.mark.parametrize('extra,environ,expected', [
@@ -1566,7 +1566,7 @@ def test_sm121_refusals_precede_any_lock(sm121_env, monkeypatch, capsys, setup, 
 def test_sm121_pool_spark_takes_its_serving_lock(sm121_env, capsys):
     assert golden.main(SM121_BASE + ['--sm121-host', 'dodo', '--command', '--dry-run', '--', 'true']) == 0
     assert '# locks (fair queue, in order): sparks' in capsys.readouterr().out
-    assert golden.sm121_locks('rhea') == ['rhea'] and golden.sm121_locks('cassowary') == ['cassowary', 'cassowary-export']
+    assert golden.sm121_locks('rhea') == ['rhea'] and golden.sm121_locks('cassowary') == ['cassowary']
 
 
 def test_raptor_default_gpus_unchanged(env, capsys):
@@ -1576,10 +1576,10 @@ def test_raptor_default_gpus_unchanged(env, capsys):
 
 
 def test_sm121_lock_wait_expiry_runs_nothing(sm121_env, capsys):
-    with open(sm121_env['locks'] / 'kakapo-export.lock', 'a') as held:
-        fcntl.flock(held, fcntl.LOCK_EX)  # a seed export holds the GPU turn
+    with open(sm121_env['locks'] / 'kakapo.lock', 'a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
         assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--wait', '0.5', '--', 'true']) == 75
-    assert 'no turn for kakapo,kakapo-export' in capsys.readouterr().err
+    assert 'no turn for kakapo' in capsys.readouterr().err
     assert sm121_run(sm121_env) == (None, None)
 
 
@@ -1611,7 +1611,7 @@ def test_sm121_sigterm_removes_container_and_releases_locks(sm121_env, monkeypat
     assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--', 'true']) == 130
     assert json.loads(env['state'].read_text()) == {}
     assert not (env['home'] / '.cache/cuteafd/builds/gr/golden-sm121').exists()
-    for name in ('kakapo', 'kakapo-export'):
+    for name in ('kakapo',):
         with open(env['locks'] / f'{name}.lock', 'a') as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 

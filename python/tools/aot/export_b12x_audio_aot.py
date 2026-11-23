@@ -8956,13 +8956,9 @@ def main():
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     import _pinned_sparkinfer
-    import multiprocessing
-    from b12x._lib.compile_pool import _initialize_worker
+    from b12x._lib.aot_target import describe_target
     capability = (args.capability // 10, args.capability % 10)
-    _initialize_worker(0, capability, "audio-offline", "audio-offline", 1,
-                       101376, 101376, multiprocessing.Array("i", [0, 0]))
-    from cutlass.cutlass_dsl import CuTeDSL
-    CuTeDSL._get_dsl().envar.arch = f"sm_{args.capability}a"
+    describe_target(capability)
     import torch
     import cutlass
     import cutlass.cute as cute

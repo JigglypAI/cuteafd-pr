@@ -141,8 +141,8 @@ def worker_command(payload, staging):
 
 def default_workers():
     sys.path.insert(0, str(ROOT / "python/tools/lib"))
-    from _export_jobs import export_jobs as admitted_jobs, host_context_cap
-    return max(1, min(admitted_jobs(), host_context_cap()))
+    from _export_jobs import export_jobs as admitted_jobs, host_worker_cap
+    return max(1, min(admitted_jobs(), host_worker_cap()))
 
 
 def program_shards(catalog, workers):

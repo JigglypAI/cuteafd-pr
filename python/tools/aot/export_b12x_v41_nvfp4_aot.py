@@ -125,15 +125,17 @@ def export(
     if tile_m is not None and (type(tile_m) is not int or tile_m not in TILE_M_CHOICES):
         raise ValueError("tile_m must be None (auto), 16, 32, 64, or 128")
 
-    import torch
-    from b12x.moe.fused_moe import _impl as moe
-    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
-
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
     if role not in ROLES:
         raise ValueError(f"unsupported NVFP4 expert role {role!r}")
     experts, intermediate, topk, capability = ROLES[role]
+    from b12x._lib.aot_target import describe_target
+
+    describe_target(capability)
+    import torch
+    from b12x.moe.fused_moe import _impl as moe
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
     source_intermediate = intermediate
     if pad_intermediate:
         intermediate = (intermediate + 127) // 128 * 128
@@ -412,6 +414,8 @@ def export(
     (output / "v41_nvfp4_experts.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
+    if torch.cuda.is_initialized():
+        raise RuntimeError("offline V4.1 NVFP4 export initialized CUDA")
 
 
 def main() -> None:

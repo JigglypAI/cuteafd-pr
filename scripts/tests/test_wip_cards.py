@@ -423,7 +423,7 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'build.lock' in output and 'gpu1.lock' not in output
     scopes = cards.build_scopes([entry])
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
-    assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
+    assert 'CUTEAFD_WIP_EXPORT_LOCKS' not in scopes
     # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
     qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [],
             'set': {'MODEL_ID': 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'SPARK_COUNT': '0'}}
@@ -493,8 +493,9 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
 
 
 def test_source_lock_capability_detection(monkeypatch):
-    texts = iter(['CUTEAFD_WIP_EXPORT_LOCKS', 'CUTEAFD_WIP_EXPORT_LOCK_FILES', 'old', 'old'])
+    texts = iter(['CUDA_VISIBLE_DEVICES=', 'CUDA_VISIBLE_DEVICES=', 'CUTEAFD_WIP_EXPORT_LOCKS', 'CUTEAFD_WIP_EXPORT_LOCK_FILES', 'old', 'old'])
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=next(texts)))
+    assert cards.build_lock_mode('cpu') == 'cpu-export'
     assert cards.build_lock_mode('new') == 'native-phase'
     assert cards.build_lock_mode('old') == 'legacy-full-build'
 
@@ -822,15 +823,10 @@ def _trace_tools(tmp_path, extra=None):
 def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
     function = _wip_function('build_expert() (', '\n# Role builders end here.') + '\nnative_store_has() { return 1; }\n'
     text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    # The lease process (build-resource.py) grants the export turn; rhea's is its exclusive lease.
-    (lease / 'export-granted').write_text('{}')
     setup = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
@@ -838,9 +834,7 @@ release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([rhea]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn
+'''
     subprocess.run(['bash', '-c', setup + function + '\nbuild_expert'], check=True,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
@@ -850,11 +844,10 @@ wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
     assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
-    # The export ran inside the granted turn, and the turn was handed back.
-    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
+    assert 'CUDA_VISIBLE_DEVICES=' in lines[native]
 
 
-def test_coordinator_export_follows_rust_with_memory_caps(tmp_path):
+def test_coordinator_export_follows_rust_on_cpu(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -864,22 +857,15 @@ sync_local_source() {{ :; }}
 release_die() {{ exit 2; }}
 cuteafd_compiler_cache_warn() {{ :; }}
 slot=test coordinator_container=owned COORDINATOR_DOCKER_DEV=image bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-CUTEAFD_WIP_COORDINATOR_EXPORT=auto
 '''
-    modes = _wip_function('wip_coordinator_export_modes() {', '\n# wip_remote_export SOURCE:')
-    subprocess.run(['bash', '-c', setup + modes + function + '\nwip_capped_export() { shift; printf \"capped\\n\" >> \"$TRACE\"; \"$@\" native; }\nbuild_coordinator all /frozen/source'], check=True,
+    subprocess.run(['bash', '-c', setup + function + '\nbuild_coordinator all /frozen/source'], check=True,
                    env={**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
-    capped = lines.index('capped')
-    # First every export is requested from the export cache (cold here), then the GPU turn.
-    cached = next(i for i, line in enumerate(lines) if 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' in line)
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native')
-                  and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line)
-    assert rust < cached < capped < native
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
+    assert rust < native
+    assert 'CUDA_VISIBLE_DEVICES=' in lines[native]
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
-    assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
     assert '/wip-export-gpu.lock' not in wip
 
@@ -2648,17 +2634,12 @@ def test_owner_marker_adopts_only_matching_sealed_retry_root(tmp_path, damage):
 
 
 def _expert_leg(tmp_path, has):
-    """build_expert with native_store_has answering from `has` in order; returns (trace lines, lease dir)."""
+    """build_expert with native_store_has answering from `has` in order; returns trace lines."""
     function = _wip_function('build_expert() (', '\n# Role builders end here.')
-    text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    (lease / 'export-granted').write_text('{}')
     answers = tmp_path / 'answers'
     answers.write_text(''.join(f'{int(not a)}\n' for a in has))
     setup = f'''set -euo pipefail
@@ -2668,44 +2649,19 @@ release_die() {{ exit 2; }}
 slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([kakapo]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
-CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn
+'''
     stub = f'''
 native_store_has() {{ local rc; rc="$(head -1 {str(answers)!r})"; sed -i 1d {str(answers)!r}; printf 'has %s\\n' "$rc" >> "$TRACE"; return "$rc"; }}
 '''
     subprocess.run(['bash', '-c', setup + function + stub + '\nbuild_expert'], check=True, timeout=30,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
-    return trace.read_text().splitlines(), lease
+    return trace.read_text().splitlines()
 
 
-def test_native_cache_hit_on_a_lan_seed_takes_no_export_turn(tmp_path):
-    lines, lease = _expert_leg(tmp_path, [True])
-    assert not (lease / 'export-request').exists() and not (lease / 'export-done').exists()
+def test_native_cache_hit_on_a_lan_seed_restores_without_rebuilding(tmp_path):
+    lines = _expert_leg(tmp_path, [True])
     native = [line for line in lines if line.endswith('/wip/output/expert native')]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
-
-
-def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
-    # A build ahead of us in the seed's export queue exported this very key.
-    lines, lease = _expert_leg(tmp_path, [False, True])
-    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
-    native = [line for line in lines if line.endswith('/wip/output/expert native')
-              and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line]
-    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
-
-
-def test_export_turn_failure_stops_the_build(tmp_path):
-    text = (ROOT / 'wip.sh').read_text()
-    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
-    lease = tmp_path / 'lease'
-    lease.mkdir()
-    (lease / 'export-failed').write_text('no turn for kakapo-export after 14400 s')
-    script = f'''release_die() {{ echo "die: $*"; exit 3; }}
-seed_host=kakapo wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
-''' + turn + '\nwip_seed_export_turn\necho unreachable'
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 3 and 'die: no GPU export turn on kakapo' in result.stdout
 
 
 @pytest.mark.parametrize('stop', [None, 'TERM', 'INT', 'HUP'])

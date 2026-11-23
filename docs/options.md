@@ -561,7 +561,7 @@ support draft/MTP comparisons or `--save-logits`.
 | `SPARKINFER_EXL3` | `disable` | `auto`, `disable`, `force` | V4.1; `disable` needs `native`, `force` needs `exl3`. |
 | `INSTANCE` | unset | `[A-Za-z0-9_.-]` | Namespaces containers and state. |
 | `WIP_INSTANCE`, `WIP_ROOT` | unset | instance / absolute path | `--wip` slot staging. |
-| `CUTEAFD_EXPORT_HOST`, `WIP_BUILD_SEED` | empty / `kakapo` | host / seed | Site build settings; every launch path accepts them. |
+| `WIP_BUILD_SEED` | `kakapo` | seed | Site build seed; every launch path accepts it. |
 
 A local `scripts/build/build-dev-images.sh` rebuild immediately moves the shared
 coordinator and Spark default image tags, even before its branch merges. Existing
@@ -571,12 +571,9 @@ for its entire invocation, including container creation, native cache keys and
 sealed metadata, so a concurrent default-tag move cannot change its build inputs.
 Versioned `tc-*` image tags remain available for older checkouts.
 
-Automatic WIP coordinator export placement yields raptor whenever a live hardware
-queue ticket requests `gpu0` or `gpu1`: it uses maxq and waits there within the
-existing export timeout, never falling back to a raptor GPU while that remote
-placement is selected. Remote exports hold coordinator `maxq.lock` and maxq's
-local `maxq-gpu.lock`, not raptor's GPU locks. Explicit
-`CUTEAFD_WIP_COORDINATOR_EXPORT=capped` retains fair queued raptor placement.
+WIP coordinator and Spark AOT kernel exports run CPU-only (`CUDA_VISIBLE_DEVICES=""`)
+with no GPU device or hardware lock required, bounded by host-wide CPU worker
+admission and `build-slot.sh`.
 
 `./wip.sh --from-slot NAME` reuses that slot's seed within the selected
 `WIP_INSTANCE`/`WIP_ROOT`, rather than choosing the least-loaded seed. New
@@ -1172,7 +1169,6 @@ original core is already FP8, not an MC publication.
 | `INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `CUTEAFD_EXPORT_HOST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_BUILD_SEED` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Placement** | | | | | | | | | | |  |
 | `RTX_GPUS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
