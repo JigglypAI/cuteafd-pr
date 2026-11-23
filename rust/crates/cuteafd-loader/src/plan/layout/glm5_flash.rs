@@ -366,6 +366,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+            exact_graph_rows: options.glmf_exact_graph_rows,
              };
         let host = super::recipe_host_memory(options)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));

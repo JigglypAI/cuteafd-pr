@@ -152,6 +152,11 @@ pub(crate) struct Cli {
     /// Extra idle cycles required of below-soft-cap donors (requires donor-always when non-zero).
     #[arg(long, global = true, default_value_t = 0)]
     pub(crate) graph_donor_cold_lag: u64,
+    /// Opt-in exact-row decode/verify graphs (GLM Flash): off (default power-of-2 buckets),
+    /// on (rank-local exact rows, lag 8 donors, literal >= 50% band pinning = 0 pinned),
+    /// or prewarm (same with cumulative >= 50% band-prefix pinning = 29 pinned).
+    #[arg(long, global = true, default_value = "off", default_missing_value = "on", num_args = 0..=1)]
+    pub(crate) graph_exact_rows: cuteafd_loader::serving_capacity::glmf_graphs::GlmfExactRows,
     /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
     #[arg(long, global = true)]
     pub(crate) graph_disable_low_mem: Option<String>,
@@ -403,6 +408,8 @@ pub(crate) struct PlanArgs {
     pub(crate) kimi_content_qualified: bool,
     #[arg(skip)]
     pub(crate) explicit_settings: std::collections::BTreeSet<String>,
+    #[arg(skip)]
+    pub(crate) graph_exact_rows: cuteafd_loader::serving_capacity::glmf_graphs::GlmfExactRows,
     #[cfg(test)]
     #[arg(skip)]
     pub(crate) test_host_memory: Option<(u64, u64)>,
@@ -1214,6 +1221,19 @@ mod tests {
             assert!(super::Cli::try_parse_from(base.into_iter().chain([
                 "--graph-donor-cold-lag", lag])).is_err());
         }
+    }
+
+    #[test]
+    fn graph_exact_rows_is_a_typed_cli_option() {
+        use clap::Parser;
+        use cuteafd_loader::serving_capacity::glmf_graphs::GlmfExactRows;
+        let base = ["cuteafd", "bench-rdma-ring"];
+        assert_eq!(super::Cli::try_parse_from(base).unwrap().graph_exact_rows, GlmfExactRows::Off);
+        assert_eq!(super::Cli::try_parse_from(base.into_iter().chain(["--graph-exact-rows"])).unwrap().graph_exact_rows, GlmfExactRows::On);
+        assert_eq!(super::Cli::try_parse_from(base.into_iter().chain(["--graph-exact-rows=on"])).unwrap().graph_exact_rows, GlmfExactRows::On);
+        assert_eq!(super::Cli::try_parse_from(base.into_iter().chain(["--graph-exact-rows=prewarm"])).unwrap().graph_exact_rows, GlmfExactRows::Prewarm);
+        assert_eq!(super::Cli::try_parse_from(base.into_iter().chain(["--graph-exact-rows=off"])).unwrap().graph_exact_rows, GlmfExactRows::Off);
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--graph-exact-rows=invalid"])).is_err());
     }
 
     #[test]

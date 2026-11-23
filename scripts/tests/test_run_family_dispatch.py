@@ -5948,6 +5948,54 @@ def test_graph_prewarm_rejects_other_values(tmp_path):
     assert "GRAPH_PREWARM must be on or off" in result.stderr
 
 
+@pytest.mark.parametrize("mode,expected", [
+    ("off", None),
+    ("on", "--graph-exact-rows=on"),
+    ("prewarm", "--graph-exact-rows=prewarm"),
+])
+def test_graph_exact_rows_dispatches_typed_cli_on_glmf(tmp_path, mode, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"RTX_GPUS=2\nGRAPH_EXACT_ROWS={mode}\n")
+    assert result.returncode == 0, result.stderr
+    assert "CUTEAFD_GRAPH_EXACT_ROWS" not in result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if "serve-glmf" in line and "--snapshot" in line))
+    if expected is None:
+        assert not any(arg.startswith("--graph-exact-rows") for arg in serve)
+    else:
+        assert expected in serve
+
+
+def test_graph_exact_rows_rejects_invalid_and_other_families(tmp_path):
+    glmf = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+            "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    bad = _family_launch_result(bad_dir, glmf, "test/glmf", "RTX_GPUS=2\nGRAPH_EXACT_ROWS=lazy\n")
+    assert bad.returncode == 2, bad.stderr
+    assert "GRAPH_EXACT_ROWS must be off, on, or prewarm" in bad.stderr
+    glm = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    unused_dir = tmp_path / "unused"
+    unused_dir.mkdir()
+    unused = _family_launch_result(unused_dir, glm, "test/glm", "GRAPH_EXACT_ROWS=on\n")
+    assert unused.returncode != 0, unused.stderr
+    assert "unused configuration key" in unused.stderr
+
+
+def test_graph_exact_rows_allows_donor_cold_lag_override(tmp_path):
+    glmf = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+            "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, glmf, "test/glmf",
+                                   "RTX_GPUS=2\nGRAPH_EXACT_ROWS=on\nGRAPH_DONOR_COLD_LAG=16\n")
+    assert result.returncode == 0, result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if "serve-glmf" in line and "--snapshot" in line))
+    assert "--graph-exact-rows=on" in serve
+    idx = serve.index("--graph-donor-cold-lag")
+    assert serve[idx + 1] == "16"
+
+
 @pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])
 @pytest.mark.parametrize("kv", ["bf16", "fp8"])
 def test_kimi_draft_weights_and_kv_are_independent(tmp_path, precision, flag, kv):

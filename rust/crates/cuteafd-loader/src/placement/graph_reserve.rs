@@ -30,6 +30,15 @@ pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") |
 const FAMILY: &str = "family default";
 const USER: &str = "user override";
 const DEFAULT_EXTRA: u64 = 500_000_000;
+const GRAPH_CHUNK: u64 = 2 << 20;
+/// Minimum soft-to-hard safety margin for working-set-sized reserves (100 MB).
+pub const WORKING_SET_MARGIN_MIN_BYTES: u64 = 100_000_000;
+
+fn is_zero(value: &u64) -> bool { *value == 0 }
+
+fn packed_chunk(bytes: u64) -> u64 {
+    bytes.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -64,6 +73,11 @@ pub struct Resolved {
     pub cap_bytes: Option<u64>,
     pub cap_source: &'static str,
     pub effective_extra_bytes: u64,
+    /// Optional minimum soft-to-hard margin (bytes) when the reserve was sized
+    /// from a lag-measured working set (`soft = reserve - margin`, `margin = max(20% soft, 100 MB, 2x growth)`).
+    /// Zero for legacy prewarm-plus-extra reserves (keeps existing `SoftState` behavior untouched).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub soft_margin_floor: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -131,7 +145,7 @@ pub fn resolve_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text
     if selected.is_some() || spark {
         return Ok(Resolved { bytes: base_bytes, source: if selected.is_some() { "user total" } else { FAMILY },
             base_bytes, base_source, extra_bytes: 0, extra_source: "not applicable", cap_bytes: None,
-            cap_source: "not applicable", effective_extra_bytes: 0 });
+            cap_source: "not applicable", effective_extra_bytes: 0, soft_margin_floor: 0 });
     }
     let extra_bytes = extra.unwrap_or(Value::Bytes(DEFAULT_EXTRA))
         .bytes("GPU_GRAPH_RESERVE_EXTRA", base_bytes)?;
@@ -144,7 +158,49 @@ pub fn resolve_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text
     let bytes = base_bytes.checked_add(effective_extra_bytes).ok_or(Error::Overflow { key })?;
     Ok(Resolved { bytes, source: "family default with extra",
         base_bytes, base_source, extra_bytes, extra_source: if extra.is_some() { USER } else { FAMILY },
-        cap_bytes, cap_source: if cap.is_some() { USER } else { FAMILY }, effective_extra_bytes })
+        cap_bytes, cap_source: if cap.is_some() { USER } else { FAMILY }, effective_extra_bytes,
+        soft_margin_floor: 0 })
+}
+
+/// Resolve a working-set-sized reserve: `soft = soft_cap`, `margin = max(20% of soft, 100 MB)`
+/// rounded up to 2 MiB (`GRAPH_CHUNK`), and `reserve = soft + margin` (no +500 MB default extra).
+/// `GPU_GRAPH_RESERVE` user totals override `reserve` while keeping the `max(reserve/6, 100 MB)`
+/// margin floor clamped so `soft = reserve - margin` stays positive.
+pub fn resolve_working_set(text: Option<&str>, rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
+    let key = "GPU_GRAPH_RESERVE";
+    let selected = select(text, rank, false, key, false)?;
+    if let Some(value) = selected {
+        let bytes = value.bytes(key, 0)?;
+        let margin = if bytes <= GRAPH_CHUNK {
+            bytes / 2
+        } else {
+            let floor = packed_chunk((bytes / 6).max(WORKING_SET_MARGIN_MIN_BYTES));
+            floor.min(bytes.saturating_sub(GRAPH_CHUNK))
+        };
+        return Ok(Resolved {
+            bytes, source: "user total", base_bytes: bytes.saturating_sub(margin),
+            base_source: USER, extra_bytes: 0, extra_source: "not applicable",
+            cap_bytes: None, cap_source: "not applicable", effective_extra_bytes: 0,
+            soft_margin_floor: margin,
+        });
+    }
+    let soft = packed_chunk(soft_cap);
+    let margin = packed_chunk((soft / 5).max(WORKING_SET_MARGIN_MIN_BYTES));
+    let bytes = soft.checked_add(margin).ok_or(Error::Overflow { key })?;
+    Ok(Resolved {
+        bytes, source: "working-set reserve", base_bytes: soft, base_source: FAMILY,
+        extra_bytes: margin, extra_source: FAMILY, cap_bytes: None, cap_source: FAMILY,
+        effective_extra_bytes: margin, soft_margin_floor: margin,
+    })
+}
+
+pub fn current_working_set(rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
+    let text = match std::env::var("CUTEAFD_GPU_GRAPH_RESERVE") {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(Error::Environment { key: "GPU_GRAPH_RESERVE" }),
+    }?;
+    resolve_working_set(text.as_deref(), rank, soft_cap)
 }
 
 pub fn resolve(text: Option<&str>, rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
@@ -299,5 +355,24 @@ mod tests {
         assert!(matches!(resolve(None, 0, false, u64::MAX, 1), Err(Error::Overflow { .. })));
         assert!(matches!(resolve_with_extra(None, Some("100%"), None, 0, false, u64::MAX, 0), Err(Error::Overflow { .. })));
         assert!(resolve_with_extra(None, None, Some("invalid"), 0, false, 100, 0).is_err());
+    }
+
+    #[test]
+    fn working_set_reserve_uses_twenty_percent_or_100mb_floor() {
+        // Below 500 MB soft cap: 100 MB floor rounded to 2 MiB (96 MiB = 100,663,296 B).
+        let small = resolve_working_set(None, 0, 94 << 20).unwrap();
+        assert_eq!(small.base_bytes, 94 << 20);
+        assert_eq!(small.soft_margin_floor, 96 << 20);
+        assert_eq!(small.bytes, 190 << 20);
+        // Above 500 MB soft cap: 20% dominates the 100 MB floor.
+        let large = resolve_working_set(None, 0, 600 << 20).unwrap();
+        assert_eq!(large.base_bytes, 600 << 20);
+        assert_eq!(large.soft_margin_floor, 120 << 20);
+        assert_eq!(large.bytes, 720 << 20);
+        // User GPU_GRAPH_RESERVE override sets total while retaining the floor.
+        let user = resolve_working_set(Some("256MiB"), 0, 94 << 20).unwrap();
+        assert_eq!(user.bytes, 256 << 20);
+        assert_eq!(user.soft_margin_floor, 96 << 20);
+        assert_eq!(user.base_bytes, 160 << 20);
     }
 }
