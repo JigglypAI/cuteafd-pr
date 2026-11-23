@@ -501,7 +501,7 @@ impl DraftHistory {
     pub fn with_cut_rule(mut self, rule: CutRule) -> Self { self.rule = rule; self }
     pub fn cut_rule(&self) -> CutRule { self.rule }
 
-    /// Share one scored explore; skip it if it would enlarge a padded verify shape.
+    /// Share one scored explore; skip growth into padded verify shapes above eight rows.
     pub fn with_shared_explore(mut self, enabled: bool) -> Self {
         self.shared_explore = enabled;
         if enabled && self.spec.head.scored() { self.last_judged = vec![[0; SCORE_BINS]; self.spec.block]; }
@@ -682,10 +682,10 @@ impl DraftHistory {
         let mut granted = self.settle(ids, max_rows);
         let rows = ids.len() + granted.iter().sum::<usize>();
         if rows >= max_rows || stops.is_empty() { return granted; }
-        // A padded path must stay in its already-selected shape. Do not turn
-        // a plain decode into a speculative pass for the sake of exploration.
-        if let Some(shape) = bucket(rows) {
-            if rows == ids.len() || bucket(rows + 1) != Some(shape) { return granted; }
+        // The smallest verify shapes are bandwidth-bound; only protect
+        // crossings into larger buckets, where the padding becomes expensive.
+        if let (Some(before), Some(after)) = (bucket(rows), bucket(rows + 1)) {
+            if after > 8 && (after > before || rows == ids.len()) { return granted; }
         }
         let best = stops.into_iter().filter(|(i, _, _, _)| {
             let p = self.requests[&ids[*i]].pending.as_ref().expect("excluded stop");
@@ -1404,12 +1404,14 @@ mod tests {
         plan(&mut policy);
         assert_eq!(policy.settle_with_padding(&ids, 64, |rows| Some(rows.next_multiple_of(4))), [2, 1, 1]);
         plan(&mut policy);
-        assert_eq!(policy.settle_with_padding(&ids, 64, Some), [1; 3]);
+        assert_eq!(policy.settle_with_padding(&ids, 64, Some), [2, 1, 1]);
+        plan(&mut policy);
+        assert_eq!(policy.settle_with_padding(&ids, 64, |rows| Some(if rows <= 6 { 8 } else { 16 })), [1; 3]);
         plan(&mut policy);
         assert_eq!(policy.settle_with_padding(&ids, 6, |rows| Some(rows.next_multiple_of(4))), [1; 3]);
         policy.plan(&[(1, 3)], 64);
         assert_eq!(policy.refine(1, 3, Some(&[-8., -8., -8.])), 1);
-        assert_eq!(policy.settle_with_padding(&[1], 64, |rows| Some(rows.next_multiple_of(4))), [0]);
+        assert_eq!(policy.settle_with_padding(&[1], 64, |rows| Some(rows.next_multiple_of(4))), [1]);
     }
 
     #[test]

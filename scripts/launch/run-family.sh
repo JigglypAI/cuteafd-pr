@@ -214,7 +214,7 @@ done
 }
 # DRAFT_POLICY: history (the default: keep while the calibrated product stays
 # above 0.3, with exploration), history-shared-explore (one scored-neural
-# explore unless it would enlarge a padded verify shape), clamped (online cut), or off (no drafts). DRAFT_LENGTH is the fixed-width
+# explore unless it would grow a verify bucket beyond eight rows), clamped (online cut), or off (no drafts). DRAFT_LENGTH is the fixed-width
 # measurement override. Sets draft_policy_args for the serve command.
 shared_draft_policy_args() {
 draft_policy_args=()

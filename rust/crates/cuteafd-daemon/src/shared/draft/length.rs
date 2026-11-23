@@ -7,7 +7,7 @@ pub(crate) enum DraftPolicyChoice {
     /// Keep the leading drafts while their calibrated product stays above 0.3, plus one explore.
     #[default]
     History,
-    /// `history` with one calibration-prioritized scored explore that cannot enlarge a padded shape.
+    /// `history` with one calibration-prioritized scored explore that cannot grow the verify bucket beyond eight rows.
     HistorySharedExplore,
     /// `history` with each round's cut set from the online ratio of non-row time per
     /// request to per-row time (`cuteafd_core::clamped`).
