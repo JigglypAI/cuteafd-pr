@@ -3933,4 +3933,91 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn loader_admitted_attn_scratch_covers_runtime_requirement() -> Result<()> {
+        let cfg = Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 42,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: (0..42).map(|i| i % 4 == 0).collect(),
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: (0..42).map(|i| i == 0).collect(),
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 3.998,
+            swiglu_limit: 10.0,
+            engram_layers: vec![1, 11, 21, 31],
+            engram_vocab_sizes: BTreeMap::new(),
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: 120_002,
+            engram_seed: 10_007,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 120_818,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        };
+        for tp in [1usize, 2] {
+            for decode_rows in [1usize, 32, 64] {
+                let required = mla_split_scratch_bytes(decode_rows, tp);
+                for unit_rows in [1usize, 64, 128, 512, 2752, 4096] {
+                    let capacity_rows = unit_rows.max(decode_rows);
+                    for rank in 0..tp {
+                        let layout = SharedScratchLayout::new(
+                            &cfg,
+                            rank,
+                            tp,
+                            capacity_rows,
+                            decode_rows,
+                            64,
+                            16,
+                            cfg.vocab_size / tp,
+                        )?;
+                        let admitted = layout
+                            .arena
+                            .view("attn_scratch")
+                            .context("missing attn_scratch view")?
+                            .bytes();
+                        assert!(
+                            admitted >= required,
+                            "tp={tp} rank={rank} unit_rows={unit_rows} decode_rows={decode_rows}: loader admitted attn_scratch {admitted} < runtime required {required}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }

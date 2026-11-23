@@ -439,4 +439,40 @@ mod tests {
         assert_eq!(cache.swa_ring_rows, cache.swa_ring_pages * PAGE_ROWS);
         Ok(())
     }
+
+    #[test]
+    fn attn_scratch_view_covers_runtime_split_k_cap_across_tp_and_rows() -> Result<()> {
+        let cfg = test_cfg();
+        for tp in [1usize, 2] {
+            for decode_rows in [1usize, 32, 64] {
+                let runtime_split_k_cap =
+                    mla_split_scratch_bytes(decode_rows, tp).max(ATTN_SCRATCH_BYTES);
+                for unit_rows in [1usize, 64, 128, 512, 2752, 4096] {
+                    let capacity_rows = unit_rows.max(decode_rows);
+                    for rank in 0..tp {
+                        let shared = SharedScratchLayout::new(
+                            &cfg,
+                            rank,
+                            tp,
+                            capacity_rows,
+                            decode_rows,
+                            64,
+                            16,
+                            cfg.vocab_size / tp,
+                        )?;
+                        let view = shared
+                            .arena
+                            .view("attn_scratch")
+                            .expect("SharedScratchLayout missing attn_scratch");
+                        assert!(
+                            view.bytes() >= runtime_split_k_cap,
+                            "tp={tp} rank={rank} unit_rows={unit_rows} decode_rows={decode_rows}: admitted attn_scratch {} < runtime split_k_cap {runtime_split_k_cap}",
+                            view.bytes()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
