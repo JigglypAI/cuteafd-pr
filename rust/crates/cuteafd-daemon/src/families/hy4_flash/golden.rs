@@ -53,6 +53,9 @@ pub(crate) struct GoldenArgs {
     /// Chunk size (rows per unit) for unit-exactness verification (`N=1` vs chunked).
     #[arg(long)]
     pub(crate) prefill_units: Option<usize>,
+    /// Prefill wave slots in flight (`1..=3`) for multi-wave byte-identity verification.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
+    pub(crate) prefill_waves: u8,
     /// Serving-shaped N=1 decode parity: prefill `0..score_from-1` in chunks, then step 1 token at a time.
     #[arg(long)]
     pub(crate) decode: bool,
@@ -81,6 +84,10 @@ pub(crate) struct GoldenArgs {
     /// Exercise host-tier mark offload + promotion during `--resume-at`.
     #[arg(long)]
     pub(crate) resume_host: bool,
+    /// Prove multi-wave single-sequence and concurrent two-sequence byte-identity
+    /// (prompt A in wave k, prompt B in wave k+1) and disjoint per-wave Engram buffers.
+    #[arg(long)]
+    pub(crate) verify_waves: bool,
 }
 
 fn read_u32_bin(path: &Path) -> Result<Vec<u32>> {
@@ -262,6 +269,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
     let max_pages = if !args.resume_at.is_empty() {
         (max_seq.div_ceil(64) * 3 + 16).max(64)
+    } else if args.verify_waves {
+        (max_seq.div_ceil(64) * 2 + 16).max(64)
     } else {
         max_seq.div_ceil(64).max(16)
     };
@@ -333,20 +342,34 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             (0..devices.len()).map(|_| None).collect()
         };
 
-    let mut engine = if !args.resume_at.is_empty() {
+    let prefill_waves = usize::from(args.prefill_waves);
+    if prefill_waves > 1 {
+        ensure!(
+            unit % 64 == 0,
+            "hy4f-golden --prefill-waves {prefill_waves} requires 64-row-aligned --prefill-units (got {unit})"
+        );
+    }
+    let mut engine = if !args.resume_at.is_empty() || args.verify_waves {
+        let marks = if !args.resume_at.is_empty() {
+            if args.resume_host { 2 } else { 4 }
+        } else {
+            0
+        };
         Hy4Engine::new_serving(
             &devices,
             &programs,
+            None,
             &checkpoint,
             cfg.clone(),
             args.kv_cache,
             unit,
             unit.min(cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS as usize),
-            1,
+            prefill_waves,
             max_pages,
             2,
             max_pages * 64,
-            if args.resume_host { 2 } else { 4 },
+            max_pages * 64,
+            marks,
             args.skip_routed_experts,
             onboarded,
         )?
@@ -358,6 +381,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             cfg.clone(),
             args.kv_cache,
             unit,
+            prefill_waves,
             max_pages,
             args.skip_routed_experts,
             onboarded,
@@ -367,6 +391,37 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     if args.decode_graphs {
         let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
         engine.configure_graphs(layout)?;
+    }
+
+    if args.verify_waves {
+        ensure!(prefill_waves >= 2, "--verify-waves requires --prefill-waves >= 2");
+        let (prompt_a, prompt_b) = if let Some(ws) = &selected_windows {
+            ensure!(ws.len() >= 2, "--verify-waves needs at least 2 distinct windows (e.g. --window a00,a01)");
+            (ws[0].tokens.clone(), ws[1].tokens.clone())
+        } else {
+            ensure!(raw_tokens.len() >= unit * 4, "--verify-waves on raw tokens needs >= 4 * unit tokens");
+            let half = (raw_tokens.len() / 2 / 64) * 64;
+            (raw_tokens[..half].to_vec(), raw_tokens[half..half * 2].to_vec())
+        };
+        let proof = engine.verify_concurrent_two_seq_waves(&prompt_a, &prompt_b, unit, args.last_layer)?;
+        for line in &proof.buffer_summary {
+            println!("hy4f-golden --verify-waves buffer: {line}");
+        }
+        println!(
+            "hy4f-golden --verify-waves PASS: gpus={} waves={} unit={} prompt_a={}({}u) digest_a={} tail_a={:?} prompt_b={}({}u) digest_b={} tail_b={:?} single_mw_diffs=0 conc_a_diffs=0 conc_b_diffs=0",
+            proof.gpus,
+            proof.waves,
+            proof.unit_rows,
+            proof.prompt_a_len,
+            proof.units_a,
+            digest_f32(&proof.logits_a_solo),
+            proof.tail_a,
+            proof.prompt_b_len,
+            proof.units_b,
+            digest_f32(&proof.logits_b_solo),
+            proof.tail_b,
+        );
+        return Ok(());
     }
 
     if !args.resume_at.is_empty() {
@@ -419,11 +474,16 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     }
                 }
             } else {
-                let mut logits = Vec::with_capacity(win.tokens.len() * vocab);
-                for chunk in win.tokens.chunks(unit) {
-                    let part = engine.forward_chunk(chunk, args.last_layer)?;
-                    logits.extend_from_slice(&part);
-                }
+                let logits = if prefill_waves > 1 {
+                    engine.forward_span(&win.tokens, unit, args.last_layer)?
+                } else {
+                    let mut logits = Vec::with_capacity(win.tokens.len() * vocab);
+                    for chunk in win.tokens.chunks(unit) {
+                        let part = engine.forward_chunk(chunk, args.last_layer)?;
+                        logits.extend_from_slice(&part);
+                    }
+                    logits
+                };
                 for pos in &win.positions {
                     let row_idx = pos.pos - 1;
                     scored_slices.push((pos.pos, logits[row_idx * vocab..(row_idx + 1) * vocab].to_vec()));
@@ -488,12 +548,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 .unwrap_or_else(|| digest_f32(&scored_flat));
             let scored_digest = digest_f32(&scored_flat);
             println!(
-                "hy4f-golden mode={} window={} rows={} digest={} scored_digest={} mean NLL={:.6} (ref {:.6}) mean KL={:.6} (gen={:.6}/{:.2}%/{} ctx={:.6}/{:.2}%/{}) top-1={:.2}% top-3={:.2}%",
+                "hy4f-golden mode={} waves={} window={} rows={} digest={} scored_digest={} engram_tail={:?} mean NLL={:.6} (ref {:.6}) mean KL={:.6} (gen={:.6}/{:.2}%/{} ctx={:.6}/{:.2}%/{}) top-1={:.2}% top-3={:.2}%",
                 mode,
+                prefill_waves,
                 win.id,
                 score.positions,
                 digest_str,
                 scored_digest,
+                engine.golden_engram_tail(),
                 score.nll,
                 score.ref_nll,
                 score.kl,
@@ -596,11 +658,16 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
     let tokens = raw_tokens;
     let window_dir = raw_window_dir;
-    let mut logits = Vec::new();
-    for chunk in tokens.chunks(unit) {
-        let part = engine.forward_chunk(chunk, args.last_layer)?;
-        logits.extend_from_slice(&part);
-    }
+    let logits = if prefill_waves > 1 {
+        engine.forward_span(&tokens, unit, args.last_layer)?
+    } else {
+        let mut logits = Vec::new();
+        for chunk in tokens.chunks(unit) {
+            let part = engine.forward_chunk(chunk, args.last_layer)?;
+            logits.extend_from_slice(&part);
+        }
+        logits
+    };
 
     if args.last_layer + 1 < cfg.layers {
         let res = engine.read_residual_f32(tokens.len().min(unit))?;
@@ -716,7 +783,7 @@ fn run_resume_check(
 
     let run_prefill = |engine: &mut Hy4Engine<'_>, placement: &mut Hy4Placement, slice: &[u32]| -> Result<Vec<f32>> {
         let start = placement.len;
-        let mut units = sequence_units(slice.len(), unit_rows, 1, layers)?;
+        let mut units = sequence_units(slice.len(), unit_rows, engine.prefill_waves(), layers)?;
         let last_idx = units.len() - 1;
         for (i, u) in units.iter_mut().enumerate() {
             let u_start = start + u.rows.start;

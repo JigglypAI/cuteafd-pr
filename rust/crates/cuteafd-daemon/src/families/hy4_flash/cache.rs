@@ -88,23 +88,15 @@ impl<'a> Hy4CacheRank<'a> {
         ensure!(pages > 0 && sequences > 0, "Hy4-flash cache requires positive pages and sequences");
         let dsa_layers = cfg.sparse_layers().len();
         let swa_layers = cfg.swa_layers().len();
-        let layout = CacheLayout::new(cfg, kv_format, sequences, dsa_layers, swa_layers)?;
-        // Ring holds the live 512-token window plus one full prefill chunk without overwriting
-        // any token still needed by queries earlier in the same chunk.
-        let swa_ring_pages = ((cfg.sliding_window + max_chunk_rows).div_ceil(PAGE_ROWS) + 1).max(SWA_RING_PAGES);
-        let swa_ring_rows = swa_ring_pages * PAGE_ROWS;
+        let layout = CacheLayout::for_unit(cfg, kv_format, sequences, dsa_layers, swa_layers, max_chunk_rows)?;
+        let swa_ring_pages = layout.swa_ring_pages;
+        let swa_ring_rows = layout.swa_ring_rows;
         let swa_ring = cuteafd_core::prefix::AppendRing {
             window: cfg.sliding_window as u64,
             step: (swa_ring_rows - cfg.sliding_window) as u64,
             rows: swa_ring_rows as u64,
         };
-        let swa_seq_layer_bytes = swa_ring_rows
-            .checked_mul(kv_format.record_bytes())
-            .context("Hy4-flash SWA ring layer overflow")?;
-        let swa_rings_bytes = swa_layers
-            .checked_mul(sequences)
-            .and_then(|v| v.checked_mul(swa_seq_layer_bytes))
-            .context("Hy4-flash SWA ring pool overflow")?;
+        let swa_rings_bytes = layout.active_swa_ring_bytes;
 
         let dsa_kv_bytes = dsa_layers
             .checked_mul(pages)

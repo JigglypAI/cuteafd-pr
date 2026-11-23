@@ -555,8 +555,15 @@ impl FamilyModel for Model {
             };
             let owned_dsa = owned(true);
             let owned_swa = owned(false);
-            let layout = CacheLayout::new(&self.cfg, kv_format, 1, owned_dsa, owned_swa)
-                .map_err(|_| CacheGeometryError::Overflow("hy4_flash cache layout"))?;
+            let layout = CacheLayout::for_unit(
+                &self.cfg,
+                kv_format,
+                1,
+                owned_dsa,
+                owned_swa,
+                usize::try_from(options.prefill_rows).unwrap_or(0),
+            )
+            .map_err(|_| CacheGeometryError::Overflow("hy4_flash cache layout"))?;
             let per_dsa = (layout.dsa_kv_page_bytes + layout.dsa_index_page_bytes) as u64;
             ranks.push(RankCacheGeometry {
                 persistent_unit_bytes: (owned_dsa as u64)

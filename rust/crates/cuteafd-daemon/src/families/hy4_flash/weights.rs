@@ -5,6 +5,7 @@ use crate::shared::mapped_table::wait_rows;
 use crate::shared::memory::{
     budget::admit_host_memory,
     device::{Allocation, Device},
+    receipts::Inventory,
     weight_arena::DeviceWeightArena,
     Tag,
 };
@@ -20,7 +21,9 @@ use cuteafd_loader::families::hy4_flash::engram::{
     read_lookup_table, Hy4EngramHasher, Hy4EngramHistory, Hy4EngramLookahead, Hy4EngramShape,
     Hy4EngramTable, ENGRAM_DECODED_TOKEN_BYTES, ENGRAM_HEADS,
 };
-use cuteafd_loader::families::hy4_flash::weight_layout::{core_split, target_arenas, CoordinatorWeights};
+use cuteafd_loader::families::hy4_flash::weight_layout::{
+    core_split, target_arenas, CoordinatorWeights, ROPE_INV_FREQ_DSA, ROPE_INV_FREQ_SWA,
+};
 use cuteafd_loader::families::hy4_flash::Hy4FlashConfig;
 use cuteafd_loader::formats::mapped_preload::{MappedPlacement, DEFAULT_CAP_BYTES};
 use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, UnitPlan};
@@ -536,16 +539,14 @@ pub(crate) fn pack_kv_b_absorbed_from_transposed(
     Ok(out)
 }
 
-fn make_inv_freq(device: Device<'_>, rope_dim: usize, theta: f64) -> Result<Allocation<'_>> {
+fn inv_freq_bytes(rope_dim: usize, theta: f64) -> Vec<u8> {
     let half = rope_dim / 2;
     let mut bytes = Vec::with_capacity(half * 4);
     for i in 0..half {
         let freq = (1.0f64 / theta.powf((2 * i) as f64 / rope_dim as f64)) as f32;
         bytes.extend_from_slice(&freq.to_le_bytes());
     }
-    let alloc = Allocation::new(device, bytes.len(), Tag::weights("hy4_flash/rope-inv-freq"))?;
-    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
-    Ok(alloc)
+    bytes
 }
 
 impl<'a> Hy4RankWeights<'a> {
@@ -595,9 +596,27 @@ impl<'a> Hy4RankWeights<'a> {
 
             let mut views = BTreeMap::new();
             let mut embedding = None;
+            let mut inv_freq_dsa = None;
+            let mut inv_freq_swa = None;
 
             for (name, view_meta) in layout.arena.views() {
                 if claimed_by_native(name) {
+                    continue;
+                }
+                if name == ROPE_INV_FREQ_DSA {
+                    let bytes = inv_freq_bytes(cfg.qk_rope_dim, cfg.sparse_rope_theta);
+                    ensure!(bytes.len() == view_meta.bytes(), "{name}: inv_freq bytes mismatch");
+                    let alloc = arena.view(name, view_meta.bytes())?;
+                    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
+                    inv_freq_dsa = Some(alloc);
+                    continue;
+                }
+                if name == ROPE_INV_FREQ_SWA {
+                    let bytes = inv_freq_bytes(cfg.swa_qk_rope_dim, cfg.swa_rope_theta);
+                    ensure!(bytes.len() == view_meta.bytes(), "{name}: inv_freq bytes mismatch");
+                    let alloc = arena.view(name, view_meta.bytes())?;
+                    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
+                    inv_freq_swa = Some(alloc);
                     continue;
                 }
                 if name == "model.embed_tokens.weight" {
@@ -705,8 +724,8 @@ impl<'a> Hy4RankWeights<'a> {
                 views.insert(name.clone(), alloc);
             }
 
-            let inv_freq_dsa = make_inv_freq(device, cfg.qk_rope_dim, cfg.sparse_rope_theta)?;
-            let inv_freq_swa = make_inv_freq(device, cfg.swa_qk_rope_dim, cfg.swa_rope_theta)?;
+            let inv_freq_dsa = inv_freq_dsa.context("Hy4-flash target arena missing inv_freq_dsa view")?;
+            let inv_freq_swa = inv_freq_swa.context("Hy4-flash target arena missing inv_freq_swa view")?;
 
             let local_vocab = cfg.vocab_size / gpus;
             let (head_ws, head) = if views.contains_key("lm_head.weight") {
@@ -766,6 +785,27 @@ impl<'a> Hy4RankWeights<'a> {
         ensure!(buf.bytes == uk_bytes + uv_bytes, "kv_b_proj absorbed view size mismatch");
         Ok((buf.ptr, buf.ptr.cast::<u8>().wrapping_add(uk_bytes).cast()))
     }
+
+    /// Record the packed target weight arena (one physical backing + all named views)
+    /// and optional BF16 head workspace into `inventory`.
+    pub(crate) fn inventory(&self, weights_inv: &mut Inventory<'_>, retained_inv: &mut Inventory<'_>) -> Result<()> {
+        let rank = self.rank;
+        for (name, alloc) in &self.views {
+            alloc.inventory(weights_inv, &format!("rank{rank}.{name}"))?;
+        }
+        self.inv_freq_dsa
+            .inventory(weights_inv, &format!("rank{rank}.{ROPE_INV_FREQ_DSA}"))?;
+        self.inv_freq_swa
+            .inventory(weights_inv, &format!("rank{rank}.{ROPE_INV_FREQ_SWA}"))?;
+        if let Some(emb) = &self.embedding {
+            emb.inventory(weights_inv, &format!("rank{rank}.embed_tokens"), weights_inv.lifetime())?;
+        }
+        self.native.inventory(weights_inv, rank)?;
+        if let Some(ws) = &self.head_ws {
+            ws.inventory(retained_inv, &format!("hy4_flash.head.{rank}.workspace"))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +861,14 @@ mod tests {
                         assert!(layout.core.is_empty() && layout.fp8.is_empty());
                     }
                     for (name, view_meta) in layout.arena.views() {
+                        if name == ROPE_INV_FREQ_DSA {
+                            assert_eq!(view_meta.bytes(), (cfg.qk_rope_dim / 2) * 4);
+                            continue;
+                        }
+                        if name == ROPE_INV_FREQ_SWA {
+                            assert_eq!(view_meta.bytes(), (cfg.swa_qk_rope_dim / 2) * 4);
+                            continue;
+                        }
                         if name == "model.embed_tokens.weight" {
                             assert!(checkpoint.contains_tensor(name));
                             continue;
