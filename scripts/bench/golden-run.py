@@ -1444,6 +1444,18 @@ class PowerSampler:
 
 # --------------------------------------------------------------------------- running
 
+# Per run beyond --timeout (and the Spark workers' ready timeout): starting and
+# removing the container, worker teardown, copying a Spark run's output back.
+ARM_SLACK_S = 900
+
+
+def turn_max_run(state, runs, args):
+    """The lock turn's hwlock --max-run: every run's --timeout, its workers'
+    ready timeout and ARM_SLACK_S, plus the at-grant --preflight."""
+    ready = state['sparks']['ready_timeout'] if state.get('sparks') else 0
+    return runs * (state['timeout'] + ready + ARM_SLACK_S) + (args.preflight_timeout if args.preflight else 0)
+
+
 def run_args(state, arm=None):
     """The golden argv, plus ARM's own --arm-arg tokens appended."""
     return substitute(state['golden'] + (arm or {}).get('args', []), state['snapshot_container'],
@@ -1968,7 +1980,8 @@ def main(argv=None):
     order = list(schedule(arms, args.repeats, not args.no_interleave))
     if args.preflight_only or args.dry_run:
         if args.dry_run:
-            print(f"# locks (fair queue, in order): {','.join(state['locks'])}")
+            print(f"# locks (fair queue, in order): {','.join(state['locks'])}; "
+                  f"--max-run {turn_max_run(state, len(order), args):.0f}")
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])
@@ -1983,7 +1996,14 @@ def main(argv=None):
         Path(state['fixtures']).mkdir(parents=True, exist_ok=True)  # ours, before Docker would create it as root
     (root / 'plan.json').write_text(json.dumps(dict(state, order=order, arms=arms), indent=2, default=str) + '\n')
 
-    held = set(filter(None, os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+    held = set(hwlock.canonical(filter(None, os.environ.get('CUTEAFD_HW_LOCKS_HELD', '').split(','))))
+    if held & set(state['locks']) and not set(state['locks']) <= held:
+        # As wip-cards and smoke (#2364): an inner ticket for the rest would wait
+        # on flocks the enclosing hold itself has, so it could never be granted.
+        print(f"golden-run: needs {','.join(state['locks'])}, but the enclosing hwlock holds "
+              f"{','.join(hwlock.canonical(held))}; rerun under hwlock.py --locks "
+              f"{','.join(hwlock.canonical(held | set(state['locks'])))}", file=sys.stderr)
+        return 2
     records = []
     previous = {signum: signal.signal(signum, _interrupt) for signum in (signal.SIGTERM, signal.SIGHUP)}
 
@@ -2005,7 +2025,8 @@ def main(argv=None):
         else:
             with hwlock.hold(state['locks'], args.wait, f'golden-run {args.task}', preflight=args.preflight,
                              preflight_timeout=args.preflight_timeout,
-                             preflight_at_grant_only=args.preflight_at_grant):
+                             preflight_at_grant_only=args.preflight_at_grant,
+                             max_run=turn_max_run(state, len(order), args)):
                 body()
     except hwlock.PreflightFailed as error:
         print(f'golden-run: {error}', file=sys.stderr)
@@ -2014,8 +2035,13 @@ def main(argv=None):
         print(f'golden-run: {error}', file=sys.stderr)
         code = 75
     except (Interrupted, KeyboardInterrupt) as error:
-        print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
-        code = 130
+        if hwlock.OVERRAN[0]:
+            print(f"golden-run: the turn's --max-run bound ({turn_max_run(state, len(order), args):.0f} s) "
+                  'was reached; containers removed, locks released', file=sys.stderr)
+            code = 124
+        else:
+            print(f'golden-run: interrupted ({error}); containers removed, locks released', file=sys.stderr)
+            code = 130
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         message = 'sealed CLI/container check failed' if isinstance(error, subprocess.SubprocessError) else str(error)
         print(f'golden-run: {message}', file=sys.stderr)

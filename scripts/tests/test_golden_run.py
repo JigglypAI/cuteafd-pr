@@ -1631,3 +1631,32 @@ def test_sm121_slot_changed_at_grant_is_refused(sm121_env, monkeypatch, capsys):
     assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--', 'true']) == 2
     assert 'changed since enqueue' in capsys.readouterr().err
     assert sm121_run(env) == (None, None)
+
+
+def test_the_lock_turn_records_its_timeouts_as_hwlock_max_run(env, monkeypatch):
+    # Every golden turn is bounded: --timeout per run plus fixed per-run slack,
+    # so it can backfill and so a waiter behind it may trust its release time.
+    monkeypatch.setattr(golden.cards._cdi, 'cdi_names', lambda specs=(): {'0', '1', 'all'})
+    write_slot(env['home'], 'i1')
+    seen = []
+    real_hold = golden.hwlock.hold
+
+    def hold(names, *args, **kwargs):
+        seen.append(kwargs.get('max_run'))
+        return real_hold(names, *args, **kwargs)
+    monkeypatch.setattr(golden.hwlock, 'hold', hold)
+    argv = BASE + ['--arm', 'a=i1:s1', '--arm', 'b=i1:s1', '--repeats', '2', '--timeout', '100'] + GOLDEN
+    assert golden.main(argv) == 0
+    assert seen == [4 * (100 + golden.ARM_SLACK_S)]
+
+
+def test_a_partial_enclosing_hold_is_refused_before_any_ticket(env, monkeypatch, capsys):
+    # The inner ticket would queue for gpu0 while its own parent holds gpu0.
+    monkeypatch.setattr(golden.cards._cdi, 'cdi_names', lambda specs=(): {'0', '1', 'all'})
+    write_slot(env['home'], 'i1')
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    monkeypatch.setenv('CUTEAFD_HW_LOCKS_HELD', 'gpu0')
+    assert golden.main(BASE + ['--arm', 'a=i1:s1', '--gpus', '0,1'] + GOLDEN) == 2
+    assert 'rerun under hwlock.py --locks gpu0,gpu1' in capsys.readouterr().err
+    assert not taken and not runs(env)
