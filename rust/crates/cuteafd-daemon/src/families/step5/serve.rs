@@ -773,8 +773,14 @@ mod tests {
         let scheduler = include_str!("../../shared/qwen/scheduler.rs");
         assert!(scheduler.contains("crate::shared::probe::first_request(&FIRST"));
         let execution = include_str!("execution.rs");
-        assert!(execution.contains("collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))"));
-        assert!(execution.contains("self.graph_completed()"));
+        let boundary = execution.split_once("    fn graph_completed(").unwrap().1
+            .split_once("    pub(super) fn validate_caches(").unwrap().0;
+        assert!(boundary.find("bank.tick()").unwrap() < boundary.find("stage.stream.drain()").unwrap());
+        assert!(boundary.find("stage.stream.drain()").unwrap() < boundary.find("observe_completed(").unwrap());
+        let enqueue = execution.split_once("    pub fn enqueue<'s").unwrap().1
+            .split_once("/// Each unit owns").unwrap().0;
+        assert!(enqueue.contains("self.graph_completed()?"));
+        assert!(!enqueue.contains("stage.stream.drain()"));
         assert!(!serve.contains("graph_capture_stats"));
     }
 
