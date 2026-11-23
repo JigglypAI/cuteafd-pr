@@ -614,7 +614,6 @@ MC_CHECKPOINTS = {
     "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
     "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
     "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
-    "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
 }
 
 
@@ -749,7 +748,7 @@ def test_v6_mc_main_cards_use_the_original_core_except_kimi_1x() -> None:
 
 def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
     compact = json.loads((ROOT / V6_COMPACT).read_text())
-    assert len(compact["entries"]) == 24
+    assert len(compact["entries"]) == 21
     views: dict[str, set] = {}
     ports: dict[str, set] = {}
     for entry in compact["entries"]:
