@@ -180,6 +180,11 @@
       "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
       "revision": "83da6981e57e110fd1ba166e0a989c411e4289b6",
       "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+      "revision": "cc72179113573d751ed3245e3e58d3640694378d",
+      "family": "hy4_flash"
     }
   ],
   "not_installed": [
