@@ -2000,6 +2000,10 @@ fn a_short_shared_base_survives_the_warm_wave_on_two_staging_slots() {
                 // The base and every turn short of the host minimum went to the host tier.
                 assert_eq!(cache.host_config().unwrap().min_tokens, 1);
                 assert_eq!(cache.stats().host.unwrap().stores_skipped, 0);
+                // Idle: every entry holds one mark, on the device or only on the host.
+                let stats = cache.stats();
+                assert!(stats.mark_family && stats.marks_in_use <= 2);
+                assert_eq!(stats.marks_in_use + stats.marks_on_host, stats.entries_prompt + stats.entries_turn);
                 cache.clear(&fake).unwrap();
                 assert_eq!(cache.pool().free(), cache.pool().capacity());
             }

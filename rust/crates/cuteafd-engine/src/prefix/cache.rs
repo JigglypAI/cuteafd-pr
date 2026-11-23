@@ -191,6 +191,12 @@ pub struct PrefixStats {
     pub marks_in_use: usize,
     /// Pool pages held by marks (counted in `pages_retained` too).
     pub mark_pages: usize,
+    /// Retained snapshots whose mark lives only on the host tier (its device staging slot was
+    /// handed back once the host copy landed). At idle, a mark family's
+    /// `marks_in_use + marks_on_host` equals its retained entries.
+    pub marks_on_host: usize,
+    /// The family's snapshots carry a positional mark (pages-only families: none).
+    pub mark_family: bool,
     pub host: Option<cuteafd_hostcache::metrics::Snapshot>,
 }
 
@@ -245,7 +251,7 @@ pub struct PrefixCache<E: CopyEngine, M = ()> {
     /// Where the last admission's restore came from (provenance only).
     restored_session: Option<String>,
     stats: PrefixStats,
-    serving_detail: std::cell::RefCell<Option<(std::time::Instant, [usize; 4])>>,
+    serving_detail: std::cell::RefCell<Option<(std::time::Instant, [usize; 5])>>,
 }
 
 impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
@@ -1326,17 +1332,18 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         *self.serving_detail.borrow_mut() = Some((std::time::Instant::now(), self.occupancy_detail()));
     }
 
-    fn occupancy_detail(&self) -> [usize; 4] {
+    fn occupancy_detail(&self) -> [usize; 5] {
         let mut retained: Vec<u32> = self.entries.values()
             .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();
         retained.sort_unstable();
         retained.dedup();
         [self.pool.shared(), retained.len(),
             self.entries.values().map(|e| e.mark_pages().len()).sum(),
-            self.entries.values().filter(|e| matches!(e.mark, Some(Mark::Pages(_)))).count()]
+            self.entries.values().filter(|e| matches!(e.mark, Some(Mark::Pages(_)))).count(),
+            self.entries.values().filter(|e| e.mark.is_none() && e.host_mark.is_some()).count()]
     }
 
-    fn stats_with_detail(&self, detail: [usize; 4]) -> PrefixStats {
+    fn stats_with_detail(&self, detail: [usize; 5]) -> PrefixStats {
         let mut stats = self.stats.clone();
         stats.entries_prompt = self.retained.bank(SnapshotKind::Prompt).entries();
         stats.entries_turn = self.retained.bank(SnapshotKind::Turn).entries();
@@ -1348,6 +1355,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         stats.mark_slots = self.arena.slots();
         stats.mark_pages = detail[2];
         stats.marks_in_use = self.arena.in_use() + detail[3];
+        stats.marks_on_host = detail[4];
+        stats.mark_family = self.layout.mark_bytes > 0;
         stats.host = self.host.as_ref().map(HostCache::metrics);
         stats
     }

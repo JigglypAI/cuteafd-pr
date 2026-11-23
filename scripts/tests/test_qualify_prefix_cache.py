@@ -90,6 +90,16 @@ def test_torture_checks_probes_and_idle_accounting():
     stray = dict(prefix_cache=dict(good["prefix_cache"], mark_slots=8, marks_in_use=4))
     report = q.torture(a, reference, send=FakeServer(), get_stats=lambda base: stray)
     assert any("idle marks do not match" in p for p in report["problems"])
+    # Host tier on: two staging slots, settled marks live on the host (#2582). Every entry still
+    # holds exactly one mark; a lost one (neither tier) or a surplus one fails.
+    staged = dict(good["prefix_cache"], mark_family=True, mark_slots=2)
+    for device, host, ok in [(0, 3, True), (1, 2, True), (2, 1, True), (0, 2, False), (2, 2, False)]:
+        idle = dict(prefix_cache=dict(staged, marks_in_use=device, marks_on_host=host))
+        problems = q.torture(a, reference, send=FakeServer(), get_stats=lambda base: idle)["problems"]
+        assert (problems == []) == ok, (device, host, problems)
+    pages_family = dict(prefix_cache=dict(good["prefix_cache"], mark_family=False, mark_slots=0, marks_in_use=0,
+                                          marks_on_host=0))
+    assert q.torture(a, reference, send=FakeServer(), get_stats=lambda base: pages_family)["problems"] == []
 
 
 def test_a_prefill_cancel_hangs_up_while_the_server_is_silent():
