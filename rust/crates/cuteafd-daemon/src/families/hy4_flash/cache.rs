@@ -51,6 +51,7 @@ pub(crate) struct Hy4CacheRank<'a> {
     pub(crate) sequences: usize,
     pub(crate) swa_ring_pages: usize,
     pub(crate) swa_ring_rows: usize,
+    pub(crate) swa_ring: cuteafd_core::prefix::AppendRing,
     pub(crate) mark_slots: usize,
     pub(crate) mark_bytes_per_slot: usize,
     /// `[dsa_layers, pages, 64, record_bytes]`
@@ -92,6 +93,11 @@ impl<'a> Hy4CacheRank<'a> {
         // any token still needed by queries earlier in the same chunk.
         let swa_ring_pages = ((cfg.sliding_window + max_chunk_rows).div_ceil(PAGE_ROWS) + 1).max(SWA_RING_PAGES);
         let swa_ring_rows = swa_ring_pages * PAGE_ROWS;
+        let swa_ring = cuteafd_core::prefix::AppendRing {
+            window: cfg.sliding_window as u64,
+            step: (swa_ring_rows - cfg.sliding_window) as u64,
+            rows: swa_ring_rows as u64,
+        };
         let swa_seq_layer_bytes = swa_ring_rows
             .checked_mul(kv_format.record_bytes())
             .context("Hy4-flash SWA ring layer overflow")?;
@@ -112,10 +118,9 @@ impl<'a> Hy4CacheRank<'a> {
             .checked_mul(dsa_layers)
             .and_then(|v| v.checked_mul(PENDING_KEY_SLOT_BYTES))
             .context("Hy4-flash DSA pending keys overflow")?;
-        let mark_bytes_per_slot = swa_layers
-            .checked_mul(swa_seq_layer_bytes)
-            .and_then(|v| v.checked_add(dsa_layers * PENDING_KEY_SLOT_BYTES))
-            .context("Hy4-flash mark slot size overflow")?;
+        // Exact prefix mark retains only the visible `sliding_window` (512) SWA rows per SWA layer
+        // plus `3` pending indexer token keys per DSA layer (~9.63 MiB FP8), matching `CacheLayout`.
+        let mark_bytes_per_slot = layout.mark_bytes_per_slot;
 
         let dsa_kv = Allocation::new(device, dsa_kv_bytes, Tag::kv("hy4_flash/dsa-kv"))?;
         let dsa_index = Allocation::new(device, dsa_index_bytes, Tag::kv("hy4_flash/dsa-index"))?;
@@ -150,6 +155,7 @@ impl<'a> Hy4CacheRank<'a> {
             sequences,
             swa_ring_pages,
             swa_ring_rows,
+            swa_ring,
             mark_slots,
             mark_bytes_per_slot,
             dsa_kv,
@@ -252,31 +258,37 @@ impl<'a> Hy4CacheRank<'a> {
         slice_buf(arena.buffer, slot * self.mark_bytes_per_slot, self.mark_bytes_per_slot)
     }
 
-    fn state_copy(&self, seq: usize, mark_slot: usize, capture: bool) -> Result<()> {
+    fn state_copy(&self, seq: usize, mark_slot: usize, len: usize, capture: bool) -> Result<()> {
         let mark = self.mark(mark_slot)?;
-        let ring_bytes = self.swa_ring_rows * self.kv_format.record_bytes();
-        let mut copies = Vec::with_capacity(self.swa_layers + 1);
-        let mut offset = 0usize;
+        let rec = self.kv_format.record_bytes();
+        let swa_mark_layer_bytes = (self.swa_ring.window as usize) * rec;
+        let runs = self.swa_ring.visible(len as u64);
+        let mut copies = Vec::with_capacity(self.swa_layers * runs.len() + 1);
         for swa_idx in 0..self.swa_layers {
-            let live = self.swa_ring(seq, swa_idx)?;
-            let saved = slice_buf(mark, offset, ring_bytes)?;
-            offset += ring_bytes;
-            copies.push(if capture { (0, saved, live) } else { (0, live, saved) });
+            let live_ring = self.swa_ring(seq, swa_idx)?;
+            let mark_layer_base = swa_idx * swa_mark_layer_bytes;
+            for run in &runs {
+                let bytes = (run.rows as usize) * rec;
+                let live = slice_buf(live_ring, (run.slot as usize) * rec, bytes)?;
+                let saved = slice_buf(mark, mark_layer_base + (run.offset as usize) * rec, bytes)?;
+                copies.push(if capture { (0, saved, live) } else { (0, live, saved) });
+            }
         }
+        let pending_offset = self.swa_layers * swa_mark_layer_bytes;
         let pending_bytes = self.dsa_layers * PENDING_KEY_SLOT_BYTES;
         let live_pending = slice_buf(self.pending_keys.buffer, seq * pending_bytes, pending_bytes)?;
-        let saved_pending = slice_buf(mark, offset, pending_bytes)?;
+        let saved_pending = slice_buf(mark, pending_offset, pending_bytes)?;
         copies.push(if capture { (0, saved_pending, live_pending) } else { (0, live_pending, saved_pending) });
         // SAFETY: disjoint active/mark regions fenced across all registered readers.
         unsafe { self.copies.copy_d2d(&copies) }
     }
 
-    pub(crate) fn capture(&self, seq: usize, mark_slot: usize) -> Result<()> {
-        self.state_copy(seq, mark_slot, true)
+    pub(crate) fn capture(&self, seq: usize, mark_slot: usize, len: usize) -> Result<()> {
+        self.state_copy(seq, mark_slot, len, true)
     }
 
     pub(crate) fn restore(&self, mark_slot: usize, seq: usize, len: usize) -> Result<()> {
-        self.state_copy(seq, mark_slot, false)?;
+        self.state_copy(seq, mark_slot, len, false)?;
         self.pending_counts.borrow_mut()[seq].fill(len % 4);
         Ok(())
     }
@@ -331,6 +343,127 @@ impl<'a> Hy4CacheRank<'a> {
 
     pub(crate) const fn swa_ring_pages() -> usize {
         SWA_RING_PAGES
+    }
+
+    /// Read back every committed causal state byte for `placement` on this rank for exact-restore verification.
+    pub(crate) fn dump_state(&self, placement: &Hy4Placement) -> Result<Hy4RankStateSnapshot> {
+        self.drain()?;
+        for reader in &self.readers {
+            reader.drain()?;
+        }
+        let rec = self.kv_format.record_bytes();
+        let len = placement.len;
+        let idx_group_bytes = self.layout.dsa_index_page_bytes / (PAGE_ROWS / 4);
+
+        let mut dsa_kv = vec![0u8; self.dsa_layers * len * rec];
+        let mut dsa_index = vec![0u8; self.dsa_layers * (len / 4) * idx_group_bytes];
+        let pending_n = len % 4;
+        let pending_tok_bytes = pending_n * 128 * 2;
+        let mut pending_keys = vec![0u8; self.dsa_layers * pending_tok_bytes];
+        let vis_start = len.saturating_sub(self.swa_ring.window as usize);
+        let vis_rows = len - vis_start;
+        let mut swa_visible = vec![0u8; self.swa_layers * vis_rows * rec];
+
+        self.device.run(|| {
+            for d in 0..self.dsa_layers {
+                let mut row_cursor = 0usize;
+                let mut page_idx = 0usize;
+                while row_cursor < len {
+                    let take = (len - row_cursor).min(PAGE_ROWS);
+                    let phys = placement.units[page_idx] as usize;
+                    let kv_buf = slice_buf(self.dsa_kv_page(d, phys)?, 0, take * rec)?;
+                    let dst_off = (d * len + row_cursor) * rec;
+                    self.device.library.copy_d2h(&mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
+                    let take_groups = take / 4;
+                    if take_groups > 0 {
+                        let idx_buf = slice_buf(self.dsa_index_page(d, phys)?, 0, take_groups * idx_group_bytes)?;
+                        let g_off = (d * (len / 4) + row_cursor / 4) * idx_group_bytes;
+                        self.device.library.copy_d2h(
+                            &mut dsa_index[g_off..g_off + take_groups * idx_group_bytes],
+                            idx_buf,
+                        )?;
+                    }
+                    row_cursor += take;
+                    page_idx += 1;
+                }
+                if pending_tok_bytes > 0 {
+                    let p_buf = slice_buf(self.pending_key_slot(placement.slot, d)?, 0, pending_tok_bytes)?;
+                    let p_off = d * pending_tok_bytes;
+                    self.device.library.copy_d2h(&mut pending_keys[p_off..p_off + pending_tok_bytes], p_buf)?;
+                }
+            }
+            let runs = self.swa_ring.visible(len as u64);
+            for s in 0..self.swa_layers {
+                let ring = self.swa_ring(placement.slot, s)?;
+                for run in &runs {
+                    let bytes = (run.rows as usize) * rec;
+                    let src = slice_buf(ring, (run.slot as usize) * rec, bytes)?;
+                    let dst_off = (s * vis_rows + run.offset as usize) * rec;
+                    self.device.library.copy_d2h(&mut swa_visible[dst_off..dst_off + bytes], src)?;
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(Hy4RankStateSnapshot {
+            len,
+            dsa_kv,
+            dsa_index,
+            pending_keys,
+            pending_counts: self.pending_counts.borrow()[placement.slot].clone(),
+            swa_visible,
+            engram_tail: placement.engram_tail,
+        })
+    }
+}
+
+/// Complete committed causal state read back from one coordinator GPU rank for byte-exact restore checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Hy4RankStateSnapshot {
+    pub(crate) len: usize,
+    pub(crate) dsa_kv: Vec<u8>,
+    pub(crate) dsa_index: Vec<u8>,
+    pub(crate) pending_keys: Vec<u8>,
+    pub(crate) pending_counts: Vec<usize>,
+    pub(crate) swa_visible: Vec<u8>,
+    pub(crate) engram_tail: [u32; 2],
+}
+
+impl Hy4RankStateSnapshot {
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.dsa_kv.len() + self.dsa_index.len() + self.pending_keys.len() + self.swa_visible.len()
+    }
+
+    pub(crate) fn diff(&self, other: &Self) -> Vec<String> {
+        let mut diffs = Vec::new();
+        if self.len != other.len {
+            diffs.push(format!("len: {} != {}", self.len, other.len));
+        }
+        if self.engram_tail != other.engram_tail {
+            diffs.push(format!("engram_tail: {:?} != {:?}", self.engram_tail, other.engram_tail));
+        }
+        if self.pending_counts != other.pending_counts {
+            diffs.push(format!("pending_counts: {:?} != {:?}", self.pending_counts, other.pending_counts));
+        }
+        for (name, a, b) in [
+            ("dsa_kv", &self.dsa_kv, &other.dsa_kv),
+            ("dsa_index", &self.dsa_index, &other.dsa_index),
+            ("pending_keys", &self.pending_keys, &other.pending_keys),
+            ("swa_visible", &self.swa_visible, &other.swa_visible),
+        ] {
+            if a.len() != b.len() {
+                diffs.push(format!("{name}: len {} != {}", a.len(), b.len()));
+            } else if let Some(first) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+                let count = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+                diffs.push(format!(
+                    "{name}: {count}/{} bytes differ (first at byte {first}: 0x{:02x} != 0x{:02x})",
+                    a.len(),
+                    a[first],
+                    b[first]
+                ));
+            }
+        }
+        diffs
     }
 }
 
@@ -500,7 +633,7 @@ impl cuteafd_engine::prefix::PrefixFamily for Hy4Prefix<'_> {
             return Err("Hy4-flash snapshot frontier does not match committed causal state".into());
         }
         for rank in &self.ranks {
-            rank.capture(placement.slot, slot.0 as usize)?;
+            rank.capture(placement.slot, slot.0 as usize, len)?;
         }
         Ok(())
     }
@@ -629,20 +762,23 @@ mod tests {
             video_token_id: 120_124,
             eos: vec![120_025],
         };
-        let rank = Rc::new(Hy4CacheRank::new(vec![reader], &cfg, Hy4KvCache::Fp8, 8, 2, 64, 3)?);
+        let rank = Rc::new(Hy4CacheRank::new(vec![reader], &cfg, Hy4KvCache::Fp8, 32, 2, 64, 3)?);
+        assert_eq!(rank.mark_bytes_per_slot, rank.layout.mark_bytes_per_slot);
         let family = Hy4Prefix::new(vec![rank.clone()], cfg.engram_pad_id)?;
         let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(
             family.layout(),
             PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 },
             None,
         )?;
+        let rec = Hy4KvCache::Fp8.record_bytes();
 
-        let tokens: Vec<u32> = (10..77).collect(); // 67 tokens -> 2 pages, partial tail = 3 rows, pending = 3!
+        // Case 1: non-wrapped frontier (67 tokens -> 2 pages, partial tail = 3 rows, pending = 3).
+        let tokens: Vec<u32> = (10..77).collect();
         let mut src = cache
             .admit(&family, &tokens, 128, false, |units| Hy4Placement::new(units, 0, cfg.engram_pad_id))?
             .placement;
         let swa0 = rank.swa_ring(0, 0)?;
-        let swa_bytes = vec![0x5Au8; swa0.bytes];
+        let swa_bytes: Vec<u8> = (0..swa0.bytes).map(|i| ((i / rec) as u8).wrapping_mul(13).wrapping_add(7)).collect();
         library.copy_h2d(swa0, &swa_bytes)?;
         let pend0 = rank.pending_key_slot(0, 0)?;
         let pend_bytes = vec![0xA5u8; pend0.bytes];
@@ -668,10 +804,56 @@ mod tests {
         assert_eq!(rank.pending_counts.borrow()[1][0], tokens.len() % 4);
         let mut got_swa = vec![0u8; swa0.bytes];
         library.copy_d2h(&mut got_swa, rank.swa_ring(1, 0)?)?;
-        assert_eq!(got_swa, swa_bytes);
+        assert_eq!(&got_swa[..tokens.len() * rec], &swa_bytes[..tokens.len() * rec]);
+        assert!(got_swa[tokens.len() * rec..].iter().all(|&b| b == 0));
         let mut got_pend = vec![0u8; pend0.bytes];
         library.copy_d2h(&mut got_pend, rank.pending_key_slot(1, 0)?)?;
         assert_eq!(got_pend, pend_bytes);
+        cache.release(&family, &restored.placement.units)?;
+
+        // Case 2: wrapped frontier (> swa_ring_rows) restores all 512 visible rows across the wrap boundary.
+        let wrap_len = rank.swa_ring_rows + 137;
+        let wrap_tokens: Vec<u32> = (0..wrap_len as u32).map(|i| 1000 + i).collect();
+        let mut wrap_src = cache
+            .admit(&family, &wrap_tokens, wrap_len + 64, false, |units| Hy4Placement::new(units, 0, cfg.engram_pad_id))?
+            .placement;
+        library.copy_h2d(rank.swa_ring(0, 0)?, &swa_bytes)?;
+        library.copy_h2d(rank.pending_key_slot(0, 0)?, &pend_bytes)?;
+        rank.pending_counts.borrow_mut()[0].fill(wrap_len % 4);
+        wrap_src.len = wrap_len;
+        wrap_src.state_len = wrap_len;
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &wrap_tokens, &wrap_src, After::from_logits(&[0.0, 1.0], true))?);
+        cache.release(&family, &wrap_src.units)?;
+
+        let wrap_restored = cache.admit(&family, &wrap_tokens, wrap_len + 64, false, |units| {
+            Hy4Placement::new(units, 1, cfg.engram_pad_id)
+        })?;
+        assert_eq!(wrap_restored.resume, wrap_len);
+        assert_eq!(rank.pending_counts.borrow()[1][0], wrap_len % 4);
+        library.copy_d2h(&mut got_swa, rank.swa_ring(1, 0)?)?;
+        for pos in (wrap_len - cfg.sliding_window)..wrap_len {
+            let slot = pos % rank.swa_ring_rows;
+            let lo = slot * rec;
+            assert_eq!(&got_swa[lo..lo + rec], &swa_bytes[lo..lo + rec], "wrapped visible SWA row {pos} (slot {slot})");
+        }
+        // State snapshot oracle: restored state matches captured state with 0 differing bytes,
+        // and any 1-byte mutation in any component is detected.
+        let mut wrap_restored_p = wrap_restored.placement.clone();
+        wrap_src.set_engram_tail_from_prefix(&wrap_tokens, cfg.engram_pad_id);
+        wrap_restored_p.set_engram_tail_from_prefix(&wrap_tokens, cfg.engram_pad_id);
+        let snap_src = rank.dump_state(&wrap_src)?;
+        let snap_dst = rank.dump_state(&wrap_restored_p)?;
+        assert!(snap_src.diff(&snap_dst).is_empty(), "diffs: {:?}", snap_src.diff(&snap_dst));
+        let mut flipped = snap_dst.clone();
+        flipped.swa_visible[0] ^= 1;
+        assert!(snap_src.diff(&flipped).iter().any(|d| d.starts_with("swa_visible:")));
+        let mut flipped_p = snap_dst.clone();
+        flipped_p.pending_keys[0] ^= 1;
+        assert!(snap_src.diff(&flipped_p).iter().any(|d| d.starts_with("pending_keys:")));
+        let mut flipped_e = snap_dst.clone();
+        flipped_e.engram_tail[0] ^= 1;
+        assert!(snap_src.diff(&flipped_e).iter().any(|d| d.starts_with("engram_tail:")));
+        cache.release(&family, &wrap_restored.placement.units)?;
         Ok(())
     }
 }

@@ -376,7 +376,7 @@ fn build_spec(
 
 impl Family for Hy4Flash {
     fn id(&self) -> &'static str { "hy4_flash" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA_BF16_ONLY
     }
@@ -492,7 +492,7 @@ impl Family for Hy4Flash {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn contract_admission(&self) -> bool { true }
-    fn native_serving_admission(&self) -> bool { false }
+    fn native_serving_admission(&self) -> bool { true }
     fn activation(&self, layer: usize, shared: bool) -> Option<cuteafd_core::FfnActivation> {
         (layer < self.cfg.layers).then(|| self.cfg.activation(layer, shared))
     }

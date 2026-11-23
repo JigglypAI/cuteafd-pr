@@ -181,6 +181,7 @@ impl<'a> RankScratch<'a> {
             None
         };
         let max_batch_groups = max_rows / 4 + max_sequences + 2;
+        let tp2_f32_bytes = if tp == 2 { max_rows * H * 4 } else { 256 };
         Ok(Self {
             ids: alloc(max_rows * 4, "ids")?,
             positions_i64: alloc(max_rows * 8, "pos-i64")?,
@@ -194,9 +195,9 @@ impl<'a> RankScratch<'a> {
             post_ffn: alloc(max_rows * HC * 4, "post-ffn")?,
             y: alloc(max_rows * H * 2, "y")?,
             delta: alloc(max_rows * H * 2, "delta")?,
-            delta_f32: alloc(max_rows * H * 4, "delta-f32")?,
-            delta_peer_f32: alloc(max_rows * H * 4, "delta-peer-f32")?,
-            delta_sum_f32: alloc(max_rows * H * 4, "delta-sum-f32")?,
+            delta_f32: alloc(tp2_f32_bytes, "delta-f32")?,
+            delta_peer_f32: alloc(tp2_f32_bytes, "delta-peer-f32")?,
+            delta_sum_f32: alloc(tp2_f32_bytes, "delta-sum-f32")?,
             delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
             engram_raw,
             engram_masked,
@@ -428,6 +429,50 @@ pub(crate) struct Hy4Engine<'a> {
 }
 
 impl<'a> Hy4Engine<'a> {
+    /// Conservative upper bound on per-rank `RankScratch` + head/selector workspace bytes
+    /// (excluding target weights, routed experts, and KV/SWA/mark caches) for KV pool sizing.
+    pub(crate) fn estimated_rank_workspace_bytes(
+        cfg: &Hy4FlashConfig,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+    ) -> u64 {
+        let max_heads = 64 / tp;
+        let max_inter = 13824 / tp;
+        let max_seq_groups = max_seq_pages * (PAGE_ROWS / 4);
+        let idx_score_floats = max_rows
+            .saturating_mul(max_seq_groups.max(1))
+            .min(MAX_IDX_SCORE_FLOATS)
+            .max(max_seq_groups.max(1));
+        let wire_row = LATENT_H + LATENT_H / 32;
+        let tp2_f32 = if tp == 2 { 3 * max_rows * H * 4 } else { 0 };
+        let split_k_cap = max_rows.min(64) * 16 * max_heads * (512 * 2 + 4);
+        let engram_count = cfg.engram_layers.len();
+        let sum = max_rows * (4 + 8 + 4 + 8 + 8)
+            + 2 * max_rows * HC * H * 2
+            + 64 * HC * H * 2
+            + 2 * max_rows * HC * 4
+            + 3 * max_rows * H * 2
+            + tp2_f32
+            + engram_count * (max_rows * 16 * 96 * 2 + max_rows)
+            + max_rows * (1536 * 2 + H * 2 + HC * H * 2)
+            + max_rows * (Q_LORA * 4 + KV_A_DIM * 2 + KV_A_PADDED * 2)
+            + max_rows * max_heads * ((256 * 3 + 576 + 512) * 2 + 4)
+            + split_k_cap
+            + max_rows * max_seq_pages.max(16) * 4
+            + max_sequences * max_seq_pages.max(16) * 4
+            + max_rows * (IDX_HEADS * IDX_DIM * 4 + IDX_HEADS * 6 + IDX_DIM * 4)
+            + (max_rows + 4 * max_sequences) * IDX_DIM * 2
+            + idx_score_floats * 4
+            + max_rows * (CANDIDATE_TOPK * 4 + 8)
+            + 3 * max_rows * max_inter * 2
+            + max_rows * (EXPERTS * 8 + TOPK * 8 + LATENT_H * 4 + wire_row + H * 8)
+            + 64 * cfg.vocab_size * 8;
+        // Include 256 MiB for optional native-core projection scratch + CUDA allocation tails.
+        (sum as u64) + (256u64 << 20)
+    }
+
     /// Single-sequence constructor used by `hy4f-golden`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -506,10 +551,15 @@ impl<'a> Hy4Engine<'a> {
             let stream = Rc::new(Stream::new(device)?);
             let peer_ready = Event::new(device)?;
             let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format, max_rows))?;
+            // DenseMlaForwardKernel only writes split-K partials when active_splits > 1,
+            // and Hy4Engine launches active_splits = 1 (never > 1 above 64 rows), matching UnitLayout.
+            let split_k_cap = max_rows.min(64) * 16 * (64 / gpus) * (512 * 2 + 4);
             let attn_scratch = progs
                 .dsa_scratch_bytes
-                .max(progs.swa_decode_scratch_bytes)
-                .max(progs.swa_extend_scratch_bytes);
+                .min(split_k_cap)
+                .max(progs.swa_decode_scratch_bytes.min(split_k_cap))
+                .max(progs.swa_extend_scratch_bytes.min(split_k_cap))
+                .max(1024);
             let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
@@ -637,6 +687,10 @@ impl<'a> Hy4Engine<'a> {
     pub(crate) fn prefix(&self) -> Result<Hy4Prefix<'a>> {
         let caches: Vec<Rc<Hy4CacheRank<'a>>> = self.ranks.iter().map(|r| r.cache.clone()).collect();
         Hy4Prefix::new(caches, self.cfg.engram_pad_id)
+    }
+
+    pub(crate) fn dump_state(&self, placement: &Hy4Placement) -> Result<Vec<super::cache::Hy4RankStateSnapshot>> {
+        self.ranks.iter().map(|r| r.cache.dump_state(placement)).collect()
     }
 
     pub(crate) fn mark_slots(&self) -> usize {

@@ -327,8 +327,12 @@ Engram tables run host-mapped `engram_fp8` by default.
 view (`original` default; `k8-compact` and `k6-compact` use stored trellis cores;
 `fp8-compact` converts the original BF16 core tensors at load with block-128
 FP8). `KV_CACHE=fp8|bf16` defaults to `fp8` for absorbed MLA KV and keeps the
-FP8 indexer key cache default. `ATTENTION_PLACEMENT=auto|heads` splits heads on
-two RTX GPUs (`context` and `layers` refuse). `EMBEDDING=gpu` is required
+FP8 indexer key cache default. `ATTENTION_PLACEMENT=auto` selects whole layers
+on one RTX GPU and `context` (ContextSplit, no DSA KV replication) on two RTX
+GPUs; `serve-hy4f` currently refuses two-GPU `auto`/`context` loudly until
+ContextSplit LSE and cross-GPU scored-indexer exports land (#2579), while
+explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
+refuses). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
 `off`); `SPECULATOR=off` is the only supported value. `RTX_EXPERT_LAYERS=auto|all|N`,
 `PREFILL_ROWS`, `PREFILL_WAVES` (1–3), `PREFILL_PACKING=unrestricted|exact`,
@@ -1071,9 +1075,9 @@ family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ heads |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context |
 | `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✗ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓ |
 | `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the

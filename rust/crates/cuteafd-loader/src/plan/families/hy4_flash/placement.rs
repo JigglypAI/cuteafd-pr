@@ -331,7 +331,11 @@ pub(super) fn layout(
     };
 
     let routed = model.routed();
-    let local = build_local_backings(catalog, opts.workspace_manifest.as_deref(), gpus, shape.rows);
+    let manifest_path = opts.workspace_manifest.clone().or_else(|| {
+        let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path)
+    });
+    let local = build_local_backings(catalog, manifest_path.as_deref(), gpus, shape.rows);
     if let LocalPackage::Missing(reason) = &local {
         notes.push(format!("Hy4-flash RTX expert onboarding unavailable: {reason}"));
     }

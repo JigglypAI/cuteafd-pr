@@ -19,7 +19,7 @@ fn hy4_snapshot() -> Option<std::path::PathBuf> {
 #[test]
 fn hy4_flash_family_descriptor_invariants() {
     assert_eq!(HY4_FLASH.id(), "hy4_flash");
-    assert_eq!(HY4_FLASH.runtime(), RuntimeStatus::Planned);
+    assert_eq!(HY4_FLASH.runtime(), RuntimeStatus::Serving);
     assert!(HY4_FLASH.expert_catalog());
     assert!(HY4_FLASH.optional(Component::Vision));
     assert!(HY4_FLASH.optional(Component::Speculator));

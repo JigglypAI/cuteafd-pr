@@ -36,6 +36,9 @@ pub(crate) struct ServeArgs {
     pub device: i32,
     #[arg(long)]
     pub split_device: Option<i32>,
+    #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
+          value_parser = ["auto", "heads", "layers", "context"])]
+    pub attention_placement: String,
     #[arg(long, value_delimiter = ',')]
     pub peers: Vec<SocketAddr>,
     #[arg(long)]
@@ -101,6 +104,23 @@ fn resolve_expert_package(native_lib: &Path, explicit: Option<&Path>, gpus: usiz
     Ok(base.join("exl3").join(exl3.package_name("hy4f")).join(format!("rtx-tp{gpus}")))
 }
 
+fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<&'static str> {
+    match (gpus, setting) {
+        (1, "auto" | "heads") => Ok("whole"),
+        (1, other) => anyhow::bail!(
+            "Hy4-flash single-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto or heads"
+        ),
+        (2, "heads") => Ok("heads"),
+        (2, "auto" | "context") => anyhow::bail!(
+            "Hy4-flash 2-GPU default ContextSplit serving is not implemented yet: missing SparkInfer partial-attention LSE + lse_combine2 (hy4_mla.py), cross-GPU scored_index_topk (hy4_indexer.py), and 32-head ContextSplit execution in Hy4Engine (#2579). Use explicit ATTENTION_PLACEMENT=heads to opt into replicated-KV head-split, or serve on 1 GPU."
+        ),
+        (2, other) => anyhow::bail!(
+            "Hy4-flash 2-GPU serving does not support ATTENTION_PLACEMENT={other}; ContextSplit is the default (pending #2579) and heads is explicit opt-in"
+        ),
+        _ => anyhow::bail!("Hy4-flash supports 1 or 2 coordinator GPUs, got {gpus}"),
+    }
+}
+
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("hy4_flash", args.max_sequences as u64)?;
     ensure!(
@@ -111,9 +131,13 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         args.peers.len() <= 6 && args.peers.iter().collect::<std::collections::BTreeSet<_>>().len() == args.peers.len(),
         "Hy4-flash supports 0..=6 distinct Spark peer endpoints"
     );
+    let gpus = if args.split_device.is_some() { 2 } else { 1 };
+    let resolved_attention = resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
-    cuteafd_bench::context::ResolvedSettings::prefill(prefill).publish();
+    cuteafd_bench::context::ResolvedSettings::prefill(prefill)
+        .value("attention-placement", resolved_attention)
+        .publish();
 
     let encoding = ModelEncoding::Hy4Flash(Arc::new(Hy4Encoding::from_snapshot(&args.snapshot)?));
     let eos = encoding.eos_token_ids();
@@ -359,7 +383,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let swa_ring_pages = ((cfg.sliding_window + unit_rows).div_ceil(PAGE_ROWS) + 1)
                 .max(cuteafd_loader::families::hy4_flash::execution::SWA_RING_PAGES);
             let swa_seq_bytes = (cfg.swa_layers().len() * swa_ring_pages * PAGE_ROWS * worker_args.kv_format.record_bytes()) as u64;
-            let mark_bytes = swa_seq_bytes + (cfg.sparse_layers().len() * super::cache::PENDING_KEY_SLOT_BYTES) as u64;
+            let cache_layout = cuteafd_loader::families::hy4_flash::execution::CacheLayout::new(
+                &cfg,
+                worker_args.kv_format,
+                worker_args.max_sequences,
+                cfg.sparse_layers().len(),
+                cfg.swa_layers().len(),
+            )?;
+            let mark_bytes = cache_layout.mark_bytes_per_slot as u64;
             let mark_slots = if worker_args.prefix.prefix_cache_entries == 0 {
                 0
             } else {
@@ -371,10 +402,19 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     worker_args.prefix.host_cache_bytes != HostBudget::Bytes(0),
                 ) as usize
             };
+            let est_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16);
+            let rank_ws_bytes = Hy4Engine::estimated_rank_workspace_bytes(
+                &cfg,
+                gpus,
+                unit_rows,
+                est_seq_pages,
+                worker_args.max_sequences,
+            );
             let reserve_and_ws: u64 = target_bytes
                 + swa_seq_bytes * worker_args.max_sequences as u64
                 + mark_bytes * mark_slots as u64
-                + (4u64 << 30); // workspaces + selector + head + CUDA reserve
+                + rank_ws_bytes
+                + (1u64 << 30); // CUDA driver/runtime headroom + selector + fragmentation tail
             let kv_avail = after_exp_free.saturating_sub(reserve_and_ws);
             let page_bytes_per_rank = (cfg.sparse_layers().len()
                 * (PAGE_ROWS * worker_args.kv_format.record_bytes()
@@ -580,6 +620,7 @@ mod tests {
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)
+                .value("attention-placement", "heads")
                 .value("prefill-rows", prefill.unit_rows)
                 .value("prefill-waves", prefill.waves)
                 .publish();
@@ -616,6 +657,20 @@ mod tests {
             assert_eq!(args.peers.len(), expected);
             assert!(args.split_device.is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn attention_placement_refuses_2gpu_context_loudly_and_allows_explicit_heads() -> anyhow::Result<()> {
+        assert_eq!(super::resolve_attention_placement(1, "auto")?, "whole");
+        assert_eq!(super::resolve_attention_placement(1, "heads")?, "whole");
+        assert!(super::resolve_attention_placement(1, "context").is_err());
+        assert_eq!(super::resolve_attention_placement(2, "heads")?, "heads");
+        let err_auto = super::resolve_attention_placement(2, "auto").unwrap_err().to_string();
+        let err_ctx = super::resolve_attention_placement(2, "context").unwrap_err().to_string();
+        assert!(err_auto.contains("ContextSplit") && err_auto.contains("ATTENTION_PLACEMENT=heads"), "{err_auto}");
+        assert!(err_ctx.contains("ContextSplit") && err_ctx.contains("ATTENTION_PLACEMENT=heads"), "{err_ctx}");
+        assert!(super::resolve_attention_placement(2, "layers").is_err());
         Ok(())
     }
 
