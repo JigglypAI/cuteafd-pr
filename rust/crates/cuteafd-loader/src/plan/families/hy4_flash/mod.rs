@@ -24,7 +24,7 @@ use crate::plan::{
 
 mod placement;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub struct Hy4Flash;
 pub static HY4_FLASH: Hy4Flash = Hy4Flash;
@@ -376,7 +376,7 @@ fn build_spec(
 
 impl Family for Hy4Flash {
     fn id(&self) -> &'static str { "hy4_flash" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA_BF16_ONLY
     }
@@ -492,7 +492,88 @@ impl Family for Hy4Flash {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn contract_admission(&self) -> bool { true }
-    fn native_serving_admission(&self) -> bool { false }
+    fn native_serving_admission(&self) -> bool { true }
+    fn cache_geometry(
+        &self,
+        options: crate::serving_capacity::CacheOptions,
+    ) -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::families::hy4_flash::execution::{CacheLayout, PAGE_ROWS};
+        use crate::families::hy4_flash::Hy4KvCache;
+        use crate::placement::{families::hy4_flash as placement_hy4, AttentionPlacement, LayerMode};
+        use crate::serving_capacity::{
+            CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry,
+        };
+        if !matches!(options.coordinator_ranks, 1 | 2) {
+            return Err(CacheGeometryError::Unsupported {
+                family: "hy4_flash",
+                what: "requires one or two coordinator GPUs",
+            });
+        }
+        if options.native_mtp_layers > 0 {
+            return Err(CacheGeometryError::Unsupported {
+                family: "hy4_flash",
+                what: "optional DFly2 drafter is reserved separately from target cache",
+            });
+        }
+        let gpus = options.coordinator_ranks;
+        let attention = placement_hy4::HY4_FLASH
+            .check_attention(options.attention_placement, gpus, false)
+            .map_err(|_| CacheGeometryError::Unsupported {
+                family: "hy4_flash",
+                what: "unsupported attention placement",
+            })?;
+        let modes = placement_hy4::layer_modes(&self.cfg, gpus, attention);
+        let kv_format = match options.mla_kv {
+            cuteafd_core::MlaCacheFormat::Bf16 => Hy4KvCache::Bf16,
+            cuteafd_core::MlaCacheFormat::Fp8 => Hy4KvCache::Fp8,
+        };
+        let context_split = modes.iter().any(|m| *m == LayerMode::ContextSplit);
+        let logical_unit_rows = if context_split { 2 * PAGE_ROWS as u64 } else { PAGE_ROWS as u64 };
+        let placement = if gpus == 1 {
+            KvPlacement::SingleDevice
+        } else {
+            match attention {
+                AttentionPlacement::Context => KvPlacement::PartitionedContext,
+                AttentionPlacement::Heads => KvPlacement::Replicated,
+                AttentionPlacement::Layers => KvPlacement::PartitionedLayers,
+            }
+        };
+        let mut ranks = Vec::with_capacity(gpus);
+        for gpu in 0..gpus {
+            let owned = |sparse: bool| -> usize {
+                modes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(layer, mode)| {
+                        self.cfg.sparse_layer[layer] == sparse
+                            && match *mode {
+                                LayerMode::Whole { gpu: owner, .. } => usize::from(owner) == gpu,
+                                LayerMode::HeadSplit | LayerMode::ContextSplit => true,
+                            }
+                    })
+                    .count()
+            };
+            let owned_dsa = owned(true);
+            let owned_swa = owned(false);
+            let layout = CacheLayout::new(&self.cfg, kv_format, 1, owned_dsa, owned_swa)
+                .map_err(|_| CacheGeometryError::Overflow("hy4_flash cache layout"))?;
+            let per_dsa = (layout.dsa_kv_page_bytes + layout.dsa_index_page_bytes) as u64;
+            ranks.push(RankCacheGeometry {
+                persistent_unit_bytes: (owned_dsa as u64)
+                    .checked_mul(per_dsa)
+                    .ok_or(CacheGeometryError::Overflow("hy4_flash persistent unit"))?,
+                active_state_per_sequence_bytes: (layout.active_swa_ring_bytes
+                    + layout.active_indexer_pending_bytes) as u64,
+                retained_mark_bytes: layout.mark_bytes_per_slot as u64,
+                ..Default::default()
+            });
+        }
+        Ok(Some(FamilyCacheGeometry {
+            logical_unit_rows,
+            placement,
+            ranks,
+        }))
+    }
     fn activation(&self, layer: usize, shared: bool) -> Option<cuteafd_core::FfnActivation> {
         (layer < self.cfg.layers).then(|| self.cfg.activation(layer, shared))
     }

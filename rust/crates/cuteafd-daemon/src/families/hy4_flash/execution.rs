@@ -1,23 +1,38 @@
-//! Full 42-layer Hy4-flash coordinator forward pass (1x RTX TP1 and 2x RTX TP2).
-use super::cache::Hy4CacheRank;
+//! Full 42-layer Hy4-flash coordinator forward pass (1x RTX TP1 and 2x RTX TP2)
+//! supporting golden single-sequence verification and batched multi-sequence serving
+//! through the shared `run_prefill_units` (`PrefillHooks`) executor and zero-host-hop
+//! `DeviceLogits` vocabulary head handoff.
+use super::cache::{Hy4CacheRank, Hy4Placement, Hy4Prefix};
 use super::native::Hy4NativeScratch;
 use super::programs::Hy4Programs;
 use super::weights::{Hy4EngramHost, Hy4RankWeights};
+use crate::shared::distributed_head::Handoff;
 use crate::shared::experts::rtx::exl3::Exl3Tp2;
 use crate::shared::experts::rtx::{ExpertInput, Routes, RtxExpertLayer};
+use crate::shared::experts::staging::RouteStaging;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::Tag;
+use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
+use crate::shared::spark_intake::SparkLink;
+use crate::shared::spark_waves::{self, WaveTicket, Waves};
 use crate::shared::target_head::{self, TargetHead};
+use crate::shared::token_io::DeviceLogits;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
-use cuteafd_loader::families::hy4_flash::engram::Hy4EngramHistory;
 use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
+use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use std::collections::BTreeMap;
+use cuteafd_transport::{
+    expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
+    ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 const H: usize = 3072;
 const HC: usize = 4;
@@ -30,8 +45,21 @@ const TOPK: usize = 16;
 const IDX_HEADS: usize = 16;
 const IDX_DIM: usize = 128;
 const CANDIDATE_TOPK: usize = 2048;
+/// Cap `idx_scores` at 64 MiB (16M floats); long-context prefill tiles rows automatically.
+const MAX_IDX_SCORE_FLOATS: usize = 16 * 1024 * 1024;
 
-/// Per-rank sequential scratch workspace for one Hy4-flash prefill/decode chunk.
+/// Which rows of a batch compute terminal `hc_head` + `lm_head` FP32 logits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadMode {
+    /// Skip terminal `hc_head` + `lm_head` (intermediate prefill units).
+    None,
+    /// Compute logits only for the final token row of each sequence in the batch.
+    LastPerSeq,
+    /// Compute logits for every row in `first_row..total_rows` in `<= 64`-row `DeviceLogits` tiles.
+    Suffix(usize),
+}
+
+/// Per-rank scratch workspace for one Hy4-flash prefill or decode unit.
 struct RankScratch<'a> {
     ids: Allocation<'a>,
     positions_i64: Allocation<'a>,
@@ -40,6 +68,7 @@ struct RankScratch<'a> {
     swa_slots_i64: Allocation<'a>,
     r_a: Allocation<'a>,
     r_b: Allocation<'a>,
+    r_head_in: Allocation<'a>,
     post: Allocation<'a>,
     post_ffn: Allocation<'a>,
     y: Allocation<'a>,
@@ -82,6 +111,7 @@ struct RankScratch<'a> {
     idx_group_pos: Allocation<'a>,
     idx_group_slots: Allocation<'a>,
     idx_scores: Allocation<'a>,
+    idx_score_floats: usize,
     idx_limits: Allocation<'a>,
     idx_cand_slots: Allocation<'a>,
     idx_cand_lens: Allocation<'a>,
@@ -99,19 +129,25 @@ struct RankScratch<'a> {
     routed_out: Allocation<'a>,
     shared_out: Allocation<'a>,
     shared_f32: Allocation<'a>,
-    // Head logits tile (<=64 rows)
+    // Sharded head logits tile (<=64 rows * local_vocab F32)
     logits_tile: Allocation<'a>,
+    // Full gathered FP32 logits tile on rank 0 (<=64 rows * vocab F32)
+    head_logits_f32: Option<Allocation<'a>>,
     // Compact-core serialized scratch (`k8-compact`, `k6-compact`, `fp8-compact`)
     native: Option<Hy4NativeScratch<'a>>,
 }
 
 impl<'a> RankScratch<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: Device<'a>,
+        rank: usize,
         tp: usize,
         max_rows: usize,
-        max_pages: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
         engram_count: usize,
+        vocab: usize,
         local_vocab: usize,
         attn_scratch_bytes: usize,
         native_layout: Option<&ProjectionScratchLayout>,
@@ -122,7 +158,11 @@ impl<'a> RankScratch<'a> {
         };
         let max_heads = 64 / tp;
         let max_inter = 13824 / tp;
-        let max_groups = max_pages * (PAGE_ROWS / 4);
+        let max_seq_groups = max_seq_pages * (PAGE_ROWS / 4);
+        let idx_score_floats = max_rows
+            .saturating_mul(max_seq_groups.max(1))
+            .min(MAX_IDX_SCORE_FLOATS)
+            .max(max_seq_groups.max(1));
         let wire_row = LATENT_H + LATENT_H / 32;
         let native = if native_layout.is_some() || native_head_layout.is_some() {
             Some(Hy4NativeScratch::allocate(device, native_layout, native_head_layout)?)
@@ -135,6 +175,13 @@ impl<'a> RankScratch<'a> {
             engram_raw.push(alloc(max_rows * 16 * 96 * 2, "engram-raw")?);
             engram_masked.push(alloc(max_rows, "engram-masked")?);
         }
+        let head_logits_f32 = if rank == 0 {
+            Some(alloc(64 * vocab * 4, "head-logits-f32")?)
+        } else {
+            None
+        };
+        let max_batch_groups = max_rows / 4 + max_sequences + 2;
+        let tp2_f32_bytes = if tp == 2 { max_rows * H * 4 } else { 256 };
         Ok(Self {
             ids: alloc(max_rows * 4, "ids")?,
             positions_i64: alloc(max_rows * 8, "pos-i64")?,
@@ -143,13 +190,14 @@ impl<'a> RankScratch<'a> {
             swa_slots_i64: alloc(max_rows * 8, "swa-slots-i64")?,
             r_a: alloc(max_rows * HC * H * 2, "r-a")?,
             r_b: alloc(max_rows * HC * H * 2, "r-b")?,
+            r_head_in: alloc(64 * HC * H * 2, "r-head-in")?,
             post: alloc(max_rows * HC * 4, "post")?,
             post_ffn: alloc(max_rows * HC * 4, "post-ffn")?,
             y: alloc(max_rows * H * 2, "y")?,
             delta: alloc(max_rows * H * 2, "delta")?,
-            delta_f32: alloc(max_rows * H * 4, "delta-f32")?,
-            delta_peer_f32: alloc(max_rows * H * 4, "delta-peer-f32")?,
-            delta_sum_f32: alloc(max_rows * H * 4, "delta-sum-f32")?,
+            delta_f32: alloc(tp2_f32_bytes, "delta-f32")?,
+            delta_peer_f32: alloc(tp2_f32_bytes, "delta-peer-f32")?,
+            delta_sum_f32: alloc(tp2_f32_bytes, "delta-sum-f32")?,
             delta_norm: alloc(max_rows * H * 2, "delta-norm")?,
             engram_raw,
             engram_masked,
@@ -167,21 +215,22 @@ impl<'a> RankScratch<'a> {
             lse_out: alloc(max_rows * max_heads * 4, "lse-out")?,
             uv_out: alloc(max_rows * max_heads * 256 * 2, "uv-out")?,
             attn_scratch: alloc(attn_scratch_bytes, "attn-scratch")?,
-            dsa_page_table: alloc(max_rows * max_pages.max(16) * 4, "dsa-page-table")?,
-            swa_page_table: alloc(max_pages.max(16) * 4, "swa-page-table")?,
-            swa_seqlens: alloc(4, "swa-seqlens")?,
+            dsa_page_table: alloc(max_rows * max_seq_pages.max(16) * 4, "dsa-page-table")?,
+            swa_page_table: alloc(max_sequences * max_seq_pages.max(16) * 4, "swa-page-table")?,
+            swa_seqlens: alloc(max_sequences * 4, "swa-seqlens")?,
             dsa_cu_seqlens: alloc((max_rows + 1) * 4, "dsa-cu-seqlens")?,
-            swa_cu_seqlens: alloc(2 * 4, "swa-cu-seqlens")?,
+            swa_cu_seqlens: alloc((max_sequences + 1) * 4, "swa-cu-seqlens")?,
             idx_q_raw: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-raw")?,
             idx_q_rot: alloc(max_rows * IDX_HEADS * IDX_DIM * 2, "idx-q-rot")?,
             idx_w_raw: alloc(max_rows * IDX_HEADS * 2, "idx-w-raw")?,
             idx_w_out: alloc(max_rows * IDX_HEADS * 4, "idx-w-out")?,
             idx_tk_raw: alloc(max_rows * IDX_DIM * 2, "idx-tk-raw")?,
             idx_tk: alloc(max_rows * IDX_DIM * 2, "idx-tk")?,
-            idx_group_tok: alloc((max_rows + 4) * IDX_DIM * 2, "idx-group-tok")?,
-            idx_group_pos: alloc((max_rows / 4 + 2) * 8, "idx-group-pos")?,
-            idx_group_slots: alloc((max_rows / 4 + 2) * 8, "idx-group-slots")?,
-            idx_scores: alloc(max_rows * max_groups.max(1) * 4, "idx-scores")?,
+            idx_group_tok: alloc((max_rows + 4 * max_sequences) * IDX_DIM * 2, "idx-group-tok")?,
+            idx_group_pos: alloc(max_batch_groups * 8, "idx-group-pos")?,
+            idx_group_slots: alloc(max_batch_groups * 8, "idx-group-slots")?,
+            idx_scores: alloc(idx_score_floats * 4, "idx-scores")?,
+            idx_score_floats,
             idx_limits: alloc(max_rows * 4, "idx-limits")?,
             idx_cand_slots: alloc(max_rows * CANDIDATE_TOPK * 4, "idx-cand-slots")?,
             idx_cand_lens: alloc(max_rows * 4, "idx-cand-lens")?,
@@ -199,6 +248,7 @@ impl<'a> RankScratch<'a> {
             shared_out: alloc(max_rows * H * 2, "shared-out")?,
             shared_f32: alloc(max_rows * H * 4, "shared-f32")?,
             logits_tile: alloc(64 * local_vocab * 4, "logits-tile")?,
+            head_logits_f32,
             native,
         })
     }
@@ -288,13 +338,44 @@ fn launch_proj_split(
     }
 }
 
+fn launch_rank_lm_head(
+    r: &RankRuntime<'_>,
+    count: usize,
+    x_buf: CuteafdDeviceBuffer,
+    out_buf: CuteafdDeviceBuffer,
+) -> Result<()> {
+    if let Some(native_head) = r.weights.native.get("lm_head") {
+        let head_scratch = r
+            .scratch
+            .native
+            .as_ref()
+            .and_then(|n| n.head_scratch.as_ref())
+            .context("Hy4 native lm_head missing scratch")?;
+        return native_head.launch(count, x_buf, out_buf, head_scratch, r.stream.raw);
+    }
+    let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
+    let lm_head_w = r.weights.weight("lm_head")?;
+    // SAFETY: caller ensures device active and buffers live through stream drain/handoff.
+    unsafe {
+        target_head::launch(
+            TargetHead::configured(),
+            head,
+            x_buf.ptr,
+            lm_head_w.ptr,
+            out_buf.ptr.cast(),
+            count,
+            r.stream.raw,
+        )
+    }
+}
+
 struct RankRuntime<'a> {
     device: Device<'a>,
-    stream: Stream<'a>,
+    stream: Rc<Stream<'a>>,
     peer_ready: Event<'a>,
     programs: Hy4Programs<'a>,
     weights: Hy4RankWeights<'a>,
-    cache: Hy4CacheRank<'a>,
+    cache: Rc<Hy4CacheRank<'a>>,
     scratch: RankScratch<'a>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
@@ -302,23 +383,97 @@ struct RankRuntime<'a> {
     onboarded_experts: Option<Exl3Tp2<'a>>,
 }
 
-/// Coordinator-only Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2).
+/// Active batch metadata staged once per unit in `begin_batch` and consumed across layers.
+#[derive(Clone, Debug)]
+struct ActiveMember {
+    sequence: usize,
+    slot: usize,
+    pos_start: usize,
+    row_start: usize,
+    row_len: usize,
+    next_engram_tail: [u32; 2],
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBatch {
+    rows: usize,
+    max_seq_end: usize,
+    pt_stride: usize,
+    all_single_row: bool,
+    dump_rows: usize,
+    use_a: bool,
+    members: Vec<ActiveMember>,
+}
+
+/// Coordinator Hy4-flash execution engine (1x RTX TP1 or 2x RTX TP2, 0-Spark or Spark-backed).
 pub(crate) struct Hy4Engine<'a> {
     pub(crate) cfg: Hy4FlashConfig,
     pub(crate) max_rows: usize,
     pub(crate) max_pages: usize,
+    pub(crate) max_sequences: usize,
+    pub(crate) max_context: usize,
     pub(crate) engram: Hy4EngramHost,
     pub(crate) skip_routed_experts: bool,
     pub(crate) dump_dir: Option<std::path::PathBuf>,
     ranks: Vec<RankRuntime<'a>>,
+    head_handoff: Option<Handoff<'a>>,
+    spark: Option<SparkLink<'a>>,
+    onboarded_layers: BTreeSet<usize>,
+    next_identity: u64,
+    placement_version: u64,
     dsa_index_of: BTreeMap<usize, usize>,
     swa_index_of: BTreeMap<usize, usize>,
     engram_index_of: BTreeMap<usize, usize>,
-    engram_histories: BTreeMap<usize, Hy4EngramHistory>,
-    committed_pos: usize,
+    golden_placement: Hy4Placement,
+    terminal: bool,
 }
 
 impl<'a> Hy4Engine<'a> {
+    /// Conservative upper bound on per-rank `RankScratch` + head/selector workspace bytes
+    /// (excluding target weights, routed experts, and KV/SWA/mark caches) for KV pool sizing.
+    pub(crate) fn estimated_rank_workspace_bytes(
+        cfg: &Hy4FlashConfig,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+    ) -> u64 {
+        let max_heads = 64 / tp;
+        let max_inter = 13824 / tp;
+        let max_seq_groups = max_seq_pages * (PAGE_ROWS / 4);
+        let idx_score_floats = max_rows
+            .saturating_mul(max_seq_groups.max(1))
+            .min(MAX_IDX_SCORE_FLOATS)
+            .max(max_seq_groups.max(1));
+        let wire_row = LATENT_H + LATENT_H / 32;
+        let tp2_f32 = if tp == 2 { 3 * max_rows * H * 4 } else { 0 };
+        let split_k_cap = max_rows.min(64) * 16 * max_heads * (512 * 2 + 4);
+        let engram_count = cfg.engram_layers.len();
+        let sum = max_rows * (4 + 8 + 4 + 8 + 8)
+            + 2 * max_rows * HC * H * 2
+            + 64 * HC * H * 2
+            + 2 * max_rows * HC * 4
+            + 3 * max_rows * H * 2
+            + tp2_f32
+            + engram_count * (max_rows * 16 * 96 * 2 + max_rows)
+            + max_rows * (1536 * 2 + H * 2 + HC * H * 2)
+            + max_rows * (Q_LORA * 4 + KV_A_DIM * 2 + KV_A_PADDED * 2)
+            + max_rows * max_heads * ((256 * 3 + 576 + 512) * 2 + 4)
+            + split_k_cap
+            + max_rows * max_seq_pages.max(16) * 4
+            + max_sequences * max_seq_pages.max(16) * 4
+            + max_rows * (IDX_HEADS * IDX_DIM * 4 + IDX_HEADS * 6 + IDX_DIM * 4)
+            + (max_rows + 4 * max_sequences) * IDX_DIM * 2
+            + idx_score_floats * 4
+            + max_rows * (CANDIDATE_TOPK * 4 + 8)
+            + 3 * max_rows * max_inter * 2
+            + max_rows * (EXPERTS * 8 + TOPK * 8 + LATENT_H * 4 + wire_row + H * 8)
+            + 64 * cfg.vocab_size * 8;
+        // Include 256 MiB for optional native-core projection scratch + CUDA allocation tails.
+        (sum as u64) + (256u64 << 20)
+    }
+
+    /// Single-sequence constructor used by `hy4f-golden`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         devices: &[Device<'a>],
@@ -330,11 +485,47 @@ impl<'a> Hy4Engine<'a> {
         max_pages: usize,
         force_engram_bf16: bool,
         skip_routed_experts: bool,
+        onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
+    ) -> Result<Self> {
+        let max_context = max_pages * PAGE_ROWS;
+        Self::new_serving(
+            devices,
+            programs,
+            checkpoint,
+            cfg,
+            kv_format,
+            max_rows,
+            max_pages,
+            1,
+            max_context,
+            0,
+            force_engram_bf16,
+            skip_routed_experts,
+            onboarded_experts,
+        )
+    }
+
+    /// Serving & multi-sequence constructor with exact prefix mark slots and COW page pool.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_serving(
+        devices: &[Device<'a>],
+        programs: &'a Programs<'a>,
+        checkpoint: &Checkpoint,
+        cfg: Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        max_rows: usize,
+        max_pages: usize,
+        max_sequences: usize,
+        max_context: usize,
+        mark_slots: usize,
+        force_engram_bf16: bool,
+        skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
     ) -> Result<Self> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4Engine supports 1 or 2 GPUs, got {gpus}");
         ensure!(onboarded_experts.len() == gpus, "onboarded_experts rank count mismatch");
+        ensure!(max_sequences > 0 && max_pages > 0 && max_rows > 0, "invalid Hy4Engine extents");
         if gpus == 2 {
             let probed = crate::shared::peer_split::probed_device(
                 devices[0].library,
@@ -352,27 +543,43 @@ impl<'a> Hy4Engine<'a> {
         let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, max_rows.min(64))?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(checkpoint, &cfg, force_engram_bf16)? };
-        let engram_histories = engram.start_histories();
+        let max_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16).min(max_pages);
 
         let mut ranks = Vec::with_capacity(gpus);
         for (rank, weights) in weights_all.into_iter().enumerate() {
             let device = devices[rank];
-            let stream = Stream::new(device)?;
+            let stream = Rc::new(Stream::new(device)?);
             let peer_ready = Event::new(device)?;
             let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format, max_rows))?;
+            // DenseMlaForwardKernel only writes split-K partials when active_splits > 1,
+            // and Hy4Engine launches active_splits = 1 (never > 1 above 64 rows), matching UnitLayout.
+            let split_k_cap = max_rows.min(64) * 16 * (64 / gpus) * (512 * 2 + 4);
             let attn_scratch = progs
                 .dsa_scratch_bytes
-                .max(progs.swa_decode_scratch_bytes)
-                .max(progs.swa_extend_scratch_bytes);
-            let cache = Hy4CacheRank::new(device, &cfg, kv_format, max_pages, 1, max_rows, 0, &stream)?;
+                .min(split_k_cap)
+                .max(progs.swa_decode_scratch_bytes.min(split_k_cap))
+                .max(progs.swa_extend_scratch_bytes.min(split_k_cap))
+                .max(1024);
+            let cache = Rc::new(Hy4CacheRank::new(
+                vec![stream.clone()],
+                &cfg,
+                kv_format,
+                max_pages,
+                max_sequences,
+                max_rows,
+                mark_slots,
+            )?);
             let native_layout = weights.native.scratch_layout(max_rows)?;
             let native_head_layout = weights.native.head_scratch_layout(max_rows.min(64))?;
             let scratch = RankScratch::new(
                 device,
+                rank,
                 gpus,
                 max_rows,
-                max_pages,
+                max_seq_pages,
+                max_sequences,
                 cfg.engram_layers.len(),
+                cfg.vocab_size,
                 weights.local_vocab,
                 attn_scratch,
                 native_layout.as_ref(),
@@ -396,6 +603,12 @@ impl<'a> Hy4Engine<'a> {
             });
         }
 
+        let head_handoff = if gpus == 2 {
+            Some(Handoff::new(ranks[0].stream.clone(), ranks[1].stream.clone())?)
+        } else {
+            None
+        };
+
         let dsa_index_of: BTreeMap<usize, usize> = cfg
             .sparse_layers()
             .into_iter()
@@ -415,21 +628,93 @@ impl<'a> Hy4Engine<'a> {
             .enumerate()
             .map(|(i, l)| (l, i))
             .collect();
+        let golden_placement = Hy4Placement::new((0..max_pages as u32).collect(), 0, cfg.engram_pad_id);
 
+        let onboarded_layers: BTreeSet<usize> = cfg.routed_layers().into_iter().collect();
         Ok(Self {
             cfg,
             max_rows,
             max_pages,
+            max_sequences,
+            max_context,
             engram,
             skip_routed_experts,
             dump_dir: None,
             ranks,
+            head_handoff,
+            spark: None,
+            onboarded_layers,
+            next_identity: 1,
+            placement_version: 1,
             dsa_index_of,
             swa_index_of,
             engram_index_of,
-            engram_histories,
-            committed_pos: 0,
+            golden_placement,
+            terminal: false,
         })
+    }
+
+    /// Attach a bootstrapped Spark expert link for routed layers not onboarded onto the RTX GPUs.
+    pub(crate) fn attach_spark(&mut self, link: SparkLink<'a>, onboarded_layers: impl IntoIterator<Item = usize>) {
+        self.spark = Some(link);
+        self.onboarded_layers = onboarded_layers.into_iter().collect();
+    }
+
+    /// Orderly terminal retirement: quiesce Spark link, drain device streams and caches, release link.
+    pub(crate) fn terminate(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        if let Some(spark) = &mut self.spark {
+            let _ = spark.terminal_quiesce();
+        }
+        let _ = self.drain();
+        if let Some(spark) = &mut self.spark {
+            let _ = spark.terminal_drain_copies();
+            let _ = spark.terminal_release();
+        }
+    }
+
+    pub(crate) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary {
+        self.ranks[0].device.library
+    }
+
+    pub(crate) fn lead_device_id(&self) -> i32 {
+        self.ranks[0].device.id
+    }
+
+    pub(crate) fn prefix(&self) -> Result<Hy4Prefix<'a>> {
+        let caches: Vec<Rc<Hy4CacheRank<'a>>> = self.ranks.iter().map(|r| r.cache.clone()).collect();
+        Hy4Prefix::new(caches, self.cfg.engram_pad_id)
+    }
+
+    pub(crate) fn dump_state(&self, placement: &Hy4Placement) -> Result<Vec<super::cache::Hy4RankStateSnapshot>> {
+        self.ranks.iter().map(|r| r.cache.dump_state(placement)).collect()
+    }
+
+    pub(crate) fn mark_slots(&self) -> usize {
+        self.ranks[0].cache.mark_slots
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        ensure!(!self.terminal, "Hy4-flash execution is terminal");
+        Ok(())
+    }
+
+    pub(crate) fn drain(&self) -> Result<()> {
+        for r in &self.ranks {
+            r.stream.drain()?;
+            r.cache.drain()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
+        for r in &self.ranks {
+            r.cache.inventory(inventory)?;
+        }
+        Ok(())
     }
 
     fn dump_bf16(&self, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
@@ -464,13 +749,9 @@ impl<'a> Hy4Engine<'a> {
 
     pub(crate) fn reset(&mut self) -> Result<()> {
         for r in &mut self.ranks {
-            r.cache.zero_all(&r.stream)?;
-            for seq in &mut r.cache.pending_counts {
-                seq.fill(0);
-            }
+            r.cache.zero_all()?;
         }
-        self.engram_histories = self.engram.start_histories();
-        self.committed_pos = 0;
+        self.golden_placement = Hy4Placement::new((0..self.max_pages as u32).collect(), 0, self.cfg.engram_pad_id);
         Ok(())
     }
 
@@ -490,7 +771,6 @@ impl<'a> Hy4Engine<'a> {
         let ev1 = self.ranks[1].peer_ready.raw;
         let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.delta_f32.buffer };
         let src1 = CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.delta_f32.buffer };
-        // Wait for peer partial to finish, then copy GPU-to-GPU directly into delta_peer_f32.
         self.ranks[0].device.run(|| unsafe {
             self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, ev1)?;
             self.ranks[0].device.library.copy_peer_async(
@@ -509,7 +789,6 @@ impl<'a> Hy4Engine<'a> {
                 self.ranks[1].stream.raw,
             )
         })?;
-        // Ensure both peer copies finished reading the source buffers before summing in-place.
         for r in &mut self.ranks {
             r.peer_ready.record(&r.stream)?;
         }
@@ -548,80 +827,167 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    /// Run a contiguous chunk of `tokens` starting at `self.committed_pos` through layers `0..=last_layer`.
-    /// Returns FP32 logits `[tokens.len(), vocab_size]` if `last_layer == self.cfg.layers - 1`, else empty.
-    pub(crate) fn forward_chunk(&mut self, tokens: &[u32], last_layer: usize) -> Result<Vec<f32>> {
-        self.forward_chunk_opts(tokens, last_layer, true)
-    }
-
-    /// Run a contiguous chunk of `tokens` starting at `self.committed_pos` through layers `0..=last_layer`,
-    /// optionally skipping the terminal `hc_head` + `lm_head` projection when `compute_head == false`
-    /// (used for prefix prefill before serving-shaped `N=1` decode steps).
-    pub(crate) fn forward_chunk_opts(
+    /// Stage metadata, Engram lookups, and token embeddings for a multi-sequence unit.
+    fn begin_batch(
         &mut self,
-        tokens: &[u32],
-        last_layer: usize,
-        compute_head: bool,
-    ) -> Result<Vec<f32>> {
-        let rows = tokens.len();
-        ensure!(rows > 0 && rows <= self.max_rows, "Hy4 chunk rows {rows} outside 1..={}", self.max_rows);
-        ensure!(last_layer < self.cfg.layers, "last_layer {last_layer} >= {}", self.cfg.layers);
-        let pos_start = self.committed_pos;
-        let pos_end = pos_start + rows;
-        let total_pages = pos_end.div_ceil(PAGE_ROWS);
-        ensure!(total_pages <= self.max_pages, "sequence length {pos_end} exceeds cache pages {}", self.max_pages);
+        placements: &[Hy4Placement],
+        initial_starts: &[usize],
+        sources: &[&[u32]],
+        unit: &Unit,
+        priority: ReadPriority,
+    ) -> Result<ActiveBatch> {
+        let rows = unit.rows.len();
+        ensure!(rows > 0 && rows <= self.max_rows, "Hy4 unit rows {rows} outside 1..={}", self.max_rows);
+        ensure!(!unit.segments.is_empty(), "Hy4 unit must carry explicit segments");
+        ensure!(unit.segments.len() <= self.max_sequences, "Hy4 batch exceeds max_sequences {}", self.max_sequences);
 
-        // 1. Upload positions and DSA/SWA KV slots; embed tokens into 4-stream iHC residual r_a.
         let swa_ring_pages = self.ranks[0].cache.swa_ring_pages;
         let swa_ring_rows = self.ranks[0].cache.swa_ring_rows;
-        let pos_i64: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i64).to_le_bytes()).collect();
-        let pos_i32: Vec<u8> = (pos_start..pos_end).flat_map(|p| (p as i32).to_le_bytes()).collect();
-        let swa_slots_i64: Vec<u8> = (pos_start..pos_end)
-            .flat_map(|p| ((p % swa_ring_rows) as i64).to_le_bytes())
-            .collect();
-        let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
-        let identity_pt_row: Vec<i32> = (0..total_pages as i32).collect();
-        let mut dsa_pt_bytes = Vec::with_capacity(rows * total_pages * 4);
-        for _ in 0..rows {
-            for &p in &identity_pt_row {
-                dsa_pt_bytes.extend_from_slice(&p.to_le_bytes());
+
+        let mut flat_tokens = Vec::with_capacity(rows);
+        let mut pos_i64 = Vec::with_capacity(rows * 8);
+        let mut pos_i32 = Vec::with_capacity(rows * 4);
+        let mut dsa_slots_i64 = Vec::with_capacity(rows * 8);
+        let mut swa_slots_i64 = Vec::with_capacity(rows * 8);
+        let mut limits_bytes = Vec::with_capacity(rows * 4);
+        let mut swa_seqlens_bytes = Vec::with_capacity(unit.segments.len() * 4);
+        let mut swa_cu_bytes = Vec::with_capacity((unit.segments.len() + 1) * 4);
+        let mut g_pos_bytes = Vec::new();
+        let mut g_slots_bytes = Vec::new();
+        let mut engram_members: Vec<([u32; 2], &[u32])> = Vec::with_capacity(unit.segments.len());
+
+        let mut max_seq_end = 0usize;
+        let mut all_single_row = true;
+        let mut members = Vec::with_capacity(unit.segments.len());
+        let mut row_cursor = 0usize;
+
+        for seg in &unit.segments {
+            let p = placements
+                .get(seg.sequence)
+                .with_context(|| format!("Hy4 segment sequence {} out of range", seg.sequence))?;
+            let src = sources
+                .get(seg.sequence)
+                .with_context(|| format!("Hy4 segment tokens {} out of range", seg.sequence))?;
+            ensure!(
+                seg.rows.start == row_cursor && seg.rows.len() == seg.tokens.len() && !seg.rows.is_empty(),
+                "Hy4 segment rows/tokens mismatch"
+            );
+            let pos_start = p.len;
+            ensure!(
+                seg.tokens.start == pos_start,
+                "Hy4 segment start {} differs from placement frontier {}",
+                seg.tokens.start,
+                pos_start
+            );
+            let base_start = *initial_starts
+                .get(seg.sequence)
+                .with_context(|| format!("Hy4 initial start {} out of range", seg.sequence))?;
+            let slice_start = seg
+                .tokens
+                .start
+                .checked_sub(base_start)
+                .context("Hy4 segment start precedes submission origin")?;
+            let tok_slice = src
+                .get(slice_start..slice_start + seg.tokens.len())
+                .context("Hy4 segment token slice out of bounds")?;
+            let n = tok_slice.len();
+            let pos_end = pos_start + n;
+            ensure!(
+                pos_end <= self.max_context && pos_end.div_ceil(PAGE_ROWS) <= p.units.len(),
+                "Hy4 sequence extent {pos_end} exceeds context {} or reserved pages {}",
+                self.max_context,
+                p.units.len()
+            );
+            ensure!(p.slot < self.max_sequences, "Hy4 sequence slot {} out of range", p.slot);
+            if n != 1 {
+                all_single_row = false;
+            }
+            max_seq_end = max_seq_end.max(pos_end);
+            swa_cu_bytes.extend_from_slice(&(row_cursor as i32).to_le_bytes());
+            swa_seqlens_bytes.extend_from_slice(&(pos_end as i32).to_le_bytes());
+            flat_tokens.extend_from_slice(tok_slice);
+
+            for (offset, _) in tok_slice.iter().enumerate() {
+                let pos = pos_start + offset;
+                let logical_page = pos / PAGE_ROWS;
+                let local_row = pos % PAGE_ROWS;
+                let phys_page = p.units[logical_page] as usize;
+                let dsa_slot = phys_page * PAGE_ROWS + local_row;
+                let swa_slot = p.slot * swa_ring_rows + (pos % swa_ring_rows);
+                pos_i64.extend_from_slice(&(pos as i64).to_le_bytes());
+                pos_i32.extend_from_slice(&(pos as i32).to_le_bytes());
+                dsa_slots_i64.extend_from_slice(&(dsa_slot as i64).to_le_bytes());
+                swa_slots_i64.extend_from_slice(&(swa_slot as i64).to_le_bytes());
+                limits_bytes.extend_from_slice(&((pos / 4) as i32).to_le_bytes());
+            }
+
+            let pending = pos_start % 4;
+            let complete = (pending + n) / 4;
+            if complete > 0 {
+                let first_gid = (pos_start - pending) / 4;
+                for g in 0..complete {
+                    let gid = first_gid + g;
+                    let logical_page = gid / (PAGE_ROWS / 4);
+                    let local_group = gid % (PAGE_ROWS / 4);
+                    let phys_page = p.units[logical_page] as usize;
+                    let phys_group_slot = phys_page * (PAGE_ROWS / 4) + local_group;
+                    g_pos_bytes.extend_from_slice(&((gid * 4) as i64).to_le_bytes());
+                    g_slots_bytes.extend_from_slice(&(phys_group_slot as i64).to_le_bytes());
+                }
+            }
+
+            let next_tail = match (p.engram_tail, tok_slice) {
+                (t, []) => t,
+                ([_, b], [x]) => [b, *x],
+                (_, slice) => [slice[slice.len() - 2], slice[slice.len() - 1]],
+            };
+            engram_members.push((p.engram_tail, tok_slice));
+            members.push(ActiveMember {
+                sequence: seg.sequence,
+                slot: p.slot,
+                pos_start,
+                row_start: row_cursor,
+                row_len: n,
+                next_engram_tail: next_tail,
+            });
+            row_cursor += n;
+        }
+        swa_cu_bytes.extend_from_slice(&(rows as i32).to_le_bytes());
+
+        let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
+        let mut dsa_pt_bytes = Vec::with_capacity(rows * pt_stride * 4);
+        let mut swa_pt_bytes = Vec::with_capacity(members.len() * pt_stride * 4);
+        for m in &members {
+            let p = &placements[m.sequence];
+            let seq_pages = (m.pos_start + m.row_len).div_ceil(PAGE_ROWS);
+            let mut row_pt = Vec::with_capacity(pt_stride * 4);
+            for lp in 0..pt_stride {
+                let phys = if lp < seq_pages { p.units[lp] as i32 } else { 0i32 };
+                row_pt.extend_from_slice(&phys.to_le_bytes());
+                let swa_phys = (m.slot * swa_ring_pages + (lp % swa_ring_pages)) as i32;
+                swa_pt_bytes.extend_from_slice(&swa_phys.to_le_bytes());
+            }
+            for _ in 0..m.row_len {
+                dsa_pt_bytes.extend_from_slice(&row_pt);
             }
         }
-        let swa_pt_bytes: Vec<u8> = (0..total_pages)
-            .flat_map(|p| ((p % swa_ring_pages) as i32).to_le_bytes())
-            .collect();
-        let swa_seqlens_bytes: Vec<u8> = (pos_end as i32).to_le_bytes().to_vec();
-        let swa_cu_bytes: Vec<u8> = [0i32, rows as i32].into_iter().flat_map(i32::to_le_bytes).collect();
-        let limits_bytes: Vec<u8> = (pos_start..pos_end).flat_map(|p| ((p / 4) as i32).to_le_bytes()).collect();
-        // Every DSA layer processes the same token stream in lockstep, so pending/complete_groups match.
-        let pending_common = self.ranks[0].cache.pending_counts[0].first().copied().unwrap_or(0);
-        let complete_groups_common = (pending_common + rows) / 4;
-        let (g_pos_bytes, g_slots_bytes) = if complete_groups_common > 0 {
-            let first_gid = (pos_start - pending_common) / 4;
-            let gp: Vec<u8> = (0..complete_groups_common).flat_map(|g| (((first_gid + g) * 4) as i64).to_le_bytes()).collect();
-            let gs: Vec<u8> = (0..complete_groups_common).flat_map(|g| ((first_gid + g) as i64).to_le_bytes()).collect();
-            (gp, gs)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
 
-        // Precompute Engram lookups on host for every Engram layer we will visit.
+        // Precompute batched Engram host lookups for every Engram layer in this unit's layer span.
         let mut engram_chunks: BTreeMap<usize, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
         for &layer in &self.cfg.engram_layers {
-            if layer <= last_layer {
-                let hist = self.engram_histories.get_mut(&layer).context("missing engram history")?;
-                let (bf16, masked) = self.engram.lookup_chunk(layer, hist, tokens)?;
-                let raw_bytes: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
+            if unit.layers.contains(&layer) {
+                let (raw_bytes, masked, _) = self.engram.lookup_batch(layer, &engram_members, priority)?;
                 engram_chunks.insert(layer, (raw_bytes, masked));
             }
         }
 
-        // Embed on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
+        // Embed tokens on rank 0 into r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
             let r0 = &mut self.ranks[0];
             let emb = r0.weights.embedding.as_ref().context("rank 0 missing TokenEmbedding")?;
             r0.device.run(|| {
-                emb.embed(tokens, r0.scratch.ids.buffer, HC, r0.scratch.r_a.buffer, r0.stream.raw)
+                emb.embed(&flat_tokens, r0.scratch.ids.buffer, HC, r0.scratch.r_a.buffer, r0.stream.raw)
             })?;
             r0.peer_ready.record(&r0.stream)?;
         }
@@ -639,14 +1005,14 @@ impl<'a> Hy4Engine<'a> {
                 )
             })?;
         }
-        // Upload every chunk metadata & Engram staging buffer ONCE on each rank's non-blocking
-        // stream with copy_h2d_ordered (whole admitted destinations, zero stream-0 races).
+
+        // Upload unit metadata & Engram buffers ONCE on each rank's non-blocking stream.
         for r in &self.ranks {
             r.device.run(|| unsafe {
                 let s = r.stream.raw;
                 r.device.library.copy_h2d_ordered(r.scratch.positions_i64.buffer, &pos_i64, s)?;
                 r.device.library.copy_h2d_ordered(r.scratch.positions_i32.buffer, &pos_i32, s)?;
-                r.device.library.copy_h2d_ordered(r.scratch.dsa_slots_i64.buffer, &pos_i64, s)?;
+                r.device.library.copy_h2d_ordered(r.scratch.dsa_slots_i64.buffer, &dsa_slots_i64, s)?;
                 r.device.library.copy_h2d_ordered(r.scratch.swa_slots_i64.buffer, &swa_slots_i64, s)?;
                 r.device.library.copy_h2d_ordered(r.scratch.dsa_page_table.buffer, &dsa_pt_bytes, s)?;
                 r.device.library.copy_h2d_ordered(r.scratch.swa_page_table.buffer, &swa_pt_bytes, s)?;
@@ -667,7 +1033,7 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
 
-        let dump_rows = if self.dump_dir.is_some() && pos_start == 0 {
+        let dump_rows = if self.dump_dir.is_some() && members.len() == 1 && members[0].pos_start == 0 {
             rows.min(16)
         } else {
             0
@@ -675,224 +1041,241 @@ impl<'a> Hy4Engine<'a> {
         if dump_rows > 0 {
             let dir = self.dump_dir.as_ref().unwrap();
             std::fs::create_dir_all(dir)?;
-            let tok_bytes: Vec<u8> = tokens[..dump_rows].iter().flat_map(|t| t.to_le_bytes()).collect();
+            let tok_bytes: Vec<u8> = flat_tokens[..dump_rows].iter().flat_map(|t| t.to_le_bytes()).collect();
             std::fs::write(dir.join("tokens.u32"), tok_bytes)?;
             self.dump_bf16("embed", self.ranks[0].scratch.r_a.buffer, dump_rows * HC * H)?;
         }
 
-        let mut use_a = true;
+        Ok(ActiveBatch {
+            rows,
+            max_seq_end,
+            pt_stride,
+            all_single_row: all_single_row && rows <= 64,
+            dump_rows,
+            use_a: true,
+            members,
+        })
+    }
+
+    /// Run Engram (when present) + attention iHC pre + absorbed MLA + indexer/SWA + sink/gate/UV
+    /// + o_proj + TP2 reduce + post_proj_norm + fused iHC post/pre for `layer`.
+    fn run_layer_attention(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let is_sparse = self.cfg.sparse_layer[layer];
+        let attn = self.cfg.attention(layer);
         let gpus = self.ranks.len();
+        let local_heads = attn.heads / gpus;
+        let rows = batch.rows;
+        let use_a = batch.use_a;
 
-        for layer in 0..=last_layer {
-            let p = format!("model.layers.{layer}");
-            let is_sparse = self.cfg.sparse_layer[layer];
-            let attn = self.cfg.attention(layer);
-            let local_heads = attn.heads / gpus;
-
-            // (A) Engram layer (in-place update on active residual stream r_cur)
-            if let Some(&slot) = self.engram_index_of.get(&layer) {
-                for r in &self.ranks {
-                    let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
-                    r.device.run(|| {
-                        let ep = format!("{p}.engram_layer");
-                        let s = [Scalar::I32(rows as i32)];
-                        // SAFETY: admitted arena weight views & rank scratch live through stream drain.
-                        unsafe {
-                            r.programs.engram_head_norm.launch(
-                                &[
-                                    r.scratch.engram_raw[slot].buffer.ptr,
-                                    r.weights.buf(&format!("{ep}.lookup_per_head_norms.packed"))?.ptr,
-                                    r.scratch.engram_normed.buffer.ptr,
-                                ],
-                                &s, r.stream.raw,
-                            )?;
-                            r.programs.proj_engram_value.launch(
-                                &[r.scratch.engram_normed.buffer.ptr, r.weights.weight(&format!("{ep}.value_proj"))?.ptr, r.scratch.engram_val.buffer.ptr],
-                                &s, r.stream.raw,
-                            )?;
-                            r.programs.proj_engram_key.launch(
-                                &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.key_projs.packed.weight"))?.ptr, r.scratch.engram_keys.buffer.ptr],
-                                &s, r.stream.raw,
-                            )?;
-                            r.programs.engram_gate_add.launch(
-                                &[
-                                    r_cur.ptr,
-                                    r.scratch.engram_keys.buffer.ptr,
-                                    r.weights.buf(&format!("{ep}.key_projs.packed.bias"))?.ptr,
-                                    r.scratch.engram_val.buffer.ptr,
-                                    r.weights.buf(&format!("{ep}.value_proj.bias"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.norm_key.packed"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.norm_query.packed"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.unified_pre_gamma"))?.ptr,
-                                    r.weights.buf(&format!("{ep}.unified_per_hc_scales.packed"))?.ptr,
-                                    r.scratch.engram_masked[slot].buffer.ptr,
-                                ],
-                                &s, r.stream.raw,
-                            )?;
-                        }
-                        Ok(())
-                    })?;
-                }
-                if dump_rows > 0 && layer <= 3 {
-                    let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
-                    self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, dump_rows * HC * H)?;
-                }
-            }
-
-            // (B) Attention iHC pre + absorbed MLA + compressed indexer (if DSA) + sink/gate W_UV + o_proj
-            for r in &mut self.ranks {
+        // (A) Engram layer (in-place update on active residual stream r_cur)
+        if let Some(&slot) = self.engram_index_of.get(&layer) {
+            for r in &self.ranks {
                 let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
-                let s_rows = [Scalar::I32(rows as i32)];
-                let inv_freq = if is_sparse { r.weights.inv_freq_dsa.buffer.ptr } else { r.weights.inv_freq_swa.buffer.ptr };
-                let kv_slots_ptr = if is_sparse {
-                    r.scratch.dsa_slots_i64.buffer.ptr
-                } else {
-                    r.scratch.swa_slots_i64.buffer.ptr
-                };
-                let kv_cache_buf = if is_sparse {
-                    r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
-                } else {
-                    r.cache.swa_ring(0, self.swa_index_of[&layer])?
-                };
-                let (w_uk, w_uv) = r.weights.kv_b_absorbed(layer, local_heads)?;
-                let dev = r.device;
-
-                dev.run(|| {
-                    // SAFETY: all arena weight views, cache planes, and scratch stay live through stream drain.
+                r.device.run(|| {
+                    let ep = format!("{p}.engram_layer");
+                    let s = [Scalar::I32(rows as i32)];
+                    // SAFETY: admitted arena weight views & rank scratch live through stream drain.
                     unsafe {
-                        r.programs.ihc_pre.launch(
+                        r.programs.engram_head_norm.launch(
+                            &[
+                                r.scratch.engram_raw[slot].buffer.ptr,
+                                r.weights.buf(&format!("{ep}.lookup_per_head_norms.packed"))?.ptr,
+                                r.scratch.engram_normed.buffer.ptr,
+                            ],
+                            &s, r.stream.raw,
+                        )?;
+                        r.programs.proj_engram_value.launch(
+                            &[r.scratch.engram_normed.buffer.ptr, r.weights.weight(&format!("{ep}.value_proj"))?.ptr, r.scratch.engram_val.buffer.ptr],
+                            &s, r.stream.raw,
+                        )?;
+                        r.programs.proj_engram_key.launch(
+                            &[r.scratch.engram_normed.buffer.ptr, r.weights.buf(&format!("{ep}.key_projs.packed.weight"))?.ptr, r.scratch.engram_keys.buffer.ptr],
+                            &s, r.stream.raw,
+                        )?;
+                        r.programs.engram_gate_add.launch(
                             &[
                                 r_cur.ptr,
-                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
-                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
-                                r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
-                                r.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
-                                r.scratch.post.buffer.ptr,
-                                r.scratch.y.buffer.ptr,
+                                r.scratch.engram_keys.buffer.ptr,
+                                r.weights.buf(&format!("{ep}.key_projs.packed.bias"))?.ptr,
+                                r.scratch.engram_val.buffer.ptr,
+                                r.weights.buf(&format!("{ep}.value_proj.bias"))?.ptr,
+                                r.weights.buf(&format!("{ep}.norm_key.packed"))?.ptr,
+                                r.weights.buf(&format!("{ep}.norm_query.packed"))?.ptr,
+                                r.weights.buf(&format!("{ep}.unified_pre_gamma"))?.ptr,
+                                r.weights.buf(&format!("{ep}.unified_per_hc_scales.packed"))?.ptr,
+                                r.scratch.engram_masked[slot].buffer.ptr,
                             ],
+                            &s, r.stream.raw,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            if batch.dump_rows > 0 && layer <= 3 {
+                let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+                self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
+            }
+        }
+
+        // (B) Attention iHC pre + absorbed MLA + compressed indexer (DSA) / SWA + sink/gate W_UV + o_proj
+        let max_groups = batch.max_seq_end / 4;
+        let pt_stride = batch.pt_stride;
+        for r in &mut self.ranks {
+            let r_cur = if use_a { r.scratch.r_a.buffer } else { r.scratch.r_b.buffer };
+            let s_rows = [Scalar::I32(rows as i32)];
+            let inv_freq = if is_sparse { r.weights.inv_freq_dsa.buffer.ptr } else { r.weights.inv_freq_swa.buffer.ptr };
+            let kv_slots_ptr = if is_sparse {
+                r.scratch.dsa_slots_i64.buffer.ptr
+            } else {
+                r.scratch.swa_slots_i64.buffer.ptr
+            };
+            let kv_cache_buf = if is_sparse {
+                r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
+            } else {
+                r.cache.swa_layer_bank(self.swa_index_of[&layer])?
+            };
+            let (w_uk, w_uv) = r.weights.kv_b_absorbed(layer, local_heads)?;
+            let dev = r.device;
+
+            dev.run(|| {
+                // SAFETY: all arena weight views, cache planes, and scratch stay live through stream drain.
+                unsafe {
+                    r.programs.ihc_pre.launch(
+                        &[
+                            r_cur.ptr,
+                            r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                            r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                            r.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                            r.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                            r.scratch.post.buffer.ptr,
+                            r.scratch.y.buffer.ptr,
+                        ],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.self_attn.q_a_proj"),
+                        &r.programs.proj_q_a,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.q_a.buffer,
+                    )?;
+                    launch_proj_kv_a(
+                        r,
+                        &format!("{p}.self_attn.kv_a_proj_with_mqa"),
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.kv_a.buffer,
+                    )?;
+                    r.programs.mla_rank_norm_pack.launch(
+                        &[
+                            r.scratch.q_a.buffer.ptr,
+                            r.scratch.kv_a.buffer.ptr,
+                            r.weights.buf(&format!("{p}.self_attn.q_a_layernorm.weight"))?.ptr,
+                            r.weights.buf(&format!("{p}.self_attn.kv_a_layernorm.weight"))?.ptr,
+                            kv_slots_ptr,
+                            r.scratch.positions_i64.buffer.ptr,
+                            inv_freq,
+                            r.scratch.q_resid.buffer.ptr,
+                            kv_cache_buf.ptr,
+                        ],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    let (proj_qb, proj_gate, q_abs, sink_uv, proj_o) = if is_sparse {
+                        (&r.programs.proj_q_b_dsa, &r.programs.proj_linear_gate_dsa, &r.programs.mla_q_absorb_dsa, &r.programs.mla_sink_gate_uv_dsa, &r.programs.proj_o_dsa)
+                    } else {
+                        (&r.programs.proj_q_b_swa, &r.programs.proj_linear_gate_swa, &r.programs.mla_q_absorb_swa, &r.programs.mla_sink_gate_uv_swa, &r.programs.proj_o_swa)
+                    };
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.self_attn.q_b_proj"),
+                        proj_qb,
+                        rows,
+                        r.scratch.q_resid.buffer,
+                        r.scratch.q_raw.buffer,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.self_attn.linear_gate"),
+                        proj_gate,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.gate.buffer,
+                    )?;
+                    q_abs.launch(
+                        &[r.scratch.q_raw.buffer.ptr, w_uk, r.scratch.positions_i64.buffer.ptr, inv_freq, r.scratch.query.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+
+                    if is_sparse {
+                        let dsa_idx = self.dsa_index_of[&layer];
+                        let idx_cache = r.cache.dsa_index_layer(dsa_idx)?;
+                        let ip = format!("{p}.self_attn.compressed_indexer");
+                        r.programs.proj_indexer_wk.launch(
+                            &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.token_key_projection"))?.ptr, r.scratch.idx_tk_raw.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.self_attn.q_a_proj"),
-                            &r.programs.proj_q_a,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.q_a.buffer,
-                        )?;
-                        launch_proj_kv_a(
-                            r,
-                            &format!("{p}.self_attn.kv_a_proj_with_mqa"),
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.kv_a.buffer,
-                        )?;
-                        r.programs.mla_rank_norm_pack.launch(
-                            &[
-                                r.scratch.q_a.buffer.ptr,
-                                r.scratch.kv_a.buffer.ptr,
-                                r.weights.buf(&format!("{p}.self_attn.q_a_layernorm.weight"))?.ptr,
-                                r.weights.buf(&format!("{p}.self_attn.kv_a_layernorm.weight"))?.ptr,
-                                kv_slots_ptr,
-                                r.scratch.positions_i64.buffer.ptr,
-                                inv_freq,
-                                r.scratch.q_resid.buffer.ptr,
-                                kv_cache_buf.ptr,
-                            ],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        let (proj_qb, proj_gate, q_abs, sink_uv, proj_o) = if is_sparse {
-                            (&r.programs.proj_q_b_dsa, &r.programs.proj_linear_gate_dsa, &r.programs.mla_q_absorb_dsa, &r.programs.mla_sink_gate_uv_dsa, &r.programs.proj_o_dsa)
-                        } else {
-                            (&r.programs.proj_q_b_swa, &r.programs.proj_linear_gate_swa, &r.programs.mla_q_absorb_swa, &r.programs.mla_sink_gate_uv_swa, &r.programs.proj_o_swa)
-                        };
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.self_attn.q_b_proj"),
-                            proj_qb,
-                            rows,
-                            r.scratch.q_resid.buffer,
-                            r.scratch.q_raw.buffer,
-                        )?;
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.self_attn.linear_gate"),
-                            proj_gate,
-                            rows,
-                            r.scratch.y.buffer,
-                            r.scratch.gate.buffer,
-                        )?;
-                        q_abs.launch(
-                            &[r.scratch.q_raw.buffer.ptr, w_uk, r.scratch.positions_i64.buffer.ptr, inv_freq, r.scratch.query.buffer.ptr],
+                        let tk_w = r.weights.buf(&format!("{ip}.token_key_norm.weight"))?.ptr;
+                        r.programs.rms_norm_128.launch(
+                            &[r.scratch.idx_tk_raw.buffer.ptr, tk_w, tk_w, tk_w, tk_w, tk_w, r.scratch.idx_tk.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
 
-                        if is_sparse {
-                            let dsa_idx = self.dsa_index_of[&layer];
-                            let idx_cache = r.cache.dsa_index_layer(dsa_idx)?;
-                            let ip = format!("{p}.self_attn.compressed_indexer");
-                            // Token keys + RMSNorm -> complete 4-token groups into group_cache.
-                            r.programs.proj_indexer_wk.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.token_key_projection"))?.ptr, r.scratch.idx_tk_raw.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-                            let tk_w = r.weights.buf(&format!("{ip}.token_key_norm.weight"))?.ptr;
-                            r.programs.rms_norm_128.launch(
-                                &[r.scratch.idx_tk_raw.buffer.ptr, tk_w, tk_w, tk_w, tk_w, tk_w, r.scratch.idx_tk.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-
-                            let pending = r.cache.pending_counts[0][dsa_idx];
+                        // Assemble completed 4-token groups across all batch members into idx_group_tok.
+                        let mut batch_groups = 0usize;
+                        for m in &batch.members {
+                            let pending = r.cache.pending_counts.borrow()[m.slot][dsa_idx];
                             ensure!(
-                                pending == pending_common,
-                                "Hy4 DSA layer {layer} pending count {pending} diverged from {pending_common}"
+                                pending == m.pos_start % 4,
+                                "Hy4 DSA layer {layer} slot {} pending count {pending} != {}",
+                                m.slot,
+                                m.pos_start % 4
                             );
-                            let total_avail = pending + rows;
-                            let complete_groups = total_avail / 4;
+                            let total_avail = pending + m.row_len;
+                            let complete = total_avail / 4;
                             let new_pending = total_avail % 4;
-                            let pending_buf = r.cache.pending_key_slot(0, dsa_idx)?;
-                            if complete_groups > 0 {
+                            let pending_buf = r.cache.pending_key_slot(m.slot, dsa_idx)?;
+                            let tok_src_base = m.row_start * IDX_DIM * 2;
+                            if complete > 0 {
+                                let group_dst_off = batch_groups * 4 * IDX_DIM * 2;
                                 if pending > 0 {
-                                    r.device.library.copy_d2d_async(
-                                        r.scratch.idx_group_tok.buffer,
-                                        pending_buf,
-                                        pending * IDX_DIM * 2,
-                                        r.stream.raw,
-                                    )?;
+                                    let dst_p = CuteafdDeviceBuffer {
+                                        ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off).cast(),
+                                        bytes: pending * IDX_DIM * 2,
+                                        ..r.scratch.idx_group_tok.buffer
+                                    };
+                                    r.device.library.copy_d2d_async(dst_p, pending_buf, pending * IDX_DIM * 2, r.stream.raw)?;
                                 }
-                                let copy_from_cur = complete_groups * 4 - pending;
+                                let copy_from_cur = complete * 4 - pending;
                                 let dst_cur = CuteafdDeviceBuffer {
-                                    ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(pending * IDX_DIM * 2).cast(),
+                                    ptr: r.scratch.idx_group_tok.buffer.ptr.cast::<u8>().wrapping_add(group_dst_off + pending * IDX_DIM * 2).cast(),
                                     bytes: copy_from_cur * IDX_DIM * 2,
                                     ..r.scratch.idx_group_tok.buffer
                                 };
-                                r.device.library.copy_d2d_async(dst_cur, r.scratch.idx_tk.buffer, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
-                                r.programs.indexer_pool_group.launch(
-                                    &[
-                                        r.scratch.idx_group_tok.buffer.ptr,
-                                        r.weights.weight(&format!("{ip}.key_value_projection"))?.ptr,
-                                        r.weights.weight(&format!("{ip}.key_gate_projection"))?.ptr,
-                                        r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
-                                        r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
-                                        r.scratch.idx_group_pos.buffer.ptr,
-                                        r.scratch.idx_group_slots.buffer.ptr,
-                                        inv_freq,
-                                        idx_cache.ptr,
-                                    ],
-                                    &[Scalar::I32(complete_groups as i32)],
-                                    r.stream.raw,
-                                )?;
+                                let src_cur = CuteafdDeviceBuffer {
+                                    ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
+                                    bytes: copy_from_cur * IDX_DIM * 2,
+                                    ..r.scratch.idx_tk.buffer
+                                };
+                                r.device.library.copy_d2d_async(dst_cur, src_cur, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
+                                batch_groups += complete;
                             }
                             if new_pending > 0 {
-                                if complete_groups == 0 {
+                                if complete == 0 {
                                     let dst = CuteafdDeviceBuffer {
                                         ptr: pending_buf.ptr.cast::<u8>().wrapping_add(pending * IDX_DIM * 2).cast(),
-                                        bytes: rows * IDX_DIM * 2,
+                                        bytes: m.row_len * IDX_DIM * 2,
                                         ..pending_buf
                                     };
-                                    r.device.library.copy_d2d_async(dst, r.scratch.idx_tk.buffer, rows * IDX_DIM * 2, r.stream.raw)?;
+                                    let src = CuteafdDeviceBuffer {
+                                        ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tok_src_base).cast(),
+                                        bytes: m.row_len * IDX_DIM * 2,
+                                        ..r.scratch.idx_tk.buffer
+                                    };
+                                    r.device.library.copy_d2d_async(dst, src, m.row_len * IDX_DIM * 2, r.stream.raw)?;
                                 } else {
-                                    let tail_off = (complete_groups * 4 - pending) * IDX_DIM * 2;
+                                    let tail_off = tok_src_base + (complete * 4 - pending) * IDX_DIM * 2;
                                     let src = CuteafdDeviceBuffer {
                                         ptr: r.scratch.idx_tk.buffer.ptr.cast::<u8>().wrapping_add(tail_off).cast(),
                                         bytes: new_pending * IDX_DIM * 2,
@@ -901,42 +1284,81 @@ impl<'a> Hy4Engine<'a> {
                                     r.device.library.copy_d2d_async(pending_buf, src, new_pending * IDX_DIM * 2, r.stream.raw)?;
                                 }
                             }
-                            r.cache.pending_counts[0][dsa_idx] = new_pending;
+                            r.cache.pending_counts.borrow_mut()[m.slot][dsa_idx] = new_pending;
+                        }
+                        if batch_groups > 0 {
+                            r.programs.indexer_pool_group.launch(
+                                &[
+                                    r.scratch.idx_group_tok.buffer.ptr,
+                                    r.weights.weight(&format!("{ip}.key_value_projection"))?.ptr,
+                                    r.weights.weight(&format!("{ip}.key_gate_projection"))?.ptr,
+                                    r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
+                                    r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
+                                    r.scratch.idx_group_pos.buffer.ptr,
+                                    r.scratch.idx_group_slots.buffer.ptr,
+                                    inv_freq,
+                                    idx_cache.ptr,
+                                ],
+                                &[Scalar::I32(batch_groups as i32)],
+                                r.stream.raw,
+                            )?;
+                        }
 
-                            let total_groups = pos_end / 4;
-                            if pos_end > CANDIDATE_TOPK && total_groups > 0 {
-                                r.programs.proj_indexer_wq_b.launch(
-                                    &[r.scratch.q_resid.buffer.ptr, r.weights.weight(&format!("{ip}.query_projection"))?.ptr, r.scratch.idx_q_raw.buffer.ptr],
-                                    &s_rows, r.stream.raw,
-                                )?;
-                                r.programs.proj_indexer_weights.launch(
-                                    &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr, r.scratch.idx_w_raw.buffer.ptr],
-                                    &s_rows, r.stream.raw,
-                                )?;
-                                r.programs.indexer_query_rope.launch(
-                                    &[
-                                        r.scratch.idx_q_raw.buffer.ptr,
-                                        r.scratch.idx_w_raw.buffer.ptr,
-                                        r.scratch.positions_i64.buffer.ptr,
-                                        inv_freq,
-                                        r.scratch.idx_q_rot.buffer.ptr,
-                                        r.scratch.idx_w_out.buffer.ptr,
-                                    ],
-                                    &s_rows, r.stream.raw,
-                                )?;
+                        if batch.max_seq_end > CANDIDATE_TOPK && max_groups > 0 {
+                            r.programs.proj_indexer_wq_b.launch(
+                                &[r.scratch.q_resid.buffer.ptr, r.weights.weight(&format!("{ip}.query_projection"))?.ptr, r.scratch.idx_q_raw.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.proj_indexer_weights.launch(
+                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr, r.scratch.idx_w_raw.buffer.ptr],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            r.programs.indexer_query_rope.launch(
+                                &[
+                                    r.scratch.idx_q_raw.buffer.ptr,
+                                    r.scratch.idx_w_raw.buffer.ptr,
+                                    r.scratch.positions_i64.buffer.ptr,
+                                    inv_freq,
+                                    r.scratch.idx_q_rot.buffer.ptr,
+                                    r.scratch.idx_w_out.buffer.ptr,
+                                ],
+                                &s_rows, r.stream.raw,
+                            )?;
+                            let tile_cap = (r.scratch.idx_score_floats / max_groups).max(1);
+                            for row_start in (0..rows).step_by(tile_cap) {
+                                let tile_rows = (rows - row_start).min(tile_cap);
+                                let q_rot_ptr = r.scratch.idx_q_rot.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * IDX_DIM * 2).cast();
+                                let w_out_ptr = r.scratch.idx_w_out.buffer.ptr.cast::<u8>().wrapping_add(row_start * IDX_HEADS * 4).cast();
+                                let pt_ptr = r.scratch.dsa_page_table.buffer.ptr.cast::<u8>().wrapping_add(row_start * pt_stride * 4).cast();
+                                let lim_ptr = r.scratch.idx_limits.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
+                                let pos_ptr = r.scratch.positions_i32.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
+                                let cand_ptr = r.scratch.idx_cand_slots.buffer.ptr.cast::<u8>().wrapping_add(row_start * CANDIDATE_TOPK * 4).cast();
+                                let len_ptr = r.scratch.idx_cand_lens.buffer.ptr.cast::<u8>().wrapping_add(row_start * 4).cast();
                                 r.programs.indexer_score_groups.launch(
                                     &[
-                                        r.scratch.idx_q_rot.buffer.ptr,
-                                        r.scratch.idx_w_out.buffer.ptr,
+                                        q_rot_ptr,
+                                        w_out_ptr,
                                         idx_cache.ptr,
-                                        r.scratch.dsa_page_table.buffer.ptr,
-                                        r.scratch.idx_limits.buffer.ptr,
+                                        pt_ptr,
+                                        lim_ptr,
                                         r.scratch.idx_scores.buffer.ptr,
                                     ],
-                                    &[Scalar::I32(rows as i32), Scalar::I32(total_groups as i32), Scalar::I32(total_pages as i32)],
+                                    &[Scalar::I32(tile_rows as i32), Scalar::I32(max_groups as i32), Scalar::I32(pt_stride as i32)],
+                                    r.stream.raw,
+                                )?;
+                                r.programs.indexer_topk_expand.launch(
+                                    &[
+                                        r.scratch.idx_scores.buffer.ptr,
+                                        pos_ptr,
+                                        pt_ptr,
+                                        cand_ptr,
+                                        len_ptr,
+                                    ],
+                                    &[Scalar::I32(tile_rows as i32), Scalar::I32(max_groups as i32), Scalar::I32(pt_stride as i32)],
                                     r.stream.raw,
                                 )?;
                             }
+                        } else {
                             r.programs.indexer_topk_expand.launch(
                                 &[
                                     r.scratch.idx_scores.buffer.ptr,
@@ -945,60 +1367,372 @@ impl<'a> Hy4Engine<'a> {
                                     r.scratch.idx_cand_slots.buffer.ptr,
                                     r.scratch.idx_cand_lens.buffer.ptr,
                                 ],
-                                &[Scalar::I32(rows as i32), Scalar::I32(total_groups.max(1) as i32), Scalar::I32(total_pages as i32)],
-                                r.stream.raw,
-                            )?;
-                            r.programs.mla_dsa_decode.launch(
-                                &[
-                                    r.scratch.query.buffer.ptr,
-                                    kv_cache_buf.ptr,
-                                    r.scratch.idx_cand_slots.buffer.ptr,
-                                    r.scratch.idx_cand_lens.buffer.ptr,
-                                    r.scratch.dsa_cu_seqlens.buffer.ptr,
-                                    r.scratch.attn_out.buffer.ptr,
-                                    r.scratch.lse_out.buffer.ptr,
-                                    r.scratch.attn_scratch.buffer.ptr,
-                                ],
-                                &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64), Scalar::I32(1)],
-                                r.stream.raw,
-                            )?;
-                        } else {
-                            // SWA-512 circular ring attention
-                            let swa_prog = if rows == 1 { &r.programs.mla_swa_decode } else { &r.programs.mla_swa_extend };
-                            swa_prog.launch(
-                                &[
-                                    r.scratch.query.buffer.ptr,
-                                    kv_cache_buf.ptr,
-                                    r.scratch.swa_page_table.buffer.ptr,
-                                    r.scratch.swa_seqlens.buffer.ptr,
-                                    r.scratch.swa_cu_seqlens.buffer.ptr,
-                                    r.scratch.attn_out.buffer.ptr,
-                                    r.scratch.lse_out.buffer.ptr,
-                                    r.scratch.attn_scratch.buffer.ptr,
-                                ],
-                                &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I64(total_pages as i64), Scalar::I32(1)],
+                                &[Scalar::I32(rows as i32), Scalar::I32(1), Scalar::I32(pt_stride as i32)],
                                 r.stream.raw,
                             )?;
                         }
-
-                        sink_uv.launch(
+                        r.programs.mla_dsa_decode.launch(
                             &[
+                                r.scratch.query.buffer.ptr,
+                                kv_cache_buf.ptr,
+                                r.scratch.idx_cand_slots.buffer.ptr,
+                                r.scratch.idx_cand_lens.buffer.ptr,
+                                r.scratch.dsa_cu_seqlens.buffer.ptr,
                                 r.scratch.attn_out.buffer.ptr,
-                                w_uv,
-                                r.scratch.gate.buffer.ptr,
                                 r.scratch.lse_out.buffer.ptr,
-                                r.weights.buf(&format!("{p}.self_attn.learnable_sink_param"))?.ptr,
-                                r.scratch.uv_out.buffer.ptr,
+                                r.scratch.attn_scratch.buffer.ptr,
                             ],
+                            &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64), Scalar::I32(1)],
+                            r.stream.raw,
+                        )?;
+                    } else {
+                        let swa_prog = if batch.all_single_row {
+                            &r.programs.mla_swa_decode
+                        } else {
+                            &r.programs.mla_swa_extend
+                        };
+                        swa_prog.launch(
+                            &[
+                                r.scratch.query.buffer.ptr,
+                                kv_cache_buf.ptr,
+                                r.scratch.swa_page_table.buffer.ptr,
+                                r.scratch.swa_seqlens.buffer.ptr,
+                                r.scratch.swa_cu_seqlens.buffer.ptr,
+                                r.scratch.attn_out.buffer.ptr,
+                                r.scratch.lse_out.buffer.ptr,
+                                r.scratch.attn_scratch.buffer.ptr,
+                            ],
+                            &[
+                                Scalar::I32(rows as i32),
+                                Scalar::I32(batch.members.len() as i32),
+                                Scalar::I64(pt_stride as i64),
+                                Scalar::I32(1),
+                            ],
+                            r.stream.raw,
+                        )?;
+                    }
+
+                    sink_uv.launch(
+                        &[
+                            r.scratch.attn_out.buffer.ptr,
+                            w_uv,
+                            r.scratch.gate.buffer.ptr,
+                            r.scratch.lse_out.buffer.ptr,
+                            r.weights.buf(&format!("{p}.self_attn.learnable_sink_param"))?.ptr,
+                            r.scratch.uv_out.buffer.ptr,
+                        ],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_split(
+                        r,
+                        gpus,
+                        &format!("{p}.self_attn.o_proj"),
+                        proj_o,
+                        rows,
+                        r.scratch.uv_out.buffer,
+                        r.scratch.delta.buffer,
+                        r.scratch.delta_f32.buffer,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")))?;
+        if batch.dump_rows > 0 && layer <= 3 {
+            let s0 = &self.ranks[0].scratch;
+            let dump_rows = batch.dump_rows;
+            self.dump_bf16(&format!("l{layer:02}_attn_y"), s0.y.buffer, dump_rows * H)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
+            self.dump_f32(&format!("l{layer:02}_attn_lse"), s0.lse_out.buffer, dump_rows * local_heads)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_uv"), s0.uv_out.buffer, dump_rows * local_heads * 256)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_delta"), s0.delta.buffer, dump_rows * H)?;
+        }
+
+        // (C) post_proj_norm + fused attention iHC post + FFN iHC pre
+        for r in &mut self.ranks {
+            let (r_in, r_out) = if use_a {
+                (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
+            } else {
+                (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
+            };
+            let s_rows = [Scalar::I32(rows as i32)];
+            r.device.run(|| unsafe {
+                let ppn = r.weights.buf(&format!("{p}.self_attn.post_proj_norm.weight"))?.ptr;
+                r.programs.rms_norm_3072.launch(
+                    &[r.scratch.delta.buffer.ptr, ppn, ppn, ppn, ppn, ppn, r.scratch.delta_norm.buffer.ptr],
+                    &s_rows, r.stream.raw,
+                )?;
+                r.programs.ihc_post_pre.launch(
+                    &[
+                        r.scratch.delta_norm.buffer.ptr,
+                        r_in.ptr,
+                        r.scratch.post.buffer.ptr,
+                        r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_fn"))?.ptr,
+                        r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_scale"))?.ptr,
+                        r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_base"))?.ptr,
+                        r.weights.buf(&format!("{p}.post_attention_layernorm.weight"))?.ptr,
+                        r_out.ptr,
+                        r.scratch.post_ffn.buffer.ptr,
+                        r.scratch.y.buffer.ptr,
+                    ],
+                    &s_rows, r.stream.raw,
+                )
+            })?;
+        }
+        batch.use_a = !batch.use_a;
+        Ok(())
+    }
+
+    /// Run MoE router + latent down + FP8 K32 quant + shared expert on all ranks (used by both local & Spark FFN).
+    fn run_moe_router_and_shared(&mut self, layer: usize, batch: &ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let gpus = self.ranks.len();
+        let rows = batch.rows;
+        for r in &mut self.ranks {
+            let s_rows = [Scalar::I32(rows as i32)];
+            let dev = r.device;
+            dev.run(|| {
+                // SAFETY: all buffers live through stream drain.
+                unsafe {
+                    r.programs.proj_router.launch(
+                        &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
+                    r.device.library.copy_d2d_async(
+                        r.scratch.router_select.buffer,
+                        r.scratch.router_logits.buffer,
+                        rows * EXPERTS * 4,
+                        r.stream.raw,
+                    )?;
+                    r.device.library.router_select(
+                        r.scratch.router_select.buffer.ptr,
+                        bias,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        r.scratch.route_ids.buffer.ptr,
+                        r.scratch.route_weights.buffer.ptr,
+                        rows,
+                        EXPERTS,
+                        TOPK,
+                        self.cfg.routed_scaling_factor as f32,
+                        true,
+                        r.stream.raw,
+                    )?;
+                    r.programs.route_weights.launch(
+                        &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.routed_expert_down_proj"),
+                        &r.programs.proj_latent_down,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.latent_in.buffer,
+                    )?;
+                    let grid = r.quantize_grid.blocks(rows, LATENT_H);
+                    r.programs.expert_input_quant.launch(
+                        &[
+                            r.scratch.latent_in.buffer.ptr,
+                            r.scratch.wire_in.buffer.ptr,
+                            r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
+                            r.scratch.wire_in.buffer.ptr,
+                        ],
+                        &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
+                        r.stream.raw,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.shared_experts.gate_proj"),
+                        &r.programs.proj_shared_gate_up,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.ffn_gate.buffer,
+                    )?;
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.shared_experts.up_proj"),
+                        &r.programs.proj_shared_gate_up,
+                        rows,
+                        r.scratch.y.buffer,
+                        r.scratch.ffn_up.buffer,
+                    )?;
+                    r.programs.post_silu_split_shared.launch(
+                        &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
+                        &s_rows, r.stream.raw,
+                    )?;
+                    launch_proj_split(
+                        r,
+                        gpus,
+                        &format!("{p}.mlp.shared_experts.down_proj"),
+                        &r.programs.proj_shared_down,
+                        rows,
+                        r.scratch.ffn_act.buffer,
+                        r.scratch.shared_out.buffer,
+                        r.scratch.shared_f32.buffer,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Finish post-FFN combine (`latent_up` + shared add + norm + iHC post) for dense or MoE layer.
+    /// When `reduce_routed_tp2 == false` on TP2, rank 0's `routed_latent` (from Spark) is replicated to rank 1.
+    fn finish_ffn_combine_and_post(&mut self, layer: usize, batch: &mut ActiveBatch, reduce_routed_tp2: bool) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let gpus = self.ranks.len();
+        let rows = batch.rows;
+
+        if self.cfg.dense_layer[layer] {
+            self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.down_proj")))?;
+        } else {
+            if gpus == 2 {
+                if reduce_routed_tp2 {
+                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None)?;
+                    for r in &self.ranks {
+                        r.device.run(|| unsafe {
+                            r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)
+                        })?;
+                    }
+                } else {
+                    // Spark reply landed on rank 0's routed_latent [rows, 1536] BF16: replicate to rank 1 via P2P.
+                    let bytes = rows * LATENT_H * 2;
+                    let (ev0, src0) = {
+                        let r0 = &mut self.ranks[0];
+                        r0.peer_ready.record(&r0.stream)?;
+                        (r0.peer_ready.raw, CuteafdDeviceBuffer { bytes, ..r0.scratch.routed_latent.buffer })
+                    };
+                    self.ranks[1].device.run(|| unsafe {
+                        self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
+                        self.ranks[1].device.library.copy_peer_async(
+                            CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.routed_latent.buffer },
+                            src0,
+                            bytes,
+                            self.ranks[1].stream.raw,
+                        )
+                    })?;
+                }
+                for r in &self.ranks {
+                    r.device.run(|| unsafe {
+                        r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.shared_f32.buffer, rows * H * 4, r.stream.raw)
+                    })?;
+                }
+                self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")))?;
+                for r in &self.ranks {
+                    r.device.run(|| unsafe {
+                        r.device.library.copy_d2d_async(r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H * 2, r.stream.raw)
+                    })?;
+                }
+            }
+            for r in &self.ranks {
+                r.device.run(|| {
+                    launch_proj_out(
+                        r,
+                        &format!("{p}.mlp.routed_expert_up_proj"),
+                        &r.programs.proj_latent_up,
+                        rows,
+                        r.scratch.routed_latent.buffer,
+                        r.scratch.routed_out.buffer,
+                    )?;
+                    // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
+                    unsafe {
+                        r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
+                    }
+                })?;
+            }
+        }
+
+        // (D) Post-FFN norm + FFN iHC post
+        let ffn_norm_name = if self.cfg.dense_layer[layer] {
+            format!("{p}.mlp.post_fc2_norm.weight")
+        } else {
+            format!("{p}.mlp.combine_output_norm.weight")
+        };
+        let use_a = batch.use_a;
+        for r in &self.ranks {
+            let (r_in, r_out) = if use_a {
+                (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
+            } else {
+                (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
+            };
+            let s_rows = [Scalar::I32(rows as i32)];
+            r.device.run(|| unsafe {
+                let nw = r.weights.buf(&ffn_norm_name)?.ptr;
+                r.programs.rms_norm_3072.launch(
+                    &[r.scratch.delta.buffer.ptr, nw, nw, nw, nw, nw, r.scratch.delta_norm.buffer.ptr],
+                    &s_rows, r.stream.raw,
+                )?;
+                r.programs.ihc_post.launch(
+                    &[r.scratch.delta_norm.buffer.ptr, r_in.ptr, r.scratch.post_ffn.buffer.ptr, r_out.ptr],
+                    &s_rows, r.stream.raw,
+                )
+            })?;
+        }
+        batch.use_a = !batch.use_a;
+
+        if batch.dump_rows > 0 {
+            let dump_rows = batch.dump_rows;
+            let r_cur = if batch.use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
+            self.dump_bf16(&format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
+            if layer <= 3 {
+                let s0 = &self.ranks[0].scratch;
+                self.dump_bf16(&format!("l{layer:02}_ffn_y"), s0.y.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
+                if !self.cfg.dense_layer[layer] {
+                    self.dump_bf16(&format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), s0.shared_out.buffer, dump_rows * H)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run dense FFN (layer 0) or local onboarded LatentMoE (layers 1..=41) + post-FFN norm + iHC post.
+    fn run_layer_local_ffn(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let gpus = self.ranks.len();
+        let rows = batch.rows;
+
+        if self.cfg.dense_layer[layer] {
+            for r in &mut self.ranks {
+                let s_rows = [Scalar::I32(rows as i32)];
+                let dev = r.device;
+                dev.run(|| {
+                    // SAFETY: all buffers live through stream drain.
+                    unsafe {
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.mlp.gate_proj"),
+                            &r.programs.proj_dense_gate_up,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.ffn_gate.buffer,
+                        )?;
+                        launch_proj_out(
+                            r,
+                            &format!("{p}.mlp.up_proj"),
+                            &r.programs.proj_dense_gate_up,
+                            rows,
+                            r.scratch.y.buffer,
+                            r.scratch.ffn_up.buffer,
+                        )?;
+                        r.programs.post_silu_split_dense.launch(
+                            &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
                             &s_rows, r.stream.raw,
                         )?;
                         launch_proj_split(
                             r,
                             gpus,
-                            &format!("{p}.self_attn.o_proj"),
-                            proj_o,
+                            &format!("{p}.mlp.down_proj"),
+                            &r.programs.proj_dense_down,
                             rows,
-                            r.scratch.uv_out.buffer,
+                            r.scratch.ffn_act.buffer,
                             r.scratch.delta.buffer,
                             r.scratch.delta_f32.buffer,
                         )?;
@@ -1006,400 +1740,477 @@ impl<'a> Hy4Engine<'a> {
                     Ok(())
                 })?;
             }
-            self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")))?;
-            if dump_rows > 0 && layer <= 3 {
-                let s0 = &self.ranks[0].scratch;
-                self.dump_bf16(&format!("l{layer:02}_attn_y"), s0.y.buffer, dump_rows * H)?;
-                self.dump_bf16(&format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
-                self.dump_bf16(&format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
-                self.dump_bf16(&format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
-                self.dump_f32(&format!("l{layer:02}_attn_lse"), s0.lse_out.buffer, dump_rows * local_heads)?;
-                self.dump_bf16(&format!("l{layer:02}_attn_uv"), s0.uv_out.buffer, dump_rows * local_heads * 256)?;
-                self.dump_bf16(&format!("l{layer:02}_attn_delta"), s0.delta.buffer, dump_rows * H)?;
-            }
+            return self.finish_ffn_combine_and_post(layer, batch, true);
+        }
 
-            // (C) post_proj_norm + fused attention iHC post + FFN iHC pre + FFN
-            for r in &mut self.ranks {
-                let (r_in, r_out) = if use_a {
-                    (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
-                } else {
-                    (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
-                };
-                let s_rows = [Scalar::I32(rows as i32)];
-                let dev = r.device;
-                dev.run(|| {
-                    // SAFETY: all buffers live through stream drain.
-                    unsafe {
-                        let ppn = r.weights.buf(&format!("{p}.self_attn.post_proj_norm.weight"))?.ptr;
-                        r.programs.rms_norm_3072.launch(
-                            &[r.scratch.delta.buffer.ptr, ppn, ppn, ppn, ppn, ppn, r.scratch.delta_norm.buffer.ptr],
-                            &s_rows, r.stream.raw,
-                        )?;
-                        r.programs.ihc_post_pre.launch(
-                            &[
-                                r.scratch.delta_norm.buffer.ptr,
-                                r_in.ptr,
-                                r.scratch.post.buffer.ptr,
-                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_fn"))?.ptr,
-                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_scale"))?.ptr,
-                                r.weights.buf(&format!("{p}.hc_mlp_layer.hc_pre.hc_base"))?.ptr,
-                                r.weights.buf(&format!("{p}.post_attention_layernorm.weight"))?.ptr,
-                                r_out.ptr,
-                                r.scratch.post_ffn.buffer.ptr,
-                                r.scratch.y.buffer.ptr,
-                            ],
-                            &s_rows, r.stream.raw,
-                        )?;
-
-                        if self.cfg.dense_layer[layer] {
-                            launch_proj_out(
-                                r,
-                                &format!("{p}.mlp.gate_proj"),
-                                &r.programs.proj_dense_gate_up,
+        self.run_moe_router_and_shared(layer, batch)?;
+        for r in &mut self.ranks {
+            let dev = r.device;
+            dev.run(|| {
+                // SAFETY: all buffers live through stream drain.
+                unsafe {
+                    if !self.skip_routed_experts {
+                        if let Some(experts) = &mut r.onboarded_experts {
+                            experts.enqueue(
+                                layer,
                                 rows,
-                                r.scratch.y.buffer,
-                                r.scratch.ffn_gate.buffer,
-                            )?;
-                            launch_proj_out(
-                                r,
-                                &format!("{p}.mlp.up_proj"),
-                                &r.programs.proj_dense_gate_up,
-                                rows,
-                                r.scratch.y.buffer,
-                                r.scratch.ffn_up.buffer,
-                            )?;
-                            r.programs.post_silu_split_dense.launch(
-                                &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-                            launch_proj_split(
-                                r,
-                                gpus,
-                                &format!("{p}.mlp.down_proj"),
-                                &r.programs.proj_dense_down,
-                                rows,
-                                r.scratch.ffn_act.buffer,
-                                r.scratch.delta.buffer,
-                                r.scratch.delta_f32.buffer,
-                            )?;
-                        } else {
-                            // LatentMoE: router + shared expert + routed experts (EXL3 K4 MUL1 onboarded or skipped)
-                            r.programs.proj_router.launch(
-                                &[r.scratch.y.buffer.ptr, r.weights.weight(&format!("{p}.mlp.gate"))?.ptr, r.scratch.router_logits.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-                            let bias = r.weights.buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?.ptr;
-                            r.device.library.copy_d2d_async(
-                                r.scratch.router_select.buffer,
-                                r.scratch.router_logits.buffer,
-                                rows * EXPERTS * 4,
+                                ExpertInput::Fp8K32(r.scratch.wire_in.buffer.ptr),
+                                Routes {
+                                    ids: r.scratch.route_ids.buffer.ptr,
+                                    weights: r.scratch.route_weights.buffer.ptr,
+                                },
                                 r.stream.raw,
+                                &mut || (),
                             )?;
-                            r.device.library.router_select(
-                                r.scratch.router_select.buffer.ptr,
-                                bias,
-                                std::ptr::null(),
-                                std::ptr::null(),
-                                r.scratch.route_ids.buffer.ptr,
-                                r.scratch.route_weights.buffer.ptr,
-                                rows,
-                                EXPERTS,
-                                TOPK,
-                                self.cfg.routed_scaling_factor as f32,
-                                true,
-                                r.stream.raw,
-                            )?;
-                            r.programs.route_weights.launch(
-                                &[r.scratch.router_logits.buffer.ptr, bias, r.scratch.route_ids.buffer.ptr, r.scratch.route_weights.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-                            launch_proj_out(
-                                r,
-                                &format!("{p}.mlp.routed_expert_down_proj"),
-                                &r.programs.proj_latent_down,
-                                rows,
-                                r.scratch.y.buffer,
-                                r.scratch.latent_in.buffer,
-                            )?;
-                            let grid = r.quantize_grid.blocks(rows, LATENT_H);
-                            r.programs.expert_input_quant.launch(
-                                &[
-                                    r.scratch.latent_in.buffer.ptr,
-                                    r.scratch.wire_in.buffer.ptr,
-                                    r.scratch.wire_in.buffer.ptr.wrapping_byte_add(LATENT_H),
-                                    r.scratch.wire_in.buffer.ptr,
-                                ],
-                                &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
-                                r.stream.raw,
-                            )?;
-
-                            if !self.skip_routed_experts {
-                                if let Some(experts) = &mut r.onboarded_experts {
-                                    experts.enqueue(
-                                        layer,
-                                        rows,
-                                        ExpertInput::Fp8K32(r.scratch.wire_in.buffer.ptr),
-                                        Routes {
-                                            ids: r.scratch.route_ids.buffer.ptr,
-                                            weights: r.scratch.route_weights.buffer.ptr,
-                                        },
-                                        r.stream.raw,
-                                        &mut || (),
-                                    )?;
-                                    let exp_out = CuteafdDeviceBuffer {
-                                        ptr: experts.output(),
-                                        bytes: rows * LATENT_H * 4,
-                                        device_id: r.device.id,
-                                        flags: 0,
-                                    };
-                                    if gpus == 1 {
-                                        r.device.library.cuda_f32_to_bf16_async(
-                                            exp_out,
-                                            r.scratch.routed_latent.buffer,
-                                            rows * LATENT_H,
-                                            r.stream.raw,
-                                        )?;
-                                    } else {
-                                        r.device.library.copy_d2d_async(
-                                            r.scratch.delta_f32.buffer,
-                                            exp_out,
-                                            rows * LATENT_H * 4,
-                                            r.stream.raw,
-                                        )?;
-                                    }
-                                } else {
-                                    anyhow::bail!(
-                                        "layer {layer}: no onboarded hy4f:exl3-k45-mul1 expert package loaded (pass --expert-package or --skip-routed-experts for non-expert diagnostics)"
-                                    );
-                                }
+                            let exp_out = CuteafdDeviceBuffer {
+                                ptr: experts.output(),
+                                bytes: rows * LATENT_H * 4,
+                                device_id: r.device.id,
+                                flags: 0,
+                            };
+                            if gpus == 1 {
+                                r.device.library.cuda_f32_to_bf16_async(
+                                    exp_out,
+                                    r.scratch.routed_latent.buffer,
+                                    rows * LATENT_H,
+                                    r.stream.raw,
+                                )?;
                             } else {
-                                r.device.library.cuda_zero_bytes_async(r.scratch.routed_latent.buffer, rows * LATENT_H * 2, r.stream.raw)?;
-                                if gpus == 2 {
-                                    r.device.library.cuda_zero_bytes_async(r.scratch.delta_f32.buffer, rows * LATENT_H * 4, r.stream.raw)?;
-                                }
+                                r.device.library.copy_d2d_async(
+                                    r.scratch.delta_f32.buffer,
+                                    exp_out,
+                                    rows * LATENT_H * 4,
+                                    r.stream.raw,
+                                )?;
                             }
-
-                            // Shared expert
-                            launch_proj_out(
-                                r,
-                                &format!("{p}.mlp.shared_experts.gate_proj"),
-                                &r.programs.proj_shared_gate_up,
-                                rows,
-                                r.scratch.y.buffer,
-                                r.scratch.ffn_gate.buffer,
-                            )?;
-                            launch_proj_out(
-                                r,
-                                &format!("{p}.mlp.shared_experts.up_proj"),
-                                &r.programs.proj_shared_gate_up,
-                                rows,
-                                r.scratch.y.buffer,
-                                r.scratch.ffn_up.buffer,
-                            )?;
-                            r.programs.post_silu_split_shared.launch(
-                                &[r.scratch.ffn_gate.buffer.ptr, r.scratch.ffn_up.buffer.ptr, r.scratch.ffn_act.buffer.ptr],
-                                &s_rows, r.stream.raw,
-                            )?;
-                            launch_proj_split(
-                                r,
-                                gpus,
-                                &format!("{p}.mlp.shared_experts.down_proj"),
-                                &r.programs.proj_shared_down,
-                                rows,
-                                r.scratch.ffn_act.buffer,
-                                r.scratch.shared_out.buffer,
-                                r.scratch.shared_f32.buffer,
-                            )?;
+                        } else {
+                            anyhow::bail!(
+                                "layer {layer}: no onboarded hy4f:exl3-k45-mul1 expert package loaded (pass --expert-package or --skip-routed-experts for non-expert diagnostics)"
+                            );
+                        }
+                    } else {
+                        r.device.library.cuda_zero_bytes_async(r.scratch.routed_latent.buffer, rows * LATENT_H * 2, r.stream.raw)?;
+                        if gpus == 2 {
+                            r.device.library.cuda_zero_bytes_async(r.scratch.delta_f32.buffer, rows * LATENT_H * 4, r.stream.raw)?;
                         }
                     }
-                    Ok(())
-                })?;
-            }
-            use_a = !use_a;
-
-            if self.cfg.dense_layer[layer] {
-                self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.down_proj")))?;
-            } else {
-                // On TP2, reduce routed latent (1536) and shared expert (3072) across ranks before latent_up + combine.
-                if gpus == 2 {
-                    self.reduce_tp2_f32_to_bf16(rows, LATENT_H, None)?;
-                    for r in &self.ranks {
-                        r.device.run(|| unsafe {
-                            r.device.library.copy_d2d_async(r.scratch.routed_latent.buffer, r.scratch.delta.buffer, rows * LATENT_H * 2, r.stream.raw)?;
-                            r.device.library.copy_d2d_async(r.scratch.delta_f32.buffer, r.scratch.shared_f32.buffer, rows * H * 4, r.stream.raw)
-                        })?;
-                    }
-                    self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")))?;
-                    for r in &self.ranks {
-                        r.device.run(|| unsafe {
-                            r.device.library.copy_d2d_async(r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H * 2, r.stream.raw)
-                        })?;
-                    }
                 }
-                for r in &self.ranks {
-                    r.device.run(|| {
-                        launch_proj_out(
-                            r,
-                            &format!("{p}.mlp.routed_expert_up_proj"),
-                            &r.programs.proj_latent_up,
-                            rows,
-                            r.scratch.routed_latent.buffer,
-                            r.scratch.routed_out.buffer,
-                        )?;
-                        // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
-                        unsafe {
-                            r.bf16_add.launch(r.scratch.routed_out.buffer, r.scratch.shared_out.buffer, r.scratch.delta.buffer, rows * H, r.stream.raw)
-                        }
-                    })?;
-                }
-            }
+                Ok(())
+            })?;
+        }
+        self.finish_ffn_combine_and_post(layer, batch, true)
+    }
 
-            // (D) Post-FFN norm (`post_fc2_norm` on dense layer 0, `combine_output_norm` on MoE) + FFN iHC post
-            let ffn_norm_name = if self.cfg.dense_layer[layer] {
-                format!("{p}.mlp.post_fc2_norm.weight")
-            } else {
-                format!("{p}.mlp.combine_output_norm.weight")
+    /// Project a `<= 64`-row tile of `r0.scratch.y[y_row_off .. y_row_off + count]` through the
+    /// vocabulary head into `r0.scratch.head_logits_f32 [count, vocab]` with zero host hop.
+    fn project_head_tile(&self, y_row_off: usize, count: usize) -> Result<DeviceLogits> {
+        ensure!(count > 0 && count <= 64, "Hy4 head tile count {count} outside 1..=64");
+        let vocab = self.cfg.vocab_size;
+        let r0 = &self.ranks[0];
+        let head_out = r0
+            .scratch
+            .head_logits_f32
+            .as_ref()
+            .context("rank 0 missing head_logits_f32")?
+            .buffer;
+        let x0_buf = CuteafdDeviceBuffer {
+            ptr: r0.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(y_row_off * H * 2).cast(),
+            bytes: count * H * 2,
+            ..r0.scratch.y.buffer
+        };
+        if self.ranks.len() == 1 {
+            let out_buf = CuteafdDeviceBuffer {
+                bytes: count * vocab * 4,
+                ..head_out
             };
-            for r in &self.ranks {
-                let (r_in, r_out) = if use_a {
-                    (r.scratch.r_a.buffer, r.scratch.r_b.buffer)
+            r0.device.run(|| launch_rank_lm_head(r0, count, x0_buf, out_buf))?;
+        } else {
+            let r1 = &self.ranks[1];
+            let handoff = self.head_handoff.as_ref().context("TP2 head handoff missing")?;
+            let local_v = r0.weights.local_vocab;
+            let x1_buf = CuteafdDeviceBuffer {
+                bytes: count * H * 2,
+                ..r1.scratch.y.buffer
+            };
+            let out0_buf = CuteafdDeviceBuffer {
+                bytes: count * local_v * 4,
+                ..r0.scratch.logits_tile.buffer
+            };
+            let out1_buf = CuteafdDeviceBuffer {
+                bytes: count * local_v * 4,
+                ..r1.scratch.logits_tile.buffer
+            };
+            handoff.project(
+                x0_buf,
+                x1_buf,
+                || launch_rank_lm_head(r0, count, x0_buf, out0_buf),
+                || launch_rank_lm_head(r1, count, x1_buf, out1_buf),
+                || {
+                    let dst_pitch = vocab * 4;
+                    let src_pitch = local_v * 4;
+                    // SAFETY: rank 0 and rank 1 projections finished before gather; disjoint columns.
+                    unsafe {
+                        r0.device.library.copy_d2d_2d_async(
+                            head_out,
+                            dst_pitch,
+                            out0_buf,
+                            src_pitch,
+                            src_pitch,
+                            count,
+                            r0.stream.raw,
+                        )?;
+                    }
+                    let dst_right = CuteafdDeviceBuffer {
+                        ptr: head_out.ptr.cast::<u8>().wrapping_add(src_pitch).cast(),
+                        bytes: head_out.bytes - src_pitch,
+                        ..head_out
+                    };
+                    handoff.copy_columns(dst_right, out1_buf, count, dst_pitch, src_pitch, src_pitch)
+                },
+            )?;
+        }
+        Ok(DeviceLogits {
+            ptr: head_out.ptr,
+            rows: count,
+            vocab,
+            stride: vocab,
+            stream: r0.stream.raw,
+            greedy: None,
+        })
+    }
+
+    /// Run terminal `hc_head` + sharded FP32 `lm_head` -> zero-host-hop `DeviceLogits` tiles.
+    fn finish_head(
+        &self,
+        batch: &ActiveBatch,
+        mode: HeadMode,
+        on_tile: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>,
+    ) -> Result<()> {
+        let r0 = &self.ranks[0];
+        let r_cur = if batch.use_a { r0.scratch.r_a.buffer } else { r0.scratch.r_b.buffer };
+        match mode {
+            HeadMode::None => Ok(()),
+            HeadMode::LastPerSeq => {
+                let count = batch.members.len();
+                ensure!(count > 0 && count <= 64, "Hy4 LastPerSeq batch {count} exceeds 64-row head");
+                let hc_src_ptr = if count == 1 {
+                    let last = batch.rows - 1;
+                    r_cur.ptr.cast::<u8>().wrapping_add(last * HC * H * 2).cast()
                 } else {
-                    (r.scratch.r_b.buffer, r.scratch.r_a.buffer)
+                    let row_bytes = HC * H * 2;
+                    r0.device.run(|| {
+                        for (idx, m) in batch.members.iter().enumerate() {
+                            let last = m.row_start + m.row_len - 1;
+                            let src = CuteafdDeviceBuffer {
+                                ptr: r_cur.ptr.cast::<u8>().wrapping_add(last * row_bytes).cast(),
+                                bytes: row_bytes,
+                                ..r_cur
+                            };
+                            let dst = CuteafdDeviceBuffer {
+                                ptr: r0.scratch.r_head_in.buffer.ptr.cast::<u8>().wrapping_add(idx * row_bytes).cast(),
+                                bytes: row_bytes,
+                                ..r0.scratch.r_head_in.buffer
+                            };
+                            // SAFETY: r_cur and r_head_in are disjoint admitted buffers on rank 0.
+                            unsafe { r0.device.library.copy_d2d_async(dst, src, row_bytes, r0.stream.raw)?; }
+                        }
+                        Ok(())
+                    })?;
+                    r0.scratch.r_head_in.buffer.ptr
                 };
-                let s_rows = [Scalar::I32(rows as i32)];
-                r.device.run(|| unsafe {
-                    let nw = r.weights.buf(&ffn_norm_name)?.ptr;
-                    r.programs.rms_norm_3072.launch(
-                        &[r.scratch.delta.buffer.ptr, nw, nw, nw, nw, nw, r.scratch.delta_norm.buffer.ptr],
-                        &s_rows, r.stream.raw,
-                    )?;
-                    r.programs.ihc_post.launch(
-                        &[r.scratch.delta_norm.buffer.ptr, r_in.ptr, r.scratch.post_ffn.buffer.ptr, r_out.ptr],
-                        &s_rows, r.stream.raw,
+                r0.device.run(|| unsafe {
+                    r0.programs.hc_head.launch(
+                        &[
+                            hc_src_ptr,
+                            r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                            r0.weights.buf("model.norm.weight")?.ptr,
+                            r0.scratch.delta_norm.buffer.ptr,
+                            r0.scratch.y.buffer.ptr,
+                        ],
+                        &[Scalar::I32(count as i32)],
+                        r0.stream.raw,
                     )
                 })?;
+                let logits = self.project_head_tile(0, count)?;
+                on_tile(0, logits)
             }
-            use_a = !use_a;
-            if dump_rows > 0 {
-                let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
-                self.dump_bf16(&format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
-                if layer <= 3 {
-                    let s0 = &self.ranks[0].scratch;
-                    self.dump_bf16(&format!("l{layer:02}_ffn_y"), s0.y.buffer, dump_rows * H)?;
-                    self.dump_bf16(&format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
-                    self.dump_bf16(&format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
-                    if !self.cfg.dense_layer[layer] {
-                        self.dump_bf16(&format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
-                        self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), s0.shared_out.buffer, dump_rows * H)?;
+            HeadMode::Suffix(first_row) => {
+                ensure!(first_row <= batch.rows, "Hy4 head suffix {first_row} > rows {}", batch.rows);
+                let total = batch.rows - first_row;
+                if total == 0 {
+                    return Ok(());
+                }
+                let hc_src_ptr = r_cur.ptr.cast::<u8>().wrapping_add(first_row * HC * H * 2).cast();
+                r0.device.run(|| unsafe {
+                    r0.programs.hc_head.launch(
+                        &[
+                            hc_src_ptr,
+                            r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                            r0.weights.buf("model.norm.weight")?.ptr,
+                            r0.scratch.delta_norm.buffer.ptr,
+                            r0.scratch.y.buffer.ptr,
+                        ],
+                        &[Scalar::I32(total as i32)],
+                        r0.stream.raw,
+                    )
+                })?;
+                if batch.dump_rows > 0 && first_row == 0 {
+                    self.dump_bf16("hc_head_y", r0.scratch.y.buffer, batch.dump_rows * H)?;
+                }
+                for tile_off in (0..total).step_by(64) {
+                    let count = (total - tile_off).min(64);
+                    let logits = self.project_head_tile(tile_off, count)?;
+                    on_tile(first_row + tile_off, logits)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Execute one or more causal units through the shared `run_prefill_units` (`PrefillHooks`) driver.
+    pub(crate) fn run_units(
+        &mut self,
+        placements: &mut [Hy4Placement],
+        sources: &[&[u32]],
+        units: &[Unit],
+        priority: ReadPriority,
+        head_mode: impl Fn(&Unit) -> HeadMode,
+        on_tile: &mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
+    ) -> Result<()> {
+        self.require_live()?;
+        let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
+        let kind = match priority {
+            ReadPriority::Decode => ExpertV2SourceKind::Decode,
+            _ => ExpertV2SourceKind::Prefill,
+        };
+        let mut spark = self.spark.take();
+        let result = (|| {
+            let waves = spark.as_mut().map(|s| s.exchange()).transpose()?;
+            struct Hooks<'e, 'a, 'p, 'w, F> {
+                engine: &'e mut Hy4Engine<'a>,
+                waves: Option<&'w mut Waves<'a>>,
+                placements: &'p mut [Hy4Placement],
+                initial_starts: &'p [usize],
+                sources: &'p [&'p [u32]],
+                priority: ReadPriority,
+                kind: ExpertV2SourceKind,
+                head_mode: F,
+                on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
+                active: Option<ActiveBatch>,
+            }
+            impl<F: Fn(&Unit) -> HeadMode> PrefillHooks for Hooks<'_, '_, '_, '_, F> {
+                type Ticket = Option<WaveTicket>;
+                fn route(&self, layer: usize) -> FfnRoute {
+                    if self.engine.cfg.dense_layer[layer]
+                        || self.waves.is_none()
+                        || self.engine.onboarded_layers.contains(&layer)
+                    {
+                        FfnRoute::Local
+                    } else {
+                        FfnRoute::Spark
                     }
                 }
-            }
-        }
-
-        self.committed_pos = pos_end;
-
-        if !compute_head || last_layer + 1 < self.cfg.layers {
-            for r in &self.ranks {
-                r.stream.drain()?;
-            }
-            return Ok(Vec::new());
-        }
-
-        // Terminal hc_head + final RMSNorm on rank 0 (head_rank = 0), replicated GPU-to-GPU to rank 1
-        // on TP2, followed by FP32 vocabulary head sharded across ranks.
-        let vocab = self.cfg.vocab_size;
-        let mut all_logits = vec![0f32; rows * vocab];
-        let mut r_host_tiles: Vec<Vec<f32>> = vec![Vec::new(); gpus];
-        {
-            let r0 = &mut self.ranks[0];
-            let r_cur = if use_a { r0.scratch.r_a.buffer } else { r0.scratch.r_b.buffer };
-            r0.device.run(|| unsafe {
-                r0.programs.hc_head.launch(
-                    &[
-                        r_cur.ptr,
-                        r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                        r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                        r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                        r0.weights.buf("model.norm.weight")?.ptr,
-                        r0.scratch.delta_norm.buffer.ptr,
-                        r0.scratch.y.buffer.ptr,
-                    ],
-                    &[Scalar::I32(rows as i32)],
-                    r0.stream.raw,
-                )
-            })?;
-            r0.peer_ready.record(&r0.stream)?;
-        }
-        if dump_rows > 0 {
-            self.dump_bf16("hc_head_y", self.ranks[0].scratch.y.buffer, dump_rows * H)?;
-        }
-        if gpus == 2 {
-            let bytes = rows * H * 2;
-            let ev0 = self.ranks[0].peer_ready.raw;
-            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].scratch.y.buffer };
-            self.ranks[1].device.run(|| unsafe {
-                self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
-                self.ranks[1].device.library.copy_peer_async(
-                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].scratch.y.buffer },
-                    src0,
-                    bytes,
-                    self.ranks[1].stream.raw,
-                )
-            })?;
-        }
-        for (rank_idx, r) in self.ranks.iter().enumerate() {
-            let local_v = r.weights.local_vocab;
-            let mut rank_logits = vec![0f32; rows * local_v];
-            for start in (0..rows).step_by(64) {
-                let count = (rows - start).min(64);
-                let x_ptr = r.scratch.y.buffer.ptr.cast::<u8>().wrapping_add(start * H * 2).cast();
-                let bytes = count * local_v * 4;
-                if let Some(native_head) = r.weights.native.get("lm_head") {
-                    let head_scratch = r.scratch.native.as_ref().and_then(|n| n.head_scratch.as_ref()).context("Hy4 native lm_head missing scratch")?;
-                    let x_buf = CuteafdDeviceBuffer {
-                        ptr: x_ptr,
-                        bytes: count * H * 2,
-                        ..r.scratch.y.buffer
+                fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+                    let batch = self.engine.begin_batch(self.placements, self.initial_starts, self.sources, unit, self.priority)?;
+                    self.active = Some(batch);
+                    Ok(())
+                }
+                fn attention(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_mut().context("Hy4 attention without active unit")?;
+                    self.engine.run_layer_attention(layer, batch)
+                }
+                fn local_ffn(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_mut().context("Hy4 FFN without active unit")?;
+                    self.engine.run_layer_local_ffn(layer, batch)
+                }
+                fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Option<WaveTicket>> {
+                    let batch = self.active.as_ref().context("Hy4 send_experts without active unit")?;
+                    self.engine.run_moe_router_and_shared(layer, batch)?;
+                    let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
+                    let rows = batch.rows;
+                    let identity = self.engine.next_identity;
+                    self.engine.next_identity = identity.checked_add(1).context("Hy4 Spark identity exhausted")?;
+                    let version = self.engine.placement_version;
+                    let dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
+                    let staging = RouteStaging::new(rows, TOPK, dtype.row_bytes(LATENT_H)?)?;
+                    let kind = self.kind;
+                    let origins: Vec<(u64, u64)> = unit
+                        .segments
+                        .iter()
+                        .flat_map(|seg| seg.tokens.clone().map(move |pos| (seg.sequence as u64 + 1, pos as u64)))
+                        .collect();
+                    let packed = unit.reply_origins()?;
+                    let combined = if kind == ExpertV2SourceKind::Prefill {
+                        packed
+                            .as_ref()
+                            .map_or_else(|| spark_waves::single_reply_eligible(rows, kind), |o| o.combined_reply_eligible())
+                    } else {
+                        spark_waves::single_reply_eligible(rows, kind)
                     };
-                    let out_buf = CuteafdDeviceBuffer {
-                        bytes,
-                        ..r.scratch.logits_tile.buffer
-                    };
-                    r.device.run(|| native_head.launch(count, x_buf, out_buf, head_scratch, r.stream.raw))?;
-                } else {
-                    let head = r.weights.head.as_ref().context("missing VocabularyHead")?;
-                    let lm_head_w = r.weights.weight("lm_head")?;
-                    r.device.run(|| unsafe {
-                        target_head::launch(
-                            TargetHead::configured(),
-                            head,
-                            x_ptr,
-                            lm_head_w.ptr,
-                            r.scratch.logits_tile.buffer.ptr.cast(),
-                            count,
-                            r.stream.raw,
-                        )
+                    let source = unit.sequence as u64 + 1;
+                    let start = unit.rows.start;
+                    let r0 = &self.engine.ranks[0];
+                    let ticket = r0.device.run(|| {
+                        // SAFETY: admitted rank-0 scratch owns route_ids/route_weights/wire_in on r0.stream.
+                        unsafe {
+                            waves.send(
+                                rows,
+                                rows * LATENT_H * 2,
+                                staging,
+                                [
+                                    r0.scratch.route_ids.buffer,
+                                    r0.scratch.route_weights.buffer,
+                                    r0.scratch.wire_in.buffer,
+                                ],
+                                r0.stream.raw,
+                                combined,
+                                Box::new(move |routes, wire| {
+                                    let mut req = build_hy4_spark_request(identity, version, layer, source, start, rows, dtype, routes, wire)?;
+                                    if let Some(packed) = packed {
+                                        packed.apply(&mut req)?;
+                                    }
+                                    ensure!(origins.len() == req.rows.len(), "Hy4 Spark origin count differs");
+                                    for (row, &(src_id, pos)) in req.rows.iter_mut().zip(&origins) {
+                                        row.source_request_id = src_id;
+                                        row.token_position = pos;
+                                        row.source_kind = kind;
+                                    }
+                                    Ok(req)
+                                }),
+                            )
+                        }
                     })?;
+                    Ok(Some(ticket))
                 }
-                r.stream.drain()?;
-                let mut tile_bytes = vec![0u8; bytes];
-                r.device.run(|| {
-                    r.device.library.copy_d2h(&mut tile_bytes, CuteafdDeviceBuffer { bytes, ..r.scratch.logits_tile.buffer })
-                })?;
-                for (i, chunk) in tile_bytes.chunks_exact(4).enumerate() {
-                    rank_logits[start * local_v + i] = f32::from_le_bytes(chunk.try_into().unwrap());
+                fn land_experts(&mut self, layer: usize, _unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
+                    let ticket = ticket.context("Hy4 land_experts missing WaveTicket")?;
+                    let slot = ticket.slot();
+                    let batch = self.active.as_mut().context("Hy4 land_experts without active unit")?;
+                    let rows = batch.rows;
+                    let waves = self.waves.as_mut().context("Hy4 Spark land without active SparkLink")?;
+                    let r0 = &self.engine.ranks[0];
+                    r0.device.run(|| {
+                        waves.land(ticket, r0.stream.raw)?;
+                        // SAFETY: wave landed on r0.stream before reduction into rank-0 routed_latent.
+                        unsafe {
+                            waves.reduce(
+                                slot,
+                                std::ptr::null(),
+                                r0.scratch.routed_latent.buffer.ptr.cast(),
+                                rows,
+                                r0.stream.raw,
+                            )
+                        }
+                    })?;
+                    self.engine.finish_ffn_combine_and_post(layer, batch, false)
+                }
+                fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+                    let batch = self.active.as_ref().context("Hy4 end_unit without active unit")?;
+                    let mode = if unit.layers.end == self.engine.cfg.layers {
+                        (self.head_mode)(unit)
+                    } else {
+                        HeadMode::None
+                    };
+                    self.engine.finish_head(batch, mode, &mut |row_off, logits| (self.on_tile)(unit, row_off, logits))
+                }
+                fn commit_unit(&mut self, _unit: &Unit) -> Result<()> {
+                    let batch = self.active.take().context("Hy4 commit_unit without active unit")?;
+                    for m in &batch.members {
+                        let p = &mut self.placements[m.sequence];
+                        p.len = m.pos_start + m.row_len;
+                        p.state_len = p.len;
+                        p.engram_tail = m.next_engram_tail;
+                    }
+                    Ok(())
                 }
             }
-            r_host_tiles[rank_idx] = rank_logits;
+            let mut hooks = Hooks {
+                engine: self,
+                waves,
+                placements,
+                initial_starts: &initial_starts,
+                sources,
+                priority,
+                kind,
+                head_mode,
+                on_tile,
+                active: None,
+            };
+            run_prefill_units(&mut hooks, units, 1)?;
+            if spark.is_some() {
+                spark_waves::healthy()?;
+            }
+            Ok(())
+        })();
+        self.spark = spark;
+        if result.is_err() {
+            self.terminate();
         }
-        for row in 0..rows {
-            for (rank_idx, r) in self.ranks.iter().enumerate() {
-                let local_v = r.weights.local_vocab;
-                let dst_off = row * vocab + rank_idx * local_v;
-                let src_off = row * local_v;
-                all_logits[dst_off..dst_off + local_v]
-                    .copy_from_slice(&r_host_tiles[rank_idx][src_off..src_off + local_v]);
-            }
+        result
+    }
+
+    /// Run a contiguous single-sequence chunk through layers `0..=last_layer` (golden API).
+    pub(crate) fn forward_chunk(&mut self, tokens: &[u32], last_layer: usize) -> Result<Vec<f32>> {
+        self.forward_chunk_opts(tokens, last_layer, true)
+    }
+
+    /// Run a contiguous single-sequence chunk through layers `0..=last_layer`, optionally skipping
+    /// the terminal vocabulary head when `compute_head == false` (prefix prefill before `N=1` decode).
+    pub(crate) fn forward_chunk_opts(
+        &mut self,
+        tokens: &[u32],
+        last_layer: usize,
+        compute_head: bool,
+    ) -> Result<Vec<f32>> {
+        let rows = tokens.len();
+        ensure!(rows > 0 && rows <= self.max_rows, "Hy4 chunk rows {rows} outside 1..={}", self.max_rows);
+        ensure!(last_layer < self.cfg.layers, "last_layer {last_layer} >= {}", self.cfg.layers);
+        let pos_start = self.golden_placement.len;
+        let unit = Unit {
+            index: 0,
+            sequence: 0,
+            segments: vec![UnitSegment {
+                sequence: 0,
+                rows: 0..rows,
+                tokens: pos_start..pos_start + rows,
+                prompt_end: true,
+                snapshot: false,
+                head: compute_head,
+            }],
+            rows: pos_start..pos_start + rows,
+            layers: 0..last_layer + 1,
+            slot: 0,
+            barrier: false,
+        };
+        let vocab = self.cfg.vocab_size;
+        let mut all_logits = if compute_head && last_layer + 1 == self.cfg.layers {
+            vec![0f32; rows * vocab]
+        } else {
+            Vec::new()
+        };
+        let mut placement = [self.golden_placement.clone()];
+        let library = self.library();
+        let mode = if compute_head { HeadMode::Suffix(0) } else { HeadMode::None };
+        self.run_units(
+            &mut placement,
+            &[tokens],
+            &[unit],
+            ReadPriority::Prefill,
+            |_| mode,
+            &mut |_, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                let dst = row_off * vocab;
+                all_logits[dst..dst + tile.len()].copy_from_slice(&tile);
+                Ok(())
+            },
+        )?;
+        self.golden_placement = placement.into_iter().next().unwrap();
+        if !compute_head || last_layer + 1 < self.cfg.layers {
+            self.drain()?;
         }
         Ok(all_logits)
     }
@@ -1417,5 +2228,86 @@ impl<'a> Hy4Engine<'a> {
             .chunks_exact(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
             .collect())
+    }
+}
+
+impl Drop for Hy4Engine<'_> {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hy4_spark_request(
+    identity: u64,
+    version: u64,
+    layer: usize,
+    source: u64,
+    start: usize,
+    rows: usize,
+    dtype: ExpertV2Dtype,
+    routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes,
+) -> Result<ExpertProtocolV2Request> {
+    ensure!(
+        identity > 0 && version > 0 && source > 0 && (1..42).contains(&layer) && (1..=4096).contains(&rows),
+        "Hy4 Spark request geometry/identity differs (layer={layer}, rows={rows})"
+    );
+    let descriptors = (0..rows)
+        .map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: (start + row) as u64,
+            source_kind: ExpertV2SourceKind::Prefill,
+            source_request_id: source,
+            token_position: (start + row) as u64,
+            route_offset: (row * TOPK) as u32,
+            route_count: TOPK as u32,
+        })
+        .collect();
+    let mut request = ExpertProtocolV2Request::new_bytes(
+        identity,
+        version,
+        u32::try_from(layer)?,
+        LATENT_H as u32,
+        dtype,
+        descriptors,
+        routes,
+        wire,
+    )?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hy4_spark_request_uses_latent_1536_k16_fp8k32_compact_bf16() -> Result<()> {
+        let routes: Vec<ExpertProtocolV2RouteEntry> = (0..32)
+            .map(|i| ExpertProtocolV2RouteEntry {
+                row_index: i / 16,
+                expert_id: i,
+                gate_weight: 0.0625,
+            })
+            .collect();
+        let req = build_hy4_spark_request(
+            7,
+            1,
+            15,
+            3,
+            100,
+            2,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            routes,
+            vec![0u8; 2 * (1536 + 1536 / 32)].into(),
+        )?;
+        assert_eq!(req.header.hidden_dim, 1536);
+        assert_eq!(req.header.hidden_dtype, ExpertV2Dtype::Fp8E4m3Ue8m0K32);
+        assert_eq!(req.header.hidden_row_stride_bytes, 1584);
+        assert_eq!(req.rows[0].route_count, 16);
+        assert_eq!(req.rows[1].route_offset, 16);
+        assert_ne!(req.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+        assert!(build_hy4_spark_request(7, 1, 0, 3, 0, 1, ExpertV2Dtype::Fp8E4m3Ue8m0K32, vec![], vec![].into()).is_err());
+        Ok(())
     }
 }

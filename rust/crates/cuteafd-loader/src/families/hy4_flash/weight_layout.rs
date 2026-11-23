@@ -126,10 +126,6 @@ pub fn fp8_role(name: &str) -> Fp8Role {
         // Absorbed MLA keeps W_UK and W_UV in BF16 inside the packed target arena.
         return Fp8Role::exact("hy4 absorbed kv_b_proj", false);
     }
-    if stem.ends_with(".mlp.down_proj") || stem.ends_with(".mlp.shared_experts.down_proj") {
-        // TP2 K-split halves (6912, 768) are not multiples of 512 for block-FP8 GEMV warps; keep BF16.
-        return Fp8Role::exact("hy4 k-split down_proj", false);
-    }
     if stem.ends_with(".self_attn.kv_a_proj_with_mqa") {
         return Fp8Role::padded("hy4 kv_a_proj_with_mqa", true, 128);
     }

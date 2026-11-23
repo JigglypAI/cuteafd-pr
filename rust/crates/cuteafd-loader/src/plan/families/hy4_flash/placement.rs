@@ -227,7 +227,13 @@ pub(super) fn layout(
         );
         return empty(notes);
     }
-    if let Err(error) = input.checkpoint().validate_fp8_roles("hy4_flash", fp8_role) {
+    // Absorbed MLA keeps `kv_b_proj` unpacked as BF16 W_UK/W_UV in the target arena across all views;
+    // validate every FP8-executed core linear projection.
+    if let Err(error) = input.checkpoint().validate_fp8_roles_where(
+        "hy4_flash",
+        |name| !name.ends_with(".self_attn.kv_b_proj.weight"),
+        fp8_role,
+    ) {
         report.refuse_placement(
             format!("Hy4-flash fp8-compact validation refused: {error:#}"),
             "Ensure every fp8-compact core weight is a BF16 matrix with whole 128x128 blocks.",
@@ -331,7 +337,11 @@ pub(super) fn layout(
     };
 
     let routed = model.routed();
-    let local = build_local_backings(catalog, opts.workspace_manifest.as_deref(), gpus, shape.rows);
+    let manifest_path = opts.workspace_manifest.clone().or_else(|| {
+        let path = std::path::PathBuf::from("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path)
+    });
+    let local = build_local_backings(catalog, manifest_path.as_deref(), gpus, shape.rows);
     if let LocalPackage::Missing(reason) = &local {
         notes.push(format!("Hy4-flash RTX expert onboarding unavailable: {reason}"));
     }

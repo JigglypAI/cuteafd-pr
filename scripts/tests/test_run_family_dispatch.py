@@ -952,6 +952,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if "CORE_VIEW=k6-compact" in keys:
         selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         (selected / "config.k6.json").write_text(json.dumps(family_config))
+    if "CORE_VIEW=k8-compact" in keys:
+        selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
+        (selected / "config.k8.json").write_text(json.dumps(family_config))
     if "SPECULATOR_MODEL_ID=test/draft" in keys:
         _snapshot(hf, "test/draft", {"speculators_model_type":"dspark"})
     if model == "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC" and not (
