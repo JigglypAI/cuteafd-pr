@@ -213,16 +213,15 @@ for feature_key in MEDIA_FEATURES_DIR AUDIO_FEATURES_DIR; do
 done
 }
 # DRAFT_POLICY: history (the default: keep while the calibrated product stays
-# above 0.3, with exploration), clamped (history with each round's cut set from
-# the online round-cost ratio) or off (verify no drafts). DRAFT_LENGTH is the fixed-width
+# above 0.3, with exploration), history-shared-explore (one rotating neural
+# explore per batch), clamped (online cut), or off (no drafts). DRAFT_LENGTH is the fixed-width
 # measurement override. Sets draft_policy_args for the serve command.
 shared_draft_policy_args() {
 draft_policy_args=()
 case "$(get DRAFT_POLICY history)" in
   history) ;;
-  clamped) draft_policy_args=(--draft-policy clamped) ;;
-  off) draft_policy_args=(--draft-policy off) ;;
-  *) echo "DRAFT_POLICY must be history, clamped or off" >&2; exit 2 ;;
+  history-shared-explore|clamped|off) draft_policy_args=(--draft-policy "$(get DRAFT_POLICY)") ;;
+  *) echo "DRAFT_POLICY must be history, history-shared-explore, clamped or off" >&2; exit 2 ;;
 esac
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace

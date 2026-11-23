@@ -42,11 +42,12 @@ impl Policy {
     /// `copies` whether the family verifies history copies.
     pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
         let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
-        let history = DraftHistory::new(spec, length.control()).with_cut_rule(length.cut_rule());
+        let history = DraftHistory::new(spec, length.control()).with_cut_rule(length.cut_rule())
+            .with_shared_explore(length.shared_explore());
         SPECULATION_ENABLED.store(block > 0 && history.control() != DraftControl::Off,
             std::sync::atomic::Ordering::Relaxed);
         cuteafd_bench::context::set_resolved("draft-mode", &length.label(block));
-        tracing::info!(policy = %history.control().label(), block, head = ?head, copy_positions = spec.copy,
+        tracing::info!(policy = %history.label(), block, head = ?head, copy_positions = spec.copy,
             requested_length = ?length.draft_length, "draft policy");
         let policy = Self { history, trace: replay_trace(), rounds: 0, contexts: Default::default() };
         policy.publish();

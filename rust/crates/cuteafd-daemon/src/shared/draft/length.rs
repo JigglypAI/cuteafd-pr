@@ -7,6 +7,8 @@ pub(crate) enum DraftPolicyChoice {
     /// Keep the leading drafts while their calibrated product stays above 0.3, plus one explore.
     #[default]
     History,
+    /// `history` with one rotating neural explore row across each decode batch.
+    HistorySharedExplore,
     /// `history` with each round's cut set from the online ratio of non-row time per
     /// request to per-row time (`cuteafd_core::clamped`).
     Clamped,
@@ -47,9 +49,13 @@ impl DraftLength {
     pub fn control(self) -> DraftControl {
         match (self.draft_length, self.draft_policy) {
             (Some(length), _) => DraftControl::Fixed(length),
-            (None, DraftPolicyChoice::History | DraftPolicyChoice::Clamped) => DraftControl::History,
+            (None, DraftPolicyChoice::History | DraftPolicyChoice::HistorySharedExplore | DraftPolicyChoice::Clamped) => DraftControl::History,
             (None, DraftPolicyChoice::Off) => DraftControl::Off,
         }
+    }
+
+    pub fn shared_explore(self) -> bool {
+        self.draft_length.is_none() && self.draft_policy == DraftPolicyChoice::HistorySharedExplore
     }
 
     /// The keep cut each `history` round uses.
@@ -73,6 +79,7 @@ impl DraftLength {
     pub fn label(self, native: usize) -> String {
         match self.control() {
             DraftControl::History if self.cut_rule() == cuteafd_core::CutRule::Clamped => "clamped".into(),
+            DraftControl::History if self.shared_explore() => "history-shared-explore".into(),
             DraftControl::History => "adaptive".into(),
             DraftControl::Fixed(_) => format!("fixed {}", self.effective(native)),
             DraftControl::Off => "no speculation".into(),
@@ -120,6 +127,10 @@ mod tests {
         let clamped = config(command, &["--draft-policy", "clamped"]);
         assert_eq!((clamped.control(), clamped.cut_rule(), clamped.effective(native), clamped.label(native)),
             (DraftControl::History, cuteafd_core::CutRule::Clamped, native, "clamped".to_string()));
+        let shared = config(command, &["--draft-policy", "history-shared-explore"]);
+        assert_eq!((shared.control(), shared.cut_rule(), shared.shared_explore(), shared.label(native)),
+            (DraftControl::History, cuteafd_core::CutRule::Fixed, true, "history-shared-explore".to_string()));
+        assert!(!config(command, &["--draft-policy", "history-shared-explore", "--draft-length", "2"]).shared_explore());
         assert_eq!(unset.cut_rule(), cuteafd_core::CutRule::Fixed);
         // A fixed width still overrides it.
         assert_eq!(config(command, &["--draft-policy", "clamped", "--draft-length", "2"]).cut_rule(),

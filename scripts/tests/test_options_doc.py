@@ -542,7 +542,7 @@ def test_mc_fp8_lever_reports_measured_glm_and_step_quality_costs():
 
 def test_every_family_accepts_the_shared_draft_policy_key():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert "DRAFT_POLICY must be history, clamped or off" in launcher
+    assert "DRAFT_POLICY must be history, history-shared-explore, clamped or off" in launcher
     assert "CUTEAFD_DRAFT_POLICY" not in launcher
     for removed in ("DRAFT_SURVIVAL_LENGTHS", "DRAFT_ROW_COST"):
         assert removed not in MATRIX and removed not in launcher

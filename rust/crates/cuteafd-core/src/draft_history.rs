@@ -459,6 +459,8 @@ pub struct DraftHistory {
     cost: RoundCost,
     /// The neural keep cut of the round being planned.
     round_cut: f64,
+    shared_explore: bool,
+    last_explorer: u64,
 }
 
 impl DraftHistory {
@@ -473,6 +475,7 @@ impl DraftHistory {
             platt: if spec.head.scored() { vec![Platt::new(); spec.block] } else { Vec::new() },
             requests: HashMap::new(),
             rule: CutRule::Fixed, cost: RoundCost::default(), round_cut: KEEP_CUT,
+            shared_explore: false, last_explorer: 0,
             stats: DraftHistoryStats {
                 length_histogram: vec![0; spec.block + spec.copy + 1],
                 position_reached: vec![0; spec.block], position_accepted: vec![0; spec.block],
@@ -487,6 +490,14 @@ impl DraftHistory {
     /// `DRAFT_POLICY=clamped`: the per-round cut follows the online round cost.
     pub fn with_cut_rule(mut self, rule: CutRule) -> Self { self.rule = rule; self }
     pub fn cut_rule(&self) -> CutRule { self.rule }
+
+    /// Share one neural stop row across a batch instead of one per request.
+    pub fn with_shared_explore(mut self, enabled: bool) -> Self { self.shared_explore = enabled; self }
+
+    pub fn label(&self) -> String {
+        if self.control == DraftControl::History && self.shared_explore { "history-shared-explore".into() }
+        else { self.control.label() }
+    }
     /// The neural keep cut the last planned round used.
     pub fn round_cut(&self) -> f64 { self.round_cut }
 
@@ -583,6 +594,7 @@ impl DraftHistory {
         // Score the candidates before spending any verify rows.
         if scored { return depths; }
         let ids: Vec<u64> = requests.iter().map(|&(id, _)| id).collect();
+        if self.shared_explore && self.control == DraftControl::History { self.limit_explore(&ids); }
         self.settle(&ids, max_rows)
     }
 
@@ -631,12 +643,35 @@ impl DraftHistory {
         count
     }
 
+    /// Retain one neural stop row, rotating in ticket-ID order regardless of
+    /// the incoming batch order or how weak a request's scores currently are.
+    fn limit_explore(&mut self, ids: &[u64]) {
+        let candidates = || ids.iter().copied().filter(|id| self.requests.get(id)
+            .and_then(|request| request.pending.as_ref())
+            .is_some_and(|pending| pending.granted[NEURAL] > pending.keep));
+        let Some(first) = candidates().min() else { return };
+        let explorer = candidates().filter(|&id| id > self.last_explorer).min().unwrap_or(first);
+        self.last_explorer = explorer;
+        for &id in ids {
+            if id == explorer { continue; }
+            let Some(pending) = self.requests.get_mut(&id).and_then(|request| request.pending.as_mut()) else { continue };
+            if pending.granted[NEURAL] <= pending.keep { continue; }
+            pending.granted = [pending.keep, 0];
+            pending.planned[NEURAL].truncate(pending.keep);
+            // Any copy had agreed with the whole proposed neural prefix.
+            pending.planned[COPY].clear();
+        }
+    }
+
     /// Fit the round into `max_rows` verify rows (one anchor per request plus
     /// its drafts): positions are granted across requests by probability,
     /// highest first, each request keeping a prefix of its plan; equal
     /// probabilities go to the request with fewer drafts so far, then to the
     /// older one. Returns each request's drafts.
     pub fn settle(&mut self, ids: &[u64], max_rows: usize) -> Vec<usize> {
+        if self.shared_explore && self.control == DraftControl::History && self.spec.head.scored() {
+            self.limit_explore(ids);
+        }
         let wanted: Vec<[usize; 2]> = ids.iter().map(|id| self.requests.get(id)
             .and_then(|request| request.pending.as_ref()).map_or([0, 0], |pending| pending.granted)).collect();
         let total: usize = wanted.iter().map(|w| w[0] + w[1]).sum();
@@ -736,7 +771,7 @@ impl DraftHistory {
             }
             self.requests.insert(outcome.id, request);
         }
-        trace.then(|| RoundTrace { policy: self.control.label(), block: self.spec.block,
+        trace.then(|| RoundTrace { policy: self.label(), block: self.spec.block,
             rounds: self.stats.rounds, short_rounds: self.stats.short_rounds, short_share: self.stats.short_share(),
             explored: self.stats.explored, explore_accepted: self.stats.explore_accepted,
             requests })
@@ -1271,6 +1306,55 @@ mod tests {
         policy.release(1);
         policy.release(2);
         assert!(policy.requests.is_empty());
+    }
+
+    #[test]
+    fn shared_explore_rotates_scored_stops_and_drops_the_dependent_copy_suffix() {
+        let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 2 };
+        let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
+        let ids = [31, 11, 21];
+        let requests = ids.map(|id| (id, 5));
+        for chosen in [11, 21, 31, 11] {
+            assert_eq!(policy.plan(&requests, 64), [3; 3]);
+            for id in ids {
+                assert_eq!(policy.refine(id, 3, Some(&[8., -4., -8.])), 2);
+                assert_eq!(policy.extend_copy(id, 2), 1);
+            }
+            let granted = policy.settle(&ids, 64);
+            assert_eq!(granted, ids.map(|id| if id == chosen { 3 } else { 1 }));
+            let trace = policy.observe(&ids.into_iter().zip(granted).map(|(id, n)| outcome(id, n, 1)).collect::<Vec<_>>(), true).unwrap();
+            assert_eq!(trace.policy, "history-shared-explore");
+            assert_eq!(trace.requests.iter().filter(|q| q.positions.iter().any(|p| p.track == Track::Neural && p.explore)).count(), 1);
+        }
+        assert_eq!(policy.stats().position_reached, [12, 4, 0]);
+    }
+
+    #[test]
+    fn shared_explore_rotates_token_only_stops_once_per_round() {
+        let mut policy = policy(3).with_shared_explore(true);
+        let requests = [(21, 3), (11, 3)];
+        assert_eq!(policy.plan(&requests, 64), [3; 2]);
+        policy.observe(&[outcome(21, 3, 0), outcome(11, 3, 0)], false);
+        for first in [true, false, true, false] {
+            let expected = if first { [0, 1] } else { [1, 0] };
+            assert_eq!(policy.plan(&requests, 64), expected);
+            for ((id, _), n) in requests.into_iter().zip(expected) { assert_eq!(policy.refine(id, n, None), n); }
+            assert_eq!(policy.settle(&[21, 11], 64), expected);
+            policy.observe(&[outcome(21, expected[0], 0), outcome(11, expected[1], 0)], false);
+        }
+        assert_eq!(policy.stats().position_reached, [6, 0, 0]);
+    }
+
+    #[test]
+    fn shared_explore_preserves_c1_and_cannot_exceed_the_row_budget() {
+        let spec = DrafterSpec { block: 3, head: HeadScore::Logit, copy: 0 };
+        let mut policy = DraftHistory::new(spec, DraftControl::History).with_shared_explore(true);
+        policy.plan(&[(1, 3)], 64);
+        assert_eq!(policy.refine(1, 3, Some(&[8., -8., -8.])), 2);
+        assert_eq!(policy.settle(&[1], 64), [2]);
+        policy.plan(&[(1, 3), (2, 3)], 3);
+        for id in [1, 2] { policy.refine(id, 3, Some(&[8., -8., -8.])); }
+        assert_eq!(policy.settle(&[1, 2], 3).iter().sum::<usize>(), 1);
     }
 
     #[test]
