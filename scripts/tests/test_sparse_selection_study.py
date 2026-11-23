@@ -56,7 +56,7 @@ def test_tidy_reads_dumps_and_reports_every_table(tmp_path):
     write(tmp_path / "layer-009.bin", 9, 32, 128, 4, [(p, [0, 1, 2, 3, 4 * (p // 128)]) for p in range(1000, 1050)])
     out = tmp_path / "out"
     assert study.main(["tidy", "--family", "t", "--dump", str(tmp_path), "--out", str(out),
-                       "--index-bytes-per-token", "132", "--kv-bytes-per-token", "656"]) == 0
+                       "--index-bytes-per-token", "132", "--kv-bytes-per-token", "656", "--min-position", "0"]) == 0
     for name in ("working.csv", "churn.csv", "cluster.csv", "cache.csv", "cross_layer.csv", "resident.csv",
                  "summary.json", "provenance.json", "summary.png"):
         assert (out / name).exists(), name

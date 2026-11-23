@@ -14,6 +14,9 @@ decode records in step order (one record per decode step at C1). Definitions
 
 * unit: what the selector picks (token, 4-token pool, compressed row of 1 or 2
   tokens, 128-token block per KV head). `ids` are logical, ascending.
+* session filter: records below --min-position (default 1024: warm-up and
+  probe requests the server also served) and every record after the first
+  position restart are dropped; provenance counts them.
 * band: the record's engine position: 0-16K, 16-32K, 32-64K, 64-128K, 128K+.
 * segment: a maximal run of records whose positions grow by exactly 1. A gap
   is a turn boundary (a new prompt was prefilled: tool result, user turn).
@@ -372,11 +375,25 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def session_only(dump, min_position: int):
+    """Keep records of the measured session: drop rows below `min_position`
+    (warm-up preludes and post-run probes the server also served) and anything
+    after the first position restart (a later, unrelated request)."""
+    pos = dump["position"]
+    keep = pos >= min_position
+    restart = np.flatnonzero(np.diff(pos) < 0)
+    if restart.size:
+        keep[restart[0] + 1:] = False
+    out = {k: (v[keep] if isinstance(v, np.ndarray) and len(v) == len(pos) else v) for k, v in dump.items()}
+    out["dropped_records"] = int((~keep).sum())
+    return out
+
+
 def tidy(args) -> int:
     files = sorted(args.dump.glob("layer-*.bin"))
     if not files:
         raise SystemExit(f"no layer-*.bin under {args.dump}")
-    dumps = {d["layer"]: d for d in (read_layer(f) for f in files)}
+    dumps = {d["layer"]: session_only(d, args.min_position) for d in (read_layer(f) for f in files)}
     by_pos = {layer: {int(p): s for p, s in zip(d["position"], sets_of(d))} for layer, d in dumps.items()}
     per_layer = {}
     for layer, d in sorted(dumps.items()):
@@ -410,7 +427,8 @@ def tidy(args) -> int:
                       script_sha256=sha256(Path(__file__)), dump_dir=str(args.dump.resolve()),
                       inputs={f.name: dict(sha256=sha256(f), bytes=f.stat().st_size) for f in files},
                       layers={l: dict(width=d["width"], unit_tokens=d["unit_tokens"], heads=d["heads"], source=d["source"],
-                                      records=int(len(d["position"])), positions=[int(d["position"].min()), int(d["position"].max())],
+                                      records=int(len(d["position"])), dropped_records=d["dropped_records"],
+                                      positions=[int(d["position"].min()), int(d["position"].max())],
                                       segments=len(segments(d["position"]))) for l, d in dumps.items()},
                       session=str(args.session) if args.session else None,
                       session_sha256=sha256(args.session) if args.session else None,
@@ -432,6 +450,8 @@ def main(argv=None) -> int:
     t.add_argument("--dump", type=Path, required=True)
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--session", type=Path)
+    t.add_argument("--min-position", type=int, default=1024,
+                   help="drop records below this engine position (server warm-up and probe requests)")
     t.add_argument("--index-bytes-per-token", type=float, required=True,
                    help="resident indexer-key bytes per virtual token, all selecting layers")
     t.add_argument("--kv-bytes-per-token", type=float, required=True,
