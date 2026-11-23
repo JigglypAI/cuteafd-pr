@@ -839,15 +839,17 @@ impl<'a> MimoLoader<'a> {
         }).collect()
     }
 
-    fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+    /// Tensor `name` whole on rank `rank` (the caller has made that rank's device current).
+    fn one(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensor = self.tensor(name)?;
         if tensor.meta.shape.len() == 2 && tensor.meta.dtype == DType::F8E4M3 {
+            ensure!(rank == 0, "{name}: FP8 dequantization loads on rank 0 only");
             ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
                 "{name}: FP8 dequantization loads through the mount");
             return self.rows(&[name.to_string()]);
         }
-        self.landed(0, vec![(self.rect(name, None, None)?, 0)], tensor.meta.byte_length as usize, &[])
+        self.landed(rank, vec![(self.rect(name, None, None)?, 0)], tensor.meta.byte_length as usize, &[])
     }
 
     /// `[bf16(w); bf16(w - bf16(w))]` of the FP32 router weight.
@@ -934,8 +936,8 @@ impl<'a> MimoLoader<'a> {
     /// `hnorm` and `final_layernorm`.
     pub fn mtp_extras(&self, k: usize) -> Result<[DeviceAllocation<'a>; 4]> {
         let p = format!("model.mtp.layers.{k}");
-        Ok([self.one(&format!("{p}.eh_proj.weight"))?, self.one(&format!("{p}.enorm.weight"))?,
-            self.one(&format!("{p}.hnorm.weight"))?, self.one(&format!("{p}.final_layernorm.weight"))?])
+        Ok([self.one(0, &format!("{p}.eh_proj.weight"))?, self.one(0, &format!("{p}.enorm.weight"))?,
+            self.one(0, &format!("{p}.hnorm.weight"))?, self.one(0, &format!("{p}.final_layernorm.weight"))?])
     }
 
     /// One decoder block, one share per rank over `ranks` GPUs: rank `r` holds
@@ -1018,7 +1020,7 @@ impl<'a> MimoLoader<'a> {
                 let (key, weight) = if cfg.router_fp32 {
                     ("w_hilo", self.on_rank(rank, |_| self.router_hilo(&router))?)
                 } else {
-                    ("w_router", self.on_rank(rank, |_| self.one(&router))?)
+                    ("w_router", self.on_rank(rank, |_| self.one(rank, &router))?)
                 };
                 map.insert(key, weight);
             }
@@ -1050,7 +1052,7 @@ impl<'a> MimoLoader<'a> {
         let mut shares = shares.into_iter();
         let weights = MimoWeights {
             layers: shares.next().context("rank 0")?,
-            norm: self.one("model.norm.weight")?,
+            norm: self.one(0, "model.norm.weight")?,
             head,
             output_fp8: self.output_formats.values().any(|&format| format == MimoProjectionRepresentation::Fp8),
         };

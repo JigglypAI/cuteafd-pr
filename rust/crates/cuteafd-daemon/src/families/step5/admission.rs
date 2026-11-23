@@ -308,7 +308,7 @@ mod tests {
                 bf16_target_head: opts.bf16_target_head,
                 host: admission::HostInputs::from_contract(&contract, &cfg, ranks,
                     opts.host_memory.unwrap(), host, 8 << 30)?, resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
-                spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+                spark_reply_formats: Default::default(),
                 kv_format,
                 inventory: Inventory {
                     gpus,

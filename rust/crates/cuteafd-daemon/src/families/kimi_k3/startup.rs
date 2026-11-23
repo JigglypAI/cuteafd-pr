@@ -40,6 +40,16 @@ impl Role {
         matches!(self, Self::Golden { skip_routed_experts: true })
     }
 
+    /// A DSA readback diagnostic (`CUTEAFD_KIMI_DSA_*`): golden runs only. A
+    /// stray variable never reaches a serving engine, whose graphs it would refuse.
+    fn golden_diagnostic<T>(self, key: &str, load: impl FnOnce() -> Result<Option<T>>) -> Result<Option<T>> {
+        if matches!(self, Self::Golden { .. }) { return load(); }
+        if std::env::var_os(key).is_some() {
+            tracing::warn!("{key} is a golden-only Kimi diagnostic; serving ignores it");
+        }
+        Ok(None)
+    }
+
     fn validate(self, cfg: &KimiK3Config, peers: usize, draft: bool) -> Result<()> {
         if self.skip_routed_experts() {
             ensure!(peers == 0 && !draft, "Kimi --skip-routed-experts golden requires zero Spark peers and no drafter");
@@ -466,16 +476,16 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
         .with_served_context(options.max_context)?;
     std::mem::take(&mut media.push).commit()?;
-    if let Some(dump) = super::dsa_dump::DsaDump::from_env()? {
+    if let Some(dump) = options.role.golden_diagnostic(super::dsa_dump::ENV_DIR, super::dsa_dump::DsaDump::from_env)? {
         engine.attach_dsa_dump(dump)?;
     }
     if let Some(dump) = crate::shared::selection_dump::shared("kimi_k3")? {
         engine.attach_selection_dump(dump)?;
     }
-    if let Some(dump) = super::score_dump::ScoreDump::from_env()? {
+    if let Some(dump) = options.role.golden_diagnostic(super::score_dump::ENV_DIR, super::score_dump::ScoreDump::from_env)? {
         engine.attach_dsa_scores(dump)?;
     }
-    if let Some(dump) = super::key_dump::KeyDump::from_env()? {
+    if let Some(dump) = options.role.golden_diagnostic(super::key_dump::ENV_DIR, super::key_dump::KeyDump::from_env)? {
         engine.attach_dsa_keys(dump)?;
     }
     memory.sample("pre-capture")?;
@@ -597,6 +607,18 @@ mod tests {
             assert!(Role::Serve.validate(&cfg, 0, false).is_err());
             assert!(Role::Golden { skip_routed_experts: false }.validate(&cfg, 0, false).is_err());
             Role::Serve.validate(&cfg, 6, false)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dsa_readback_diagnostics_attach_only_to_golden_runs() -> Result<()> {
+        let refused = || -> Result<Option<()>> { anyhow::bail!("diagnostic loaded") };
+        assert!(Role::Serve.golden_diagnostic("CUTEAFD_KIMI_DSA_TEST_UNSET", refused)?.is_none());
+        for skip_routed_experts in [false, true] {
+            let golden = Role::Golden { skip_routed_experts };
+            assert!(golden.golden_diagnostic("CUTEAFD_KIMI_DSA_TEST_UNSET", refused).is_err());
+            assert_eq!(golden.golden_diagnostic("CUTEAFD_KIMI_DSA_TEST_UNSET", || Ok(Some(3)))?, Some(3));
         }
         Ok(())
     }

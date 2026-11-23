@@ -1916,9 +1916,9 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
 
 @pytest.mark.parametrize("family_config,model,row_key,rtx,ranks", [
     ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
-      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_BATCH_TOKENS", 1, 4),
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_ROWS", 1, 4),
     ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
-      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_BATCH_TOKENS", 2, 6),
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_ROWS", 2, 6),
     ({"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
       "first_k_dense_replace": 1, "moe_layer_freq": 1}}, "test/Kimi-K3", "PREFILL_ROWS", 2, 6),
     ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
@@ -2510,6 +2510,27 @@ def test_mistral_large4_launch_places_its_pixtral_encoder_where_the_plan_does(tm
         assert f"--encoder-plan-hash {'ab' * 32}" in worker and f"--encoder-plan-hash {'ab' * 32}" in launch
         assert "--encoder-max-tokens 3080" in worker
         assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
+
+
+@pytest.mark.parametrize("vision", ["rtx", "off"])
+def test_mistral_large4_media_cache_reaches_plan_and_serve_only_with_vision(tmp_path, vision):
+    config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
+              "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1},
+              "vision_config": {"model_type": "pixtral", "num_hidden_layers": 30}}
+    placement = {"kind": "rtx", "gpu": 0} if vision == "rtx" else {"kind": "off"}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "max_image_tokens": 55 * 56,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = f"RTX_GPUS=1\nSPECULATOR=off\nAUDIO=off\nVISION={'auto' if vision == 'rtx' else 'off'}\nMEDIA_CACHE_BYTES=2GiB\n"
+    result = _family_launch_result(tmp_path, config, "test/ml4", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    planned = next(shlex.split(line) for line in result.stderr.splitlines()
+                   if "cuteafd plan" in line and "--deployment" in line)
+    for argv in (serve, planned):
+        assert ("--media-cache-bytes" in argv) == (vision == "rtx")
+        if vision == "rtx":
+            assert argv[argv.index("--media-cache-bytes") + 1] == "2GiB"
 
 
 @pytest.mark.parametrize("gpus", [1, 2])
@@ -4004,12 +4025,12 @@ def test_speculator_uses_canonical_depth_and_validates_family(tmp_path: Path) ->
                                            ("HOST_CACHE_BYTES=16GiB\n", "16GiB")])
 def test_mimo_port_flags_preserve_explicit_host_budget(tmp_path: Path, host: str, expected: str | None) -> None:
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
-    keys = ("MIMO_HOST_CACHE=on\nMIMO_PREFIX_DRAFT=on\n"
+    keys = ("MIMO_PREFIX_DRAFT=on\n"
             "MIMO_SNAPSHOT_WAIT=on\nMIMO_PREFILL_CHUNK_S=4\nHTTP_QUEUE_DEPTH=32\nHTTP_QUEUE_WAIT_MS=1234\n") + host
     result = _family_launch_result(tmp_path, config, "XiaomiMiMo/MiMo-V2-Flash", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
-    for flag in ("--mimo-host-cache", "--mimo-prefix-draft",
+    for flag in ("--mimo-prefix-draft",
                  "--mimo-snapshot-wait", "--prefill-chunk-s 4", "--http-queue-depth 32", "--http-queue-wait-ms 1234"):
         assert flag in launch
     if expected is None:
@@ -5779,7 +5800,7 @@ def test_nondefault_config_handoff_matches_composed_serving_values(tmp_path, fam
     if local:
         keys += "EXPERT_BACKEND=local\n"
     else:
-        prefill = "PREFILL_BATCH_TOKENS" if family in ("deepseek_v41", "step5") else "PREFILL_ROWS"
+        prefill = "PREFILL_BATCH_TOKENS" if family == "deepseek_v41" else "PREFILL_ROWS"
         keys += f"{prefill}=1024\nRTX_EXPERT_LAYERS=0\n"
     has_kv = family in ("mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "muse_spark")
     if has_kv:

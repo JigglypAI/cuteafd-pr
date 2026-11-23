@@ -308,3 +308,24 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn bf16_router_replica_lands_on_its_own_rank() -> Result<()> {
+    use crate::shared::experts::rtx::dense;
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 1 << 30)?; }
+    let router = "model.layers.1.mlp.gate.weight";
+    let checkpoint = checkpoint(&fixture, &[(router, DType::Bf16, &[8, 256])])?;
+    let formats = BTreeMap::new();
+    let load = std::rc::Rc::new(dense::DenseLoad::push(&library));
+    let loader = MimoLoader { dense: load.clone(), ..loader(&library, &checkpoint, &formats) };
+    let replicas = (0..loader.ranks()).map(|rank| loader.on_rank(rank, |_| loader.one(rank, router)))
+        .collect::<Result<Vec<_>>>()?;
+    let records = load.sink.as_ref().unwrap().take_all();
+    assert_eq!(records.operands.iter().map(|operand| operand.device).collect::<Vec<_>>(), [0, 1]);
+    for (operand, replica) in records.operands.iter().zip(&replicas) {
+        assert_eq!(operand.buffer.ptr, replica.buffer.ptr);
+    }
+    Ok(())
+}
