@@ -2938,11 +2938,24 @@ def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
 def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
     job = make(entry, tmp_path)
-    with cards.hwlock.hold(['gpu0'], 1):
+    locks = cards.hwlock.LOCK_DIR
+    marker = tmp_path / 'holding'
+    # Another job (not an ancestor: hwlock refuses to nest inside one) holds gpu0.
+    other = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'), '--locks', 'gpu0', '--wait', '10', '--',
+                              sys.executable, '-c', f'import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(30)'],
+                             env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+    try:
+        end = time.time() + 10
+        while not marker.exists():
+            assert time.time() < end, 'the other holder never started'
+            time.sleep(0.02)
         with pytest.raises(TimeoutError, match='no turn'):
             with cards.serving_turn([job], {}, 0.02):
                 pytest.fail('a conflicting turn cannot be granted')
-    assert not list((cards.hwlock.LOCK_DIR / 'hwq').glob('*.ticket'))
+        assert not list((locks / 'hwq').glob('*.ticket'))
+    finally:
+        other.terminate()
+        other.wait(timeout=30)
 
 
 def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):

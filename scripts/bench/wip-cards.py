@@ -670,6 +670,11 @@ def job_max_run(job):
     return bound + SMOKE_STOP_GRACE_S + JOB_DRIVER_SLACK_S
 
 
+def held_by_ancestor(env=None):
+    """Locks an enclosing hwlock hold already has for this process (`CUTEAFD_HW_LOCKS_HELD`)."""
+    return hwlock.canonical(filter(None, (os.environ if env is None else env).get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+
+
 @contextlib.contextmanager
 def serving_turn(jobs, env, wait):
     """Hold one post-build turn until every smoke has exited and torn down.
@@ -686,7 +691,7 @@ def serving_turn(jobs, env, wait):
     cover queues behind tickets waiting on the outer hold itself and cannot be
     granted (#2364). Fail at once instead.
     """
-    parent = hwlock.canonical(filter(None, env.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+    parent = held_by_ancestor(env)
     locks = serving_locks(jobs)
     if parent:
         missing = [name for name in locks if name not in parent]
@@ -3216,7 +3221,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         arm['build_slot'] = build_slot_capable(revision)
         if arm['build_lock_mode'] == 'legacy-full-build':
             print('# legacy arm: GPU lock held for the full build')
-            build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
+            # hwlock refuses to nest inside an enclosing hold (exit 77); one that covers gpu1 already holds it for us.
+            if 'gpu1' not in held_by_ancestor():
+                build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
         print('# build locking ' + name + ': ' + arm['build_lock_mode'])
         # Seed on an out-of-pool host; stage the sealed slot to the whole serving union.
         # The seed is wip.sh's own parameter (WIP_SEED_HOST), never a SPARK_* rank,
@@ -3294,7 +3301,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                 if cmd is commands[-1]:
                     # CPU-export and native-phase checkouts manage seed leases inside wip.sh;
                     # only legacy full-build checkouts need a pre-build fair wait.
-                    if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build':
+                    if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build' and seed not in held_by_ancestor():
                         # Wait (not fail) while another job's export holds the seed Spark; wip.sh
                         # takes the lock itself for the native phase, so release it at once.
                         seed_wait = int(os.environ.get('CUTEAFD_WIP_SEED_WAIT_S', '14400'))
