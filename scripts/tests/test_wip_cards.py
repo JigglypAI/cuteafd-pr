@@ -2250,6 +2250,69 @@ def test_exact_state_golden_runs_against_the_live_server_at_sweep_end(entry, tmp
                        {'PROFILE': 'nsys'}, set(), None, 1, exact_state=golden)
 
 
+def test_client_runs_against_the_live_server_after_readiness(entry, tmp_path):
+    client = ['/opt/x/agentic', 'record', '--output', 'session.json']
+    with pytest.raises(ValueError, match='--client needs --panels none'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       client=client)
+    none = {**entry, 'profile': 'panels:', 'baseline': False}
+    with pytest.raises(ValueError, match='--client needs --panels none and no sweep'):
+        cards.generate({**none, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
+                       {}, set(), None, 1, client=client)
+    for kwargs in (dict(exact_state=['/x', 'g']), dict(cold_hosts=['raptor'])):
+        with pytest.raises(ValueError, match='excludes --exact-state and --cold-window'):
+            cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                           client=client, **kwargs)
+    with pytest.raises(ValueError, match='--client-timeout must be'):
+        cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       client=client, client_timeout=0)
+    job = cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                         client=client)
+    hook = job['entry']['precheck']
+    out = Path(job['state']) / 'client'
+    assert out.is_dir() and hook['required'] and hook['timeout_s'] == cards.CLIENT_TIMEOUT_S == 3600
+    assert hook['argv'][:3] == ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={tmp_path / "key"}']
+    assert hook['argv'][-len(client):] == client and job['client'] == hook['argv']
+    assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['precheck'] == hook
+    # A card that already has a precheck (an expected pool) runs it first, then the client.
+    job = cards.generate(none, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key', {}, set(), 4096, 1,
+                         client=client, client_timeout=600)
+    hook = job['entry']['precheck']
+    assert hook['argv'][:2] == ['sh', '-c'] and hook['timeout_s'] == 600 + 180
+    assert hook['argv'][2].index('--precheck') < hook['argv'][2].index('/opt/x/agentic')
+    with pytest.raises(ValueError, match='7200 s hook limit'):
+        cards.generate(none, 'c', dict(instance='r', slot='s'), tmp_path, tmp_path / 'key', {}, set(), 4096, 1,
+                       client=client, client_timeout=7200)
+
+
+def test_client_hook_runs_in_its_output_directory(entry, tmp_path):
+    none = {**entry, 'profile': 'panels:', 'baseline': False}
+    job = cards.generate(none, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                         client=['sh', '-c', 'pwd > where; printf %s "$CUTEAFD_SMOKE_URL" > url; exit 3'])
+    result = subprocess.run(job['entry']['precheck']['argv'], env={**os.environ, 'CUTEAFD_SMOKE_URL': 'http://h:1'})
+    out = Path(job['state']) / 'client'
+    assert result.returncode == 3
+    assert (out / 'where').read_text().strip() == str(out) and (out / 'url').read_text() == 'http://h:1'
+
+
+def test_client_dry_run_shows_the_hook_and_requires_panels_none(entry, tmp_path, monkeypatch, capsys):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    base = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s',
+            '--state', str(state), '--dry-run', '--client', '/opt/x/agentic record --output s.json']
+    monkeypatch.setattr(sys, 'argv', base)
+    with pytest.raises(SystemExit):
+        cards.main()
+    assert '--client needs --panels none' in capsys.readouterr().err
+    monkeypatch.setattr(sys, 'argv', base + ['--panels', 'none', '--client-timeout', '5400'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert job['entry']['baseline'] is False and job['entry']['profile'] == 'panels:'
+    assert job['entry']['precheck']['timeout_s'] == 5400
+    output = capsys.readouterr().out
+    assert '# smoke client (after readiness' in output and '/opt/x/agentic record --output s.json' in output
+
+
 def test_fabric_probe_card_selector(entry, tmp_path):
     probes, scoped = cards.probe_selection(['v41-min:console,fabric'], [entry], {'a': {}, 'b': {}})
     assert not scoped
