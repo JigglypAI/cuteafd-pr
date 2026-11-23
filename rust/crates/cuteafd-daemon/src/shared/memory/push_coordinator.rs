@@ -199,6 +199,7 @@ impl CoordinatorExpertPlan {
 
     /// All ranks and both DenseArenas per rank coexist with their receive rings.
     /// Dense staging is supplied only once its records are complete, before offers.
+    #[cfg(test)]
     pub fn admit_host(plans: &[Option<&Self>], dense: &[crate::shared::experts::rtx::dense::HostStaging],
         slots: usize, slot_bytes: usize, available: u64) -> Result<usize> {
         ensure!(dense.is_empty() || dense.len() == plans.len(), "dense host owners differ from coordinator ranks");

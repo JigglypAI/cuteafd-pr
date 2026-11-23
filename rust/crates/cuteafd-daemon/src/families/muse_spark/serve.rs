@@ -302,10 +302,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
         if admission_plan.coordinator_pushes() {
-            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view(&view, Some(&catalog), gpus, experts)?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
-            Ok((CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?, None, 0))
+            Ok((CoordinatorPush::prepare_alone_view(&view, Some(&catalog), gpus, experts)?, None, 0))
         }
     })?;
     let (push, coordinator, push_sparks) = match prepared {

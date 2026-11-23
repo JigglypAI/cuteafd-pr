@@ -179,7 +179,6 @@ pub(crate) struct Admission<'a> {
     io_allocated: Vec<Vec<bool>>,
     spark_connected: Vec<bool>,
     spark_links: Vec<cuteafd_loader::placement::PreparedSparkLink>,
-    push_host: cuteafd_loader::push_load::PushHostEnvelope,
 }
 
 /// Startup retains these until persistent local lanes acquire the same owners.
@@ -484,9 +483,9 @@ impl<'a> Admission<'a> {
                         budget: budgets[0] }] }
                 } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let prepared = CoordinatorPush::prepare_view_admitted(checkpoint.view.as_ref()
+            let prepared = CoordinatorPush::prepare_view(checkpoint.view.as_ref()
                 .context("Kimi push requires the immutable selected checkpoint view")?, Some(catalog), RANKS,
-                experts, self.push_host.clone())?;
+                experts)?;
             Ok((prepared, owners, records, dense))
         })?;
         let (planned, ranks) = match planned {
@@ -997,8 +996,6 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
     recipe.owners.extend(kimi::stream_slab_owners_with_block(RANKS,maximum_pages,
         matches!(draft,Some(DraftLayout::BlockTp2 { .. })))?);
-    let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
-    if !skip_routed_experts { recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?); }
     recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
@@ -1065,7 +1062,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
         global_layouts, global_uploaded: vec![false; devices.len()], global_owners: vec![Weak::new(); devices.len()],
-        io_layouts, io_allocated, spark_connected: vec![false; lanes as usize], spark_links: recipe.links.clone(), push_host };
+        io_layouts, io_allocated, spark_connected: vec![false; lanes as usize], spark_links: recipe.links.clone() };
     for rank in 0..RANKS {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;

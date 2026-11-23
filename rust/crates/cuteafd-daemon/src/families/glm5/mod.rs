@@ -1246,20 +1246,10 @@ impl Opened {
                 page_owners: if attention == cuteafd_loader::placement::AttentionPlacement::Context {
                     cuteafd_engine::prefix::PageOwners::Parity } else { cuteafd_engine::prefix::PageOwners::Uniform },
             }, args.max_context, concurrency)).transpose()?.flatten() };
-        let push_headers = checkpoint.is_none().then(|| cuteafd_loader::plan::Checkpoint::coordinator_view(
-            self.catalog.selected_view().context("GLM push selected view")?, false, args.dspark)).transpose()?;
-        let push_headers = checkpoint.as_ref().or(push_headers.as_ref()).context("GLM selected push headers")?;
-        let largest_native = native_records.iter().flatten().flat_map(|record| &record.components)
-            .map(|component| component.source.bytes as u64).max().unwrap_or(0);
-        let admitted_push_host = push_host_envelope(&push_headers, &self.cfg, layers, devices.len(),
-            Some(&self.catalog), metadata.as_ref(), largest_native)?;
-        let mut additional = Vec::new();
-        if let Some(envelope) = &admitted_push_host {
-            additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
-                let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
-                Component::allocation(owner, bytes, false, maximum_pages)
-            }));
-        }
+        let mut additional = match metadata.as_ref() {
+            Some(metadata) => retained_expert_metadata(&args.snapshot, &self.cfg, layers, devices.len(), metadata, maximum_pages)?,
+            None => Vec::new(),
+        };
         let mut blas = Vec::new();
         if let Some((device, weights, total)) = media_owners.0 {
             let rank = devices.iter().position(|&id| id == device).context("vision device absent from GLM placement")?;
@@ -1490,9 +1480,8 @@ impl Opened {
                 push_policy.plan(|| {
                     let experts = dense_push_experts()?;
                     let planned = plan_dense(peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
-                        self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
-                        admitted_push_host.clone().context("GLM push host receipt")?)?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare_view(
+                        self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts)?;
                     Ok((prepared, planned))
                 }).context("GLM coordinator dense push planning")?
             } else { None };
@@ -1506,9 +1495,8 @@ impl Opened {
                 (None, Some(_)) if admission.coordinator_pushes() => {
                     let planned = push_policy.plan(|| {
                         let experts = native_push_experts()?;
-                        crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
-                            self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
-                            admitted_push_host.clone().context("GLM push host receipt")?)
+                        crate::shared::experts::rtx::push::CoordinatorPush::prepare_view(
+                            self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts)
                     }).context("GLM native coordinator push planning")?;
                     planned.map(|(push, streams, ranks)| {
                         native_push = Some((push, peers.len()));
@@ -1524,9 +1512,8 @@ impl Opened {
             coordinator_push = push_policy.plan(|| {
                 let experts = dense_push_experts()?;
                 let planned = plan_dense(0)?;
-                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
-                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
-                    admitted_push_host.clone().context("GLM push host receipt")?)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts)?;
                 Ok((push, 0, planned))
             }).context("GLM coordinator dense push planning")?;
         }
@@ -1534,9 +1521,8 @@ impl Opened {
         // Idle Spark peers acknowledge identity while these destinations push alone.
         if native_records.is_some() && native_push.is_none() {
             native_push = push_policy.plan(|| {
-                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
-                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), native_push_experts()?,
-                    admitted_push_host.clone().context("GLM push host receipt")?)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), native_push_experts()?)?;
                 Ok((push, 0))
             }).context("GLM native coordinator push planning")?;
         }

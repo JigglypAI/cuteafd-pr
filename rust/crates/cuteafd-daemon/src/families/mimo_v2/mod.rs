@@ -515,10 +515,9 @@ mod source_format_tests {
         assert_eq!(selected.fingerprint(), view.fingerprint());
         assert_eq!(selected.snapshot(), view.snapshot());
         if installed {
-            use crate::shared::experts::rtx::push::{CoordinatorPush, push_host_envelope};
-            let envelope = push_host_envelope(&[None], &[])?;
-            let (_push, streams, _ranks) = CoordinatorPush::prepare_view_admitted(
-                view, Some(catalog), 1, None, envelope)?;
+            use crate::shared::experts::rtx::push::CoordinatorPush;
+            let (_push, streams, _ranks) = CoordinatorPush::prepare_view(
+                view, Some(catalog), 1, None)?;
             assert_eq!(streams.len(), 1);
         }
         Ok(())
@@ -1256,12 +1255,11 @@ impl Opened {
                 &preflight.placement.expert_ranges, &preflight.working_set.rtx_layers,
                 preflight.expert_resident_bytes, devices.len())?;
             let view = self.checkpoint.view.as_ref().context("MiMo push requires selected checkpoint view")?;
-            let envelope = preflight.push_host.clone().context("MiMo push host receipt")?;
             let prepared = if sparks == 0 {
-                (CoordinatorPush::prepare_alone_view_admitted(view, self.catalog.as_ref(), devices.len(), experts, envelope)?, None)
+                (CoordinatorPush::prepare_alone_view(view, self.catalog.as_ref(), devices.len(), experts)?, None)
             } else {
-                let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view,
-                    self.catalog.as_ref(), devices.len(), experts, envelope)?;
+                let (push, streams, ranks) = CoordinatorPush::prepare_view(view,
+                    self.catalog.as_ref(), devices.len(), experts)?;
                 (push, Some((streams, ranks)))
             };
             Ok((prepared, (loaded, planning.transient.clone(), dense, devices)))

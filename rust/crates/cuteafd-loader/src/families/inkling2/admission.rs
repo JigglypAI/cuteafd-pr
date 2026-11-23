@@ -414,38 +414,6 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
-    let dense_push_bytes = targets.iter().enumerate().map(|(rank, target)| {
-        let draft = drafter.as_ref().map(|draft| &draft.layout.weights[rank]);
-        let trellis_window = target.core.values().chain(draft.into_iter().flat_map(|d| d.core.values()))
-            .map(|layout| {
-                let tile_row = layout.shape[0] / 16 * 32 * layout.bits;
-                tile_row * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / tile_row).max(1)
-            }).max().unwrap_or(0);
-        let fp8_window = target.fp8.values().chain(draft.into_iter().flat_map(|d| d.fp8.values()))
-            .map(|layout| {
-                let block = layout.shape[1] * 2 * 128;
-                block * (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / block).max(1)
-            }).max().unwrap_or(0);
-        let largest = trellis_window.max(fp8_window);
-        if largest == 0 { return Ok(0); }
-        // The target and drafter land from the same ordered source. In
-        // particular, MTP down has wider BF16 source rows than any target role.
-        crate::push_load::admitted_push_envelope(largest as u64, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
-            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)
-    }).collect::<Result<Vec<_>, _>>().map_err(|error| refused(
-        format!("Inkling compact push staging refused: {error:#}"), "Check the selected projection geometry."))?;
-    let push_host = (0..=routed.len()).map(|count| {
-        if !push_required { return Ok(None); }
-        let backings = match &local {
-            LocalPackage::Installed { backings } => backings[count].as_slice(),
-            LocalPackage::Missing(_) if count == 0 => &[],
-            LocalPackage::Missing(_) => return Ok(None),
-        };
-        let mut envelope = super::weight_layout::push_host_envelope(&catalog, backings, gpus)?;
-        for (gpu, &bytes) in dense_push_bytes.iter().enumerate() { envelope.dense_bytes[gpu] = bytes; }
-        Ok(Some(envelope))
-    }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling push host inventory refused: {error:#}"),
-        "Provide complete native push source/descriptor headers."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
@@ -455,5 +423,5 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),
-        resident_weight_limit: Some(request.resident_weight_limit), mount, push_host })
+        resident_weight_limit: Some(request.resident_weight_limit), mount, push_required })
 }

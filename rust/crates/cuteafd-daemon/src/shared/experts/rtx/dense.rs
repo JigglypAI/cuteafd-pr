@@ -392,18 +392,19 @@ impl PushDestination for DenseArena<'_> {
             let staging = match self.pool.iter().position(|s| s.buffer.bytes == need) {
                 Some(found) => self.pool.swap_remove(found),
                 None => {
-                    // Exact-size buffers keep tiny coded-scale steps cheap.
-                    // Discard unused size classes before allocating; retained
-                    // pools must never exceed the same admitted byte bound.
-                    while self.held + need as u64 > self.layout.host_staging.staging_bytes as u64 {
+                    // Keep reusable buffers up to the open-window high water, not the
+                    // theoretical frontier. An arriving step can always grow the pool.
+                    let cache_ceiling = self.peak.max(self.staged + need as u64);
+                    while self.held + need as u64 > cache_ceiling {
                         let Some(unused) = self.pool.pop() else { break; };
                         self.held -= unused.buffer.bytes as u64;
                         drop(unused);
                     }
-                    ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
-                        "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
-                        self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
-                    let allocation = HostAllocation::new(self.device.library, need, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?;
+                    let allocation = HostAllocation::new(self.device.library, need,
+                        crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))
+                        .map_err(|source| super::push::PushStartupError::StagingAllocation {
+                            device: self.device.id, bytes: need, owner: "dense transform", source: source.into(),
+                        })?;
                     self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
                     allocation
@@ -449,6 +450,7 @@ impl PushDestination for DenseArena<'_> {
             host_operands = self.layout.host_operands.len(),
             host_operand_bytes = self.layout.host_operands.iter().map(|(_, h)| h.rect.bytes() as u64).sum::<u64>(),
             finishes = self.layout.finishes.len(), finish_ms,
+            peak_staged_bytes = self.peak, peak_pinned_bytes = self.peak_held,
             peak_staged_mib = self.peak as f64 / (1u64 << 20) as f64,
             peak_pinned_mib = self.peak_held as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
         #[cfg(test)]

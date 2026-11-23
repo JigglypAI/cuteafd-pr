@@ -614,15 +614,6 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         pinned.extend(mount.allocations(&format!("muse.native.load.{gpu}")).into_iter()
             .filter(|owner| owner.location == Location::PINNED));
     }
-    let catalog = input.expert_catalog().unwrap();
-    let manifest = catalog.exl3().unwrap();
-    let validation = (0..2).map(|gpu| (0..placement.onboard_layers).map(|layer|
-        manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, gpu).unwrap().loads.iter()
-            .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4).sum()).collect();
-    // Dense staging is an estimated allowance, not a physical pinned root.
-    let push = crate::push_load::PushHostEnvelope::new(validation, vec![0; 2],
-        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).unwrap();
-    pinned.extend(push.allocations("muse.push").unwrap().into_iter().filter(|owner| owner.location == Location::PINNED));
     for gpu in 0..2 {
         let id = format!("rtx{gpu}");
         let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")

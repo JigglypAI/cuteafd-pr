@@ -43,25 +43,6 @@ fn invalid(detail: &str) -> Refusal {
 
 fn anyhow_refusal(error: anyhow::Error) -> Refusal { invalid(&format!("{error:#}")) }
 
-fn dense_push_staging(core: &CoreInventory, gpus: usize) -> Result<(u64, String), Refusal> {
-    if core.native.is_empty() {
-        // Preserve the parent K6 for_steps bounds, including their attribution.
-        let bytes = if gpus == 2 { 2 << 30 } else { 1 << 30 };
-        return Ok((bytes, format!("Muse dense push staging: estimated {} GiB/rank from 1191-muse-min-pair / muse-max-push-incast8 for_steps bounds (#1274)", bytes >> 30)));
-    }
-    let largest = core.projections.values().map(|projection| projection.source_bytes).max().unwrap_or(0);
-    // Native FP8 conversion starts from the whole selected BF16 source, before TP slicing.
-    let largest = core.native.values().try_fold(largest, |largest, projection| {
-        let [n, k] = projection.shape;
-        let bytes = u64::try_from(n).ok().and_then(|n| u64::try_from(k).ok().and_then(|k| n.checked_mul(k)))
-            .and_then(|elements| elements.checked_mul(2)).ok_or(Refusal::Overflow("Muse native push source"))?;
-        Ok::<_, Refusal>(largest.max(bytes))
-    })?;
-    let bytes = crate::push_load::admitted_push_envelope(largest,
-        cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?;
-    Ok((bytes, "Muse native dense push staging: shared windowed receive and transform envelope from selected source headers".into()))
-}
-
 /// One coordinator GPU's planned budget: the CUDA context is the forecast
 /// charge; everything else the family states as an owner.
 pub fn planned_budget(gpu: u8, physical_bytes: u64, capacity_bytes: u64, headroom_bytes: u64, context_bytes: u64) -> Budget {
@@ -214,7 +195,6 @@ pub struct PreparedMuse<'a> {
     projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
     spark_budget: SparkBudgetInventory,
     host: HostAdmission,
-    push: Vec<crate::push_load::PushHostEnvelope>,
 }
 
 /// The one admitted answer. Both edges read the same fields.
@@ -237,7 +217,6 @@ pub struct AdmittedMuse {
     pub spark_budget: SparkBudgetInventory,
     pub solve_us: u64,
     pub host: HostAdmission,
-    pub push: crate::push_load::PushHostEnvelope,
 }
 
 impl AdmittedMuse {
@@ -576,20 +555,7 @@ impl<'a> ProductionInput<'a> {
         let mut expert_cases = Vec::with_capacity(cfg.layers + 1);
         // Count zero is a case too: with every routed layer on the Sparks, the
         // slice ledger is the whole Spark charge and must bind their budgets.
-        let mut push = Vec::with_capacity(cfg.layers + 1);
-        let (dense_bound, dense_source) = dense_push_staging(core, gpus)?;
-        let mut validation = vec![0u64; gpus];
-        let manifest = catalog.exl3().ok_or_else(|| invalid("Muse push requires EXL3 headers"))?;
         for count in 0..=cfg.layers {
-            if count > 0 {
-                for (gpu, bytes) in validation.iter_mut().enumerate() {
-                    let residency = manifest.residency(crate::V41Exl3Layer::Backbone(count - 1), gpus, gpu)
-                        .map_err(anyhow_refusal)?;
-                    *bytes = bytes.checked_add(residency.loads.iter()
-                        .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
-                        .ok_or(Refusal::Overflow("Muse push validation"))?;
-                }
-            }
             let mut sum = [0u64; 2];
             for layer in 0..count {
                 for gpu in 0..gpus {
@@ -650,22 +616,6 @@ impl<'a> ProductionInput<'a> {
                     }
                 }
             }
-            let envelope = crate::push_load::PushHostEnvelope::new(validation.clone(), vec![dense_bound; gpus],
-                cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64,
-                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?;
-            for owner in envelope.allocations("muse.push")? {
-                if owner.id.ends_with(".dense") {
-                    components.push(Component { activation: Activation::always(),
-                        bytes: ByteCurve::fixed(owner.bytes, maximum_pages),
-                        kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes: owner.bytes,
-                            lifetime: owner.lifetime, source: dense_source.clone(),
-                            assumed: true }) });
-                } else {
-                    let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
-                    components.push(Component::allocation(owner, bytes, false, maximum_pages));
-                }
-            }
-            push.push(envelope);
             expert_cases.push(Case { when: vec![When::Onboard(count)], value: components });
         }
 
@@ -710,7 +660,7 @@ impl<'a> ProductionInput<'a> {
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone(), head_backend: if global.head.is_none() && global.head_native.is_none() { bf16_target_head } else { serving::BlasHead::Native } };
         Ok(PreparedMuse { pool, kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
-            spark_budget, host: host_quotas, push })
+            spark_budget, host: host_quotas })
     }
 }
 
@@ -1060,17 +1010,16 @@ impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
         let PreparedMuse { pool, kv_cache, recipe, budgets, local, drafter, layouts, global, projections,
-            spark_budget, mut host, push } = self;
+            spark_budget, mut host } = self;
         let started = std::time::Instant::now();
         let solved = solve_sampled(request, budgets, &recipe, &pool)?;
         let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
         if spark.spark_layers.is_empty() { return Err(LOCAL_ONLY_REFUSAL); }
-        let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }
         Ok(AdmittedMuse { kv_cache, placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
-            drafter, layouts, global, projections, spark_budget, solve_us, host, push })
+            drafter, layouts, global, projections, spark_budget, solve_us, host })
     }
 }
 
@@ -1405,39 +1354,6 @@ mod contract_tests {
         input.prefix_bytes = None;
         input.total = 1;
         assert!(input.quotas(&cfg, 1 << 20, 16).is_err());
-    }
-
-    #[test]
-    fn native_push_staging_is_load_only_host_demand_and_compact_keeps_its_bound() {
-        use crate::formats::{native_attention::NativeProjection, trellis_core::CoreSplit};
-        let mut core = CoreInventory::default();
-        for gpus in [1, 2] {
-            let (bytes, source) = dense_push_staging(&core, gpus).unwrap();
-            assert_eq!(bytes, if gpus == 2 { 2 << 30 } else { 1 << 30 });
-            assert_eq!(source, format!("Muse dense push staging: estimated {} GiB/rank from 1191-muse-min-pair / muse-max-push-incast8 for_steps bounds (#1274)", bytes >> 30));
-        }
-        for fp8 in [false, true] {
-            core.native.insert("o_proj".into(), NativeProjection { shape: [8192, 8192], fp8, split: CoreSplit::Input });
-            for gpus in [1, 2] {
-                let (bytes, _) = dense_push_staging(&core, gpus).unwrap();
-                assert_eq!(bytes, 17_716_740_096);
-                let envelope = crate::push_load::PushHostEnvelope::new(vec![0; gpus], vec![bytes; gpus],
-                    cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64,
-                    cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).unwrap();
-                let host = HostInput { total: 256 << 30, available: 256 << 30, reserve: 0,
-                    prefix_bytes: Some(0), prefix_entries: 0, media_bytes: Some(0), device_sampling: true }.budget();
-                for owner in envelope.allocations("muse.push").unwrap() {
-                    assert_eq!(owner.location, Location::PINNED);
-                    assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
-                    assert!(host.locations.contains(&owner.location));
-                    for gpu in 0..gpus {
-                        assert!(!planned_budget(gpu as u8, 96 << 30, 80 << 30, 0, 0).locations.contains(&owner.location));
-                    }
-                }
-            }
-        }
-        core.native.get_mut("o_proj").unwrap().shape = [usize::MAX; 2];
-        assert!(matches!(dense_push_staging(&core, 2), Err(Refusal::Overflow(_))));
     }
 
     #[test]

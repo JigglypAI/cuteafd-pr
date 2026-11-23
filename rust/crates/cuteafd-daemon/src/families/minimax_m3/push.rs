@@ -5,7 +5,7 @@ use crate::shared::{
     memory::{device::Device, push_exl3::CoordinatorRanks},
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::{plan::checkpoint::CheckpointView, push_load::PushHostEnvelope, OfficialV41Catalog};
+use cuteafd_loader::{plan::checkpoint::CheckpointView, OfficialV41Catalog};
 
 pub(crate) type Membership = (Vec<std::net::TcpStream>, CoordinatorRanks);
 
@@ -26,7 +26,7 @@ pub(crate) struct Prepared<'a, T> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare<'a, T>(view: &CheckpointView, catalog: &OfficialV41Catalog,
     devices: &[Device<'a>], sparks: usize, expert_sets: Vec<CoordinatorExperts>,
-    envelope: PushHostEnvelope, load: impl FnOnce() -> Result<T>)
+    load: impl FnOnce() -> Result<T>)
     -> Result<(Prepared<'a, T>, Option<Membership>)> {
     ensure!(PushPolicy::for_snapshot(view.snapshot())? == PushPolicy::Required,
         "MiniMax grouped push needs a SparkNest namespace");
@@ -38,10 +38,10 @@ pub(crate) fn prepare<'a, T>(view: &CheckpointView, catalog: &OfficialV41Catalog
     let dense = dense::plan_records(view.snapshot(), records.clone(), devices, sparks)?;
     let experts = (!expert_sets.is_empty()).then_some(CoordinatorExperts::Sets(expert_sets));
     let (push, membership) = if sparks == 0 {
-        (CoordinatorPush::prepare_alone_view_admitted(view, Some(catalog), devices.len(), experts, envelope)?, None)
+        (CoordinatorPush::prepare_alone_view(view, Some(catalog), devices.len(), experts)?, None)
     } else {
-        let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(view, Some(catalog),
-            devices.len(), experts, envelope)?;
+        let (push, streams, ranks) = CoordinatorPush::prepare_view(view, Some(catalog),
+            devices.len(), experts)?;
         (push, Some((streams, ranks)))
     };
     Ok((Prepared { push, owners, devices: devices.to_vec(), sparks, dense, records, media: Default::default() }, membership))
@@ -98,7 +98,7 @@ struct ServingContract {
 
 /// The startup edge owns Spark selection/handshake policy. It passes returned
 /// membership to SparkAdmission::start_with, then consumes the pending barrier
-/// in finish. This function accepts only the recipe's selected host envelope.
+/// in finish.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_serving<'a>(view: &CheckpointView, catalog: &OfficialV41Catalog,
     checkpoint: &cuteafd_loader::plan::Checkpoint, devices: &[Device<'a>],
@@ -117,7 +117,7 @@ pub(crate) fn prepare_serving<'a>(view: &CheckpointView, catalog: &OfficialV41Ca
     ensure!(checkpoint.snapshot == view.snapshot() && catalog.snapshot() == view.snapshot()
         && checkpoint.view.as_ref().is_none_or(|selected| selected.fingerprint() == view.fingerprint()),
         ServingRefusal::Contract("checkpoint, catalog and push view differ".into()));
-    let envelope = admitted.push_host_envelope.clone().ok_or(ServingRefusal::PushRequired)?;
+    ensure!(inputs.push_required, ServingRefusal::PushRequired);
     let expected = ServingContract::new(checkpoint, devices, inputs, admitted)?;
     ensure!(expected.backings.iter().all(|backing| backing.storage == ExpertStorage::Push),
         ServingRefusal::Contract("selected expert backing is mount-only".into()));
@@ -134,7 +134,7 @@ pub(crate) fn prepare_serving<'a>(view: &CheckpointView, catalog: &OfficialV41Ca
     };
     ensure!(planned == inputs.targets, ServingRefusal::Contract("checkpoint target layout changed".into()));
     let expert_sets = serving_expert_plan(&expected.backings, devices.len())?.into_iter().collect();
-    let (prepared, membership) = prepare(view, catalog, devices, inputs.spark_ranks, expert_sets, envelope, || {
+    let (prepared, membership) = prepare(view, catalog, devices, inputs.spark_ranks, expert_sets, || {
         let (target, embedding) = match (&heads, &split) {
             (Some(heads), _) => super::TargetWeights::load_heads_with_embedding(devices[0], checkpoint,
                 &heads[0], EmbedPlacement::Gpu)?,

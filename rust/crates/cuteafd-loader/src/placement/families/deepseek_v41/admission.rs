@@ -706,7 +706,6 @@ pub struct HostFacts {
     pub estimates: Vec<Opaque>,
     pub prefix_bytes: u64,
     pub mapped: crate::formats::mapped_preload::MappedPlacement,
-    pub push: crate::push_load::PushHostEnvelope,
 }
 
 impl HostFacts {
@@ -792,23 +791,7 @@ impl HostFacts {
         }
         estimate("workspace/router", (prefill.rows + 64) * (5120 * 2 + 8 * 8), false);
         estimate("staging/tables-and-sync", (prefill.rows + 64) * 5120 * 8 + (2 << 20), true);
-        // Estimated ring-frontier bound: one maximum dense step per receive
-        // slot, not twice the checkpoint. prepare_admitted checks real usage.
-        let dense = 128 * crate::shared::dense_read::STEP_BYTES as u64;
-        let expert = headers.iter().filter(|h| h.name.contains(".ffn.experts.") && h.name.ends_with(".scale"))
-            .map(|h| h.byte_length).sum::<u64>();
-        let push = crate::push_load::PushHostEnvelope::new(vec![expert.saturating_add(1 << 20); gpus], vec![dense; gpus], 128, 1 << 20)?;
-        for allocation in push.allocations("v41.push")? {
-            if allocation.id.ends_with(".dense") {
-                estimates.push(Opaque { location: allocation.location, bytes: allocation.bytes,
-                    basis: Basis::Estimated, lifetime: allocation.lifetime,
-                    source: "V4.1 dense push staging (estimated: 128 slots x 32 MiB maximum step)".into() });
-            } else {
-                owners.push(Owner::host(allocation.category, allocation.group, allocation.bytes)
-                    .at(allocation.location).with_lifetime(allocation.lifetime));
-            }
-        }
-        Ok(Self { owners, estimates, prefix_bytes, mapped, push })
+        Ok(Self { owners, estimates, prefix_bytes, mapped })
     }
 }
 
