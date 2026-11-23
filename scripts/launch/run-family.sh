@@ -496,6 +496,13 @@ if [[ "$family" == qwen3_5 ]]; then
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
+if [[ "$family" == inkling2 ]]; then
+  case "$(get DECODE_GRAPHS on)" in
+    on) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
+    off) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
+    *) release_die "DECODE_GRAPHS must be on or off" ;;
+  esac
+fi
 if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == hy4_flash ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
@@ -2610,6 +2617,13 @@ audio_encoder_hash=""
     case "$(get DECODE_GRAPHS on)" in
       on) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
       off) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
+      *) release_die "DECODE_GRAPHS must be on or off" ;;
+    esac
+  fi
+  if [[ "$family" == inkling2 ]]; then
+    case "$(get DECODE_GRAPHS on)" in
+      on) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
+      off) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
       *) release_die "DECODE_GRAPHS must be on or off" ;;
     esac
   fi

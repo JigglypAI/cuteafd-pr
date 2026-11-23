@@ -5,137 +5,11 @@ use crate::shared::{prefill_pipeline::Unit, spark_intake::SparkLink, token_io::D
 use anyhow::{ensure, Result};
 use cuteafd_loader::families::inkling2::Inkling2Config;
 
-/// Startup and first-use capture row buckets of the private heads epilogue.
-const PREWARM_ROWS: [usize; 4] = [1, 4, 16, 64];
-
-/// Keep transport ahead of every consumer's retirement. On failure the owner
-/// releases device waits, drains consumers, then releases registered buffers.
-pub(crate) struct DecodeGraphs<'a> {
-    bank: crate::shared::decode_graph::GraphBank<(usize, usize), crate::shared::decode_graph::GraphOwner<'a, ()>>,
-    stream: std::rc::Rc<crate::shared::memory::device::Stream<'a>>,
-    rank: usize,
-}
-impl<'a> DecodeGraphs<'a> {
-    pub fn new(requests: &RequestOwners<'a>, rank: usize, reserve: u64) -> Result<Self> {
-        use crate::shared::decode_graph::{GraphBank, device::{Basis, Cycle, Preference, Site}};
-        let stream = requests.decode.stream.clone();
-        let mut bank = GraphBank::with_family("inkling2");
-        bank.attach_device(stream.device.library, stream.device.id, reserve,
-            Site { name: "inkling2.heads.output", cycle: Cycle::Decode, preference: Preference::Capture,
-                bootstrap: 2 << 20, basis: Basis::Bytes,
-                spans_devices: super::graph_sites::spans("inkling2.heads.output", false) })?;
-        Ok(Self { bank, stream, rank })
-    }
-    pub fn project(&mut self, layer: usize, rows: usize, work: impl Fn() -> Result<()>) -> Result<()> {
-        if let Some(owner) = self.bank.cached_launch(&(layer, rows)) {
-            // SAFETY: startup captured this same issuing stream, fixed unit
-            // planes and immutable layer weights. No mutable cache is captured.
-            return unsafe { crate::shared::decode_graph::launch(self.stream.device.library, owner.raw, self.stream.raw) };
-        }
-        // Startup's row buckets capture on first use (`GRAPH_PREWARM=off`, or a
-        // startup ticket the reserve declined); other row counts stay eager.
-        if !PREWARM_ROWS.contains(&rows) { return work(); }
-        let key = (layer, rows);
-        let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else { return work() };
-        use crate::shared::decode_graph::{self, GraphOwner};
-        let stream = &self.stream;
-        let lib = stream.device.library;
-        let raw = stream.device.run(|| {
-            // SAFETY: the private epilogue records only this stream's launches
-            // over the fixed decode unit and immutable weights; no peer operand.
-            if let Err(error) = unsafe { decode_graph::begin_capture(lib, stream.raw, &ticket) } {
-                self.bank.cache_ticket_failed(ticket, &error);
-                return Ok(None);
-            }
-            let executed = work();
-            // SAFETY: close the owned capture even when recording failed.
-            let captured = unsafe { decode_graph::end_capture(lib, stream.raw, &mut ticket) };
-            if let Err(error) = executed {
-                if let Ok((raw, ..)) = captured {
-                    // SAFETY: recording failed; executable never launched.
-                    unsafe { lib.cuda_graph_exec_destroy(raw)?; }
-                }
-                self.bank.cache_ticket_failed(ticket, &error);
-                return Err(error);
-            }
-            let (raw, nodes, width, spans, inspection) = match captured {
-                Ok(result) => result,
-                Err(error) => { self.bank.cache_ticket_failed(ticket, &error); return Ok(None); }
-            };
-            // SAFETY: executable uses only the persistent decode unit and target
-            // arena; the executor drains before dropping them.
-            let owner = unsafe { GraphOwner::new(lib, stream.device.id, raw, ())? };
-            if nodes > 1 && !spans && inspection.is_none() {
-                self.bank.census_capture_key("heads.output", self.rank as i32, None, &key, raw);
-                self.bank.cache_commit(key, owner, ticket, nodes as u64, width, false);
-                Ok(Some(raw))
-            } else { Ok(None) }
-        })?;
-        match raw {
-            // SAFETY: the committed executable is retained by the bank until a drained boundary.
-            Some(raw) => stream.device.run(|| unsafe { decode_graph::launch(lib, raw, stream.raw) }),
-            // Recording executed nothing: run the epilogue eagerly.
-            None => work(),
-        }
-    }
-    fn prewarm(&mut self, rank: usize, requests: &RequestOwners<'a>, kernels: &Kernels<'a>,
-        target: &TargetWeights<'a>, cfg: &Inkling2Config) -> Result<()> {
-        use crate::shared::decode_graph::{self, GraphOwner};
-        // Every Inkling site is rank-local: `GRAPH_PREWARM=off` leaves the row
-        // buckets to first-use capture (#2303).
-        let Some(_startup) = decode_graph::sites::startup(
-            super::graph_sites::spans("inkling2.heads.output", false)) else { return Ok(()) };
-        let unit = &requests.decode;
-        let stream = &self.stream;
-        stream.drain()?;
-        for rows in PREWARM_ROWS {
-            for layer in 0..cfg.layers {
-                let key = (layer, rows);
-                let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else { continue; };
-                stream.device.run(|| {
-                    let lib = stream.device.library;
-                    let work = || super::layers::project_heads(kernels, unit, target, cfg, layer, rows);
-                    // SAFETY: startup has no request/peer work in flight. This
-                    // records only the private epilogue on permanent buffers.
-                    if let Err(error) = unsafe { decode_graph::begin_capture(lib, stream.raw, &ticket) } {
-                        self.bank.cache_ticket_failed(ticket, &error);
-                        return Ok(());
-                    }
-                    let executed = work();
-                    // SAFETY: close the owned capture even when recording failed.
-                    let captured = unsafe { decode_graph::end_capture(lib, stream.raw, &mut ticket) };
-                    if let Err(error) = executed {
-                        if let Ok((raw, ..)) = captured {
-                            // SAFETY: recording failed; executable never launched.
-                            unsafe { lib.cuda_graph_exec_destroy(raw)?; }
-                        }
-                        return Err(error);
-                    }
-                    let (raw, nodes, width, spans, inspection) = match captured {
-                        Ok(result) => result,
-                        Err(error) => { self.bank.cache_ticket_failed(ticket, &error); return Ok(()); }
-                    };
-                    // SAFETY: executable uses only the persistent decode unit
-                    // and target arena; the executor drains before dropping them.
-                    let owner = unsafe { GraphOwner::new(lib, stream.device.id, raw, ())? };
-                    if nodes > 1 && !spans && inspection.is_none() {
-                        self.bank.census_capture_key("heads.output", rank as i32, None, &key, raw);
-                        self.bank.cache_commit(key, owner, ticket, nodes as u64, width, false);
-                    }
-                    Ok(())
-                })?;
-                stream.drain()?;
-                // SAFETY: the same persistent decode owner outlives all graphs.
-                unsafe { crate::shared::decode_graph::device::observe_completed(stream.device.library, |visit|
-                    visit(stream.device.id, "inkling2.heads.output", false, &mut self.bank))?; }
-            }
-        }
-        Ok(())
-    }
-}
+use super::graphs::{DecodeGraphs, Mode};
+use crate::shared::decode_graph::device::Cycle;
 
 pub(crate) struct Peer<'a> {
-    pub graphs: DecodeGraphs<'a>,
+    pub(super) graphs: Option<DecodeGraphs<'a>>,
     pub exchange: crate::shared::peer_split::PeerExchange<'a>,
     pub requests: RequestOwners<'a>,
     pub kernels: Kernels<'a>,
@@ -151,12 +25,12 @@ impl<'a> Peer<'a> {
         (super::head::PeerHead { kernels: &self.kernels, target: &self.target },
         super::prefill::PeerUnits { exchange: &self.exchange, cache: &self.requests.cache,
             target: &self.target, kernels: &self.kernels, owners, uploads,
-            graphs: decode.then_some(&mut self.graphs) })
+            graphs: if decode { self.graphs.as_mut() } else { None } })
     }
 }
 
 pub(crate) struct Execution<'a> {
-    graphs: Option<DecodeGraphs<'a>>,
+    pub(super) graphs: Option<DecodeGraphs<'a>>,
     pub link: SparkLink<'a>,
     pub requests: RequestOwners<'a>,
     pub peer: Option<Peer<'a>>,
@@ -191,23 +65,21 @@ impl<'a> Execution<'a> {
     /// Both ranks drained and the peer exchange still live: only then may a
     /// step's logits or graph observations be used (a timed-out peer wait
     /// skipped itself, so its drained step is void).
-    fn completed(&mut self) -> Result<()> {
+    fn completed(&self) -> Result<()> {
         self.requests.decode.stream.drain()?;
         if let Some(peer) = &self.peer {
             peer.requests.decode.stream.drain()?;
             peer.exchange.require_live()?;
         }
-        crate::shared::spark_waves::healthy()?;
-        self.observe_completed()
+        crate::shared::spark_waves::healthy()
     }
     pub fn new(link: SparkLink<'a>, requests: RequestOwners<'a>, head: Head<'a>,
         target: TargetWeights<'a>, kernels: Kernels<'a>, local: Vec<Box<dyn Dispatcher + 'a>>,
-        cfg: Inkling2Config, graph_reserve: u64, ingress: Vec<cuteafd_core::SparkIngress>) -> Result<Self> {
+        cfg: Inkling2Config, ingress: Vec<cuteafd_core::SparkIngress>) -> Result<Self> {
         ensure!(target.rank == 0 && target.layers.iter().copied().eq(0..cfg.layers)
             && !requests.prefill.is_empty() && local.len() <= cfg.layers && ingress.len() == cfg.layers,
             "Inkling whole execution differs from admitted owners");
-        let graphs = (requests.decode.layout.head_parts == 2).then(|| DecodeGraphs::new(&requests, 0, graph_reserve)).transpose()?;
-        Ok(Self { graphs, link, requests, peer: None, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
+        Ok(Self { graphs: None, link, requests, peer: None, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
     }
 
     /// Tokens are submitted suffixes; placement frontiers define their origins
@@ -232,12 +104,14 @@ impl<'a> Execution<'a> {
         if result.is_err() { self.terminate(); }
         result
     }
-    /// Eager non-speculative decode uses the admitted decode owner and shared
-    /// unit executor. Each member's output row remains in the one bounded head.
+    /// Decode and verify use the admitted decode owner and shared unit executor. Each member's output row remains in the one bounded head.
     pub fn decode(&mut self, placements: &mut [Placement], tokens: &[&[u32]], unit: &Unit,
         version: u64) -> Result<DeviceLogits> {
         ensure!(!self.terminal && !placements.is_empty() && placements.len() == tokens.len()
             && unit.rows.len() <= 64 && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
+        let mode = if self.requests.decode.replaying() { Mode::Verify } else { Mode::Decode };
+        let cycle = if mode == Mode::Verify { Cycle::Verify } else { Cycle::Decode };
+        self.for_each_graph(|graphs| graphs.cycle(cycle));
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
@@ -253,6 +127,7 @@ impl<'a> Execution<'a> {
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
             self.completed()?;
+            self.observe_completed()?;
             Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
                 vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                 stream: self.requests.decode.stream.raw, greedy: None })
@@ -260,18 +135,20 @@ impl<'a> Execution<'a> {
         if result.is_err() { self.terminate(); }
         result
     }
-    pub fn prewarm(&mut self) -> Result<()> {
-        if let Some(graphs) = &mut self.graphs { graphs.prewarm(0, &self.requests, &self.kernels, &self.target, &self.cfg)?; }
-        if let Some(peer) = &mut self.peer { peer.graphs.prewarm(1, &peer.requests, &peer.kernels, &peer.target, &self.cfg)?; }
-        Ok(())
+    fn for_each_graph(&mut self, mut f: impl FnMut(&mut DecodeGraphs<'a>)) {
+        if let Some(graphs) = &mut self.graphs { f(graphs); }
+        if let Some(graphs) = self.peer.as_mut().and_then(|peer| peer.graphs.as_mut()) { f(graphs); }
     }
+
     fn observe_completed(&mut self) -> Result<()> {
-        let stream = &self.requests.decode.stream;
-        // SAFETY: completed lead work consumes all peer partials. Both banks
-        // retain only graph executables over persistent rank-local storage.
-        unsafe { crate::shared::decode_graph::device::observe_completed(stream.device.library, |visit| {
-            if let Some(graphs) = &mut self.graphs { visit(stream.device.id, "inkling2.heads.output", false, &mut graphs.bank)?; }
-            if let Some(peer) = &mut self.peer { visit(peer.requests.decode.stream.device.id, "inkling2.heads.output", false, &mut peer.graphs.bank)?; }
+        let mut peer = self.peer.as_mut().and_then(|peer| peer.graphs.as_mut());
+        if self.graphs.is_none() && peer.is_none() { return Ok(()); }
+        let library = self.requests.decode.stream.device.library;
+        // SAFETY: both ranks have drained, and every graph borrows persistent
+        // unit/cache/weight storage; destroying a graph cannot retire those owners.
+        unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
+            if let Some(graphs) = &mut self.graphs { graphs.visit(visit)?; }
+            if let Some(graphs) = peer.as_deref_mut() { graphs.visit(visit)?; }
             Ok(())
         }) }
     }
@@ -296,8 +173,7 @@ impl<'a> Execution<'a> {
             link.terminal_release()
         });
         crate::shared::decode_graph::fatal_drain(drained, "Inkling request executor retirement");
-        if let Some(graphs) = &mut self.graphs { graphs.bank.cache_clear_drained(); }
-        if let Some(peer) = &mut self.peer { peer.graphs.bank.cache_clear_drained(); }
+        self.for_each_graph(DecodeGraphs::clear_drained);
     }
 }
 impl Drop for Execution<'_> {
@@ -312,11 +188,6 @@ mod tests {
         assert!(source.contains("Stateful {"));
         assert!(source.contains(".run(units)"));
         assert!(source.contains("self.link.exchange()?"));
-        assert!(source.contains("bank.attach_device("));
-        assert!(source.contains("graph_sites::spans(\"inkling2.heads.output\", false)"));
-        let project = source.split("pub fn project(").nth(1).unwrap().split("fn prewarm(").next().unwrap();
-        assert!(project.contains("PREWARM_ROWS.contains(&rows)") && project.contains("begin_capture("),
-            "first-use capture of the startup row buckets");
         assert!(source.contains("device::observe_completed("));
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("begin_capture("));
         let terminal = source.split("pub fn terminate(").nth(1).unwrap();

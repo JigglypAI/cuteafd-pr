@@ -116,6 +116,8 @@ pub(crate) struct UnitOwner<'a> {
     decode_attention:bool,
 }
 impl<'a> UnitOwner<'a> {
+    pub(super) fn replaying(&self) -> bool { self.replay.get().is_some() }
+
     /// The caller retains replay storage through every queued convolution and commit.
     pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
         ensure!(replay.is_none_or(|(buffer,width)| width == 9216 + 2048 / self.layout.head_parts && buffer.device_id==self.stream.device.id
