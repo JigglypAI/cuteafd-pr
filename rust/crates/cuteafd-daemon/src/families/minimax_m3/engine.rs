@@ -1101,8 +1101,10 @@ impl<'a> ServingPrefill<'a> {
         if result.is_err() {
             self.terminal = true;
             self.dispatchers.clear();
+            rank.decode.borrow().stream.drain_or_abort("MiniMax failed eager decode submission");
         }
-        rank.decode.borrow().stream.drain_or_abort("MiniMax eager decode submission");
+        // The head and any retained taps use this decode stream; the host
+        // waits at selection, graph maintenance or state publication.
         result
     }
 
@@ -1373,10 +1375,8 @@ impl<'a> ServingPrefill<'a> {
     }
 
     pub fn drain(&self, storage: &Storage<'a>) -> Result<()> {
-        for rank in &storage.ranks {
-            rank.decode.borrow().stream.drain()?;
-            for owner in &rank.prefill { owner.borrow().stream.drain()?; }
-        }
+        // The prefix fence already joins every rank's decode/prefill readers
+        // and the draft stream before its copy streams drain.
         storage.prefix.drain().map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 }
