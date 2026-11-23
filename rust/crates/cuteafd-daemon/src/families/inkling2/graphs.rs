@@ -33,6 +33,7 @@ struct Key {
 pub(super) struct DecodeGraphs<'a> {
     bank: GraphBank<Key, GraphOwner<'a, ()>>,
     first_touched: HashSet<Key>,
+    first_touch_pending: bool,
     unsupported: HashSet<Key>,
     rank: usize,
     device: i32,
@@ -51,10 +52,16 @@ impl<'a> DecodeGraphs<'a> {
             spans_devices: super::graph_sites::spans("inkling2.section", false),
         })?;
         device::set_reserve_policy(device, policy)?;
-        Ok(Some(Self { bank, first_touched: HashSet::new(), unsupported: HashSet::new(), rank, device }))
+        Ok(Some(Self { bank, first_touched: HashSet::new(), first_touch_pending: false,
+            unsupported: HashSet::new(), rank, device }))
     }
 
     pub(super) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+    pub(super) fn needs_boundary(&self) -> bool {
+        self.first_touch_pending || self.bank.cache_needs_boundary()
+    }
+    pub(super) fn observed(&mut self) { self.first_touch_pending = false; }
+    pub(super) fn tick(&mut self) { self.bank.cache_tick(); }
 
     pub(super) fn visit(&mut self, visit: &mut device::GraphVisitor<'_>) -> Result<()> {
         visit(self.device, "inkling2.section", false, &mut self.bank)
@@ -67,8 +74,10 @@ impl<'a> DecodeGraphs<'a> {
     pub(super) fn clear_drained(&mut self) { self.bank.cache_clear_drained(); }
 
     fn run(&mut self, key: Key, stream: &Stream<'a>, work: impl Fn() -> Result<()>) -> Result<()> {
-        if self.unsupported.contains(&key) || self.first_touched.insert(key) {
+        if self.unsupported.contains(&key) { return work(); }
+        if self.first_touched.insert(key) {
             // Initialize this exact arithmetic route eagerly before measuring a capture.
+            self.first_touch_pending = true;
             return work();
         }
         let library = stream.device.library;

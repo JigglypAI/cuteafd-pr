@@ -50,7 +50,7 @@ impl<'a> BlockVerifyTarget for Target<'_,'a>{
             requests.decode.set_replay(Some((verify.replay.buffer,requests.cache.layout.conv.width)))?;
         }
         let sources=tokens.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let result=self.execution.decode(self.placements,&sources,&unit,1);
+        let result=self.execution.verify(self.placements,&sources,&unit,1);
         for requests in self.execution.request_ranks(){requests.decode.set_replay(None)?;}
         let logits=match result{Ok(logits)=>logits,Err(error)=>{self.restore(mark)?;return Err(error);}};
         for (verify,mark) in draft.verify.iter().zip(&mark.conv){verify.submitted(mark,submitted.clone())?;}
@@ -73,11 +73,14 @@ impl<'a> BlockVerifyTarget for Target<'_,'a>{
         }
         let frontiers=rank_frontiers.first().context("Inkling accepted lead frontiers missing")?;
         ensure!(rank_frontiers.iter().all(|other|other==frontiers),"Inkling TP2 accepted frontiers differ");
+        for requests in self.execution.request_ranks(){requests.decode.stream.drain()?;}
+        self.execution.require_live()?;
+        crate::shared::spark_waves::healthy()?;
         for (p,saved) in self.placements.iter_mut().zip(&mark.placements){
             let frontier=frontiers.iter().find(|(slot,_)|*slot==p.slot).context("Inkling accepted frontier omitted")?.1;
             p.len=frontier;p.state_len=frontier;
             ensure!(frontier>=saved.len,"Inkling accepted prefix precedes mark");
         }
-        for requests in self.execution.request_ranks(){requests.decode.stream.drain()?;} Ok(())
+        Ok(())
     }
 }

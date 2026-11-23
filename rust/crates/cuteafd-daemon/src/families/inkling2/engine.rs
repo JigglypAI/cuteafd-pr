@@ -62,9 +62,8 @@ impl<'a> Execution<'a> {
         if let Some(peer) = &self.peer { peer.exchange.require_live()?; }
         Ok(())
     }
-    /// Both ranks drained and the peer exchange still live: only then may a
-    /// step's logits or graph observations be used (a timed-out peer wait
-    /// skipped itself, so its drained step is void).
+    /// Finish a published step or quiesce both ranks for graph upkeep. A
+    /// timed-out peer wait can skip itself, so check liveness after draining.
     fn completed(&self) -> Result<()> {
         self.requests.decode.stream.drain()?;
         if let Some(peer) = &self.peer {
@@ -107,7 +106,20 @@ impl<'a> Execution<'a> {
     /// Decode and verify use the admitted decode owner and shared unit executor. Each member's output row remains in the one bounded head.
     pub fn decode(&mut self, placements: &mut [Placement], tokens: &[&[u32]], unit: &Unit,
         version: u64) -> Result<DeviceLogits> {
-        ensure!(!self.terminal && !placements.is_empty() && placements.len() == tokens.len()
+        self.decode_inner(placements, tokens, unit, version, false)
+    }
+
+    /// A verify proposal stays private until its accepted-prefix commit.
+    /// The caller consumes logits on their producing stream before committing.
+    pub fn verify(&mut self, placements: &mut [Placement], tokens: &[&[u32]], unit: &Unit,
+        version: u64) -> Result<DeviceLogits> {
+        self.decode_inner(placements, tokens, unit, version, true)
+    }
+
+    fn decode_inner(&mut self, placements: &mut [Placement], tokens: &[&[u32]], unit: &Unit,
+        version: u64, staged: bool) -> Result<DeviceLogits> {
+        self.require_live()?;
+        ensure!(!placements.is_empty() && placements.len() == tokens.len()
             && unit.rows.len() <= 64 && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
         let mode = if self.requests.decode.replaying() { Mode::Verify } else { Mode::Decode };
         let cycle = if mode == Mode::Verify { Cycle::Verify } else { Cycle::Decode };
@@ -126,8 +138,14 @@ impl<'a> Execution<'a> {
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
-            self.completed()?;
-            self.observe_completed()?;
+            let observe = self.graph_needs_boundary();
+            // Staged logits stay on their producing stream until sampling.
+            if !staged || observe { self.completed()?; }
+            if observe {
+                self.observe_completed()?;
+            } else {
+                self.for_each_graph(DecodeGraphs::tick);
+            }
             Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
                 vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
                 stream: self.requests.decode.stream.raw, greedy: None })
@@ -138,6 +156,10 @@ impl<'a> Execution<'a> {
     fn for_each_graph(&mut self, mut f: impl FnMut(&mut DecodeGraphs<'a>)) {
         if let Some(graphs) = &mut self.graphs { f(graphs); }
         if let Some(graphs) = self.peer.as_mut().and_then(|peer| peer.graphs.as_mut()) { f(graphs); }
+    }
+    fn graph_needs_boundary(&self) -> bool {
+        self.graphs.as_ref().is_some_and(DecodeGraphs::needs_boundary)
+            || self.peer.as_ref().and_then(|peer| peer.graphs.as_ref()).is_some_and(DecodeGraphs::needs_boundary)
     }
 
     fn observe_completed(&mut self) -> Result<()> {
@@ -150,7 +172,9 @@ impl<'a> Execution<'a> {
             if let Some(graphs) = &mut self.graphs { graphs.visit(visit)?; }
             if let Some(graphs) = peer.as_deref_mut() { graphs.visit(visit)?; }
             Ok(())
-        }) }
+        }) }?;
+        self.for_each_graph(DecodeGraphs::observed);
+        Ok(())
     }
     pub fn terminate(&mut self) {
         if self.terminal { return; }
