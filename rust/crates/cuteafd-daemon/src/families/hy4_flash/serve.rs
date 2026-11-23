@@ -82,6 +82,19 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
+    fn resolved_decode_rows(&self, gpus: usize) -> Result<usize> {
+        Ok(cuteafd_loader::plan::resolve_decode_rows(
+            "hy4_flash",
+            cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+                requested: self.decode_rows.as_option(),
+                concurrency: self.max_sequences as u64,
+                decode_lanes: 1,
+                rtx_gpus: gpus,
+                draft_length: Some(0),
+            },
+        )? as usize)
+    }
+
     fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         Ok(prefill_shape(
@@ -135,11 +148,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Hy4-flash supports 0..=6 distinct Spark peer endpoints"
     );
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
-    let decode_rows = cuteafd_loader::plan::resolve_decode_rows("hy4_flash",
-        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
-            requested: args.decode_rows.as_option(), concurrency: args.max_sequences as u64,
-            decode_lanes: 1, rtx_gpus: gpus, draft_length: Some(0),
-        })? as usize;
+    let decode_rows = args.resolved_decode_rows(gpus)?;
     let resolved_attention = resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
@@ -626,6 +635,8 @@ mod tests {
             "2048",
             "--prefill-waves",
             "1",
+            "--decode-rows",
+            "32",
         ];
         let crate::cli::Commands::ServeHy4f(mut args) = crate::cli::Cli::try_parse_from(argv)?.command else {
             anyhow::bail!("Hy4-flash command not parsed");
@@ -634,7 +645,10 @@ mod tests {
         crate::commands::bench::assert_resolved_family_seam("serve-hy4f", &[], || {
             args.prefix.resolve_entries(args.max_sequences);
             let prefill = args.prefill()?;
+            let decode_rows = args.resolved_decode_rows(2)?;
+            assert_eq!(decode_rows, 32);
             cuteafd_bench::context::ResolvedSettings::default()
+                .value("decode-rows", decode_rows)
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)
