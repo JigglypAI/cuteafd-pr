@@ -1021,6 +1021,9 @@ int cuteafd_cuda_event_record(void *handle, void *stream) {
     event('R');
     return 0;
 }
+int cuteafd_cuda_event_record_external(void *handle, void *stream) {
+    return cuteafd_cuda_event_record(handle, stream);
+}
 int cuteafd_cuda_event_query(void *handle, int *ready) {
     struct upload_event *upload = handle;
     pthread_mutex_lock(&upload_mutex);
