@@ -154,6 +154,12 @@ fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::Med
     let selected = command_attention(command).map(|(_, attention)| {
         attention.selected_view.as_ref().context("media requires its selected checkpoint view")?.config()
     }).transpose()?;
+    if matches!(command, Commands::ServeQwen35(_)) {
+        // No dense Qwen tower is qualified: automatic media serves text, explicit placement refuses.
+        anyhow::ensure!(matches!(vision, MediaMode::Auto | MediaMode::Off) && matches!(audio, MediaMode::Auto | MediaMode::Off),
+            "dense Qwen has no qualified media execution; use --vision auto|off and --audio auto|off");
+        return Ok((MediaMode::Off, MediaMode::Off));
+    }
     let Some(options) = serve_media(command) else {
         anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
             "explicit audio placement requires a media-capable serve command");
@@ -331,6 +337,23 @@ mod media_defaults_tests {
     }
 
     fn owns_audio_command(name: &str) -> bool { matches!(name, "serve-mimo" | "serve-muse") }
+
+    #[test]
+    fn dense_qwen_never_enables_media_input_and_refuses_explicit_placement() -> anyhow::Result<()> {
+        use clap::Parser;
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", "serve-qwen35", "--snapshot", "/not-read",
+            "--native-lib", "/native.so"])?.command;
+        for vision in [MediaMode::Auto, MediaMode::Off] {
+            for audio in [MediaMode::Auto, MediaMode::Off] {
+                assert_eq!(super::resolve_serve_media(&mut command, vision, audio)?, (MediaMode::Off, MediaMode::Off));
+            }
+        }
+        for explicit in [MediaMode::Rtx(Some(0)), MediaMode::Spark(Some(0))] {
+            assert!(super::resolve_serve_media(&mut command, explicit, MediaMode::Off).is_err());
+            assert!(super::resolve_serve_media(&mut command, MediaMode::Off, explicit).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn declared_mimo_rvq_errors_and_off_bypass_match_shared_resolver() -> anyhow::Result<()> {

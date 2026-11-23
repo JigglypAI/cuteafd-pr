@@ -121,6 +121,10 @@ PROFILE_NSYS_GPU_METRICS
 PROFILE_NSYS_CPU
 PROFILE_NSYS_GRAPH_TRACE
 PROFILE_NSYS_ROOT
+TARGET_HEAD
+HOST_WAIT
+IDLE_PARK_SECONDS
+HOST_ISA
 EOF
     # Inventory hosts are accepted but never contacted by this RTX-only family.
     _spark_slot_keys HOST LANE_A
