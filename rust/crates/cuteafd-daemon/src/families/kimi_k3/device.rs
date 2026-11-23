@@ -1362,36 +1362,6 @@ impl<'a> LocalLane<'a> {
         })
     }
 
-    /// Diagnostic: a decode step's selected physical token slots, read back
-    /// with the row positions, causal lengths and page table the selector
-    /// used, as logical token ids (shared `CUTEAFD_DIAG_SELECTION_DUMP`).
-    fn dump_selection(&self, layer: usize, rows: usize, indices: CuteafdDeviceBuffer, table_width: usize) -> Result<()> {
-        use crate::shared::selection_dump::{self as dump, Layout, Row};
-        let Some(selection) = self.selection_dump.as_deref() else { return Ok(()) };
-        let stream = self.stream();
-        stream.drain()?;
-        let read = |buffer: CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
-            let mut out = vec![0u8; bytes];
-            stream.device.run(|| stream.device.library.copy_d2h(&mut out, view(buffer, 0, bytes)?))?;
-            Ok(out)
-        };
-        let positions: Vec<u64> = read(self.lane.buffer("DSA positions")?, rows * 8)?.chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()).max(0) as u64).collect();
-        if !selection.wants(positions.iter().copied()) { return Ok(()) }
-        let lengths = dump::i32s(&read(self.lane.buffer("DSA selected lengths")?, rows * 4)?);
-        let frontiers = dump::i32s(&read(self.lane.buffer("DSA lengths")?, rows * 4)?);
-        let table = dump::i32s(&read(self.lane.buffer("DSA page table")?, rows * table_width * 4)?);
-        let slots = dump::i32s(&read(indices, rows * 2048 * 4)?);
-        let rows = (0..rows).map(|row| {
-            let pages = (frontiers[row].max(0) as usize).div_ceil(64).min(table_width);
-            let length = (lengths[row].max(0) as usize).min(2048);
-            Ok(Row { position: positions[row], frontier: frontiers[row],
-                ids: dump::logical_tokens(&slots[row * 2048..row * 2048 + length],
-                    &table[row * table_width..row * table_width + pages], 64)? })
-        }).collect::<Result<Vec<_>>>()?;
-        selection.write(layer, Layout { width: 2048, unit_tokens: 1, source: layer, heads: 1 }, rows)
-    }
-
     pub(crate) fn context_dsa_dump(&self, layer: usize, rows: usize) -> Result<()> {
         #[cfg(test)]
         if self.rank == 0 && self.context_dsa_diagnostic()
@@ -1650,6 +1620,19 @@ impl<'a> LocalLane<'a> {
             Some(false) => { binding.attention()?; binding.commit()?; binding.output() }
             None => gathered_prefill_with(&mut binding),
         }
+    }
+
+    /// Diagnostic: a decode step's selected physical token slots, read back
+    /// with the row positions, causal lengths and page table the selector
+    /// used, as logical token ids (shared `CUTEAFD_DIAG_SELECTION_DUMP`). The
+    /// drain and copies live in `shared::selection_dump::read_paged`; unset
+    /// returns before touching the stream.
+    fn dump_selection(&self, layer: usize, rows: usize, indices: CuteafdDeviceBuffer, table_width: usize) -> Result<()> {
+        let Some(selection) = self.selection_dump.as_deref() else { return Ok(()) };
+        crate::shared::selection_dump::read_paged(selection, self.stream(), layer, rows, 2048, table_width, 64,
+            crate::shared::selection_dump::PagedBuffers { positions: self.lane.buffer("DSA positions")?,
+                lengths: self.lane.buffer("DSA selected lengths")?, frontiers: self.lane.buffer("DSA lengths")?,
+                table: self.lane.buffer("DSA page table")?, slots: indices })
     }
 
     fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {

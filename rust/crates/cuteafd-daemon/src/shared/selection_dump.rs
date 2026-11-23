@@ -213,6 +213,46 @@ pub(crate) fn logical_tokens(slots: &[i32], table: &[i32], page_rows: usize) -> 
     }).collect()
 }
 
+/// Device buffers of a paged selector (Kimi): i64 positions, i32 retained
+/// lengths and causal frontiers per row, i32 `[rows, table_width]` page table,
+/// i32 `[rows, width]` physical slots.
+pub(crate) struct PagedBuffers {
+    pub positions: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub lengths: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub frontiers: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub table: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub slots: cuteafd_ffi::CuteafdDeviceBuffer,
+}
+
+/// Drains `stream`, reads a paged selector's rows back and records them as
+/// logical tokens. Called only with a dump attached.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_paged(dump: &SelectionDump, stream: &crate::shared::memory::device::Stream<'_>, layer: usize,
+    rows: usize, width: usize, table_width: usize, page_rows: usize, buffers: PagedBuffers) -> Result<()> {
+    use crate::shared::prefix::view;
+    stream.drain()?;
+    let read = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
+        let mut out = vec![0u8; bytes];
+        stream.device.run(|| stream.device.library.copy_d2h(&mut out, view(buffer, 0, bytes)?))?;
+        Ok(out)
+    };
+    let positions: Vec<u64> = read(buffers.positions, rows * 8)?.chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()).max(0) as u64).collect();
+    if !dump.wants(positions.iter().copied()) { return Ok(()) }
+    let lengths = i32s(&read(buffers.lengths, rows * 4)?);
+    let frontiers = i32s(&read(buffers.frontiers, rows * 4)?);
+    let table = i32s(&read(buffers.table, rows * table_width * 4)?);
+    let slots = i32s(&read(buffers.slots, rows * width * 4)?);
+    let rows = (0..rows).map(|row| {
+        let pages = (frontiers[row].max(0) as usize).div_ceil(page_rows).min(table_width);
+        let length = (lengths[row].max(0) as usize).min(width);
+        Ok(Row { position: positions[row], frontier: frontiers[row],
+            ids: logical_tokens(&slots[row * width..row * width + length],
+                &table[row * table_width..row * table_width + pages], page_rows)? })
+    }).collect::<Result<Vec<_>>>()?;
+    dump.write(layer, Layout { width, unit_tokens: 1, source: layer, heads: 1 }, rows)
+}
+
 /// Host copy helpers for the families' raw-stream engines.
 pub(crate) fn i32s(bytes: &[u8]) -> Vec<i32> {
     bytes.chunks_exact(4).map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap())).collect()
