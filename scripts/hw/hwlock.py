@@ -55,13 +55,19 @@ at-grant preflight and CMD's own teardown. Inside a live gate the gate's own
 bound applies (its children take flocks without tickets or records).
 A request without --max-run never backfills and queues exactly as before.
 
-No nesting inside a backfilled job: any acquisition (a new ticket, --gate or
-in-process hold) by the backfilled holder's process or its descendants (by
-/proc parent links) is refused at once (exit 77), since an inner ticket would
-queue behind the very ticket the backfill went ahead of. Backfill never applies
-inside any live holder or gate: such a request queues as before. The --gate
-child path is unchanged: inside a live gate a hold takes the flocks without a
-ticket.
+No nesting inside a holder, gates excepted: any acquisition (a new ticket,
+--gate or in-process hold) by a live non-gate holder's process or its
+descendants (by /proc parent links) is refused at once (exit 77). An inner
+ticket queues behind every older ticket, and those wait on the outer holder's
+flocks (directly, or through a lock they also want), so it can never be granted
+while the outer hold waits for it: a self-deadlock that idles the hardware.
+When the outer hold covers the request, the child runs without hwlock
+(CUTEAFD_HW_LOCKS_HELD names the held locks for that); otherwise request every
+lock in the one outer hwlock call. Inside a backfilled job the refusal names
+the ticket the backfill went ahead of. Backfill never applies inside a live
+gate: such a request queues as before. The --gate child path is unchanged: a
+gate's holder record is exempt, and inside a live gate a hold takes the flocks
+without a ticket.
 """
 from __future__ import annotations
 
@@ -201,7 +207,7 @@ def _ancestry() -> set[int]:
 
 
 class NestedAcquisition(ValueError):
-    """An acquisition inside a backfilled job (refused)."""
+    """An acquisition inside a live non-gate holder (refused; module doc)."""
 
 
 def enclosing_holders(queue: Path) -> list[dict]:
@@ -375,18 +381,32 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
     With `gate`, release the flocks at our turn and keep the ticket instead.
     `cancelled()`, polled while waiting, raises Cancelled when true. `max_run`
     bounds the hold from its grant (enforced) and lets a non-gate request
-    backfill (module doc); inside a backfilled job, NestedAcquisition."""
+    backfill (module doc); inside a live non-gate holder, NestedAcquisition."""
     locks = canonical(names)
     if max_run is not None and not 0 < max_run < float('inf'):
         raise ValueError('max_run must be finite and positive')
     # Read without creating the queue: a failing enqueue preflight leaves no trace.
     enclosing = enclosing_holders(lock_dir() / 'hwq')
-    inner = next((data for data in enclosing if data.get('backfill')), None)
+    # A gate leaves its flocks to CMD, which may take them (path below); any
+    # other enclosing holder keeps them while it waits for us (module doc).
+    outer = [data for data in enclosing if not data.get('gate')]
+    inner = next((data for data in outer if data.get('backfill')), None)
     if inner is not None:
         raise NestedAcquisition(
             f'refusing {",".join(locks)} inside backfilled ticket {inner.get("seq")} '
             f'(holding {",".join(inner.get("locks", []))}): an inner ticket would queue behind the ticket '
             'it went ahead of; request every lock in the one outer hwlock call')
+    if outer:
+        tickets = ','.join(str(data.get('seq')) for data in outer)
+        held_here = canonical({name for data in outer for name in data.get('locks', [])})
+        if set(locks) <= set(held_here):
+            raise NestedAcquisition(
+                f'refusing {",".join(locks)}: already held by ancestor ticket {tickets} '
+                f'({",".join(held_here)}); run this child without hwlock (CUTEAFD_HW_LOCKS_HELD names the held locks)')
+        raise NestedAcquisition(
+            f'refusing {",".join(locks)} inside ancestor ticket {tickets} (holding {",".join(held_here)}): '
+            'an inner ticket would wait on its own ancestor; request every lock in the one outer hwlock call '
+            f'(--locks {",".join(canonical(set(held_here) | set(locks)))})')
     # A check on state the queue itself changes (free memory on shared hosts) is
     # meaningful only once our turn comes; such checks run at grant alone.
     if not preflight_at_grant_only:
