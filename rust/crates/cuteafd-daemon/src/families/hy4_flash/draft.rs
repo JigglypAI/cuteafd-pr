@@ -15,7 +15,7 @@ use cuteafd_ffi::dense_trellis::TrellisDType;
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::hy4_flash::{
-    draft::{Admission, ARENA_ID, ATTENTION_SCRATCH, MLP_WIDTH, PREFIX},
+    draft::{Admission, ARENA_ID, ATTENTION_SCRATCH, MAX_BATCH, MLP_WIDTH, PREFIX},
     Hy4DflyConfig, Hy4FlashConfig, Hy4KvCache,
 };
 use cuteafd_loader::plan::Checkpoint;
@@ -38,6 +38,7 @@ pub(super) struct Drafter<'a> {
     add: Bf16Add<'a>,
     frontiers: Vec<Cell<Option<usize>>>,
     verify_rows: usize,
+    batch_capacity: usize,
 }
 
 impl<'a> Drafter<'a> {
@@ -52,7 +53,7 @@ impl<'a> Drafter<'a> {
         slots: usize,
         verify_rows: usize,
     ) -> Result<Self> {
-        let extent = cfg.block_rows();
+        let extent = cfg.block_rows() * slots;
         let layout = admission.weights;
         let arena = DeviceWeightArena::new(
             device,
@@ -226,7 +227,7 @@ impl<'a> Drafter<'a> {
                 .unwrap_or(&0),
         )?;
         ensure!(
-            attn <= ATTENTION_SCRATCH,
+            attn <= ATTENTION_SCRATCH * MAX_BATCH,
             "DFly2 attention scratch exceeds admission"
         );
         let workspace = admission.workspace;
@@ -253,6 +254,7 @@ impl<'a> Drafter<'a> {
             add: device.run(|| device.library.bf16_add())?,
             frontiers: (0..slots).map(|_| Cell::new(None)).collect(),
             verify_rows,
+            batch_capacity: slots,
         })
     }
 
@@ -480,117 +482,104 @@ impl<'a> Drafter<'a> {
         &self,
         stream: &Stream<'a>,
         embedding: &TokenEmbedding<'a>,
-        slot: usize,
-        pos: usize,
-        bonus: u32,
-        depth: usize,
+        members: &[Member],
         rope: Buffer,
         cache: impl Fn(usize) -> Result<Buffer>,
-        mut head: impl FnMut(Buffer) -> Result<DeviceLogits>,
-    ) -> Result<Vec<u32>> {
-        if !self.valid(slot, pos) || depth == 0 {
+        mut head: impl FnMut(Buffer, usize) -> Result<DeviceLogits>,
+    ) -> Result<Vec<Vec<u32>>> {
+        if members.is_empty() {
             return Ok(Vec::new());
         }
-        let depth = depth.min(self.cfg.num_speculative_tokens);
-        // The checkpoint's trained mask block is fixed; a shorter proposal
-        // simply stops the causal hidden-correction scan earlier.
+        ensure!(
+            members.len() <= self.batch_capacity,
+            "DFly2 batch exceeds admission"
+        );
+        ensure!(
+            members.iter().all(|m| m.depth > 0
+                && m.depth <= self.cfg.num_speculative_tokens
+                && self.valid(m.slot, m.pos)),
+            "DFly2 batch contains a stale tap or invalid depth"
+        );
+        let count = members.len();
+        let depth = members.iter().map(|m| m.depth).max().unwrap();
         let width = self.cfg.block_rows();
+        let rows = count * width;
         let record = self.format.record_bytes();
-        let recall = if pos <= TOPK {
-            pos
-        } else {
-            TOPK - 4 + ((pos - 1) % 4 + 1)
-        };
+        let pt_width = TOPK + width;
+        let meta = BatchMeta::new(members, width, self.cfg.mask_token_id)?;
         self.device.run(|| {
+            let mut completed = stream.cancellation_guard("Hy4 DFly2 proposal batch");
             let row = |b: Buffer, i: usize| slice_buf(b, i * H * 2, H * 2);
             let state = self.b("state");
             let residual = self.b("residual");
             let norm = self.b("norm");
             let delta = self.b("delta");
             let join = self.b("joined");
-            let joined = |i| slice_buf(join, i * H * 2, H * 2);
-            let mut ids = vec![self.cfg.mask_token_id; width];
-            ids[0] = bonus;
-            embedding.embed(&ids, self.b("ids"), 1, state, stream.raw)?;
+            let left = self.b("join_left");
+            let right = self.b("join_right");
+            let anchor = self.b("anchor");
+            let features = self.b("features");
+            embedding.embed(&meta.ids, self.b("ids"), 1, state, stream.raw)?;
+            for (i, member) in members.iter().enumerate() {
+                self.copy(row(anchor, i)?, row(state, i * width)?, stream)?;
+                self.copy(row(features, i)?, self.hidden(false, member.slot)?, stream)?;
+            }
             let f = format!("{PREFIX}mtp_fusion");
-            self.norm(
-                &format!("{f}.enorm.weight"),
-                row(state, 0)?,
-                joined(0)?,
-                1,
-                stream,
-            )?;
-            self.norm(
-                &format!("{f}.hnorm.weight"),
-                self.hidden(false, slot)?,
-                joined(1)?,
-                1,
-                stream,
-            )?;
-            self.proj("join", &format!("{f}.eh_proj"), join, delta, 1, stream)?;
+            self.norm(&format!("{f}.enorm.weight"), anchor, left, count, stream)?;
+            self.norm(&format!("{f}.hnorm.weight"), features, right, count, stream)?;
+            self.join_rows(join, left, right, count, stream)?;
+            self.proj("join", &format!("{f}.eh_proj"), join, delta, count, stream)?;
             self.rows(
                 "fusion",
-                &[state, delta, self.w(&format!("{f}.gate"))?, residual],
-                1,
+                &[anchor, delta, self.w(&format!("{f}.gate"))?, residual],
+                count,
                 stream,
             )?;
-            self.copy(row(state, 0)?, residual, stream)?;
+            for i in 0..count {
+                self.copy(row(state, i * width)?, row(residual, i)?, stream)?;
+            }
 
-            let positions = (pos..pos + width)
-                .flat_map(|x| (x as i64).to_le_bytes())
-                .collect::<Vec<_>>();
-            let slots = (TOPK..TOPK + width)
-                .flat_map(|x| (x as i64).to_le_bytes())
-                .collect::<Vec<_>>();
-            let pt_width = TOPK + width;
-            let table = (0..width)
-                .flat_map(|q| {
-                    (0..pt_width).flat_map(move |j| {
-                        let entry = if j < recall {
-                            j as i32
-                        } else if j <= recall + q {
-                            (TOPK + j - recall) as i32
-                        } else {
-                            -1
-                        };
-                        entry.to_le_bytes()
-                    })
-                })
-                .collect::<Vec<_>>();
-            let lengths = (1..=width)
-                .flat_map(|q| ((recall + q) as i32).to_le_bytes())
-                .collect::<Vec<_>>();
-            let cu = (0..=width)
-                .flat_map(|q| (q as i32).to_le_bytes())
-                .collect::<Vec<_>>();
             for (name, data) in [
-                ("positions", positions),
-                ("write_slots", slots),
-                ("page_table", table),
-                ("lengths", lengths),
-                ("cu", cu),
+                ("positions", words(&meta.positions)),
+                ("write_slots", words(&meta.write_slots)),
+                ("page_table", words(&meta.table)),
+                ("lengths", words(&meta.lengths)),
+                ("cu", words(&(0..=rows as i32).collect::<Vec<_>>())),
+                ("anchor_ids", words(&meta.anchors)),
             ] {
                 self.upload(self.b(name), &data, stream)?;
             }
             let kv = self.b("kv");
             ensure!(
-                kv.bytes >= (TOPK + width) * record,
+                kv.bytes >= count * pt_width * record,
                 "DFly2 KV staging is short"
             );
             for (stage, &target) in self.cfg.target_kv_layers.iter().enumerate() {
                 let p = format!("{PREFIX}{stage}");
                 let a = format!("{p}.self_attn");
-                self.launch(
-                    "gather",
-                    &[cache(target)?, self.recall(false, slot, stage)?, kv],
-                    &[Scalar::I32(recall as i32), Scalar::I32(1), Scalar::I32(0)],
-                    stream,
-                )?;
+                let layer_cache = cache(target)?;
+                for (i, member) in members.iter().enumerate() {
+                    let staging = slice_buf(kv, i * pt_width * record, pt_width * record)?;
+                    self.launch(
+                        "gather",
+                        &[
+                            layer_cache,
+                            self.recall(false, member.slot, stage)?,
+                            staging,
+                        ],
+                        &[
+                            Scalar::I32(meta.recall[i] as i32),
+                            Scalar::I32(1),
+                            Scalar::I32(0),
+                        ],
+                        stream,
+                    )?;
+                }
                 self.norm(
                     &format!("{p}.input_layernorm.weight"),
                     state,
                     norm,
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.proj(
@@ -598,7 +587,7 @@ impl<'a> Drafter<'a> {
                     &format!("{a}.q_a_proj"),
                     norm,
                     self.b("q_a"),
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.proj(
@@ -606,7 +595,7 @@ impl<'a> Drafter<'a> {
                     &format!("{a}.kv_a_proj_with_mqa"),
                     norm,
                     self.b("kv_a"),
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.proj(
@@ -614,7 +603,7 @@ impl<'a> Drafter<'a> {
                     &format!("{a}.linear_gate"),
                     norm,
                     self.b("gate"),
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.rows(
@@ -630,7 +619,7 @@ impl<'a> Drafter<'a> {
                         self.b("q_norm"),
                         kv,
                     ],
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.proj(
@@ -638,7 +627,7 @@ impl<'a> Drafter<'a> {
                     &format!("{a}.q_b_proj"),
                     self.b("q_norm"),
                     self.b("q_b"),
-                    width,
+                    rows,
                     stream,
                 )?;
                 let kv_b = self.w(&format!("{a}.kv_b_proj.weight"))?;
@@ -654,7 +643,7 @@ impl<'a> Drafter<'a> {
                         rope,
                         self.b("query"),
                     ],
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.launch(
@@ -670,8 +659,8 @@ impl<'a> Drafter<'a> {
                         self.b("attn_scratch"),
                     ],
                     &[
-                        Scalar::I32(width as i32),
-                        Scalar::I32(width as i32),
+                        Scalar::I32(rows as i32),
+                        Scalar::I32(rows as i32),
                         Scalar::I64(pt_width as i64),
                         Scalar::I32(1),
                     ],
@@ -687,7 +676,7 @@ impl<'a> Drafter<'a> {
                         self.w(&format!("{a}.learnable_sink_param"))?,
                         self.b("uv"),
                     ],
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.proj(
@@ -695,22 +684,22 @@ impl<'a> Drafter<'a> {
                     &format!("{a}.o_proj"),
                     self.b("uv"),
                     delta,
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.norm(
                     &format!("{a}.post_proj_norm.weight"),
                     delta,
                     norm,
-                    width,
+                    rows,
                     stream,
                 )?;
-                self.add(residual, state, norm, width, stream)?;
+                self.add(residual, state, norm, rows, stream)?;
                 self.norm(
                     &format!("{p}.post_attention_layernorm.weight"),
                     residual,
                     norm,
-                    width,
+                    rows,
                     stream,
                 )?;
                 self.ffn(
@@ -720,36 +709,38 @@ impl<'a> Drafter<'a> {
                     "silu",
                     norm,
                     delta,
-                    width,
+                    rows,
                     MLP_WIDTH,
                     stream,
                 )?;
-                self.add(state, residual, delta, width, stream)?;
+                self.add(state, residual, delta, rows, stream)?;
             }
             self.norm(
                 &format!("{PREFIX}final_norm.weight"),
                 state,
                 norm,
-                width,
+                rows,
                 stream,
             )?;
             let c = format!("{PREFIX}hidden_correction");
             for step in 0..depth {
-                let hidden = row(norm, step + 1)?;
+                for i in 0..count {
+                    self.copy(row(features, i)?, row(norm, i * width + step + 1)?, stream)?;
+                }
                 let previous = if step == 0 {
-                    self.b("ids")
+                    self.b("anchor_ids")
                 } else {
-                    slice_buf(self.b("greedy_ids"), (step - 1) * 4, 4)?
+                    slice_buf(self.b("greedy_ids"), (step - 1) * count * 4, count * 4)?
                 };
-                // SAFETY: the ID plane and the embedding output are live and ordered before the correction.
+                // SAFETY: previous IDs and output are live and ordered on the proposal stream.
                 unsafe {
                     embedding.gather(
                         previous.ptr,
                         std::ptr::null(),
-                        1,
+                        count,
                         1,
                         std::ptr::null(),
-                        residual.ptr,
+                        anchor.ptr,
                         None,
                         crate::shared::peer_split::RankDevice {
                             device: self.device.id,
@@ -759,18 +750,19 @@ impl<'a> Drafter<'a> {
                 }
                 self.norm(
                     &format!("{c}.hidden_norm.weight"),
-                    hidden,
-                    joined(0)?,
-                    1,
+                    features,
+                    left,
+                    count,
                     stream,
                 )?;
                 self.norm(
                     &format!("{c}.embed_norm.weight"),
-                    residual,
-                    joined(1)?,
-                    1,
+                    anchor,
+                    right,
+                    count,
                     stream,
                 )?;
+                self.join_rows(join, left, right, count, stream)?;
                 self.ffn(
                     &c,
                     "join",
@@ -778,46 +770,92 @@ impl<'a> Drafter<'a> {
                     "correction_silu",
                     join,
                     delta,
-                    1,
+                    count,
                     H,
                     stream,
                 )?;
-                self.add(residual, hidden, delta, 1, stream)?;
-                let logits = head(row(residual, 0)?)?;
-                // SAFETY: the target head emits rank-0 F32 logits on this stream;
-                // token and score outputs are disjoint per-position views.
+                self.add(residual, features, delta, count, stream)?;
+                let logits = head(slice_buf(residual, 0, count * H * 2)?, count)?;
+                ensure!(
+                    logits.rows == count
+                        && logits.vocab == logits.stride
+                        && logits.stream == stream.raw,
+                    "DFly2 shared head returned the wrong batch or stream"
+                );
+                // SAFETY: F32 head rows and output spans are on rank 0, ordered and live.
                 unsafe {
                     let buffer = Buffer {
                         ptr: logits.ptr.cast_mut(),
-                        bytes: logits.vocab * 4,
+                        bytes: count * logits.vocab * 4,
                         ..self.b("greedy_ids")
                     };
                     self.device.library.cuda_logits_argmax_checked_f32_async(
                         buffer,
-                        slice_buf(self.b("greedy_ids"), step * 4, 4)?,
-                        slice_buf(self.b("greedy_scores"), step * 4, 4)?,
-                        1,
+                        slice_buf(self.b("greedy_ids"), step * count * 4, count * 4)?,
+                        slice_buf(self.b("greedy_scores"), step * count * 4, count * 4)?,
+                        count,
                         logits.vocab,
                         stream.raw,
                     )?;
                 }
             }
             stream.drain()?;
-            let mut ids = vec![0u8; depth * 4];
+            completed.complete = true;
+            let mut ids = vec![0u8; depth * count * 4];
+            let bytes = ids.len();
             self.device
                 .library
-                .copy_d2h(&mut ids, self.b("greedy_ids"))?;
-            ids.chunks_exact(4)
-                .map(|word| {
-                    let token = u32::from_le_bytes(word.try_into().unwrap());
-                    ensure!(
-                        (token as usize) < 120_832,
-                        "DFly2 invalid draft token {token}"
-                    );
-                    Ok(token)
+                .copy_d2h(&mut ids, slice_buf(self.b("greedy_ids"), 0, bytes)?)?;
+            members
+                .iter()
+                .enumerate()
+                .map(|(member, m)| {
+                    (0..m.depth)
+                        .map(|step| {
+                            let off = (step * count + member) * 4;
+                            let token = u32::from_le_bytes(ids[off..off + 4].try_into().unwrap());
+                            ensure!(
+                                (token as usize) < 120_832,
+                                "DFly2 invalid draft token {token}"
+                            );
+                            Ok(token)
+                        })
+                        .collect()
                 })
                 .collect()
         })
+    }
+
+    fn join_rows(
+        &self,
+        joined: Buffer,
+        left: Buffer,
+        right: Buffer,
+        rows: usize,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
+        let width = H * 2;
+        // SAFETY: each source is contiguous, and the two disjoint pitched destinations are [rows, 2H].
+        unsafe {
+            self.device.library.copy_d2d_2d_async(
+                joined,
+                width * 2,
+                left,
+                width,
+                width,
+                rows,
+                stream.raw,
+            )?;
+            self.device.library.copy_d2d_2d_async(
+                slice_buf(joined, width, joined.bytes - width)?,
+                width * 2,
+                right,
+                width,
+                width,
+                rows,
+                stream.raw,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -848,5 +886,131 @@ impl<'a> Drafter<'a> {
         self.proj(gate_up, &format!("{prefix}.up_proj"), src, up, rows, stream)?;
         self.rows(silu, &[gate, up, act], rows, stream)?;
         self.proj(down, &format!("{prefix}.down_proj"), act, dst, rows, stream)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Member {
+    pub slot: usize,
+    pub pos: usize,
+    pub bonus: u32,
+    pub depth: usize,
+}
+
+struct BatchMeta {
+    ids: Vec<u32>,
+    anchors: Vec<u32>,
+    positions: Vec<i64>,
+    write_slots: Vec<i64>,
+    table: Vec<i32>,
+    lengths: Vec<i32>,
+    recall: Vec<usize>,
+}
+
+fn words<T, const N: usize>(input: &[T]) -> Vec<u8>
+where
+    T: LeBytes<N>,
+{
+    input.iter().flat_map(LeBytes::le_bytes).collect()
+}
+trait LeBytes<const N: usize> {
+    fn le_bytes(&self) -> [u8; N];
+}
+impl LeBytes<4> for i32 {
+    fn le_bytes(&self) -> [u8; 4] {
+        self.to_le_bytes()
+    }
+}
+impl LeBytes<4> for u32 {
+    fn le_bytes(&self) -> [u8; 4] {
+        self.to_le_bytes()
+    }
+}
+impl LeBytes<8> for i64 {
+    fn le_bytes(&self) -> [u8; 8] {
+        self.to_le_bytes()
+    }
+}
+
+impl BatchMeta {
+    fn new(members: &[Member], block: usize, mask: u32) -> Result<Self> {
+        ensure!(
+            (2..=6).contains(&block) && members.len() <= MAX_BATCH,
+            "invalid DFly2 batch extent"
+        );
+        let stride = TOPK + block;
+        let rows = members.len() * block;
+        let mut out = Self {
+            ids: vec![mask; rows],
+            anchors: Vec::with_capacity(members.len()),
+            positions: Vec::with_capacity(rows),
+            write_slots: Vec::with_capacity(rows),
+            table: vec![-1; rows * stride],
+            lengths: Vec::with_capacity(rows),
+            recall: Vec::with_capacity(members.len()),
+        };
+        for (i, member) in members.iter().enumerate() {
+            ensure!(member.pos > 0, "DFly2 requires a committed target row");
+            let recall = if member.pos <= TOPK {
+                member.pos
+            } else {
+                TOPK - 4 + (member.pos - 1) % 4 + 1
+            };
+            let base = i * stride;
+            out.ids[i * block] = member.bonus;
+            out.anchors.push(member.bonus);
+            out.recall.push(recall);
+            for query in 0..block {
+                let row = i * block + query;
+                out.positions.push((member.pos + query) as i64);
+                out.write_slots.push((base + TOPK + query) as i64);
+                out.lengths.push((recall + query + 1) as i32);
+                let dst = &mut out.table[row * stride..(row + 1) * stride];
+                for (entry, slot) in dst.iter_mut().take(recall).zip(base..) {
+                    *entry = slot as i32;
+                }
+                for (entry, slot) in dst[recall..].iter_mut().take(query + 1).zip(base + TOPK..) {
+                    *entry = slot as i32;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_context_batch_has_disjoint_causal_latent_regions() -> Result<()> {
+        for count in [1, 2, 16, MAX_BATCH] {
+            let members = (0..count)
+                .map(|i| Member {
+                    slot: i,
+                    pos: [7, 2048, 2049, 2064][i % 4],
+                    bonus: i as u32 + 10,
+                    depth: i % 5 + 1,
+                })
+                .collect::<Vec<_>>();
+            let meta = BatchMeta::new(&members, 6, 120009)?;
+            let stride = TOPK + 6;
+            for (i, m) in members.iter().enumerate() {
+                let recall = [7, 2048, 2045, 2048][i % 4];
+                assert_eq!(meta.recall[i], recall);
+                for offset in 0..6 {
+                    let row = i * 6 + offset;
+                    let table = &meta.table[row * stride..(row + 1) * stride];
+                    let live = recall + offset + 1;
+                    assert_eq!(meta.ids[row], if offset == 0 { m.bonus } else { 120009 });
+                    assert_eq!(meta.positions[row], (m.pos + offset) as i64);
+                    assert_eq!(meta.lengths[row], live as i32);
+                    assert_eq!(table[0], (i * stride) as i32);
+                    assert_eq!(table[live - 1] as i64, meta.write_slots[row]);
+                    assert!(table[live..].iter().all(|&slot| slot == -1));
+                }
+            }
+        }
+        Ok(())
     }
 }

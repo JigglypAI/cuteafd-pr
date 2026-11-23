@@ -1640,12 +1640,18 @@ impl<'a> Hy4Engine<'a> {
     }
 
     pub(super) fn draft_propose(&self, placement: &Hy4Placement, bonus: u32, depth: usize) -> Result<Vec<u32>> {
+        if depth == 0 || !self.draft_valid(placement) { return Ok(Vec::new()); }
+        let batch = [super::draft::Member { slot: placement.slot, pos: placement.len, bonus, depth }];
+        Ok(self.draft_batch(&batch)?.pop().unwrap_or_default())
+    }
+
+    pub(super) fn draft_batch(&self, members: &[super::draft::Member]) -> Result<Vec<Vec<u32>>> {
         let Some(draft) = &self.draft else { return Ok(Vec::new()); };
         let r = &self.ranks[0];
         let embedding = r.weights.embedding.as_ref().context("DFly2 target embedding missing")?;
-        draft.propose(&r.stream, embedding, placement.slot, placement.len, bonus, depth,
-            r.weights.inv_freq_dsa.buffer, |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
-            |hidden| self.project_vocab_tile(0, hidden, 1))
+        draft.propose(&r.stream, embedding, members, r.weights.inv_freq_dsa.buffer,
+            |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
+            |hidden, rows| self.project_vocab_tile(0, hidden, rows))
     }
 
     pub(super) fn accept_draft(&self, slot: usize, row: usize, pos: usize) -> Result<()> {

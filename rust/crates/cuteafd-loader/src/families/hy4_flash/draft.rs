@@ -21,6 +21,8 @@ pub const MLP_WIDTH: usize = 9216;
 // The draft attention export allows at most 16 resident partials per one of
 // six rows. The eager path uses one, but reserves the manifest's bound.
 pub const ATTENTION_SCRATCH: usize = 6 * 32 * 16 * (512 * 2 + 4);
+/// All admitted Hy4 request slots may have a proposal in the same round.
+pub const MAX_BATCH: usize = 64;
 
 pub fn verify_key_bytes(cfg: &Hy4FlashConfig, rows: usize) -> usize {
     cfg.sparse_layers().len() * rows * cfg.indexer_head_dim * 2
@@ -174,7 +176,12 @@ pub fn workspace(
     verify_rows: usize,
     attention_scratch: usize,
 ) -> Result<WeightArenaLayout> {
-    let r = cfg.block_rows();
+    ensure!(
+        (1..=MAX_BATCH).contains(&slots),
+        "DFly2 draft batch exceeds installed capacity"
+    );
+    let block = cfg.block_rows();
+    let r = slots * block;
     let h = text.hidden;
     let heads = text.sparse_heads;
     let k = cfg.target_index_topk;
@@ -184,15 +191,20 @@ pub fn workspace(
         ("ids", r * 4),
         ("positions", r * 8),
         ("write_slots", r * 8),
-        ("page_table", r * (k + r) * 4),
+        ("page_table", r * (k + block) * 4),
         ("lengths", r * 4),
         ("cu", (r + 1) * 4),
-        ("kv", (k + r) * record),
+        ("kv", slots * (k + block) * record),
         ("state", r * h * 2),
         ("residual", r * h * 2),
         ("norm", r * h * 2),
         ("delta", r * h * 2),
-        ("joined", h * 4),
+        ("joined", slots * h * 4),
+        ("anchor_ids", slots * 4),
+        ("anchor", slots * h * 2),
+        ("features", slots * h * 2),
+        ("join_left", slots * h * 2),
+        ("join_right", slots * h * 2),
         ("q_a", r * text.q_lora_rank * 2),
         ("q_norm", r * text.q_lora_rank * 2),
         ("kv_a", r * record.max(1280)),
@@ -259,9 +271,9 @@ impl Admission {
         rows: usize,
     ) -> Result<Self> {
         let weights = DraftWeights::plan(checkpoint, text, cfg, core)?;
-        let workspace = workspace(cfg, text, kv, slots, rows, ATTENTION_SCRATCH)?;
+        let workspace = workspace(cfg, text, kv, slots, rows, ATTENTION_SCRATCH * slots)?;
         let trellis_bytes = weights
-            .trellis_scratch(cfg.block_rows())?
+            .trellis_scratch(cfg.block_rows() * slots)?
             .map(|s| s.packed_bytes())
             .transpose()?
             .unwrap_or(0);
