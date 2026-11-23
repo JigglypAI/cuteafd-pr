@@ -24,7 +24,8 @@ from .export import DirectMCWriter, verify_original_discovery
 from .forward import native_projection, reference, recalled_context
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
-from .storage import CANDIDATE_GAMMA_CONTRACT, IDENTITY_CONTRACT, MINIMUM_EXPERT_ROWS, Routes, Stages, candidate_routes
+from .storage import (CANDIDATE_GAMMA_CONTRACT, IDENTITY_CONTRACT, MINIMUM_EXPERT_ROWS,
+                      HostExpertStaging, Routes, Stages, candidate_routes)
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -44,6 +45,7 @@ CODE = (
 SEGMENT_BYTES = 256 * (1 << 20)
 EXPERT_GROUP = 32
 EXPERT_ROWS = 2048
+EXPERT_INPUT_STAGE_BYTES = 8 << 30
 
 
 def read_json(path):
@@ -182,6 +184,7 @@ class Runner:
     verify_discovery = staticmethod(verify_original_discovery)
     use_expert_latent = True
     persist_projected_routes = True
+    host_expert_inputs = False
     # Flash Engram can modify the residual at attention entry.
     store_attention_residual = True
 
@@ -462,13 +465,20 @@ class Runner:
         combined = None
         if moe:
             def routes(start):
-                for number, values in self.rows(mlp_stage, "inputs", start=start):
-                    inputs = values["inputs"]
+                source = self.stages.records(mlp_stage, keys=("inputs",), start=start,
+                                             device="cpu" if self.host_expert_inputs else self.device)
+                for number, values in source:
+                    inputs = values["inputs"].to(self.device)
                     config = self.model.config
                     scores, choice = self.model.routing_scores(inputs, layer)
                     ids, gamma = self.forward.reference.native_routes(scores, choice, config)
-                    latent = (layer.project("mlp.routed_expert_down_proj", inputs, project)
-                              if self.use_expert_latent else inputs)
+                    if self.use_expert_latent:
+                        latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
+                    elif self.host_expert_inputs and number < self.calibration_count:
+                        # Populate the host bank from the original CPU stage read.
+                        latent = values["inputs"]
+                    else:
+                        latent = inputs
                     record = dict(latent=latent, ids=ids, gamma=gamma)
                     if number < self.calibration_count:
                         near, near_gamma = candidate_routes(scores, choice, ids, config)
@@ -481,8 +491,8 @@ class Runner:
                         yield number - start, self.stages.read_batch(route_stage, number)
             else:
                 # Full Hy4 routes the already sealed MLP inputs directly.
-                # Fill the device spool once. Only integer routes and weights
-                # cross to the CPU for stable ordering and coverage selection.
+                # The spool preserves corpus order. Route selection and
+                # recovery use CPU indices regardless of input placement.
                 stream = routes(0)
                 def route_batches(start, stop):
                     for number, record in islice(stream, stop - start):
@@ -491,7 +501,7 @@ class Runner:
             held = self.calibration_count
             lengths = list(map(len, self.records))
             spool = Routes(route_batches(0, held), self.recipe.EXPERTS_PER_LAYER,
-                           sum(lengths[:held]), device=self.device, recover=True)
+                           sum(lengths[:held]), device="cpu" if self.host_expert_inputs else self.device, recover=True)
             witness = Routes(route_batches(held, len(lengths)), self.recipe.EXPERTS_PER_LAYER,
                              sum(lengths[held:]), device=self.device)
             self.expert_witness = gates.ExpertWitness(
@@ -539,7 +549,9 @@ class Runner:
 
     def experts(self, label, layer, spool):
         packed, errors, stages = {}, [], []
-        combined = torch.zeros_like(spool.latent)
+        combined = torch.zeros_like(spool.latent, device=self.device)
+        staging = (HostExpertStaging(spool.latent, self.device, EXPERT_ROWS, EXPERT_INPUT_STAGE_BYTES)
+                   if self.host_expert_inputs else None)
         for start in range(0, self.recipe.EXPERTS_PER_LAYER, EXPERT_GROUP):
             stage = f"{label}-expert-{start:03d}"
             metrics = []
@@ -548,13 +560,13 @@ class Runner:
             if manifest is None:
                 def encode_group():
                     for expert in range(start, min(start + EXPERT_GROUP, self.recipe.EXPERTS_PER_LAYER)):
-                        yield expert - start, self.expert(layer, spool, expert, metrics, combined)
+                        yield expert - start, self.expert(layer, spool, expert, metrics, combined, staging)
 
                 manifest = self.stages.write_batches(stage, encode_group(), {"metrics": metrics},
                                                       segment_bytes=SEGMENT_BYTES, segment_batches=EXPERT_GROUP)
             else:
                 for entry in manifest["entries"]:
-                    self.replay_expert(layer, spool, start + entry["index"], combined, stage, entry["index"])
+                    self.replay_expert(layer, spool, start + entry["index"], combined, stage, entry["index"], staging)
             for entry in manifest["entries"]:
                 ordinal = entry["index"]
                 for name in self.expert_names(layer, start + ordinal):
@@ -575,10 +587,9 @@ class Runner:
         prefix = f"{layer.prefix}mlp.experts.{expert}."
         return tuple(prefix + leaf for leaf in ("gate_proj", "up_proj", "down_proj"))
 
-    def expert_activations(self, spool, rows, names, gate, up):
+    def expert_activations(self, chunks, names, gate, up):
         limit = self.model.config.swiglu_limit
-        for selection in rows.split(EXPERT_ROWS):
-            chunk = spool.latent.index_select(0, selection)
+        for chunk in chunks:
             g = self.forward.native_projection(names[0], chunk, gate).clamp_max(limit)
             u = self.forward.native_projection(names[1], chunk, up).clamp(-limit, limit)
             yield F.silu(g) * u
@@ -595,10 +606,11 @@ class Runner:
         if not bool(finite):
             raise ValueError(f"nonfinite Hy4 expert output: {name}")
 
-    def replay_expert(self, layer, spool, expert, combined, stage, ordinal):
+    def replay_expert(self, layer, spool, expert, combined, stage, ordinal, staging=None):
         rows, gamma = spool.expert(expert)
         if not len(rows) and self.expert_witness is None:
             return
+        selected = rows
         rows, gamma = rows.to(self.device), gamma.to(self.device)
         names = self.expert_names(layer, expert)
         keys = tuple(f"k4.{name}.{suffix}" for name in names for suffix in self.recipe.SUFFIXES)
@@ -614,10 +626,11 @@ class Runner:
             self.expert_witness.add(expert, (gate, up, down))
         if not len(rows):
             return
-        activated = self.expert_activations(spool, rows, names, gate, up)
+        chunks = spool.input_chunks(selected if staging is not None else rows, EXPERT_ROWS, staging)
+        activated = self.expert_activations(chunks(len(rows)), names, gate, up)
         self.accumulate_expert(combined, rows, gamma, names[2], down, activated)
 
-    def expert(self, layer, spool, expert, metrics, combined):
+    def expert(self, layer, spool, expert, metrics, combined, staging=None):
         selected, coefficients, evidence = spool.calibration(expert)
         rows, gamma = selected.to(self.device), coefficients.to(self.device)
         natural = evidence["natural_rows"]
@@ -626,9 +639,10 @@ class Runner:
         names = self.expert_names(layer, expert)
         weights = tuple(w.to(self.device) for w in self.reader.expert_weights(layer.index, expert))
         acc = numerical.covariance_accumulator(weights[0].shape[-1], device=self.device)
+        chunks = spool.input_chunks(selected if staging is not None else rows, EXPERT_ROWS, staging)
         if len(rows):
-            for part in rows.split(EXPERT_ROWS):
-                acc.add(spool.latent.index_select(0, part))
+            for part in chunks(len(rows)):
+                acc.add(part)
         covariance = raw(acc, identity)
         values = {}
         for name, weight in zip(names[:2], weights[:2], strict=True):
@@ -637,7 +651,7 @@ class Runner:
                     for name, weight in zip(names[:2], weights[:2], strict=True))
         acc = numerical.covariance_accumulator(weights[2].shape[-1], device=self.device)
         if len(rows):
-            activations = self.expert_activations(spool, rows, names, gate, up)
+            activations = self.expert_activations(chunks(len(rows)), names, gate, up)
             # Gamma scales the linear down output in Hy4's native forward. In
             # its Hessian, scale the input by the same coefficient to measure
             # the error on that weighted output; gate/up observe latent inputs.
@@ -649,7 +663,7 @@ class Runner:
             metric.update(evidence)
         down = reconstruction(values, names[2], 4, weights[2].shape, self.device)
         if natural:
-            activated = self.expert_activations(spool, rows[:natural], names, gate, up)
+            activated = self.expert_activations(chunks(natural), names, gate, up)
             self.accumulate_expert(combined, rows[:natural], gamma[:natural], names[2], down, activated)
         if self.expert_witness is not None:
             self.expert_witness.add(expert, (gate, up, down), names=names, native=weights, metrics=metrics)
