@@ -59,10 +59,11 @@ class ExpertWitness:
     def add(self, expert, matrices, *, names=None, native=None, metrics=None):
         rows, gamma = self.routes.expert(expert)
         rows = rows.to(self.combined.device)
-        inputs = self.routes.latent.index_select(0, rows)
         check = self.layer in self.target_gates and metrics is not None
         selection = "heldout-natural-routes"
-        if not len(rows):
+        if len(rows):
+            inputs = self.routes.latent.index_select(0, rows)
+        else:
             if not check:
                 return
             # An unrouted expert still has a real projection to evaluate. Use
@@ -70,15 +71,24 @@ class ExpertWitness:
             inputs = self.routes.latent[-128:]
             selection = "heldout-latent-tail-no-natural-routes"
         gate, up, down = matrices
-        gated = self.projection("", inputs, gate).clamp_max(self.limit)
-        lifted = self.projection("", inputs, up).clamp(-self.limit, self.limit)
-        active = F.silu(gated) * lifted
+        # The projection results are private temporaries. Keep the same GEMM
+        # shapes and FP32 operation order when reusing their storage.
+        active = self.projection("", inputs, gate).clamp_max_(self.limit)
+        lifted = self.projection("", inputs, up).clamp_(-self.limit, self.limit)
+        F.silu(active, inplace=True).mul_(lifted)
+        del lifted
+        if not check:
+            del inputs
         if len(rows):
+            gamma = gamma.to(active.device)[:, None]
             output = self.projection("", active, down)
-            self.combined.index_copy_(0, rows, self.combined.index_select(0, rows)
-                                      + output * gamma.to(output.device)[:, None])
+            output.mul_(gamma)
+            accumulated = self.combined.index_select(0, rows)
+            accumulated.add_(output)
+            self.combined.index_copy_(0, rows, accumulated)
+            del output, accumulated
         if check:
-            down_inputs = active * gamma.to(active.device)[:, None] if len(rows) else active
+            down_inputs = active.mul_(gamma) if len(rows) else active
             for row, name, xs, weight, reconstruction in zip(metrics[-3:], names, (inputs, inputs, down_inputs),
                                                              native, matrices, strict=True):
                 if row["module"] != name or row["bits"] != 4:

@@ -181,6 +181,7 @@ class Runner:
     writer_type = DirectMCWriter
     load_batches = staticmethod(load_token_batches)
     frozen_identity = staticmethod(identity)
+    checkpoint_identity = staticmethod(checkpoint_identity)
     verify_discovery = staticmethod(verify_original_discovery)
     use_expert_latent = True
     persist_projected_routes = True
@@ -196,7 +197,7 @@ class Runner:
         self.header = self.header_type(args.source)
         preflight = read_json(args.preflight)
         self.policy = dict(include_head=True, include_kv_b=True, k6_drafter_bits=6)
-        self.identity = checkpoint_identity(self.root, self.frozen_identity(self.header, args.corpus, preflight))
+        self.identity = self.checkpoint_identity(self.root, self.frozen_identity(self.header, args.corpus, preflight))
         self.core = self.recipe.reviewed_core_modules(
             include_head=self.policy["include_head"], include_kv_b=self.policy["include_kv_b"])
         self.total = len(self.core) * 2 + self.recipe.EXPERT_MODULE_COUNT
@@ -579,8 +580,11 @@ class Runner:
             phase = "expert_group_complete" if metrics else "expert_group_replayed"
             self.progress.event(phase, current_layer=layer.index,
                                 expert_group_seconds=time.monotonic() - tick,
-                                new_expert_projections=len(metrics))
+                                new_expert_projections=len(metrics), **self.expert_group_memory())
         return packed, errors, stages, combined
+
+    def expert_group_memory(self):
+        return {}
 
     @staticmethod
     def expert_names(layer, expert):
