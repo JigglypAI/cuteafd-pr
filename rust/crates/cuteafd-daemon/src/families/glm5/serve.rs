@@ -1315,7 +1315,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         Some(policy) => {
             let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), d)| Proposal {
                 id: a.ticket.id(), tokens, head: d.as_ref().map(|d| d.confidence.as_slice()), history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
-            policy.shape(&mut shaped, DECODE_ROWS)
+            let min_end = active.iter().map(|a| a.placement.len + 1).max().unwrap_or(1);
+            let max_end = active.iter().zip(&limits).map(|(a, &room)| a.placement.len + room + 1).max().unwrap_or(min_end);
+            policy.shape_with_padding(&mut shaped, DECODE_ROWS, |rows|
+                Some(engine.verify_explore_bucket(rows, min_end, max_end)))
         }
         None => vec![0; active.len()],
     };

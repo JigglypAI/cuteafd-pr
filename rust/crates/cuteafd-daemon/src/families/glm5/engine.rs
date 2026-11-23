@@ -1557,6 +1557,13 @@ impl<'a> GlmEngine<'a> {
         Ok((logits, buckets))
     }
 
+    pub(crate) fn verify_explore_bucket(&self, rows: usize, min_end: usize, max_end: usize) -> usize {
+        let width = |end: usize| self.table_width_bucket(end.div_ceil(PAGE_ROWS));
+        // A possible table-width boundary gives no attested padding slack.
+        if width(min_end) != width(max_end) { return rows; }
+        glm_decode_row_bucket(rows, width(min_end)).unwrap_or(rows)
+    }
+
     /// The page-table width a decode step whose longest row needs `pages`
     /// pages runs with: a power of two from 16, capped at the
     /// context's pages.
