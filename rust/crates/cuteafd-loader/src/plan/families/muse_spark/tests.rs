@@ -582,7 +582,8 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     let budget = ledger.budgets.iter().find(|budget| budget.id == "host").unwrap();
     assert_eq!(budget.locations, [Location::HOST, Location::PINNED]);
     let load = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Load).unwrap();
-    assert!(load.owned > 0 && load.opaque >= 4 << 30, "both estimated dense ranks are Load owners");
+    assert!(load.owned > 0);
+    assert_eq!(load.opaque, 1536 << 20, "ordinary host allowance, without push staging");
     let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
     assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
     assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
@@ -635,7 +636,7 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         assert_eq!(placement.items[gpu].iter().filter(|item|
             item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
     }
-    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
+    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 26 << 30));
     let direct = input.plan(&options).unwrap();
     let counted = input.plan_spark_count(&options, 6, Some(6)).unwrap();
     assert!(!direct.fits && !counted.fits);
