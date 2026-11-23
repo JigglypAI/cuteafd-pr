@@ -19,6 +19,14 @@
 //! ancestor wins over an approximate partial match unless the partial saves more than the rule's
 //! ancestor slack beyond it.
 //!
+//! A host-enabled mark family keeps a retained entry's positional mark only on the host
+//! (`Entry::host_mark`) once its copy landed. That host snapshot is pinned while the device entry
+//! lives, so host pressure evicts host-only snapshots and never orphans live device pages; the
+//! pinned bytes stay inside the host quota. If pinned snapshots fill the quota, new host stores
+//! are skipped and those entries keep their device staging mark until the staging ring evicts
+//! them: an ordinary eviction, never a dead mark. A dead mark is still checked
+//! (`PrefixStats::dead_marks`, `marks_lost`): the entry is evicted and selection retried.
+//!
 //! Approximate lineage is scoped to a row ([`Entry::approximate_from`]): a placement restored by
 //! approximate replay, or from a snapshot that carries such lineage, may differ from an exact
 //! prefill from that row on (and in all of its positional state). Pages wholly before it keep
@@ -68,6 +76,9 @@ pub enum PrefixError {
     Host(String),
     #[error("family layout: {0}")]
     Layout(&'static str),
+    /// A selected entry had no mark on either tier; it was evicted (admission retries selection).
+    #[error("retained snapshot lost its positional mark")]
+    DeadMark,
 }
 
 fn draft_exhaustion(mut error: &(dyn std::error::Error + 'static)) -> Option<PoolExhausted> {
@@ -176,6 +187,10 @@ pub struct PrefixStats {
     pub restore_failures: u64,
     /// Hits dropped because the pool could not hold the fork.
     pub fork_no_room: u64,
+    /// Device entries found holding no mark anywhere (their host-only mark was gone). An
+    /// invariant violation: host marks of live entries are pinned. The entry is evicted and
+    /// selection retried, never served approximately.
+    pub dead_marks: u64,
     pub captures_prompt: u64,
     pub captures_turn: u64,
     /// Prompt snapshots parked by a prefill cancelled at a chunk boundary.
@@ -213,6 +228,9 @@ pub struct PrefixStats {
     pub marks_on_host: usize,
     /// The family's snapshots carry a positional mark (pages-only families: none).
     pub mark_family: bool,
+    /// Retained device entries whose only mark is a host snapshot that is no longer resident.
+    /// Always 0 while host marks of live entries are pinned.
+    pub marks_lost: usize,
     pub host: Option<cuteafd_hostcache::metrics::Snapshot>,
 }
 
@@ -374,6 +392,14 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn arena(&self) -> &MarkArena {
         &self.arena
     }
+    /// Host keys holding live entries' only marks, oldest entry first (test support).
+    #[doc(hidden)]
+    pub fn host_mark_keys(&self) -> Vec<cuteafd_hostcache::snapshot::Key> {
+        self.entries.values().filter(|e| e.mark.is_none()).filter_map(|e| e.host_mark).collect()
+    }
+    #[doc(hidden)]
+    pub fn host_mut(&mut self) -> Option<&mut HostCache<E, HostPayload<M>>> { self.host.as_mut() }
+
     /// Read the already-present host tier; absence never initializes one.
     pub fn host_engine(&self) -> Option<&E> {
         self.host.as_ref().map(HostCache::engine)
@@ -420,8 +446,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.tick();
         self.reconcile_draft(family)?;
         let total = self.pool.pages_for(capacity.max(tokens.len()));
-        if self.enabled() && !tokens.is_empty() {
-            self.stats.lookups += 1;
+        let mut lookups = if self.enabled() && !tokens.is_empty() { 1 + self.entries.len() } else { 0 };
+        if lookups > 0 { self.stats.lookups += 1; }
+        // A dead mark evicts its entry and selects again (bounded by the retained entries).
+        while lookups > 0 {
+            lookups -= 1;
             let mut promoted = false;
             let mut hit = if let Some(compatible) = compatible {
                 self.device_compatible_hit(tokens, media, sampled, compatible)
@@ -459,6 +488,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                 match result {
                     Ok(Some(admitted)) => return Ok(admitted),
                     Ok(None) => {},
+                    Err(PrefixError::DeadMark) => continue,
                     Err(PrefixError::Family { what, source }) => {
                         tracing::warn!(target: "cuteafd::prefix", what, error = %source, "prefix restore abandoned; prefilling");
                         self.stats.restore_failures += 1;
@@ -466,6 +496,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     Err(error) => return Err(error),
                 }
             }
+            break;
         }
         self.admit_cold(family, tokens.len(), capacity, build)
     }
@@ -723,6 +754,15 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             };
             if mark.is_none() {
                 self.release(family, &pages)?;
+                if !self.host.as_ref().is_some_and(|h| h.payload(key).is_some()) {
+                    // The pinned host mark is gone: an invariant violation, never an
+                    // approximate restore. Drop the entry so selection finds the next exact one.
+                    debug_assert!(false, "a live device entry lost its pinned host mark");
+                    tracing::error!(target: "cuteafd::prefix", tokens = hit.frontier, "device entry lost its host mark");
+                    self.stats.dead_marks += 1;
+                    self.evict(family, hit.id)?;
+                    return Err(PrefixError::DeadMark);
+                }
                 return Ok(None);
             }
         }
@@ -1231,6 +1271,9 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                     let key = report.committed.iter().find_map(|&(done, key)|
                         (done == ticket && host.payload(key).is_some()).then_some(key));
                     if let Some(key) = key.filter(|_| entry.mark.is_some()) {
+                        // The host copy now holds the entry's only mark: pin it for the
+                        // entry's lifetime, so host pressure cannot orphan its pages.
+                        host.pin(key);
                         entry.host_mark = Some(key);
                         match entry.mark.take() {
                             Some(Mark::Slot(slot)) => self.arena.give_back(slot),
@@ -1271,6 +1314,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
                         let entry = self.entries.get_mut(&id).unwrap();
                         entry.ticket = None;
                         if let Some(key) = key {
+                            host.pin(key);
                             entry.host_mark = Some(key);
                             let mark = entry.mark.take();
                             self.give_back(family, mark)?;
@@ -1389,6 +1433,8 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         stats.marks_in_use = self.arena.in_use() + detail[3];
         stats.marks_on_host = detail[4];
         stats.mark_family = self.layout.mark_bytes > 0;
+        stats.marks_lost = self.host.as_ref().map_or(0, |host| self.entries.values()
+            .filter(|e| e.mark.is_none() && e.host_mark.is_some_and(|key| host.payload(key).is_none())).count());
         stats.host = self.host.as_ref().map(HostCache::metrics);
         stats
     }
@@ -1490,6 +1536,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             }
         }
         let entry = self.entries.remove(&id).expect("checked before release barrier");
+        if let (Some(key), Some(host)) = (entry.host_mark, self.host.as_mut()) { host.release_pin(key); }
         self.retained.bank_mut(entry.kind).remove_exact(&entry.tokens);
         self.stats.evictions += 1;
         self.release(family, &entry.pages)?;
@@ -1793,6 +1840,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.next_id += 1;
         self.entries.insert(id, Entry { session, tokens: snapshot_tokens.clone(), media: saved_media, kind: hit.kind, pages, mark, after,
             meta, approximate_from, draft, last_use: self.clock, ticket: None, host_mark: Some(hit.key) });
+        self.host.as_mut().expect("promoted from the host").pin(hit.key);
         if let Some(evicted) = self.retained.bank_mut(hit.kind).insert(&snapshot_tokens, id) {
             self.evict(family, evicted)?;
         }

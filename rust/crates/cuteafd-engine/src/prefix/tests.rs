@@ -2075,3 +2075,80 @@ fn host_minimum_clamps_only_for_staged_marks() {
     let cache: PrefixCache<Shared> = PrefixCache::new(fake.layout(), PrefixConfig { min_tokens: 64, ..config(20, 2) }, host(&fake)).unwrap();
     assert_eq!(cache.host_config().unwrap().min_tokens, HOST_MIN);
 }
+
+/// The stressed V4.1 failure: with a host tier, a device entry keeps its positional mark only on
+/// the host. Host eviction takes leaves before reusable ancestors, and in a growing agentic
+/// conversation the newest turn (the one the next request continues) is the leaf. Without a pin
+/// its mark went first and the next turn prefilled cold (dev: 20 total misses of 30-62K tokens
+/// on V4.1 with a 1 GiB host tier). Pinned, every live entry restores exactly.
+#[test]
+fn host_pressure_never_orphans_a_live_device_entry() {
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(1200, 4) } else { Fake::new(1200, 4, 2) };
+        let host = HostConfig { bytes: 3 << 10, chunk_bytes: 1 << 10, min_tokens: 1, ..HostConfig::default() };
+        let mut cache = PrefixCache::new(fake.layout(), config(6, fake.slots), Some((host, Shared(fake.mem.clone())))).unwrap();
+        let mut history = seq(100, 13);
+        for turn in 0..16u32 {
+            let reply = seq(5000 + turn * 10, 3);
+            let admitted = cache.admit(&fake, &history, history.len() + 8, false,
+                |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+            if turn > 0 {
+                let source = admitted.source.as_ref().expect("the live previous turn is restored");
+                assert_eq!((admitted.resume, source.plan.exact()), (history.len() - 2, true), "turn {turn}");
+            }
+            let mut p = admitted.placement;
+            let logits = fake.forward(&mut p, &history).unwrap();
+            cache.capture(&fake, SnapshotKind::Prompt, &history, &p, After::from_logits(&logits, true)).unwrap();
+            let mut tokens = history.clone();
+            tokens.extend(&reply);
+            let logits = fake.forward(&mut p, &tokens).unwrap();
+            cache.capture(&fake, SnapshotKind::Turn, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+            fake.mem.borrow_mut().advance(10_000_000);
+            cache.tick();
+            // Other conversations' traffic presses the host tier (new leaves, unrelated tokens).
+            for other in 0..3u32 {
+                let (_, _, f) = serve(&mut cache, &fake, 1, &seq(20_000 + (turn * 3 + other) * 100, 13), &seq(30_000, 3), 20);
+                cache.release(&fake, &f.pages).unwrap();
+                fake.mem.borrow_mut().advance(10_000_000);
+                cache.tick();
+                let stats = cache.stats();
+                assert_eq!(stats.marks_lost, 0, "turn {turn}: a live device entry's host mark was evicted");
+            }
+            history = tokens;
+            history.extend([9000 + turn, 9001]); // the next user message (resumes 2 short of its end)
+        }
+        let stats = cache.stats();
+        assert!(stats.host.unwrap().host_evictions > 0, "the host tier was under pressure");
+        assert_eq!((stats.dead_marks, stats.restore_failures), (0, 0));
+    }
+}
+
+/// A dead mark (an invariant violation the pin prevents) is counted, its entry evicted, and
+/// selection falls through to the next exact candidate instead of prefilling cold.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "lost its pinned host mark"))]
+fn a_dead_mark_falls_through_to_the_next_exact_candidate() {
+    let fake = Fake::new(160, 4, 2);
+    let mut cache = cache(&fake, 8, 1 << 20);
+    let prompt = seq(100, 13);
+    let (_, turn, p) = serve(&mut cache, &fake, 0, &prompt, &seq(5000, 3), 20);
+    cache.release(&fake, &p.pages).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    // Both marks are host-only now; remove the turn's (the newest entry) behind the pin.
+    let keys = cache.host_mark_keys();
+    assert_eq!(keys.len(), 2);
+    let turn_key = *keys.iter().max().unwrap();
+    assert!(cache.host_mut().unwrap().pinned(turn_key));
+    assert!(cache.host_mut().unwrap().remove_for_test(turn_key));
+    assert_eq!(cache.stats().marks_lost, 1);
+    let mut next = turn.clone();
+    next.push(9999);
+    let admitted = cache.admit(&fake, &next, 24, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    // Release builds: the prompt snapshot (exact) serves it, the dead entry is gone.
+    assert_eq!(admitted.resume, prompt.len());
+    assert!(admitted.source.unwrap().plan.exact());
+    assert_eq!((cache.stats().dead_marks, cache.stats().marks_lost), (1, 0));
+}
