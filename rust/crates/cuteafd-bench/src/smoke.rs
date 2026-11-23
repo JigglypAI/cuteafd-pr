@@ -1288,10 +1288,32 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
                         pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
                 }
             }
+            if let Some(line) = o.sweep.as_ref().and_then(|sweep| graph_band_line(&sweep.graph_bands)) {
+                out.push_str(&format!("\nGraph captures {}: {line}\n", e.name));
+            }
             for caveat in &o.caveats { out.push_str(&format!("\nNote {}: {caveat}\n",e.name)); }
         }
     }
     out
+}
+
+/// One summary line for a sweep's timed graph bands: all capture-free, or
+/// each band that captured or had no comparable counters.
+fn graph_band_line(bands: &[Value]) -> Option<String> {
+    if bands.is_empty() { return None; }
+    let flagged: Vec<String> = bands.iter().filter(|band| band["zero_captures"] != true).map(|band| {
+        if band["available"] == true {
+            format!("{} {} process / {} device-cache captures", band["band"].as_str().unwrap_or("?"),
+                band["captures"], band["device_captures"])
+        } else {
+            format!("{} unavailable ({})", band["band"].as_str().unwrap_or("?"), band["reason"].as_str().unwrap_or("?"))
+        }
+    }).collect();
+    Some(if flagged.is_empty() {
+        format!("all {} timed bands capture-free", bands.len())
+    } else {
+        format!("{} of {} timed bands not capture-free: {}", flagged.len(), bands.len(), flagged.join("; "))
+    })
 }
 
 /// Every entry serves an API key: its own API_KEY_FILE, else `<state>/api-key`
@@ -1911,6 +1933,18 @@ pub fn describe(matrix: &Matrix) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graph_band_line_names_only_bands_that_captured() {
+        use serde_json::json;
+        assert_eq!(super::graph_band_line(&[]), None);
+        let clean = json!({"band": "levels C1", "available": true, "captures": 0, "device_captures": 0, "zero_captures": true});
+        assert_eq!(super::graph_band_line(&[clean.clone(), clean.clone()]).unwrap(), "all 2 timed bands capture-free");
+        let dirty = json!({"band": "levels C16", "available": true, "captures": 3, "device_captures": 1, "zero_captures": false});
+        let gone = json!({"band": "prefill 8192", "available": false, "reason": "no start sample", "zero_captures": null});
+        assert_eq!(super::graph_band_line(&[clean, dirty, gone]).unwrap(),
+            "2 of 3 timed bands not capture-free: levels C16 3 process / 1 device-cache captures; prefill 8192 unavailable (no start sample)");
+    }
+
     #[test]
     fn release_smoke_entries_all_serve_an_api_key() {
         use super::*;

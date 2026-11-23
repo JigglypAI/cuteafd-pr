@@ -1444,16 +1444,28 @@ class PowerSampler:
 
 # --------------------------------------------------------------------------- running
 
-# Per run beyond --timeout (and the Spark workers' ready timeout): starting and
-# removing the container, worker teardown, copying a Spark run's output back.
-ARM_SLACK_S = 900
+# Per run beyond --timeout (and the Spark workers' ready timeout). A raptor-only
+# run starts and removes one local container: measured 2026-11-24 on raptor,
+# docker run 0.5-0.7 s, docker rm -f 0.25 s, and the at-grant slot re-check
+# (artifact sha256s 0.3 s, SparkInfer tree 0.2 s, sealed --help container
+# 1.0 s) about 2 s per arm; 120 s also covers a killed CUDA process releasing a
+# full 96 GB card. A run with Spark expert workers (ssh start and per-host
+# teardown, 180 s per attempt) or on --sm121-host (remote scratch, teardown and
+# copying {out} back over ssh) keeps the old remote allowance.
+LOCAL_ARM_SLACK_S = 120
+REMOTE_ARM_SLACK_S = 900
+
+
+def arm_slack(state):
+    """Per-run teardown slack: remote only when Spark workers or an SM121 copy-back are involved."""
+    return REMOTE_ARM_SLACK_S if state.get('sparks') or state.get('sm121') else LOCAL_ARM_SLACK_S
 
 
 def turn_max_run(state, runs, args):
     """The lock turn's hwlock --max-run: every run's --timeout, its workers'
-    ready timeout and ARM_SLACK_S, plus the at-grant --preflight."""
+    ready timeout and arm_slack, plus the at-grant --preflight."""
     ready = state['sparks']['ready_timeout'] if state.get('sparks') else 0
-    return runs * (state['timeout'] + ready + ARM_SLACK_S) + (args.preflight_timeout if args.preflight else 0)
+    return runs * (state['timeout'] + ready + arm_slack(state)) + (args.preflight_timeout if args.preflight else 0)
 
 
 def run_args(state, arm=None):

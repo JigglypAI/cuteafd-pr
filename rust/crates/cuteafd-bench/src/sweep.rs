@@ -6,7 +6,7 @@
 //! draft-policy gates read). It runs in the driver's own binary, so both arms
 //! of an A/B measure the same workload whatever their server builds contain.
 use crate::client::Client;
-use crate::panels::common::{aggregate, expert_usage_interval, mapped_interval, median, phase_counters, plain, wave, Timed};
+use crate::panels::common::{aggregate, expert_usage_interval, graph_interval, mapped_interval, median, phase_counters, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
 use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
@@ -59,6 +59,10 @@ pub struct Point {
     /// Approximate phase deltas from asynchronous device snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_usage: Option<Value>,
+    /// Graph capture and cache counters over the timed band alone
+    /// (`common::graph_interval`; `zero_captures` is the steady-state check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sustained: Option<crate::sustained::Window>,
 }
@@ -89,6 +93,10 @@ pub struct PrefillPoint {
     /// Approximate phase deltas from asynchronous device snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_usage: Option<Value>,
+    /// Graph capture and cache counters over the timed band alone
+    /// (`common::graph_interval`; `zero_captures` is the steady-state check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<Value>,
 }
 
 /// Explicit cold C1 prose cells; omitted seeds retain the original corpus seed.
@@ -152,9 +160,30 @@ pub struct Sweep {
     /// The verify-shape sweep (smoke `sweep_verify`), instead of decode points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<crate::sweep_verify::VerifySweep>,
+    /// Per timed band (`prefill <length>`, `<phase> C<c>`): graph captures in
+    /// it and whether it was capture-free; see [`Sweep::graph_bands`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_bands: Vec<Value>,
 }
 
 impl Sweep {
+    /// One row per timed band that has graph counters: its label, process
+    /// captures, device-cache captures, misses and eager runs, and
+    /// `zero_captures` (null when the counters were unavailable).
+    pub fn graph_bands(&self) -> Vec<Value> {
+        let row = |band: String, graph: &Value| {
+            let device = |key: &str| graph["devices"].as_array().map(|devices|
+                devices.iter().filter_map(|d| d["totals"][key].as_u64()).sum::<u64>());
+            serde_json::json!({"band": band, "available": graph["available"], "captures": graph["captures"],
+                "device_captures": device("captures"), "misses": device("misses"),
+                "eager_runs": device("eager_runs"), "zero_captures": graph["zero_captures"],
+                "reason": graph["reason"]})
+        };
+        self.prefill.iter().filter_map(|p| p.graph.as_ref().map(|g| row(format!("prefill {}", p.length), g)))
+            .chain(self.points.iter().filter_map(|p| p.graph.as_ref().map(|g| row(format!("{} C{}", p.phase, p.c), g))))
+            .collect()
+    }
+
     /// Aggregate decode tok/s at `c` in `phase`.
     pub fn rate(&self, c: usize, phase: &str) -> Option<f64> {
         self.points.iter().find(|p| p.c == c && p.phase == phase).map(|p| p.aggregate_tok_s)
@@ -234,6 +263,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let after = phase_counters(client);
     let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
     let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
+    let graph = graph_interval(counters.graph.as_ref(), after.graph.as_ref());
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
@@ -244,7 +274,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     let point = Point { c, requests: ok.iter().map(|r| r.chat.timing.clone()).collect(), phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, expert_usage,
+        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, expert_usage, graph,
         context: c1.map(|x| x.0), seed: c1.map(|x| x.1),
         prompt_sha256: c1.map(|_| format!("{:x}", Sha256::digest(prompts.timed[0].as_bytes()))),
         prompt_tokens: c1.map(|_| ok[0].chat.timing.prompt_tokens),
@@ -328,6 +358,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let after = phase_counters(client);
         let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
         let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
+        let graph = graph_interval(counters.graph.as_ref(), after.graph.as_ref());
         let thermal = client.thermal_since(mark);
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
@@ -335,7 +366,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         crate::prefill::validate(timed_text.tokens, t.prompt_tokens)?;
         points.push(PrefillPoint { length, label: (length == tail).then(|| "8K w/tail".into()),
             shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
+            idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage, graph });
     }
     Ok(points)
 }
@@ -469,6 +500,7 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
                 fabric: client.fabric_since(fabric_mark, &format!("sustained/c{c}"), true).map(|p| serde_json::json!(p)),
                 mapped_tables: mapped_interval(&counters.mapped_tables, &after.mapped_tables),
                 expert_usage: expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref()),
+                graph: graph_interval(counters.graph.as_ref(), after.graph.as_ref()),
                 sustained: Some(window), ..Point::default() });
         }
     }
@@ -483,6 +515,12 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     }
     for (phase, window) in &sweep.thermal {
         eprintln!("sweep {phase} GPU throttle: {}", cuteafd_core::thermal::describe(window));
+    }
+    sweep.graph_bands = sweep.graph_bands();
+    for band in &sweep.graph_bands {
+        eprintln!("sweep {} graph captures: {} process, {} device cache, {} misses, {} eager runs (zero_captures={})",
+            band["band"].as_str().unwrap_or(""), band["captures"], band["device_captures"], band["misses"],
+            band["eager_runs"], band["zero_captures"]);
     }
     Ok(sweep)
 }
@@ -728,5 +766,28 @@ mod tests {
         assert_eq!(sweep.rate(1, "levels"), Some(50.0));
         assert_eq!(sweep.rate(1, "post_load"), Some(48.0));
         assert_eq!(sweep.rate(16, "levels"), None);
+    }
+
+    #[test]
+    fn graph_bands_label_each_timed_band_and_export() {
+        let clean = serde_json::json!({"available": true, "captures": 0, "zero_captures": true,
+            "devices": [{"device": 0, "totals": {"captures": 0, "misses": 0, "eager_runs": 0}},
+                        {"device": 1, "totals": {"captures": 0, "misses": 1, "eager_runs": 1}}]});
+        let dirty = serde_json::json!({"available": true, "captures": 2, "zero_captures": false,
+            "devices": [{"device": 0, "totals": {"captures": 2, "misses": 2, "eager_runs": 0}}]});
+        let sweep = Sweep { prefill: vec![PrefillPoint { length: 8192, graph: Some(dirty), ..Default::default() }],
+            points: vec![Point { c: 16, phase: "levels".into(), graph: Some(clean), ..Point::default() },
+                         Point { c: 1, phase: "post_load".into(), ..Point::default() }], ..Sweep::default() };
+        let bands = sweep.graph_bands();
+        assert_eq!(bands.len(), 2, "a point without counters has no band");
+        assert_eq!(bands[0]["band"], "prefill 8192");
+        assert_eq!((bands[0]["captures"].as_u64(), bands[0]["device_captures"].as_u64()), (Some(2), Some(2)));
+        assert_eq!(bands[0]["zero_captures"], false);
+        assert_eq!(bands[1]["band"], "levels C16");
+        assert_eq!((bands[1]["misses"].as_u64(), bands[1]["eager_runs"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(bands[1]["zero_captures"], true);
+        let exported = serde_json::to_value(&sweep.points[0]).unwrap();
+        assert_eq!(exported["graph"]["zero_captures"], true);
+        assert!(serde_json::to_value(&sweep.points[1]).unwrap().get("graph").is_none());
     }
 }

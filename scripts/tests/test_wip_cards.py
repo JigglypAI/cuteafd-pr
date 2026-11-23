@@ -4552,3 +4552,17 @@ def test_serving_turn_is_bounded_by_its_jobs_budgets(entry, tmp_path, monkeypatc
     assert seen[0] == expected == cards.job_max_run(short)
     assert seen[1] == cards.job_max_run(short) + cards.job_max_run(long)
     assert cards.job_max_run(long) - cards.job_max_run(short) == 4800
+
+
+def test_summary_lists_graph_captures_per_timed_band(tmp_path):
+    bands = [dict(band='levels C1', available=True, captures=0, device_captures=0, misses=0, eager_runs=0, zero_captures=True),
+             dict(band='levels C16', available=True, captures=2, device_captures=1, misses=3, eager_runs=1, zero_captures=False),
+             dict(band='prefill 8192', available=False, reason='no start sample', zero_captures=None)]
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, graph_bands=bands)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert '## Graph Captures Per Timed Band' in text
+    assert '| c | candidate | 1 | levels C1 | 0 | 0 | 0 | 0 | yes |' in text
+    assert '| c | candidate | 1 | levels C16 | 2 | 1 | 3 | 1 | NO |' in text
+    assert 'unavailable: no start sample' in text
+    assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['graph_bands'] == bands

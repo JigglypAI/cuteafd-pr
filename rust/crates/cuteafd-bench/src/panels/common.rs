@@ -193,17 +193,136 @@ pub fn mapped_counters(client: &Client) -> Vec<Value> {
     client.stats().ok().and_then(|v| v["mapped_tables"].as_array().cloned()).unwrap_or_default()
 }
 
-/// One stats read at a phase boundary, shared by mapped-table and route telemetry.
+/// One stats read at a phase boundary, shared by mapped-table, route and graph telemetry.
 pub struct PhaseCounters {
     pub mapped_tables: Vec<Value>,
     pub expert_usage: Option<Value>,
+    pub graph: Option<Value>,
 }
 pub fn phase_counters(client: &Client) -> PhaseCounters {
-    let stats = client.stats().unwrap_or(Value::Null);
+    phase_counters_from(&client.stats().unwrap_or(Value::Null))
+}
+pub fn phase_counters_from(stats: &Value) -> PhaseCounters {
     PhaseCounters {
         mapped_tables: stats["mapped_tables"].as_array().cloned().unwrap_or_default(),
         expert_usage: stats.get("expert_usage").cloned(),
+        graph: graph_sample(stats),
     }
+}
+
+/// The cumulative graph counters of one `/v1/stats` read, kept compact: the
+/// process capture total and its per-site totals, eager runs of shapes a sealed
+/// graph set lacked, and per device the graph cache's per-cycle counters
+/// (decode, verify, prefill, wave, other) and completed lane cycles. None when
+/// the server publishes neither total (an older build, or no graph cache).
+pub fn graph_sample(stats: &Value) -> Option<Value> {
+    let captures = stats["graph_captures"].as_u64();
+    let cache = stats["graph_cache"].as_array();
+    if captures.is_none() && cache.is_none() { return None; }
+    let devices: Vec<Value> = cache.into_iter().flatten().map(|device| json!({"device": device["device"],
+        "cycles": device["cycles"], "lane_cycles_completed": device["epochs"]["completed"]})).collect();
+    Some(json!({"captures": captures, "sites": stats["graph_capture_sites"], "devices": devices,
+        "missing_variants": stats["graph_missing_variants"]}))
+}
+
+/// Per-device totals every graph interval reports, zero included; `updates`
+/// is soft plus hard executable updates.
+pub const GRAPH_TOTALS: [&str; 7] = ["captures", "misses", "eager_runs", "evictions", "updates", "update_failures", "hits"];
+
+/// Nonzero differences of one counter object's integer fields; None when one went backwards.
+fn counter_delta(before: &Value, after: &Value) -> Option<serde_json::Map<String, Value>> {
+    let mut delta = serde_json::Map::new();
+    for (key, value) in after.as_object().into_iter().flatten() {
+        let Some(new) = value.as_u64() else { continue };
+        let old = before[key.as_str()].as_u64().unwrap_or(0);
+        let change = new.checked_sub(old)?;
+        if change > 0 { delta.insert(key.clone(), json!(change)); }
+    }
+    Some(delta)
+}
+
+/// Differences of `[name, count]` pairs (capture sites); nonzero only, None when one went backwards.
+fn pair_delta(before: &Value, after: &Value) -> Option<Vec<Value>> {
+    let old = |name: &Value| before.as_array().into_iter().flatten()
+        .find(|pair| &pair[0] == name).and_then(|pair| pair[1].as_u64()).unwrap_or(0);
+    let mut delta = Vec::new();
+    for pair in after.as_array().into_iter().flatten() {
+        let Some(new) = pair[1].as_u64() else { continue };
+        let change = new.checked_sub(old(&pair[0]))?;
+        if change > 0 { delta.push(json!([pair[0], change])); }
+    }
+    Some(delta)
+}
+
+/// Graph counters over one timed band: differences of two cumulative
+/// [`graph_sample`]s read just before and just after it. `zero_captures` is the
+/// steady-state check (AGENTS.md): no process capture and no device-cache
+/// capture in the band. Device rows report [`GRAPH_TOTALS`] and the nonzero
+/// per-cycle counters; a device cache first seen after the start reads as new.
+pub fn graph_interval(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
+    let after = after?;
+    let unavailable = |reason: &str| Some(json!({"available": false, "reason": reason}));
+    let Some(before) = before else { return unavailable("no start sample") };
+    let captures = match (before["captures"].as_u64(), after["captures"].as_u64()) {
+        (Some(old), Some(new)) => match new.checked_sub(old) {
+            Some(change) => Some(change),
+            None => return unavailable("capture total went backwards (server restarted?)"),
+        },
+        _ => None,
+    };
+    let Some(sites) = pair_delta(&before["sites"], &after["sites"]) else {
+        return unavailable("a capture site total went backwards");
+    };
+    let empty = json!({});
+    let old_devices = before["devices"].as_array().cloned().unwrap_or_default();
+    let new_devices = after["devices"].as_array().cloned().unwrap_or_default();
+    if old_devices.iter().any(|old| !new_devices.iter().any(|new| new["device"] == old["device"])) {
+        return unavailable("a device graph cache disappeared");
+    }
+    let mut devices = Vec::new();
+    for device in &new_devices {
+        let old = old_devices.iter().find(|old| old["device"] == device["device"]);
+        let start = old.unwrap_or(&empty);
+        let mut by_cycle = serde_json::Map::new();
+        let mut totals: serde_json::Map<String, Value> = GRAPH_TOTALS.iter().map(|k| (k.to_string(), json!(0u64))).collect();
+        for (cycle, counters) in device["cycles"].as_object().into_iter().flatten() {
+            let Some(delta) = counter_delta(&start["cycles"][cycle.as_str()], counters) else {
+                return unavailable("a device graph counter went backwards");
+            };
+            for (key, value) in &delta {
+                let total = if key == "updates_soft" || key == "updates_hard" { "updates" } else { key.as_str() };
+                if let Some(slot) = totals.get_mut(total) {
+                    *slot = json!(slot.as_u64().unwrap_or(0) + value.as_u64().unwrap_or(0));
+                }
+            }
+            if !delta.is_empty() { by_cycle.insert(cycle.clone(), Value::Object(delta)); }
+        }
+        let lanes = device["lane_cycles_completed"].as_array().map(|lanes| lanes.iter().enumerate().map(|(i, n)| {
+            n.as_u64().and_then(|n| n.checked_sub(start["lane_cycles_completed"][i].as_u64().unwrap_or(0)))
+        }).collect::<Option<Vec<_>>>());
+        let lanes = match lanes {
+            Some(None) => return unavailable("a lane cycle count went backwards"),
+            Some(Some(lanes)) => json!(lanes),
+            None => Value::Null,
+        };
+        devices.push(json!({"device": device["device"], "new_device": old.is_none(), "totals": totals,
+            "by_cycle": by_cycle, "lane_cycles_completed": lanes}));
+    }
+    let mut eager = Vec::new();
+    for variant in after["missing_variants"].as_array().into_iter().flatten() {
+        let old = before["missing_variants"].as_array().into_iter().flatten()
+            .find(|old| old["family"] == variant["family"] && old["shape"] == variant["shape"])
+            .and_then(|old| old["runs"].as_u64()).unwrap_or(0);
+        let Some(runs) = variant["runs"].as_u64().and_then(|runs| runs.checked_sub(old)) else {
+            return unavailable("a missing-variant run count went backwards");
+        };
+        if runs > 0 { eager.push(json!({"family": variant["family"], "shape": variant["shape"], "runs": runs})); }
+    }
+    let zero = captures.unwrap_or(0) == 0 && sites.is_empty()
+        && devices.iter().all(|device| device["totals"]["captures"] == 0);
+    Some(json!({"available": true, "boundaries": "/v1/stats reads just before and after the timed band",
+        "captures": captures, "zero_captures": zero, "capture_sites": sites, "devices": devices,
+        "missing_variant_runs": eager}))
 }
 
 /// Differences of asynchronous total snapshots, not exact phase-isolated counts.
@@ -461,6 +580,80 @@ mod tests {
             *field = value;
             assert_eq!(super::expert_usage_interval(Some(&a), Some(&b)).unwrap()["available"], false);
         }
+    }
+
+    /// A `/v1/stats` payload as the daemon serves it (probe::graph_capture_stats):
+    /// totals, per-site totals, missing variants and per-device graph_cache rows.
+    fn graph_stats(captures: u64, decode_misses: u64, verify_captures: u64, completed: u64) -> Value {
+        json!({"active": 0, "graph_captures": captures,
+            "graph_capture_sites": [["engine.rs:1937", captures], ["draft.rs:20", 1]],
+            "graph_capture_site_deltas": [],
+            "graph_missing_variants": [{"family": "glm5", "shape": "c=3", "runs": decode_misses}],
+            "graph_cache": [
+                {"device": 0, "charged": 335544320, "reserve": 1 << 30, "top_hits": [{"hits": 9}],
+                 "cycles": {"decode": {"hits": 100 + completed, "misses": decode_misses, "captures": 4,
+                                       "segments_launched": 3 * completed, "eager_runs": decode_misses,
+                                       "evictions": 0, "updates_soft": 2, "updates_hard": 0, "update_failures": 0},
+                            "verify": {"hits": 10, "misses": 0, "captures": verify_captures, "eager_runs": 0,
+                                       "evictions": verify_captures / 2, "updates_soft": 0, "updates_hard": 1}},
+                 "epochs": {"cycles": [completed + 1, 0], "completed": [completed, 0], "pending": [0, 0]}},
+                {"device": 1, "cycles": {"decode": {"hits": 7, "captures": 2}},
+                 "epochs": {"completed": [5, 0]}}]})
+    }
+
+    #[test]
+    fn graph_intervals_difference_cumulative_stats_and_certify_zero_captures() {
+        let before = super::phase_counters_from(&graph_stats(6, 1, 3, 40)).graph;
+        let sample = before.as_ref().unwrap();
+        assert_eq!(sample["captures"], 6);
+        assert!(sample["devices"][0].get("charged").is_none(), "samples stay compact");
+        // Steady state: hits and lane cycles move, nothing captures.
+        let steady = super::phase_counters_from(&graph_stats(6, 1, 3, 72)).graph;
+        let band = super::graph_interval(before.as_ref(), steady.as_ref()).unwrap();
+        assert_eq!(band["available"], true);
+        assert_eq!(band["captures"], 0);
+        assert_eq!(band["zero_captures"], true);
+        assert_eq!(band["capture_sites"], json!([]));
+        let device = &band["devices"][0];
+        assert_eq!(device["totals"], json!({"captures": 0, "misses": 0, "eager_runs": 0, "evictions": 0,
+            "updates": 0, "update_failures": 0, "hits": 32}));
+        assert_eq!(device["by_cycle"], json!({"decode": {"hits": 32, "segments_launched": 96}}));
+        assert_eq!(device["lane_cycles_completed"], json!([32, 0]));
+        assert_eq!(band["devices"][1]["totals"]["hits"], 0);
+        assert_eq!(band["missing_variant_runs"], json!([]));
+        // A band that captured: the process total, the site, the verify cycle and an eager miss.
+        let after = super::phase_counters_from(&graph_stats(8, 3, 5, 80)).graph;
+        let band = super::graph_interval(before.as_ref(), after.as_ref()).unwrap();
+        assert_eq!(band["captures"], 2);
+        assert_eq!(band["zero_captures"], false);
+        assert_eq!(band["capture_sites"], json!([["engine.rs:1937", 2]]));
+        let device = &band["devices"][0];
+        assert_eq!(device["totals"]["captures"], 2);
+        assert_eq!(device["totals"]["misses"], 2);
+        assert_eq!(device["totals"]["eager_runs"], 2);
+        assert_eq!(device["totals"]["evictions"], 1);
+        assert_eq!(device["by_cycle"]["verify"], json!({"captures": 2, "evictions": 1}));
+        assert_eq!(band["missing_variant_runs"], json!([{"family": "glm5", "shape": "c=3", "runs": 2}]));
+    }
+
+    #[test]
+    fn graph_intervals_refuse_restarts_and_absent_counters() {
+        assert!(super::graph_sample(&json!({"active": 0})).is_none());
+        assert!(super::graph_interval(None, None).is_none());
+        let sample = super::graph_sample(&graph_stats(6, 1, 3, 40));
+        assert_eq!(super::graph_interval(None, sample.as_ref()).unwrap()["available"], false);
+        let restarted = super::graph_sample(&graph_stats(2, 0, 0, 1));
+        assert_eq!(super::graph_interval(sample.as_ref(), restarted.as_ref()).unwrap()["available"], false);
+        let mut gone = graph_stats(6, 1, 3, 40);
+        gone["graph_cache"].as_array_mut().unwrap().pop();
+        assert_eq!(super::graph_interval(sample.as_ref(), super::graph_sample(&gone).as_ref()).unwrap()["available"], false);
+        // A device cache published only after the start reads as new, from zero.
+        let mut late = graph_stats(6, 1, 3, 40);
+        late["graph_cache"].as_array_mut().unwrap().pop();
+        let band = super::graph_interval(super::graph_sample(&late).as_ref(), sample.as_ref()).unwrap();
+        assert_eq!(band["devices"][1]["new_device"], true);
+        assert_eq!(band["devices"][1]["totals"]["captures"], 2);
+        assert_eq!(band["zero_captures"], false);
     }
 
     #[test]
