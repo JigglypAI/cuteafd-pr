@@ -647,7 +647,10 @@ GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "muse_spark": "dflash2", "minimax_m3": "dspark"}
 # Card name -> why it intentionally differs from the family default. Empty:
 # no gate card overrides its family's shipped drafter.
-GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {}
+GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {
+    "hy4f-exl3-min": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
+    "hy4f-exl3-max": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
+}
 
 
 def _default_speculator(family: str, model: str) -> str:
