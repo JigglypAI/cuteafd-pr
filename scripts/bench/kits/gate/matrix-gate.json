@@ -7,67 +7,6 @@
   },
   "entries": [
     {
-      "name": "muse-spark-exl3-max",
-      "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-max.config",
-      "gpus": [
-        0,
-        1
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi",
-        "rhea",
-        "moa"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8752",
-        "EXPERT_PORT": "19852",
-        "SPARK_COUNT": "6",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_2_HOST": "emu",
-        "SPARK_3_HOST": "kiwi",
-        "SPARK_4_HOST": "rhea",
-        "SPARK_5_HOST": "moa",
-        "SPARK_0_LANE_A": "10.55.0.1",
-        "SPARK_1_LANE_A": "10.55.0.2",
-        "SPARK_2_LANE_A": "10.55.0.3",
-        "SPARK_3_LANE_A": "10.55.0.4",
-        "SPARK_4_LANE_A": "10.55.0.5",
-        "SPARK_5_LANE_A": "10.55.0.6"
-      }
-    },
-    {
-      "name": "muse-spark-exl3-min",
-      "family": "muse_spark",
-      "config": "examples/configs/muse-spark-exl3-min.config",
-      "gpus": [
-        0
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8753",
-        "EXPERT_PORT": "19853",
-        "SPARK_COUNT": "4",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_2_HOST": "emu",
-        "SPARK_3_HOST": "kiwi",
-        "SPARK_0_LANE_A": "10.55.0.1",
-        "SPARK_1_LANE_A": "10.55.0.2",
-        "SPARK_2_LANE_A": "10.55.0.3",
-        "SPARK_3_LANE_A": "10.55.0.4"
-      }
-    },
-    {
       "name": "minimax-flash-min",
       "family": "minimax_m3",
       "config": "examples/configs/minimax-m31-flash-nvfp4-min.config",
@@ -174,20 +113,53 @@
       }
     },
     {
-      "name": "glmf-exl3-max",
+      "name": "glmf-mc-original-min",
       "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-max.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8767",
+        "EXPERT_PORT": "19867",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+        "CORE_VIEW": "original",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2"
+      }
+    },
+    {
+      "name": "glmf-mc-original-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1
       ],
       "sparks": [],
       "set": {
-        "GLM5_FLASH_FP8_HEAD": "auto",
-        "ADDR": "0.0.0.0:8716",
-        "EXPERT_PORT": "19816",
+        "ADDR": "0.0.0.0:8768",
+        "EXPERT_PORT": "19868",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
         "EXPERT_BACKEND": "local",
-        "SPARK_COUNT": "0"
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "MODEL_REVISION": "558931fe149f59b49d19b2376a692bd7a12fb8b7",
+        "CORE_VIEW": "original"
       }
     },
     {
@@ -356,9 +328,43 @@
       }
     },
     {
-      "name": "glm53-exl3-max",
+      "name": "glm53-mc-original-min",
       "family": "glm5",
-      "config": "examples/configs/glm53-exl3-k6core-max.config",
+      "config": "examples/configs/glm53-exl3-k4-mc-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8769",
+        "EXPERT_PORT": "19869",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "4",
+        "EXPERT_BACKEND": "spark",
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+        "MODEL_REVISION": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
+        "CORE_VIEW": "original",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_3_HOST": "kiwi",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_LANE_A": "10.55.0.4"
+      }
+    },
+    {
+      "name": "glm53-mc-original-max",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1
@@ -372,39 +378,27 @@
         "moa"
       ],
       "set": {
-        "ADDR": "0.0.0.0:8703",
-        "EXPERT_PORT": "19803",
+        "ADDR": "0.0.0.0:8770",
+        "EXPERT_PORT": "19870",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
+        "EXPERT_BACKEND": "spark",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
+        "MODEL_REVISION": "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e",
+        "CORE_VIEW": "original",
         "SPARK_0_HOST": "ostrich",
         "SPARK_1_HOST": "dodo",
         "SPARK_2_HOST": "emu",
         "SPARK_3_HOST": "kiwi",
         "SPARK_4_HOST": "rhea",
-        "SPARK_5_HOST": "moa"
-      }
-    },
-    {
-      "name": "glm53-exl3-min",
-      "family": "glm5",
-      "config": "examples/configs/glm53-exl3-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8747",
-        "COORDINATOR_GPUS": "1",
-        "EXPERT_PORT": "19847",
-        "SPARK_COUNT": "4",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_2_HOST": "emu",
-        "SPARK_3_HOST": "kiwi"
+        "SPARK_5_HOST": "moa",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_LANE_A": "10.55.0.4",
+        "SPARK_4_LANE_A": "10.55.0.5",
+        "SPARK_5_LANE_A": "10.55.0.6"
       }
     },
     {
@@ -435,34 +429,6 @@
       }
     },
     {
-      "name": "glm53-exlr8-max",
-      "family": "glm5",
-      "config": "examples/configs/glm53-exlr8-max.config",
-      "gpus": [
-        0,
-        1
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi",
-        "rhea",
-        "moa"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8746",
-        "EXPERT_PORT": "19846",
-        "SPARK_COUNT": "6",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_2_HOST": "emu",
-        "SPARK_3_HOST": "kiwi",
-        "SPARK_4_HOST": "rhea",
-        "SPARK_5_HOST": "moa"
-      }
-    },
-    {
       "name": "mimo26-pro-max",
       "family": "mimo_v2",
       "config": "examples/configs/mimo-v26-pro-mxfp4-max.config",
@@ -488,27 +454,6 @@
         "SPARK_3_HOST": "kiwi",
         "SPARK_4_HOST": "rhea",
         "SPARK_5_HOST": "moa"
-      }
-    },
-    {
-      "name": "glmf-exl3-min",
-      "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo"
-      ],
-      "set": {
-        "GLM5_FLASH_FP8_HEAD": "auto",
-        "ADDR": "0.0.0.0:8736",
-        "EXPERT_PORT": "19836",
-        "COORDINATOR_GPUS": "1",
-        "SPARK_COUNT": "2",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo"
       }
     },
     {
@@ -601,9 +546,39 @@
       }
     },
     {
-      "name": "step5-fp8-max",
+      "name": "step5-mc-original-min",
       "family": "step5",
-      "config": "examples/configs/step5-fp8-max.config",
+      "config": "examples/configs/step5-exl3-k4-mc-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8771",
+        "EXPERT_PORT": "19871",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "3",
+        "EXPERT_BACKEND": "spark",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+        "CORE_VIEW": "original",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_LANE_A": "10.55.0.3"
+      }
+    },
+    {
+      "name": "step5-mc-original-max",
+      "family": "step5",
+      "config": "examples/configs/step5-exl3-k4-mc-max.config",
       "gpus": [
         0,
         1
@@ -617,59 +592,27 @@
         "moa"
       ],
       "set": {
-        "ADDR": "0.0.0.0:8743",
-        "EXPERT_PORT": "19843",
+        "ADDR": "0.0.0.0:8772",
+        "EXPERT_PORT": "19872",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
+        "EXPERT_BACKEND": "spark",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
+        "MODEL_REVISION": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
+        "CORE_VIEW": "original",
         "SPARK_0_HOST": "ostrich",
         "SPARK_1_HOST": "dodo",
         "SPARK_2_HOST": "emu",
         "SPARK_3_HOST": "kiwi",
         "SPARK_4_HOST": "rhea",
-        "SPARK_5_HOST": "moa"
-      }
-    },
-    {
-      "name": "step5-nvfp4-min",
-      "family": "step5",
-      "config": "examples/configs/step5-nvfp4-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8744",
-        "EXPERT_PORT": "19844",
-        "COORDINATOR_GPUS": "1",
-        "SPARK_COUNT": "4",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_2_HOST": "emu",
-        "SPARK_3_HOST": "kiwi"
-      }
-    },
-    {
-      "name": "glmf-exlr8-k4-min",
-      "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exlr8-k4-min.config",
-      "gpus": [
-        1
-      ],
-      "sparks": [
-        "ostrich"
-      ],
-      "set": {
-        "ADDR": "0.0.0.0:8750",
-        "EXPERT_PORT": "19850",
-        "RTX_GPUS": "1",
-        "COORDINATOR_GPUS": "1",
-        "SPARK_COUNT": "1",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_0_LANE_A": "10.55.0.1"
+        "SPARK_5_HOST": "moa",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_LANE_A": "10.55.0.4",
+        "SPARK_4_LANE_A": "10.55.0.5",
+        "SPARK_5_LANE_A": "10.55.0.6"
       }
     },
     {

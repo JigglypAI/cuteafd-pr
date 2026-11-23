@@ -787,12 +787,18 @@ def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, spar
 
 
 @pytest.mark.parametrize("name,gpus,sparks,package", [
-    ("step5-fp8-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "fp8/fp8-step5"),
-    ("step5-nvfp4-min", [1], ["ostrich", "dodo", "emu", "kiwi"], "fp8/fp8-step5-nvfp4a4"),
+    ("step5-mc-original-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"], "exl3/exl3-step5-k46"),
+    ("step5-mc-original-min", [1], ["ostrich", "dodo", "emu"], "exl3/exl3-step5-k46"),
 ])
 def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, gpus, sparks, package) -> None:
+    # The gate kit cards the live K4-MC checkpoint; the official FP8 and NVFP4
+    # releases keep their example configs (tested above) but no gate card.
     card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [name])[0]
     assert card["family"] == "step5" and card["gpus"] == gpus and card["sparks"] == sparks
+    values = {**cards.config(card["config"]), **card["set"]}
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC"
+    assert values["MODEL_REVISION"] == "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4"
+    assert values["CORE_VIEW"] == "original"
     assert card["profile"] == "smoke"
     assert cards.slot_needs(card)["spark"] == [package]
     key = tmp_path / "key"

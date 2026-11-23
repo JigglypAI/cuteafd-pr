@@ -95,9 +95,11 @@ and arms for cleanup. Source worktrees are retained for inspection.
 
 ## Subsets, traces, profiles, preflight and resume
 
-- `--kit gate` is the in-repo kit (`scripts/bench/kits/gate`): mimo26-flash-max,
-  qwen38-exl3-min, glmf-exl3-max (2 RTX, 0 Sparks, EXL3) and v41-flash-max on
-  `examples/configs`, with ports of their own.
+- `--kit gate` is the in-repo kit (`scripts/bench/kits/gate`): e.g. mimo26-flash-max,
+  qwen38-exl3-min, glmf-mc-original-max (2 RTX, 0 Sparks, EXL3 K4-MC) and
+  v41-flash-max on `examples/configs`, with ports of their own. Every card loads a
+  checkpoint that is a live `benchmarks/current-matrix.json` cell
+  (`test_gate_kit_cards_load_live_matrix_checkpoints`).
 - `--panels LIST` replaces every card's profile (`baseline` alone for the basic
   card and quick quality, `none` for no server profile). `--levels 1,16` adds a
   client-side code-decode sweep after it (one warm and one measured wave per

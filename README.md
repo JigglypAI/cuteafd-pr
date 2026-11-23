@@ -270,6 +270,11 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-mxfp8-2rtx-4spark-inkling2-mxfp8-max/card.svg"><img src="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-mxfp8-2rtx-4spark-inkling2-mxfp8-max/card.svg" alt="thinkingmachines/Inkling-2-Small-MXFP8 on 2× RTX PRO 6000 @ gpu-powerd 425/425 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/hy4_flash.md"><b>hy4_flash</b></a><br><sub>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="27%" valign="top">pending<br><sub>v7 bring-up, cards not yet measured</sub></td>
+<td width="27%" valign="top">pending<br><sub>v7 bring-up, cards not yet measured</sub></td>
+</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).
