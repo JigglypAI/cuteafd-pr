@@ -2959,6 +2959,24 @@ mod tests {
     }
 
     #[test]
+    fn simulated_5090_layout_uses_the_explicit_physical_sm_count() {
+        use clap::Parser;
+        for (args, sms) in [(&[][..], 170), (&["--physical-sms", "170"][..], 170),
+                            (&["--physical-sms", "188"][..], 188)] {
+            let cli = crate::cli::Cli::try_parse_from([
+                "cuteafd", "plan", "/not-read", "--layout", "--rtx", "2",
+                "--gpu-memory-cap", "32GiB",
+            ].into_iter().chain(args.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(mut plan) = cli.command else { panic!("plan") };
+            plan.memory = cli.memory;
+            let layout = options(&plan).unwrap().layout.unwrap();
+            assert_eq!(layout.rtx_bytes, vec![32 << 30; 2]);
+            // Kimi sizes the drafter on the head rank, a separate GPU in TP2.
+            assert_eq!(layout.coordinator_sms(1), sms);
+        }
+    }
+
+    #[test]
     fn v41_prefix_and_worker_layout_match_launch_arguments() {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
         let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram), ..Default::default() };

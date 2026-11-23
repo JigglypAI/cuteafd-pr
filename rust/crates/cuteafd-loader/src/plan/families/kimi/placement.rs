@@ -289,6 +289,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         use crate::families::kimi_k3::draft::DraftLayout;
         let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let slots = usize::try_from(slots)?;
+        // Live admission resolves all drafter variants on the head owner.
+        let draft_sms = opts.coordinator_sms(head_rank) as usize;
         let layout = if crate::families::glm5::draft_representation::is_dspark(&raw) {
             anyhow::ensure!(!opts.tp2_dflash,
                 "block dSpark uses physical GQA head splits, not TP2_DFLASH");
@@ -296,12 +298,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 else { GlmDraftRepresentation::Bf16Only };
             if gpus==2 && opts.draft_context_window==0 && crate::formats::block_dspark::BlockDsparkConfig::from_json(&raw)?.window.is_some() {
                 let rank=|rank|crate::formats::block_dspark::BlockDsparkRuntimeLayout::for_rank_representation(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{rank}"),
+                    slots,slots.min(8),draft_sms,&format!("kimi/draft/{rank}"),
                     opts.draft_kv_cache,rank,2,head_rank,representation);
                 DraftLayout::BlockTp2 { ranks:Box::new([rank(0)?,rank(1)?]),lead:head_rank }
             } else {
                 DraftLayout::Block(crate::formats::block_dspark::BlockDsparkRuntimeLayout::with_context(snapshot,
-                    slots,slots.min(8),opts.physical_sms.unwrap_or(188) as usize,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation,
+                    slots,slots.min(8),draft_sms,&format!("kimi/draft/{head_rank}"),opts.draft_kv_cache,representation,
                     usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("block draft pool overflow")?,opts.draft_context_window)?)
             }
         } else {
@@ -313,7 +315,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 else { GlmDraftRepresentation::Bf16Only };
             DraftLayout::Mla(draft.serving_runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
                 usize::try_from(context)?,slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?,
-                opts.physical_sms.unwrap_or(188) as usize,0,draft.cache_format(opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
+                draft_sms,0,draft.cache_format(opts.draft_kv_cache))?.with_context_split(opts.tp2_dflash)?)
         };
         match &layout {
             DraftLayout::Block(local)=>{ local.validate_projection_programs(manifest.as_ref().context("block dSpark requires installed projection inventory")?)?; }

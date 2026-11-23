@@ -44,8 +44,7 @@ inline void expert_launch(void** args, int) { recorded_cap=*static_cast<int*>(ar
 
 FP8_HEADER = r"""
 #pragma once
-#define CUTEAFD_V41_FP8_SMS 188
-static const uint32_t grids[] = {752};
+static const uint32_t grids[] = {1000};
 #define CUTEAFD_V41_FP8_VARIANTS \
  {{1,1,32,32,64,0,16,32,16},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,170,1,1}, \
  {{1,1,32,32,128,0,16,32,16},{init,load,quant},{init,load,plan188},{init,load,noop},grids,64,4,1,0,188,1,1}, \
@@ -77,9 +76,10 @@ int main() {
  minor=0;
  for (int dev : {2,5}) {
   device=dev;
+  override_sms=dev==5 ? 220 : 0;
   for (int k : {32,256}) {
    assert(cuteafd_v41_fp8_matrix_initialize(1,k,32,&h)==0);
-   assert(handle(h)->device_sms==(dev==2 ? 170 : 188));
+   assert(handle(h)->device_sms==(dev==2 ? 170 : 220));
    cuteafd_v41_fp8_info_t info;
    assert(cuteafd_v41_fp8_matrix_info(1,k,32,&info)==0);
    assert(info.scratch_bytes==(k==32 && dev==5 ? 128 : 64));
@@ -90,7 +90,7 @@ int main() {
      reinterpret_cast<uint8_t*>(0x20000),reinterpret_cast<uint8_t*>(0x30000),
      reinterpret_cast<void*>(0x40000),info.scratch_bytes,reinterpret_cast<float*>(0x50000),
      reinterpret_cast<uint16_t*>(0x60000),1,nullptr)==0);
-   assert(recorded_grid==(dev==2 ? 680 : 752));
+   assert(recorded_grid==(dev==2 ? 680 : 880));
    if (k==32) assert(recorded_plan==(dev==2 ? 170 : 188));
   }
  }
@@ -114,7 +114,7 @@ EXPERT_HEADER = r"""
 
 INPUT_QUANT_HEADER = r"""
 #pragma once
-static const uint32_t cuteafd_v41_input_quant_grids[] = {752};
+static const uint32_t cuteafd_v41_input_quant_grids[] = {1000};
 #define _mlir_cuteafd_v41_expert_input_quant_cuda_init ::init
 #define _mlir_cuteafd_v41_expert_input_quant_cuda_load_to_device ::load
 #define CUTEAFD_V41_INPUT_QUANT_ENTRY quant
@@ -157,10 +157,11 @@ int main() {
  assert(cuteafd_v41_expert_launch(h,&args)==cudaErrorInvalidDevice);
  for (int dev : {2,5}) {
   device=dev;
+  override_sms=dev==5 ? 220 : 0;
   assert(cuteafd_v41_expert_input_quant_initialize(&h)==0);
   assert(cuteafd_v41_expert_input_quantize_async(h,reinterpret_cast<uint16_t*>(0x10000),
     reinterpret_cast<uint8_t*>(0x20000),1,nullptr)==0);
-  assert(recorded_grid==(dev==2 ? 680 : 752));
+  assert(recorded_grid==(dev==2 ? 680 : 880));
  }
  device=2;
  assert(cuteafd_v41_expert_input_quantize_async(h,reinterpret_cast<uint16_t*>(0x10000),

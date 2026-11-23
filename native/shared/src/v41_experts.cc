@@ -327,8 +327,8 @@ extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
-    return reject_expert_device("v41 expert input-quant", device, major, minor, sms);
+  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR || sms <= 0)
+    return cudaErrorInvalidDevice;
   std::lock_guard<std::mutex> lock(initialization_mutex);
   auto* owner = input_quant.device == device ? &input_quant :
       (peer_input_quant.device == device ? &peer_input_quant :
@@ -350,11 +350,6 @@ extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
   }
   owner->device_sms = sms;
   owner->device = device;
-  if (sms != CUTEAFD_V41_SMS)
-    std::fprintf(stderr,
-                 "cuteafd: v41 input-quant AOT exported on %d SMs; device %d has %d SMs; "
-                 "using the same kernel with grid capped at %d CTAs\n",
-                 int(CUTEAFD_V41_SMS), device, sms, 4 * sms);
   *out = owner;
   return cudaSuccess;
 }

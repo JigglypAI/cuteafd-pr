@@ -55,8 +55,7 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
 
 def dispatch_header(output: Path, manifest: dict) -> None:
     from b12x._lib.quant.mxfp8_rows import mxfp8_rows_quant_aot_grid
-    lines = ['#pragma once', '#include <stdint.h>',
-             '#define CUTEAFD_V41_FP8_SMS 188']
+    lines = ['#pragma once', '#include <stdint.h>']
     lines.append('#include "v41_hc_project.h"')
     prefix = '_mlir_cuteafd_v41_hc_project'
     lines.append('#define CUTEAFD_V41_HC_PROJECT_MODULE {' + ','.join((
@@ -75,10 +74,13 @@ def dispatch_header(output: Path, manifest: dict) -> None:
         groups = variant.get('groups', 1)
         if groups > 1:
             lines.append(f'#include "{label}_quant_rope.h"')
-        grids = [mxfp8_rows_quant_aot_grid(size_k=k, rows=rows, expected_m=variant.get('expected_m', capacity),
-                                         sm_count=188) for rows in range(1, capacity + 1)]
         if groups > 1:
-            grids = [min(rows * 32, 188 * 4) for rows in range(1, capacity + 1)]
+            grids = [rows * 32 for rows in range(1, capacity + 1)]
+        else:
+            # One CTA per K32 block already exceeds the work grid; native
+            # dispatch applies the residency cap from the actual device.
+            grids = [mxfp8_rows_quant_aot_grid(size_k=k, rows=rows, expected_m=variant['expected_m'],
+                                             sm_count=rows * (k // 32)) for rows in range(1, capacity + 1)]
         lines.append('static const uint32_t ' + label + '_grids[] = {' + ','.join(map(str, grids)) + '};')
         info = [1, capacity, k, n, variant['scratch_bytes'],
                 variant['activation_values_offset'], variant['activation_row_scales_offset'],
@@ -98,9 +100,10 @@ def dispatch_header(output: Path, manifest: dict) -> None:
 def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None:
     os.environ['B12X_COMPILE_DISK_CACHE'] = '0'
     os.environ['B12X_COMPILE_MEMORY_CACHE'] = '0'
-    from b12x._lib.aot_target import describe_target
+    from b12x._lib.aot_target import describe_target, target_for
 
     describe_target('sm120')
+    reference_sms = target_for('sm120').multi_processor_count
     import torch
     from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot
     from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
@@ -122,8 +125,10 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 'variants': []}
     for name, n, k in projections:
         for capacity in rows:
+            # Only these four shapes need different tactics on 5090/PRO.
+            # Common GEMMs query the persistent grid at launch.
             dual = name in ('q_a', 'kv') and capacity in (1, 16)
-            for plan_sms in ((170, 188) if dual else (188,)):
+            for plan_sms in ((170, reference_sms) if dual else (reference_sms,)):
                 label = f'v41_{name}_fp8_m{capacity}' + (f'_sm{plan_sms}' if dual else '')
                 groups = 8 if name == 'o_a' else 1
                 expected_m = capacity
