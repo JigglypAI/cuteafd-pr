@@ -127,7 +127,9 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context.filter(|&tokens| tokens > 0).unwrap_or(cfg.max_position),
         context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context.map(|n| n as u64)),
-        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
+        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0),
+        // A selection dump reads back inside the step: serve without startup graphs.
+        graphs: crate::shared::selection_dump::shared("kimi_k3")?.is_none(),
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
         #[cfg(test)] prove_serve_admission: false,
     })

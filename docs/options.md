@@ -1046,6 +1046,21 @@ the readback. All three diagnostics refuse attached CUDA graphs and startup
 capture, so run them on eager arms only. Unset: no readback, no extra launch,
 no stream drain.
 
+`CUTEAFD_DIAG_SELECTION_DUMP=DIR` is a private coordinator-only diagnostic for the
+sparse-selecting families (GLM 5.3, GLM Flash, V4.1, MiniMax M3.1, Kimi K3.1), not a
+launch configuration key; pass it through `wip-cards --arm-env`. Eager decode drains
+the selecting stream after each selector and appends every decode row's selection to
+`DIR/layer-NNN.bin` (`SSEL0001`, one record per row and step, repeated positions kept)
+at the family's native unit, as ascending logical ids: GLM 5.3 and Kimi tokens (GLM
+records only full-indexer layers), GLM Flash 4-token pools, V4.1 compressed rows (2
+tokens at layers 2/8/14, 1 from 20), MiniMax 128-token blocks per KV head (`block * 4 +
+head`). `CUTEAFD_DIAG_SELECTION_DUMP_FROM=N` drops rows before engine position `N`.
+It refuses attached CUDA graphs and context attention placement (use `heads` or
+whole). GLM 5.3 and GLM Flash skip startup graph prewarm and Kimi serves without
+startup graphs while it is set; V4.1 needs `GPU_GRAPH_RESERVE=0` to keep its index
+selection eager (GLM Flash refuses that key, #2586). `scripts/bench/sparse_selection_study.py` reads the files (#2576).
+Unset: no drain, no copy, no behavior change.
+
 `CUTEAFD_DIAG_PEER_WAIT=1` is a private coordinator-only diagnostic for every
 family with a two-GPU head split, not a launch configuration key. Pass it through
 `wip-cards --arm-env ARM:CUTEAFD_DIAG_PEER_WAIT=1`; the launcher forwards every

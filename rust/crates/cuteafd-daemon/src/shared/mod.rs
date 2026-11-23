@@ -41,6 +41,7 @@ pub(crate) mod qwen;
 pub(crate) mod repeat_guard;
 pub(crate) mod rope;
 pub(crate) mod sampler;
+pub(crate) mod selection_dump;
 pub(crate) mod serve;
 pub(crate) mod speculation;
 pub(crate) mod speculation_trace;
