@@ -47,13 +47,13 @@ fn verify_kept(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u3
     let taps=execution.draft.as_ref().context("width oracle needs admitted FIR verifier")?.layout.config.taps.clone();
     let rows=tokens.iter().enumerate().map(|(offset,&token)|VerifyRow{slot:placement.slot,position:placement.len+offset,token:Some(token)}).collect::<Vec<_>>();
     let library=execution.requests.decode.stream.device.library;
-    let template=execution.head.logits.buffer;
     let mut target=super::verify_target::Target::new(execution,std::slice::from_mut(placement));
     let mark=target.checkpoint(&[0])?;
     let result:Result<Vec<u8>>=(||{
         let logits=target.verify(&mark,VerifyRequest{rows:&rows,tap_sites:&taps})?.logits;
-        let bytes=tokens.len()*logits.vocab*4;let mut data=vec![0;bytes];
-        library.copy_d2h(&mut data,Buffer{ptr:logits.ptr.cast_mut(),bytes,..template})?;Ok(data)
+        let values=logits.to_host(library)?;
+        crate::shared::spark_waves::healthy()?;
+        Ok(values.into_iter().flat_map(f32::to_le_bytes).collect())
     })();
     if result.is_err(){target.restore(&mark)?;}
     let result=result?;

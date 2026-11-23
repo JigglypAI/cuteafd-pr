@@ -170,7 +170,11 @@ impl<'a> InklingBackend<'a> {
         }else{
             (self.execution.borrow_mut().decode(&mut placements,&sources,&unit,1)?,Pending::Plain(receipt))
         };
-        for ((placement, _), next) in sequences.iter_mut().zip(placements) { **placement = next; }
+        // A speculative proposal's placements are disposable. Accept carries
+        // the saved FIR mark and publishes only its selected prefix.
+        if !speculative {
+            for ((placement, _), next) in sequences.iter_mut().zip(placements) { **placement = next; }
+        }
         *self.pending.borrow_mut() = Some(pending);
         Ok(Some(logits))
     }
