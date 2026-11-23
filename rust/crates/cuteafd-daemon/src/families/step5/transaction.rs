@@ -1064,7 +1064,10 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             }
             guard.complete = true;
         }
-        super::execution::collect_lane_results(self.staging.iter().map(|stage| stage.stream.drain()))
+        // A skipped peer wait or released Spark wait must not publish stale state.
+        super::execution::collect_lane_results(self.staging.iter().map(|stage| stage.stream.drain()))?;
+        self.staging[0].stream.device.library.check_peer_wait_timeout()?;
+        crate::shared::spark_waves::healthy()
     }
 
     pub fn publish(mut self, accepted: usize) -> Result<()> {
