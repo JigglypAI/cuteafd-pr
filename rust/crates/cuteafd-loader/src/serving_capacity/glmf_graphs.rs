@@ -8,6 +8,136 @@ pub const PLAIN_DECODE_BUCKETS: [usize; 6] = [1, 4, 8, 16, 32, 64];
 pub const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
 use serde::{Deserialize, Serialize};
 
+/// Opt-in exact-row decode/verify graph policy (`GRAPH_EXACT_ROWS` / `--graph-exact-rows`).
+///
+/// - `Off` (default): power-of-2 row buckets, spanning `glm5_flash.decode` on 2-RTX.
+/// - `On` (Reading A, primary): rank-local `glm5_flash.decode_local`, exact row keys,
+///   donor-always with cold lag 8, pinning/prewarming only shapes used in >= 50% of decode
+///   cycles in at least one concurrency band (none on measured traces -> 0 pinned, pure lazy),
+///   reserve = lag-8 working-set soft cap + max(20% soft, 100 MB).
+/// - `Prewarm` (Reading B, A/B arm): same rank-local exact-row policy + lag 8, pinning and
+///   prewarming the cumulative >= 50% hot-set prefix per concurrency band (C1/C4/C8/C16, short+32K).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GlmfExactRows {
+    #[default]
+    Off,
+    On,
+    Prewarm,
+}
+
+impl GlmfExactRows {
+    pub fn is_enabled(self) -> bool { !matches!(self, Self::Off) }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Prewarm => "prewarm",
+        }
+    }
+}
+
+impl std::fmt::Display for GlmfExactRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+}
+
+impl std::str::FromStr for GlmfExactRows {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            "prewarm" => Ok(Self::Prewarm),
+            other => Err(format!("invalid GRAPH_EXACT_ROWS {other:?}; expected off, on, or prewarm")),
+        }
+    }
+}
+
+/// Measured lag-8 working-set soft caps per GPU (bytes, exec-priced upper bound from
+/// `GLM-5.3-Flash-EXL3-K4-MC` original 2+0 traces, rounded to 2 MiB) for exact-row mode.
+/// Reading A (`On`, 0 pinned): 94 MiB RTX0 / 92 MiB RTX1 -> +96 MiB (100 MB) margin = 190/188 MiB reserve.
+/// Reading B (`Prewarm`, 29 pinned): 326 MiB RTX0 / 316 MiB RTX1 -> +96 MiB margin = 422/412 MiB reserve.
+pub fn glmf_exact_soft_caps(mode: GlmfExactRows, gpus: usize) -> Vec<u64> {
+    let pair = match mode {
+        GlmfExactRows::Off => [0, 0],
+        GlmfExactRows::On => [94 << 20, 92 << 20],
+        GlmfExactRows::Prewarm => [326 << 20, 316 << 20],
+    };
+    (0..gpus).map(|rank| pair[rank.min(1)]).collect()
+}
+
+/// Cumulative >= 50% hot-set rows per band (C1/C4/C8/C16, short and 32K) from measured
+/// `K4-MC original` 2+0 `history` (`block=7`) traces — used ONLY for Reading B (`Prewarm`).
+/// Reading A (`On`) pins only shapes with single-shape share >= 50% in some band (none today).
+const READING_B_SHORT_PLAIN: [usize; 1] = [1];
+const READING_B_SHORT_SPEC: [usize; 17] = [3, 11, 13, 14, 15, 18, 26, 28, 29, 32, 33, 34, 35, 36, 62, 63, 64];
+const READING_B_LONG_SPEC: [usize; 11] = [3, 4, 29, 30, 31, 32, 34, 35, 37, 38, 41];
+
+/// Startup prewarm shapes for exact-row mode (`Off` returns empty; `On` / Reading A returns
+/// empty today because no individual shape reaches >= 50% of decode cycles in any band;
+/// `Prewarm` / Reading B returns the 29 cumulative >= 50% band-prefix shapes admitted by the launch).
+pub fn glmf_exact_prewarm_shapes(context: usize, pool_tokens: usize, dense: usize,
+    speculation: bool, decode_rows: usize, mode: GlmfExactRows) -> Vec<(usize, bool, GraphGeometry)> {
+    if mode != GlmfExactRows::Prewarm { return Vec::new(); }
+    let geometries = graph_geometries(context, pool_tokens.div_ceil(PAGE_ROWS), dense);
+    let short_geom = geometries.iter().copied().find(|g| !g.long);
+    // Representative 32K long geometry (pool_width=128, page_stride=512, pool_stride=128) if admitted,
+    // otherwise the narrowest admitted long geometry (all long geometries share one MLA signature).
+    let long_geom = geometries.iter().copied()
+        .find(|g| g.long && g.pool_width == 128 && g.page_stride == 512 && g.pool_stride == 128)
+        .or_else(|| geometries.iter().copied().find(|g| g.long));
+    let mut out = Vec::new();
+    if let Some(short) = short_geom {
+        for &rows in &READING_B_SHORT_PLAIN {
+            if rows <= decode_rows { out.push((rows, false, short)); }
+        }
+        if speculation {
+            for &rows in &READING_B_SHORT_SPEC {
+                if rows <= decode_rows { out.push((rows, true, short)); }
+            }
+        }
+    }
+    if speculation {
+        if let Some(long) = long_geom {
+            for &rows in &READING_B_LONG_SPEC {
+                if rows <= decode_rows { out.push((rows, true, long)); }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `shape` is pinned in exact-row mode.
+/// Reading A (`On`) pins nothing today (0 shapes >= 50% single-shape share);
+/// Reading B (`Prewarm`) pins its 29 prewarmed band-prefix shapes.
+pub fn glmf_exact_pinned(mode: GlmfExactRows, shape: &(usize, bool, GraphGeometry)) -> bool {
+    if mode != GlmfExactRows::Prewarm { return false; }
+    let &(rows, spec, geom) = shape;
+    if !geom.long {
+        if !spec { READING_B_SHORT_PLAIN.contains(&rows) } else { READING_B_SHORT_SPEC.contains(&rows) }
+    } else {
+        spec && READING_B_LONG_SPEC.contains(&rows)
+    }
+}
+
+/// Exact-row working-set reserve inputs (soft cap per GPU, prewarm shapes, measured bootstrap).
+/// Admission prices `reserve = soft_cap + max(20% soft, 100 MB)` via `graph_reserve::current_working_set`.
+#[allow(clippy::too_many_arguments)]
+pub fn glmf_exact_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
+    speculation: bool, gpus: usize, decode_rows: usize, sparks: bool, mode: GlmfExactRows)
+    -> GlmfGraphReserve {
+    let layout = GlmfLayout::resolved(gpus, sparks);
+    let shapes = glmf_exact_prewarm_shapes(context, pool_tokens, dense, speculation, decode_rows, mode);
+    let list = glmf_prewarm_list();
+    let price = list.layout(layout).unwrap_or_else(|| list.priciest());
+    let reserves = glmf_exact_soft_caps(mode, gpus);
+    let bootstraps = (0..gpus).map(|rank| price.executable_bytes(rank)).collect::<Vec<_>>();
+    let executables = reserves.iter().zip(&bootstraps)
+        .map(|(&soft, &boot)| soft.div_ceil(boot.max(1))).collect();
+    GlmfGraphReserve { layout, traced: true, reserves, executables, extra: 0, bootstraps, shapes }
+}
+
 pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {
     if decode_rows <= DECODE_ROWS { decode_rows } else { (3 * sms / 4).clamp(DECODE_ROWS, decode_rows) }
 }
@@ -527,6 +657,21 @@ mod tests {
         assert_eq!(plan.executables, [shapes * 46, shapes * 45]);
         assert_eq!(plan.reserves.len(), 2);
         assert!(plan.reserves[0] >= plan.reserves[1]);
+    }
+
+    #[test]
+    fn exact_row_reading_a_and_b_budgets_and_pins() {
+        // Reading A (On): 0 pinned shapes (no single shape >= 50%), soft caps 94/92 MiB.
+        let a = glmf_exact_graph_reserve(1_048_576, 1_620_480, 2051, true, 2, 64, false, GlmfExactRows::On);
+        assert!(a.shapes.is_empty(), "Reading A prewarms 0 shapes today");
+        assert_eq!(a.reserves, [94 << 20, 92 << 20]);
+        assert!(!glmf_exact_pinned(GlmfExactRows::On, &(1, false, GraphGeometry::keyed(0, 64, 0, false))));
+        // Reading B (Prewarm): 29 pinned band-prefix shapes (C1/C4/C8/C16, short+32K), soft caps 326/316 MiB.
+        let b = glmf_exact_graph_reserve(1_048_576, 1_620_480, 2051, true, 2, 64, false, GlmfExactRows::Prewarm);
+        assert_eq!(b.shapes.len(), 29);
+        assert_eq!(b.reserves, [326 << 20, 316 << 20]);
+        assert!(b.shapes.iter().all(|s| glmf_exact_pinned(GlmfExactRows::Prewarm, s)));
+        assert!(!glmf_exact_pinned(GlmfExactRows::Prewarm, &(2, true, GraphGeometry::keyed(0, 64, 0, false))));
     }
 }
 

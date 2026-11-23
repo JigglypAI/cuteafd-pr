@@ -97,6 +97,8 @@ pub struct LayoutOptions {
     /// Resolve GLM 5.3 Flash's replay records from the admitted expert world (`--replay-records auto`):
     /// `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`.
     pub glmf_auto_replay: bool,
+    /// Opt-in GLM 5.3 Flash exact-row decode/verify graph mode (`--graph-exact-rows`).
+    pub glmf_exact_graph_rows: crate::serving_capacity::glmf_graphs::GlmfExactRows,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -317,6 +319,7 @@ impl Default for LayoutOptions {
             glmf_pool_marks: false,
             glmf_shared_replay: false,
             glmf_auto_replay: false,
+            glmf_exact_graph_rows: crate::serving_capacity::glmf_graphs::GlmfExactRows::Off,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: None,

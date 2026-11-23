@@ -1,7 +1,9 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 
+use cuteafd_loader::serving_capacity::glmf_graphs::GlmfExactRows;
+
 #[derive(Clone, Copy, Default)]
-struct Options { no_prewarm: bool, donor_always: bool, donor_cold_lag: u64 }
+struct Options { no_prewarm: bool, donor_always: bool, donor_cold_lag: u64, exact_rows: GlmfExactRows }
 impl Options {
     fn validate(self) -> anyhow::Result<Self> {
         anyhow::ensure!(self.donor_always || self.donor_cold_lag == 0,
@@ -10,10 +12,14 @@ impl Options {
     }
 }
 static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
-pub(crate) fn configure(no_prewarm: bool, donor_always: bool, donor_cold_lag: u64) -> anyhow::Result<()> {
-    let options = Options { no_prewarm, donor_always, donor_cold_lag }.validate()?;
+pub(crate) fn configure(no_prewarm: bool, donor_always: bool, donor_cold_lag: u64,
+    exact_rows: GlmfExactRows) -> anyhow::Result<()> {
+    let options = Options { no_prewarm, donor_always, donor_cold_lag, exact_rows }.validate()?;
     assert!(OPTIONS.set(options).is_ok(), "graph policy configured twice");
     Ok(())
+}
+pub(crate) fn exact_rows() -> GlmfExactRows {
+    OPTIONS.get().copied().unwrap_or_default().exact_rows
 }
 pub(crate) fn prewarm_enabled() -> bool {
     #[cfg(test)]
@@ -220,10 +226,10 @@ mod tests {
 
     #[test]
     fn donor_cold_lag_requires_donor_always() {
-        use super::Options;
+        use super::{GlmfExactRows, Options};
         for donor_always in [false, true] {
-            assert!(Options { no_prewarm: false, donor_always, donor_cold_lag: 0 }.validate().is_ok());
-            let result = Options { no_prewarm: false, donor_always, donor_cold_lag: 16 }.validate();
+            assert!(Options { no_prewarm: false, donor_always, donor_cold_lag: 0, exact_rows: GlmfExactRows::Off }.validate().is_ok());
+            let result = Options { no_prewarm: false, donor_always, donor_cold_lag: 16, exact_rows: GlmfExactRows::Off }.validate();
             assert_eq!(result.is_ok(), donor_always);
             if let Err(error) = result {
                 assert!(error.to_string().contains("--graph-donor-cold-lag requires --graph-donor-always"));

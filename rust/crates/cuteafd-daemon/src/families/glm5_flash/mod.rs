@@ -2138,6 +2138,7 @@ impl Opened {
                 && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
+            exact_graph_rows: crate::shared::decode_graph::exact_rows(),
  };
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
@@ -3058,10 +3059,16 @@ impl Opened {
                     &admitted_graphs.bootstraps, admitted_graphs.extra)?;
                 let prewarm = admitted_graphs.prewarm_bytes();
                 for (rank, &charge) in admitted_graphs.charged.iter().enumerate() {
-                    let resolved = cuteafd_loader::placement::graph_reserve::current(rank, false,
-                        admitted_graphs.reserves[rank], admitted_graphs.extra).map_err(anyhow::Error::msg)?;
+                    let resolved = if admitted_graphs.exact_rows.is_enabled() {
+                        cuteafd_loader::placement::graph_reserve::current_working_set(rank, admitted_graphs.reserves[rank])
+                    } else {
+                        cuteafd_loader::placement::graph_reserve::current(rank, false,
+                            admitted_graphs.reserves[rank], admitted_graphs.extra)
+                    }.map_err(anyhow::Error::msg)?;
                     tracing::info!(rank, reserve = charge, default = resolved.bytes, source = %resolved.source,
                         prewarm_bytes = prewarm[rank], capture_headroom = resolved.effective_extra_bytes,
+                        soft_margin_floor = resolved.soft_margin_floor,
+                        exact_rows = %admitted_graphs.exact_rows,
                         extra_source = %resolved.extra_source, cap_source = %resolved.cap_source,
                         executables = admitted_graphs.executables[rank], prewarm_shapes = admitted_graphs.shapes,
                         bootstrap = admitted_graphs.bootstraps[rank], "GLM Flash graph reserve");

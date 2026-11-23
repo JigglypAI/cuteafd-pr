@@ -225,6 +225,8 @@ pub struct GlmfInputs<'a> {
     pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
+    /// Opt-in exact-row decode/verify graph policy (`GRAPH_EXACT_ROWS`).
+    pub exact_graph_rows: glmf_graphs::GlmfExactRows,
 }
 
 /// One drafter's exact device request lists on each candidate GPU: the resident
@@ -640,6 +642,7 @@ pub(crate) mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
             drafter_scratch: vec![0; ranks], drafter_requests: None, drafter_bridge: None, requested_pool: None, onboard: default_onboard(),
+            exact_graph_rows: glmf_graphs::GlmfExactRows::Off,
         }
     }
 

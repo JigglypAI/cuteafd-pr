@@ -492,6 +492,14 @@ if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
   [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
   graph_policy_args+=(--graph-donor-cold-lag "$graph_donor_cold_lag")
 fi
+if [[ "$family" == glm5_flash ]]; then
+  case "$(get GRAPH_EXACT_ROWS off)" in
+    off) ;;
+    on) graph_policy_args+=(--graph-exact-rows=on) ;;
+    prewarm) graph_policy_args+=(--graph-exact-rows=prewarm) ;;
+    *) release_die 'GRAPH_EXACT_ROWS must be off, on, or prewarm' ;;
+  esac
+fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;

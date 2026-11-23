@@ -372,6 +372,8 @@ pub struct GlmfGraphs {
     pub extra: u64,
     /// Per-capture bootstrap until the device measures its own capture.
     pub bootstraps: Vec<u64>,
+    /// Exact-row graph mode that sized this reserve (`Off` = legacy power-of-2 buckets).
+    pub exact_rows: glmf_graphs::GlmfExactRows,
 }
 
 impl GlmfGraphs {
@@ -381,20 +383,34 @@ impl GlmfGraphs {
 }
 
 /// A launch's reserve at `context` and `pool_tokens`, from the checked-in list
-/// of its resolved card shape (coordinator devices, Sparks attached or not).
+/// of its resolved card shape (coordinator devices, Sparks attached or not), or
+/// from the measured lag-8 working set when `exact_graph_rows` is enabled.
 fn graph_reserve(i: &GlmfInputs<'_>, context: usize, pool_tokens: usize, sms: usize)
     -> glmf_graphs::GlmfGraphReserve {
-    glmf_graphs::glmf_graph_reserve(context, pool_tokens, i.cfg.dense_context(), i.sequences as usize,
-        i.speculation, i.layers, i.gpus.len(), i.decode_rows as usize, sms, i.spark_ranks > 0)
+    if i.exact_graph_rows.is_enabled() {
+        glmf_graphs::glmf_exact_graph_reserve(context, pool_tokens, i.cfg.dense_context(),
+            i.speculation, i.gpus.len(), i.decode_rows as usize, i.spark_ranks > 0, i.exact_graph_rows)
+    } else {
+        glmf_graphs::glmf_graph_reserve(context, pool_tokens, i.cfg.dense_context(), i.sequences as usize,
+            i.speculation, i.layers, i.gpus.len(), i.decode_rows as usize, sms, i.spark_ranks > 0)
+    }
+}
+
+fn resolve_graph_rank(gpu: usize, graphs: &glmf_graphs::GlmfGraphReserve, exact_rows: glmf_graphs::GlmfExactRows)
+    -> Result<crate::placement::graph_reserve::Resolved, p::Refusal> {
+    if exact_rows.is_enabled() {
+        crate::placement::graph_reserve::current_working_set(gpu, graphs.reserves[gpu])
+    } else {
+        crate::placement::graph_reserve::current(gpu, false, graphs.reserves[gpu], graphs.extra)
+    }.map_err(|error| p::Refusal::InvalidFact(error.to_string()))
 }
 
 /// One opaque per-device graph owner: the whole configured reserve, charged
 /// before KV sizing and independent of the onboarding choice.
-fn graph_components(graphs: &glmf_graphs::GlmfGraphReserve, maximum: u64)
+fn graph_components(graphs: &glmf_graphs::GlmfGraphReserve, exact_rows: glmf_graphs::GlmfExactRows, maximum: u64)
     -> Result<Vec<p::Component>, p::Refusal> {
     (0..graphs.reserves.len()).map(|gpu| {
-        let resolved = crate::placement::graph_reserve::current(gpu, false, graphs.reserves[gpu], graphs.extra)
-            .map_err(|error| p::Refusal::InvalidFact(error.to_string()))?;
+        let resolved = resolve_graph_rank(gpu, graphs, exact_rows)?;
         let id = format!("glmf.graphs.{gpu}");
         let mut component = p::serving::startup_graph_component(&id, p::Location::coordinator(gpu as u8),
             crate::placement::GraphRank::estimated(graphs.executables[gpu], resolved.bytes), maximum)?;
@@ -1054,7 +1070,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     // The graph reserve is one fixed per-device owner, charged once here (before
     // the pool is solved), and independent of the onboarding choice.
     contract.components.extend(graph_components(&graph_reserve(i, i.max_context as usize,
-        (maximum * 256) as usize, sms), maximum)?);
+        (maximum * 256) as usize, sms), i.exact_graph_rows, maximum)?);
     let (rtx_blas, spark_blas): (Vec<_>, Vec<_>) = blas.into_iter()
         .partition(|owner| matches!(owner.location.device, p::Device::Coordinator(_)));
     contract.components.extend(p::serving::blas_components("sm_120", &rtx_blas, maximum, contract.phase_order)?);
@@ -1105,8 +1121,7 @@ impl PreparedGlmf<'_> {
         let mut charged = Vec::with_capacity(i.gpus.len());
         for gpu in 0..i.gpus.len() {
             let id = format!("glmf.graphs.{gpu}");
-            let resolved = crate::placement::graph_reserve::current(gpu, false, prepared.reserves[gpu], prepared.extra)
-                .map_err(|error| p::Refusal::InvalidFact(error.to_string()))?;
+            let resolved = resolve_graph_rank(gpu, &prepared, i.exact_graph_rows)?;
             let source = crate::placement::graph_reserve::source(&id);
             let owner = solved.facts.allowances.iter_mut().find(|owner| owner.source == source)
                 .ok_or_else(|| invalid("missing admitted graph reserve owner"))?;
@@ -1116,7 +1131,8 @@ impl PreparedGlmf<'_> {
             charged.push(resolved.bytes);
         }
         let graphs = GlmfGraphs { shapes: prepared.shapes.len(), reserves: prepared.reserves,
-            executables: prepared.executables, charged, extra: prepared.extra, bootstraps: prepared.bootstraps };
+            executables: prepared.executables, charged, extra: prepared.extra, bootstraps: prepared.bootstraps,
+            exact_rows: i.exact_graph_rows };
         // Exact evaluation only decreases the bound. Reconcile the selected
         // facts, never run a second admission or alter the selected geometry.
         solved.phases = p::evaluate(&solved.facts, &solved.budgets)?;

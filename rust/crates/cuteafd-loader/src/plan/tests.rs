@@ -4213,7 +4213,8 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             // The plan's own startup graph bound (no graph-budget user key).
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard, };
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
+            exact_graph_rows: crate::serving_capacity::glmf_graphs::GlmfExactRows::Off, };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();

@@ -95,6 +95,8 @@ mod core;
 mod native;
 #[path = "engine/layers.rs"]
 mod layers;
+#[path = "engine/local_graph.rs"]
+mod local_graph;
 #[path = "engine/units.rs"]
 mod units;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
@@ -1469,6 +1471,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    exact_graph_rows: cuteafd_loader::serving_capacity::glmf_graphs::GlmfExactRows,
     /// Either prewarm pass runs: the masked bucket owns the FFN boundary, so no real
     /// rows are routed.
     warming_graphs: std::cell::Cell<bool>,
@@ -1515,7 +1518,7 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_prewarm_list, glmf_prewarm_shapes};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfExactRows, GlmfLayout, decode_strides, glmf_exact_pinned, glmf_exact_prewarm_shapes, glmf_prewarm_list, glmf_prewarm_shapes};
 #[allow(unused_imports)]
 use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
@@ -1593,6 +1596,7 @@ fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 struct GraphKey {
     segment: usize,
+    sub: u8,
     rows: usize,
     spec: bool,
     head: bool,
@@ -1606,8 +1610,12 @@ impl GraphKey {
     /// Segment `segment` of a decode step of `rows` rows over `tables`, keyed by its geometry
     /// ([`GraphGeometry::keyed`]: a short step keys no pool-table width or stride).
     fn new(segment: usize, rows: usize, tables: &StepTables) -> Self {
+        Self::new_sub(segment, 0, rows, tables)
+    }
+
+    fn new_sub(segment: usize, sub: u8, rows: usize, tables: &StepTables) -> Self {
         let geometry = GraphGeometry::keyed(tables.pool_width, tables.page_stride, tables.pool_stride, tables.long);
-        Self { segment, rows, spec: tables.spec, head: false, long: geometry.long, pool_width: geometry.pool_width,
+        Self { segment, sub, rows, spec: tables.spec, head: false, long: geometry.long, pool_width: geometry.pool_width,
             page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
     }
 
@@ -1784,6 +1792,7 @@ impl<'a> GlmfEngine<'a> {
             prefill_slots: RefCell::new(Vec::new()),
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family("glm5_flash")),
             use_graphs: Self::graphs_enabled(),
+            exact_graph_rows: crate::shared::decode_graph::exact_rows(),
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
@@ -1832,8 +1841,20 @@ impl<'a> GlmfEngine<'a> {
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
         let layout = self.graph_layout();
-        let shapes = glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
-            sequences.min(self.decode_rows), speculation, &self.buckets, layout);
+        let shapes = if self.exact_graph_rows.is_enabled() {
+            glmf_exact_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
+                speculation, self.decode_rows, self.exact_graph_rows)
+        } else {
+            glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
+                sequences.min(self.decode_rows), speculation, &self.buckets, layout)
+        };
+        if shapes.is_empty() {
+            for rank in 0..self.ranks() { drop(self.decode_workspace_of(rank)?); }
+            self.graphs_warmed.set(true);
+            tracing::info!(layout = %layout, exact_rows = %self.exact_graph_rows,
+                "GLM Flash exact-row graphs: 0 startup shapes pinned/prewarmed; capturing lazily on first use");
+            return Ok(false);
+        }
         ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
             "prewarm peer layer inventory differs from planner");
         ensure!(!self.graphs_warmed.get() && (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().len() == 0),
@@ -1881,21 +1902,40 @@ impl<'a> GlmfEngine<'a> {
         if basis == crate::shared::decode_graph::device::Basis::Bytes {
             tracing::warn!("GLM Flash graph cache uses a per-site byte estimate: no node-rate calibration for this route");
         }
+        let spans_devices = self.graph_spans();
         for rank in 0..self.ranks() {
             let device = if rank == 0 { self.device } else { self.peer()?.device };
-            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], Site {
-                name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
-                bootstrap: bootstraps[rank], basis,
-                spans_devices: self.graph_spans(),
-            })?;
-            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?;
+            let site = if self.exact_graph_rows.is_enabled() {
+                Site {
+                    name: "glm5_flash.decode_local", cycle: Cycle::Decode,
+                    preference: Preference::Adaptive, bootstrap: bootstraps[rank],
+                    basis, spans_devices,
+                }
+            } else {
+                Site {
+                    name: "glm5_flash.decode", cycle: Cycle::Decode,
+                    preference: Preference::Adaptive, bootstrap: bootstraps[rank],
+                    basis, spans_devices,
+                }
+            };
+            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], site)?;
+            let policy = if self.exact_graph_rows.is_enabled() {
+                cuteafd_loader::placement::graph_reserve::current_working_set(rank, bases[rank])?
+            } else {
+                cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?
+            };
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
     }
 
+    fn graph_site_name(&self) -> &'static str {
+        if self.exact_graph_rows.is_enabled() { "glm5_flash.decode_local" } else { "glm5_flash.decode" }
+    }
+
     fn graph_spans(&self) -> bool {
-        super::graph_sites::spans("glm5_flash.decode", self.ranks() > 1 || self.peer.is_some())
+        let declared = !self.exact_graph_rows.is_enabled() && (self.ranks() > 1 || self.peer.is_some());
+        super::graph_sites::spans(self.graph_site_name(), declared)
     }
 
     /// #1612 calibrated no GLM Flash route, so every device estimates in bytes: the site's
@@ -1919,10 +1959,29 @@ impl<'a> GlmfEngine<'a> {
     /// trace prewarms its bootstrap set unpinned and lets ARC decide.
     fn graph_pinned(&self, key: &GraphKey) -> bool {
         let attention = self.weights.layers.get(key.segment).map(|layer| layer.attention);
+        if self.exact_graph_rows.is_enabled() {
+            let shape = (key.rows, key.spec, GraphGeometry {
+                pool_width: key.pool_width, page_stride: key.page_stride,
+                pool_stride: key.pool_stride, long: key.long,
+            });
+            if attention == Some(GlmNextAttention::Mla) {
+                return glmf_exact_pinned(self.exact_graph_rows, &shape);
+            }
+            // Non-MLA / Head keys drop geometry (and Head drops spec): pin if any pinned shape matches.
+            let short = GraphGeometry::keyed(0, MIN_PAGE_STRIDE, 0, false);
+            let long = GraphGeometry::keyed(128, 512, 128, true);
+            if attention.is_none() {
+                return [false, true].into_iter().any(|spec|
+                    glmf_exact_pinned(self.exact_graph_rows, &(key.rows, spec, short))
+                        || glmf_exact_pinned(self.exact_graph_rows, &(key.rows, spec, long)));
+            }
+            return glmf_exact_pinned(self.exact_graph_rows, &(key.rows, key.spec, short))
+                || glmf_exact_pinned(self.exact_graph_rows, &(key.rows, key.spec, long));
+        }
         glmf_prewarm_list().layout(self.graph_layout()).is_some_and(|layout| {
             layout.entries.iter().filter(|entry| entry.pin).any(|entry| {
                 let (rows, spec, geometry) = entry.shape();
-                GraphKey { segment: key.segment, rows, spec, head: false, long: geometry.long,
+                GraphKey { segment: key.segment, sub: key.sub, rows, spec, head: false, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                     pool_stride: geometry.pool_stride }.normalized(attention) == *key
             })
@@ -1935,7 +1994,8 @@ impl<'a> GlmfEngine<'a> {
     /// and captures only persistent engine buffers, so destroying a victim
     /// executable never releases storage an in-flight launch reads.
     fn observe_graphs_completed(&self) -> Result<()> {
-        let spans = self.ranks() > 1 || self.peer.is_some();
+        let site = self.graph_site_name();
+        let spans = self.graph_spans();
         // SAFETY: every GLM Flash graph owner pins `()` (see `GraphOwner::new`
         // in `replay_on`) and its captured pointers are persistent engine
         // buffers, never per-graph allocations.
@@ -1943,7 +2003,7 @@ impl<'a> GlmfEngine<'a> {
             crate::shared::decode_graph::device::observe_completed(&self.library, |visit| {
                 for rank in 0..self.ranks() {
                     let device = if rank == 1 { self.peer()?.device } else { self.device };
-                    visit(device, "glm5_flash.decode", spans,
+                    visit(device, site, spans,
                         &mut *self.graphs_of(rank).borrow_mut())?;
                 }
                 Ok(())
@@ -3835,9 +3895,9 @@ impl<'a> GlmfEngine<'a> {
     /// Production replay is ready once the prewarm finished: before it every segment is eager.
     pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.graphs_warmed.get() }
 
-    /// Physical row count of an ordinary serving verify (an eager step keeps its exact rows).
+    /// Physical row count of an ordinary serving verify (an eager or exact-row step keeps its exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
-        if self.use_graphs { self.buckets.bucket(rows, spec) } else { rows }
+        if self.use_graphs && !self.exact_graph_rows.is_enabled() { self.buckets.bucket(rows, spec) } else { rows }
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
@@ -4275,7 +4335,11 @@ impl<'a> GlmfEngine<'a> {
                 tables, tables1, t, logit_rows, graphed, on_layer);
         }
         if graphed {
-            let result = self.decode_graphed(w, w1, tables, tables1, t, rows, logit_rows);
+            let result = if self.exact_graph_rows.is_enabled() {
+                self.decode_graphed_local(w, w1, tables, tables1, t, rows, logit_rows)
+            } else {
+                self.decode_graphed(w, w1, tables, tables1, t, rows, logit_rows)
+            };
             self.finish_route_checks()?;
             return result;
         }
@@ -6359,7 +6423,7 @@ mod wide_decode_tests {
             for (rows, spec, geometry) in added {
                 assert_eq!((rows, spec), (127, true));
                 let tables = startup_tables(rows, spec, geometry);
-                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, rows, spec, head: false, long: geometry.long,
+                assert_eq!(GraphKey::new(0, rows, &tables), GraphKey { segment: 0, sub: 0, rows, spec, head: false, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride, pool_stride: geometry.pool_stride });
             }
             // The plain set is unchanged.
@@ -6530,7 +6594,7 @@ mod graph_key_tests {
                     (rows, rows * geometry.page_stride, rows * geometry.pool_stride, 0));
                 assert!(tables.positions.iter().all(|&p| p == -1) && tables.kv_slots.iter().all(|&s| s == -1));
                 for segment in [0, 45] {
-                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, rows, spec, head: false,
+                    assert_eq!(GraphKey::new(segment, rows, &tables), GraphKey { segment, sub: 0, rows, spec, head: false,
                         long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                         pool_stride: geometry.pool_stride });
                 }

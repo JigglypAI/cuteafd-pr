@@ -353,6 +353,138 @@ impl<'a> GlmfEngine<'a> {
         self.mla_output(rank, w, layer, cap, rows, true)
     }
 
+    /// Rank-local phase helpers for `engine/local_graph.rs` (`glm5_flash.decode_local`):
+    /// identical kernels and operand order as `context_decode_attention`, with every
+    /// `ContextExchange` push/wait moved outside CUDA graph capture.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn context_local_produce_score(&self, rank: usize, w: &Workspace<'_>, index: usize,
+        layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
+        let t = tables.positions.len();
+        ensure!(t <= DECODE_ROWS, "a context decode step of {t} rows (the exchange holds {DECODE_ROWS})");
+        self.mla_producer(rank, w, index, layer, rows, cap, true)?;
+        self.index_producer(rank, w, index, layer, rows, cap, tables)?;
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let k = self.cfg.index_topk / KPOOL;
+        if !tables.long {
+            let local_lengths = view(&own.local, DECODE_ROWS * k * 4, t * 4)?.ptr;
+            self.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
+                ("local_pools", own.local.buffer.ptr), ("local_lengths", local_lengths),
+                ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
+                ("lengths", w.lengths.buffer.ptr)],
+                &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)])?;
+            // Short steps already have local record indices; compute this GPU's own partial
+            // inside the same local graph before the query exchange.
+            self.context_local_partial(rank, w, index, rows, t, w.query.buffer.ptr, rank)?;
+            return Ok(());
+        }
+        let admitted = split.admitted_pages;
+        ensure!(admitted as u64 == cuteafd_core::coordinator_programs::scored_decode::admitted_pages(
+            split.charged_extent, self.cfg.index_kpool as u64 * 64), "selector deployment capacity changed after admission");
+        let candidates_indices = view(&own.candidates, DECODE_ROWS * k * 4, t * k * 4)?.ptr;
+        let pools = &self.caches_of(rank).index[index].as_ref().context("MLA layer without an index cache")?.pools;
+        let width = Scalar::I32(tables.context_stride as i32);
+        self.run_on(rank, false, "scored_index_topk_decode_m64", &[("q", w.q_fp8.buffer.ptr),
+            ("weights", w.head_weights.buffer.ptr), ("cache", pools.buffer.ptr),
+            ("table", w.pool_table.buffer.ptr), ("lengths", w.cache_lengths.buffer.ptr),
+            ("indices", candidates_indices), ("scores", own.candidates.buffer.ptr),
+            ("scratch", own.topk_scratch.buffer.ptr)],
+            &[rows, Scalar::I32(tables.context_width as i32), width, Scalar::I32(2),
+                Scalar::I32(rank as i32), Scalar::I32(admitted)])
+    }
+
+    pub(super) fn context_local_merge_and_partials(&self, rank: usize, w: &Workspace<'_>, index: usize,
+        rows: Scalar, tables: &StepTables, peer_scores: *mut c_void, peer_indices: *mut c_void,
+        peer_query: *mut c_void) -> Result<()> {
+        let t = tables.positions.len();
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let k = self.cfg.index_topk / KPOOL;
+        let local_lengths = view(&own.local, DECODE_ROWS * k * 4, t * 4)?.ptr;
+        self.run_on(rank, false, "dsa_candidate_merge", &[("scores", peer_scores), ("indices", peer_indices),
+            ("out_scores", own.candidates.buffer.ptr),
+            ("out_indices", view(&own.candidates, DECODE_ROWS * k * 4, t * k * 4)?.ptr),
+            ("table", w.pool_table.buffer.ptr), ("local_slots", own.local.buffer.ptr),
+            ("local_lengths", local_lengths)],
+            &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)])?;
+        self.run_on(rank, false, "index_expand_owned", &[("positions", w.positions.buffer.ptr),
+            ("local_pools", own.local.buffer.ptr), ("local_lengths", local_lengths),
+            ("units", w.pool_table.buffer.ptr), ("indices", w.indices.buffer.ptr),
+            ("lengths", w.lengths.buffer.ptr)],
+            &[rows, Scalar::I32(tables.context_stride as i32), Scalar::I32(rank as i32)])?;
+        self.context_local_partial(rank, w, index, rows, t, peer_query, 1 - rank)?;
+        self.context_local_partial(rank, w, index, rows, t, w.query.buffer.ptr, rank)
+    }
+
+    pub(super) fn context_local_partial(&self, rank: usize, w: &Workspace<'_>, index: usize,
+        rows: Scalar, t: usize, query: *mut c_void, heads_rank: usize) -> Result<()> {
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let out = if heads_rank == rank { &own.own } else { &own.peer };
+        let heads = self.cfg.heads / 2;
+        let lse = view(out, DECODE_ROWS * heads * 512 * 2, t * heads * 4)?.ptr;
+        let kv = self.caches_of(rank).kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
+        let name = split.partial[rank][heads_rank].strip_prefix("glmf_").context("partial program name")?;
+        self.run_on(rank, false, name, &[("q", query), ("cache", kv),
+            ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
+            ("extra_cache", kv), ("extra_indices", w.indices.buffer.ptr),
+            ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
+            ("scratch", own.partial_scratch.buffer.ptr)], &[rows])
+    }
+
+    pub(super) fn context_local_combine_out(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>,
+        rows: Scalar, cap: &str, t: usize, received: (*mut c_void, *mut c_void)) -> Result<()> {
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let heads = self.cfg.heads / 2;
+        let own_lse = view(&own.own, DECODE_ROWS * heads * 512 * 2, t * heads * 4)?.ptr;
+        let [first, second] = crate::shared::peer_split::context::combine_order(
+            rank, (own.own.buffer.ptr, own_lse), received);
+        self.run_on(rank, false, "lse_combine2", &[("o0", first.0), ("l0", first.1),
+            ("o1", second.0), ("l1", second.1), ("sink", split.sink[rank].buffer.ptr),
+            ("out", w.latent.buffer.ptr)], &[rows])?;
+        self.mla_output(rank, w, layer, cap, rows, true)
+    }
+
+    pub(super) fn context_local_slot(&self, rank: usize, index: usize) -> Result<usize> {
+        let ordinal = self.caches_of(rank).mla_ordinal[index].context("MLA layer without an ordinal")?;
+        Ok(crate::shared::peer_split::context::slot(ordinal, 0))
+    }
+
+    pub(super) fn context_local_push_query(&self, rank: usize, w: &Workspace<'_>, slot: usize, t: usize) -> Result<()> {
+        let split = self.context.as_ref().context("context split")?;
+        let pitch = self.cfg.heads / 2 * self.cfg.kv_lora_rank * 2;
+        split.exchange.push_query(rank, slot, w.query.buffer.ptr, pitch, t)
+    }
+
+    pub(super) fn context_local_wait_query(&self, rank: usize, slot: usize) -> Result<*mut c_void> {
+        self.context.as_ref().context("context split")?.exchange.wait_query(rank, slot)
+    }
+
+    pub(super) fn context_local_push_candidates(&self, rank: usize, slot: usize, t: usize) -> Result<()> {
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let k = self.cfg.index_topk / KPOOL;
+        let indices = view(&own.candidates, DECODE_ROWS * k * 4, t * k * 4)?.ptr;
+        split.exchange.push_candidates(rank, slot, own.candidates.buffer.ptr, indices, t)
+    }
+
+    pub(super) fn context_local_wait_candidates(&self, rank: usize, slot: usize) -> Result<(*mut c_void, *mut c_void)> {
+        self.context.as_ref().context("context split")?.exchange.wait_candidates(rank, slot)
+    }
+
+    pub(super) fn context_local_push_partial(&self, rank: usize, slot: usize, t: usize) -> Result<()> {
+        let split = self.context.as_ref().context("context split")?;
+        let own = &split.ranks[rank];
+        let heads = self.cfg.heads / 2;
+        let lse = view(&own.peer, DECODE_ROWS * heads * 512 * 2, t * heads * 4)?.ptr;
+        split.exchange.push_partial(rank, slot, own.peer.buffer.ptr, lse, t)
+    }
+
+    pub(super) fn context_local_wait_partial(&self, rank: usize, slot: usize) -> Result<(*mut c_void, *mut c_void)> {
+        self.context.as_ref().context("context split")?.exchange.wait_partial(rank, slot)
+    }
+
     /// Prefill attention of MLA layer `index` on `rank` under context (module docs): gather the
     /// history into the layer parity's staging view, the head-split programs over it through
     /// identity tables, then this GPU's chunk rows into its pools. Leaves the o_proj partial in

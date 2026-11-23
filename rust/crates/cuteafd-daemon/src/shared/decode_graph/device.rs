@@ -548,6 +548,13 @@ pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement:
         .ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     anyhow::ensure!(cache.reserve == policy.bytes, "graph reserve policy disagrees with admission on device {device}");
+    if policy.soft_margin_floor > 0 {
+        let floor = policy.soft_margin_floor.min(cache.reserve.saturating_sub(cache.soft.granule));
+        if floor > cache.soft.margin {
+            cache.soft.margin = floor;
+            cache.soft.limit = cache.reserve.saturating_sub(cache.soft.margin);
+        }
+    }
     cache.reserve_policy = Some(policy);
     Ok(())
 }
@@ -1456,11 +1463,14 @@ impl DeviceCache {
             }) || (!self.donor_always && !hard && self.charged < self.soft.limit) { return None }
         self.donor_candidates.retain(|_, lanes| lanes.iter().any(|lane| lane.first.is_some()));
         let signature = self.identities.get(&identity).and_then(|id| self.records[id].signature.clone());
-        // Unknown or non-kernel topologies never justify a hard-cap capture.
-        // Below hard, one source inspection can teach a retained ghost its key.
+        // Known empty or mismatched topologies never justify a hard-cap source
+        // capture. An unseen shape (`None`) may still do one host-only source
+        // capture (no device arena allocation) when a cold donor exists, learn
+        // its signature, and transfer the oldest matching unpinned donor; if
+        // nothing matches, `fallback_update` retains the learned signature on
+        // the ghost and returns `Miss::Eager`.
         let any_cold = match signature {
             Some(signature) => self.cold_donor(&signature).is_some(),
-            None if hard => false,
             None => {
                 let signatures: Vec<_> = self.donor_candidates.keys().cloned().collect();
                 signatures.iter().any(|signature| self.cold_donor(signature).is_some())
@@ -1682,9 +1692,26 @@ impl DeviceCache {
         let request = self.update_requests.remove(&id).expect("active update request");
         let signature = self.take_native(id).map(|native| native.signature);
         let identity = request.identity.clone();
+        let cycle = request.site.cycle;
+        let spans_devices = request.site.spans_devices;
         let result = self.miss(request.identity, request.site, request.estimate, request.pinned);
         if let Some(record) = self.identities.get(&identity).and_then(|id| self.records.get_mut(id)) {
             record.signature = signature;
+        } else if let Some(signature) = signature {
+            // Hard-stop fallback returns `Miss::Eager` before `miss()` creates a ghost.
+            // Retain a zero-byte ghost with the learned signature so future misses at
+            // hard stop avoid repeating host-only source capture unless a matching donor exists.
+            let now = self.started.elapsed().as_millis() as u64;
+            self.next_id += 1;
+            let ghost_id = self.next_id;
+            self.identities.insert(identity.clone(), ghost_id);
+            self.records.insert(ghost_id, Record { token: None, last_used: None, identity, cycle, bytes: 0,
+                estimate: 0, list: None, previous: None, next: None, pinned: false, pending_destroy: false,
+                pending_capture: false, frequent: false, nodes: 0, node_rate: 1, graph_rate: 0, parallel_width: 1,
+                spans_devices, oom: None, oom_warned: false, permanently_eager: false, signature: Some(signature),
+                stats: KeyStats::new(now), accounted: Inventory::default() });
+            self.push(ghost_id, List::RecentGhost);
+            self.trim_ghosts();
         }
         result
     }
@@ -2089,8 +2116,11 @@ impl DeviceCache {
         if self.charged >= self.reserve { return }
         let native = self.native_pools();
         if self.soft.measured_bytes.is_none() {
-            let requested = self.soft.margin.max(growth.saturating_mul(2).div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
-            let maximum = self.reserve / 2;
+            let policy_floor = self.reserve_policy.map_or(0, |policy| policy.soft_margin_floor)
+                .min(self.reserve.saturating_sub(self.soft.granule));
+            let requested = self.soft.margin.max(policy_floor)
+                .max(growth.saturating_mul(2).div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
+            let maximum = (self.reserve / 2).max(policy_floor);
             if requested > maximum && !self.margin_clamp_warned {
                 tracing::warn!(device = self.device, hard = self.reserve, requested_margin = requested,
                     clamped_margin = maximum, "graph margin clamped to preserve half the reserve as soft capacity");
@@ -2776,8 +2806,8 @@ mod tests {
     }
 
     #[test]
-    fn hard_cap_unknown_empty_and_mismatched_signatures_never_capture() {
-        for signature in [None, Some(vec![]), Some(vec![42])] {
+    fn hard_cap_empty_and_mismatched_signatures_never_capture() {
+        for signature in [Some(vec![]), Some(vec![42])] {
             let (mut cache, donor) = aged_update_fixture(2, false);
             cache.captured_topology(donor, 10, 1, false);
             // Remember a ghost while soft-limited, as an earlier failed donor
@@ -2795,6 +2825,76 @@ mod tests {
             }
             assert!(cache.update_requests.is_empty());
         }
+    }
+
+    #[test]
+    fn hard_cap_unseen_shape_learns_signature_and_reuses_oldest_cold_donor() {
+        let mut cache = test_cache(-1088, 1000);
+        cache.soft.limit = 500;
+        let pinned = capture(&mut cache, 1, true);
+        cache.register_native(pinned, 100, vec![7, 1]);
+        let oldest = capture(&mut cache, 2, false);
+        cache.register_native(oldest, 101, vec![7, 1]);
+        cache.advance_for_update_fixture(0, 2);
+        let newer = capture(&mut cache, 3, false);
+        cache.register_native(newer, 102, vec![7, 1]);
+        cache.advance_for_update_fixture(0, 2);
+        cache.charged = cache.reserve;
+        // Brand-new key(4) has never been seen: host-only source capture learns its
+        // signature at hard stop and transfers the oldest unpinned matching donor (exec 101).
+        let id = cache.update_ticket(key(4), site(Preference::Capture), None, false)
+            .expect("unseen shape at hard stop should probe cold donor");
+        cache.register_native(id, 0, vec![7, 1]);
+        let mut updated_exec = None;
+        let transferred = cache.finish_update(id, |exec| { updated_exec = Some(exec); Ok(true) },
+            |exec| Ok(exec + 1000), |_| panic!());
+        assert_eq!(updated_exec, Some(101), "must select oldest unpinned donor, never pinned (100) or newer (102)");
+        assert_eq!(transferred, Some(1101));
+        assert_eq!(cache.charged, cache.reserve, "in-place donor transfer allocates zero arena bytes");
+        assert!(cache.owns(pinned, 1) && cache.owns(newer, 1) && !cache.owns(oldest, 1));
+        assert_eq!(cache.counters[&Cycle::Decode].updates_hard, 1);
+
+        // Brand-new key(5) with a mismatched topology fails update once, caches its
+        // signature on a zero-byte ghost, runs eager, and never re-captures while no donor matches.
+        let id2 = cache.update_ticket(key(5), site(Preference::Capture), None, false)
+            .expect("first miss of unseen shape learns signature via host-only capture");
+        cache.register_native(id2, 0, vec![99]);
+        assert!(cache.finish_update(id2, |_| panic!(), |_| panic!(), |_| panic!()).is_none());
+        assert!(matches!(cache.fallback_update(id2), Miss::Eager));
+        assert_eq!(cache.charged, cache.reserve);
+        let ghost_id = cache.identities[&key(5)];
+        assert_eq!(cache.records[&ghost_id].signature.as_deref(), Some(&[99][..]));
+        for _ in 0..5 {
+            assert!(cache.update_ticket(key(5), site(Preference::Capture), None, false).is_none());
+        }
+    }
+
+    #[test]
+    fn working_set_reserve_policy_reconciles_soft_margin_and_2x_growth() {
+        let policy = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, 0, 94 << 20).unwrap();
+        assert_eq!(policy.bytes, 190 << 20);
+        assert_eq!(policy.soft_margin_floor, 96 << 20);
+        let mut cache = DeviceCache::new(-1089, policy.bytes);
+        let floor = policy.soft_margin_floor.min(cache.reserve.saturating_sub(cache.soft.granule));
+        cache.soft.margin = cache.soft.margin.max(floor);
+        cache.soft.limit = cache.reserve.saturating_sub(cache.soft.margin);
+        cache.reserve_policy = Some(policy);
+        assert_eq!(cache.soft.limit, 94 << 20, "soft limit lands directly at measured lag-8 working set");
+        // Small capture growth keeps the 100 MB (96 MiB) policy margin floor without reserve/2 clamp shrinking it.
+        cache.apply_soft_pressure(2 << 20, None);
+        assert_eq!(cache.soft.margin, 96 << 20);
+        assert_eq!(cache.soft.limit, 94 << 20);
+        // Large capture growth (> margin / 2) still grows margin via 2x growth, clamped to reserve/2 (or floor).
+        let big_policy = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, 0, 600 << 20).unwrap();
+        let mut big = DeviceCache::new(-1090, big_policy.bytes);
+        big.soft.margin = big_policy.soft_margin_floor;
+        big.soft.limit = big.reserve.saturating_sub(big.soft.margin);
+        big.reserve_policy = Some(big_policy);
+        assert_eq!(big.soft.margin, 120 << 20);
+        assert_eq!(big.soft.limit, 600 << 20);
+        big.apply_soft_pressure(80 << 20, None);
+        assert_eq!(big.soft.margin, 160 << 20, "2x measured growth dominates when larger than 20% floor");
+        assert_eq!(big.soft.limit, 560 << 20);
     }
 
     #[test]
