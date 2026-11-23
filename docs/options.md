@@ -341,10 +341,11 @@ explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers
 refuses). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
 `off`); `SPECULATOR=off` is the only supported value. `RTX_EXPERT_LAYERS=auto|all|N`,
-`PREFILL_ROWS`, `PREFILL_WAVES` (1–3), `PREFILL_PACKING=unrestricted|exact`,
+`PREFILL_ROWS`, `PREFILL_WAVES` (1–3), `PREFILL_PACKING=unrestricted`,
 `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`, `PREFIX_CACHE_ENTRIES`,
 `HOST_CACHE_BYTES`, `GPU_GRAPH_RESERVE` (with extra/cap keys) and `GRAPH_TRACE`
-follow the shared contracts. Exact prefix restores preserve SWA ring banks, DSA
+follow the shared contracts. `PREFILL_PACKING=exact` refuses at startup: Hy4
+attests no coordinator packed-route cap yet. Exact prefix restores preserve SWA ring banks, DSA
 KV/indexer pages and the Engram rolling token tail byte-identically.
 
 ### MiniMax Serving
