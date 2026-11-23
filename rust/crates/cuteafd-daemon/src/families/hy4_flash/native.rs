@@ -353,8 +353,7 @@ impl<'a> Hy4NativeScratch<'a> {
 }
 
 /// Dequantize an EXL3 `kv_b_proj` (`[local_heads * (nope + v_dim), kv_lora]`) via transient GPU
-/// storage into absorbed BF16 `[w_uk, w_uv]` host bytes (all transient GPU allocations are dropped
-/// before return so no permanent storage lives outside the target arena).
+/// storage into the final absorbed BF16 `[w_uk, w_uv]` views of the target arena.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dequant_kv_b_trellis_absorbed(
     device: Device<'_>,
@@ -367,7 +366,8 @@ pub(crate) fn dequant_kv_b_trellis_absorbed(
     nope: usize,
     v_dim: usize,
     kv_lora: usize,
-) -> Result<Vec<u8>> {
+    destination: Buffer,
+) -> Result<()> {
     let core_layout = CoreWeightLayout::new(proj, TrellisSide::Output, rank, gpus)?;
     let [local_n, local_k] = core_layout.shape;
     ensure!(
@@ -407,12 +407,17 @@ pub(crate) fn dequant_kv_b_trellis_absorbed(
     let eye = Allocation::new(device, eye_bytes.len(), Tag::workspace("hy4_flash/transient-eye"))?;
     let out = Allocation::new(device, local_k * local_n * 2, Tag::workspace("hy4_flash/transient-kv-b-out"))?;
     let stream = Stream::new(device)?;
-    device.run(|| {
+    let uk_bytes = local_heads * kv_lora * nope * 2;
+    ensure!(destination.device_id == device.id && destination.bytes == local_k * local_n * 2,
+        "{}: absorbed KV-B arena extent mismatch", proj.stem);
+    let submitted = device.run(|| {
         device.library.copy_h2d(eye.buffer, &eye_bytes)?;
-        projection.local(local_k, eye.buffer, &weights, scratch.scratch.as_ref().unwrap(), out.buffer, stream.raw)
-    })?;
-    stream.drain()?;
-    let mut y_bytes = vec![0u8; local_k * local_n * 2];
-    device.run(|| device.library.copy_d2h(&mut y_bytes, out.buffer))?;
-    super::weights::pack_kv_b_absorbed_from_transposed(&y_bytes, local_heads, nope, v_dim, kv_lora)
+        projection.local(local_k, eye.buffer, &weights, scratch.scratch.as_ref().unwrap(), out.buffer, stream.raw)?;
+        // SAFETY: W^T is produced on this stream; the disjoint UK/UV views
+        // exhaust the validated destination and the stream drains before return.
+        unsafe { device.library.load_kvb_absorb_transposed(out.buffer.ptr, destination.ptr,
+            destination.ptr.wrapping_byte_add(uk_bytes), local_heads, nope, v_dim, kv_lora, stream.raw) }
+    });
+    stream.drain_or_abort("Hy4 KV-B dequant/absorb");
+    submitted
 }

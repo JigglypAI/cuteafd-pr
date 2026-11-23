@@ -21,6 +21,9 @@ extern "C" int32_t cuteafd_load_narrow_i64_i32(const void* src, void* dst, int64
                                                uint32_t* invalid, void* stream);
 extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv, int64_t h0, int64_t heads,
                                            int64_t nope, int64_t v, int64_t lat, void* stream);
+extern "C" int32_t cuteafd_load_kvb_absorb_transposed(const void* kv_b, void* uk, void* uv,
+                                                      int64_t heads, int64_t nope, int64_t v, int64_t lat,
+                                                      void* stream);
 extern "C" int32_t cuteafd_load_kvb_split_fp8(const void* kv_b, const void* grid, void* uk, void* uk_scale, void* uv,
                                               void* uv_scale, int64_t row0, int64_t heads, int64_t nope, int64_t v,
                                               int64_t lat, void* stream);
@@ -108,6 +111,26 @@ int transforms() {
     std::fprintf(stderr, "absorb layout differs from kv_b\n");
     return 1;
   }
+  // Compact Hy4 loads W^T, not W. Check full BF16 payloads against the
+  // already-attested row-major device absorption on both head shards.
+  const int64_t cols = share * (nope + v);
+  uint16_t* w_t = nullptr;
+  CHECK(cudaMalloc(&w_t, cols * lat * 2));
+  std::vector<uint16_t> transposed(cols * lat);
+  for (int64_t rank = 0; rank < 2; ++rank) {
+    for (int64_t c = 0; c < lat; ++c)
+      for (int64_t r = 0; r < cols; ++r)
+        transposed[c * cols + r] = kv_b[(rank * cols + r) * lat + c];
+    CHECK(cudaMemcpy(w_t, transposed.data(), transposed.size() * 2, cudaMemcpyHostToDevice));
+    CHECK(cudaError_t(cuteafd_load_kvb_absorb_transposed(w_t, uk, uv, share, nope, v, lat, nullptr)));
+    CHECK(cudaMemcpy(k.data(), uk, k.size() * 2, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(w.data(), uv, w.size() * 2, cudaMemcpyDeviceToHost));
+    for (int64_t i = 0; i < int64_t(k.size()); ++i)
+      if (k[i] != lq::absorb_uk(kv_b, rank * share, nope, v, lat, i)) return 1;
+    for (int64_t i = 0; i < int64_t(w.size()); ++i)
+      if (w[i] != lq::absorb_uv(kv_b, rank * share, nope, v, lat, i)) return 1;
+  }
+  CHECK(cudaFree(w_t));
   cudaFree(uk); cudaFree(uv); cudaFree(wide); cudaFreeHost(kv_b); cudaFreeHost(src);
   std::printf("GPU load widen + kv_b absorb exact\n");
   return split_fp8();

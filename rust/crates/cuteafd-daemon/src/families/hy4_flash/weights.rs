@@ -498,7 +498,8 @@ fn pack_kv_b_absorbed(
 
 /// Pack column-major `W^T [kv_lora, local_heads * (nope + v_dim)]` BF16 (as returned by
 /// `Projection::local(I_kv_lora)` on EXL3 `kv_b_proj`) into `[w_uk, w_uv]` identical to `pack_kv_b_absorbed`.
-pub(crate) fn pack_kv_b_absorbed_from_transposed(
+#[cfg(test)]
+fn pack_kv_b_absorbed_from_transposed(
     transposed: &[u8],
     local_heads: usize,
     nope: usize,
@@ -645,36 +646,27 @@ impl<'a> Hy4RankWeights<'a> {
                 }
 
                 let alloc = arena.view(name, view_meta.bytes())?;
+                let stem = name.strip_suffix(".weight").unwrap_or(name);
+                if let Some(proj) = model.core.get(stem).filter(|_| stem.ends_with(".self_attn.kv_b_proj")) {
+                    let local_heads = (proj.shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
+                    dequant_kv_b_trellis_absorbed(device, programs, checkpoint, proj, rank, gpus, local_heads,
+                        cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, alloc.buffer)?;
+                    views.insert(name.clone(), alloc);
+                    continue;
+                }
                 let upload_bytes: Vec<u8> = if let Some(packed) = read_packed_engram(checkpoint, cfg, name)? {
                     packed
                 } else {
-                    let stem = name.strip_suffix(".weight").unwrap_or(name);
                     if stem.ends_with(".self_attn.kv_b_proj") {
-                        if let Some(proj) = model.core.get(stem) {
-                            let local_heads = (proj.shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
-                            dequant_kv_b_trellis_absorbed(
-                                device,
-                                programs,
-                                checkpoint,
-                                proj,
-                                rank,
-                                gpus,
-                                local_heads,
-                                cfg.qk_nope_dim,
-                                cfg.v_head_dim,
-                                cfg.kv_lora_rank,
-                            )?
+                        let (raw, dtype, shape) = read_tensor_bytes(checkpoint, name)?;
+                        ensure!(dtype == DType::Bf16 && shape.len() == 2, "bad kv_b_proj shape for {name}");
+                        let sliced = if gpus == 2 {
+                            slice_2d(&raw, shape[0], shape[1], 2, Axis::Rows, rank, gpus)
                         } else {
-                            let (raw, dtype, shape) = read_tensor_bytes(checkpoint, name)?;
-                            ensure!(dtype == DType::Bf16 && shape.len() == 2, "bad kv_b_proj shape for {name}");
-                            let sliced = if gpus == 2 {
-                                slice_2d(&raw, shape[0], shape[1], 2, Axis::Rows, rank, gpus)
-                            } else {
-                                raw
-                            };
-                            let local_heads = (shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
-                            pack_kv_b_absorbed(&sliced, local_heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank)?
-                        }
+                            raw
+                        };
+                        let local_heads = (shape[0] / gpus) / (cfg.qk_nope_dim + cfg.v_head_dim);
+                        pack_kv_b_absorbed(&sliced, local_heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank)?
                     } else {
                         let ckpt_name = if checkpoint.contains_tensor(name) {
                             name.clone()
