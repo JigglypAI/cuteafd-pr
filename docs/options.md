@@ -94,6 +94,12 @@ bounds cases per arm; each case's prime completes before its warm measurement.
 The same map works through the run API, smoke `panel_config` and wip-cards;
 unknown settings fail validation. This opt-in adds no launch key or env knob.
 
+Smoke entries take `"sweep_verify":{"shapes":["4x8","5,4x7","4x8@64"],"context":1024,
+"repeats":20}` (wip-cards `--verify-shapes`, [details](wip-cards.md#subsets-traces-profiles-preflight-and-resume))
+for warmed verify-only exact-shape timing on GLM Flash and GLM 5.3; it runs instead
+of `levels`/`prefill_lengths`. It adds no launch key: the server takes it as an
+authenticated benchmark probe (`verify_timing`) and refuses it while requests are in flight.
+
 Draft acceptance rate remains accepted draft tokens / proposed draft tokens.
 Acceptance length is **1 + accepted draft tokens / draft verify passes**: one
 bonus/target token per draft pass, including passes accepting no draft tokens.

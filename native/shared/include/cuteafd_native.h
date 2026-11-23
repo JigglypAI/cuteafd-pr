@@ -365,6 +365,9 @@ cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_even
 cuteafd_status_t cuteafd_cuda_graph_census_begin(void* cuda_stream, const char* bank,
     uint64_t rows, int32_t replay, int32_t arm, void** token);
 cuteafd_status_t cuteafd_cuda_graph_census_end(void* token);
+// Benchmark phase ranges (NVTX 3 push/pop on the calling thread).
+cuteafd_status_t cuteafd_nvtx_range_push(const char* name);
+cuteafd_status_t cuteafd_nvtx_range_pop(void);
 // Prepare before Ready/capture, on the execution thread/device. Each stream
 // retains its own 4 MiB workspace; the no-argument form prepares stream zero.
 cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* cuda_stream);

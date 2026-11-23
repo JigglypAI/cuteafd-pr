@@ -112,6 +112,36 @@ and arms for cleanup. Source worktrees are retained for inspection.
   drain; output-only tok/s includes the time spent on refill prefills. See
   [benchmark panel configuration](options.md#benchmark-panel-configuration)
   for window metadata and the explicit uniform-emission overlap estimate.
+- `--panels none --verify-shapes '4x8;5,4x7;8x8;4x8@64'` replaces the decode
+  sweep with warmed verify-only exact-shape timing (#2460): each `;`-separated
+  shape lists per-request verify rows (`ROWS` or `ROWSxCOUNT`, so `5,4x7` is C8
+  at R=33), optionally `@B` to pad to a forced bucket B. B must be a bucket
+  serving itself pads to (a fixed point of the family's bucket map: the padded
+  ladder, or every row count under exact-row graphs) and at least R's natural
+  bucket, so same-R/different-B isolates padding cost without new graph
+  geometry. The server runs the shapes through its production verify step
+  (captured graphs, real padding) on cold scratch sequences of
+  `--verify-context` (default 1024) prefilled tokens each, one untimed pass,
+  then `--verify-repeats` (default 20) timed steps per shape in one load. Only
+  an idle server takes the probe, whose scratch pages must fit without
+  evicting retained prefixes. Sequences are reset after every step and
+  nothing is committed. A greedy reference decode before the probes,
+  restored from the prefix cache after them, must reproduce every token and
+  row hash, or the card fails `measurement`. `sweep.json` `verify` and the
+  summary's `verify_shapes` give per shape R, B, natural B, contexts,
+  synchronized verify and selection medians, and graph captures/misses/eager
+  runs during the timed steps (`graphed` is true only with none). With
+  `--set CARD:PROFILE=nsys` the window frames the timed pass, which carries NVTX
+  ranges per sample (`verify SHAPE R= B=`), per layer segment (`L<i>
+  attention`, `L<i> attention+dense`, `head`), MoE (`L<i> moe R/B`, `router`,
+  `experts`, `exchange wait`; GLM 5.3 `L<i> experts exchange R/B`) and `select`.
+  They are host ranges around graph launches: with node tracing, a captured
+  segment's kernels fall in its range, so attention/dense versus MoE/exchange
+  split per layer, and kernel names split inside a segment. Under a head
+  split, the second GPU's segments fall only in the sample range: split them
+  by device. Families: GLM
+  Flash and GLM 5.3; another family adopts it by implementing
+  `shared::probe::verify_timing::VerifyTarget` over its serving verify step.
 - `--panels baseline,spec_lossless_set` adds the lossless merge gate: every
   case of `scripts/bench/fixtures/spec-lossless-set-v1.json` (or
   `--lossless-set FILE`, `[{id, prompt, nonce}]` with the full nonce string)

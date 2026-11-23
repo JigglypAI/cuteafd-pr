@@ -740,6 +740,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             Ok(tokens) => tokens,
                             Err(error) => { reject(&job, format!("{error:#}")); continue; }
                         };
+                        if let Some(timing) = probe::verify_timing::admit(&job.probe, busy || !media.is_empty()) {
+                            verify_timing(engine, opened, &family, &mut cache, &mut selector,
+                                transport.as_deref_mut(), runtime, job, tokens, timing);
+                            continue;
+                        }
                         let events = job.events.clone();
                         let (prompt, mut request_media, jobs) = match ml4_media::prepare(job, tokens, expander,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
@@ -1179,6 +1184,82 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// plan, verify on the lane's decode link, select, emit and commit. `None`
 /// when the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
+/// The serving decode path the verify-timing probe drives.
+struct TimingTarget<'r, 'e, 'l, 'a> {
+    engine: &'r GlmEngine<'e>,
+    transport: Option<&'r mut SparkLink<'l>>,
+    runtime: &'r tokio::runtime::Runtime,
+    selector: &'r mut TokenSelector<'a>,
+    logits: Option<crate::shared::token_io::DeviceLogits>,
+}
+
+impl probe::verify_timing::VerifyTarget for TimingTarget<'_, '_, '_, '_> {
+    type Placement = GlmPlacement;
+    fn prefill(&mut self, placement: &mut GlmPlacement, tokens: &[u32]) -> Result<()> {
+        let experts = self.transport.as_deref_mut().map(|t| (t, self.runtime));
+        self.engine.prefill_device(placement, tokens, experts, 1)?.context("verify timing needs every layer")?;
+        Ok(())
+    }
+    fn verify(&mut self, step: &mut [(&mut GlmPlacement, usize)], tokens: &[u32], forced: Option<usize>)
+        -> Result<probe::verify_timing::Buckets> {
+        let experts = self.transport.as_deref_mut().map(|t| (t, self.runtime));
+        let (logits, buckets) = self.engine.verify_timing_device(step, tokens, experts, forced)?;
+        self.logits = Some(logits.context("verify timing needs every layer")?);
+        Ok(buckets)
+    }
+    fn select(&mut self, batch: &SelectBatch) -> Result<usize> {
+        Ok(self.selector.select(self.logits.as_ref().context("selection before a verify")?, batch)?.len())
+    }
+    fn synchronize(&mut self) -> Result<()> { self.engine.synchronize() }
+    fn len(placement: &GlmPlacement) -> usize { placement.len }
+    fn reset(placement: &mut GlmPlacement, len: usize) { placement.len = len; }
+    fn replay_ready(&self) -> bool { self.engine.production_replay_ready() }
+}
+
+/// Runs a verify-timing probe on scratch sequences of an idle server: cold pages that fit the
+/// free pool without evicting retained prefixes, no drafter slot, nothing captured or committed;
+/// every page goes back before the next request.
+#[allow(clippy::too_many_arguments)]
+fn verify_timing<'a>(engine: &GlmEngine<'_>, opened: &Opened, family: &GlmPrefix<'_, 'a>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, selector: &mut TokenSelector<'_>, transport: Option<&mut SparkLink<'_>>,
+    runtime: &tokio::runtime::Runtime, job: NativeRequest, tokens: Vec<u32>,
+    timing: Result<cuteafd_api::openai::probe::verify_timing::VerifyTiming>) {
+    let probe = job.probe.clone().expect("verify timing is a probe");
+    let mut placements: Vec<GlmPlacement> = Vec::new();
+    let result = (|| -> Result<cuteafd_api::openai::probe::verify_timing::VerifyTimingRecord> {
+        let timing = timing?;
+        let capacity = timing.context + timing.max_rows() + 1;
+        ensure!(capacity < engine.max_context, "verify timing rows exceed the context");
+        ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "verify timing needs the routed experts");
+        probe::admitted(&job.probe, "glm5", &tokens, 0);
+        for _ in 0..timing.sequences() {
+            let need = cache.pool().need_for(0..cache.pool().pages_for(capacity));
+            ensure!(cache.pool().fits(need), "verify timing scratch pages do not fit the free pool without eviction");
+            let admitted = cache.admit_cold(family, capacity, capacity, |pages| GlmPlacement { pages, len: 0, draft_slot: None })
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            placements.push(admitted.placement);
+        }
+        let mut target = TimingTarget { engine, transport, runtime, selector, logits: None };
+        probe::verify_timing::run(&mut target, Some(&opened.library), "glm5", &timing, &tokens, &mut placements)
+    })();
+    // Drained before release: the scratch pages' last readers are complete.
+    let drained = engine.synchronize();
+    let mut slots = Vec::new();
+    for placement in &placements { release(family, cache, &mut slots, placement, None); }
+    match result.and_then(|record| drained.map(|()| record)) {
+        Ok(record) => {
+            probe.verify_timing(record);
+            let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: Some(opened.view.fingerprint().to_owned()),
+                prompt_usage: PromptUsage { prompt_tokens: probe.record().prompt_ids.len(), prompt_cache_hit_tokens: 0 } }));
+            let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+        }
+        Err(error) => {
+            probe.fail(format!("verify timing: {error:#}"));
+            let _ = job.events.send(Err(NativeFailure::BadRequest(format!("verify timing: {error:#}"))));
+        }
+    }
+}
+
 async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Opened,
     transport: &mut Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, phases: &mut [f64; 8],
     active: &mut Vec<Active<'_>>, shared: &mut Option<DraftPolicy>,

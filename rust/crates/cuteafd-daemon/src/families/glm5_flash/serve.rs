@@ -945,6 +945,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                         let Some(tokens) = crate::shared::api::admission_result(&job.events,
                             probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
+                        if let Some(timing) = probe::verify_timing::admit(&job.probe, busy || !media.is_empty()) {
+                            verify_timing(engine, opened, &family, &mut cache, &mut selector, &mut free_kda, job, tokens, timing);
+                            continue;
+                        }
                         let events = job.events.clone();
                         let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, &config,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
@@ -1312,6 +1316,84 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
     })
+}
+
+/// The serving decode path the verify-timing probe drives.
+struct TimingTarget<'r, 'e, 'a> {
+    engine: &'r GlmfEngine<'e>,
+    library: &'r cuteafd_ffi::NativeLibrary,
+    selector: &'r mut TokenSelector<'a>,
+    logits: Option<crate::shared::token_io::DeviceLogits>,
+}
+
+impl probe::verify_timing::VerifyTarget for TimingTarget<'_, '_, '_> {
+    type Placement = GlmfPlacement;
+    fn prefill(&mut self, placement: &mut GlmfPlacement, tokens: &[u32]) -> Result<()> {
+        self.engine.prefill_device(placement, tokens)?.context("verify timing needs every layer")?;
+        Ok(())
+    }
+    fn verify(&mut self, step: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32], forced: Option<usize>)
+        -> Result<probe::verify_timing::Buckets> {
+        let (logits, buckets) = self.engine.verify_timing_device(step, tokens, forced)?;
+        self.logits = Some(logits.context("verify timing needs every layer")?);
+        Ok(buckets)
+    }
+    fn select(&mut self, batch: &SelectBatch) -> Result<usize> {
+        Ok(self.selector.select(self.logits.as_ref().context("selection before a verify")?, batch)?.len())
+    }
+    fn synchronize(&mut self) -> Result<()> { self.engine.synchronize() }
+    fn len(placement: &GlmfPlacement) -> usize { placement.len }
+    // A speculative step leaves the KDA state at the start; a plain one (one row per request)
+    // advances it in place, which only changes this scratch slot's later timing inputs.
+    fn reset(placement: &mut GlmfPlacement, len: usize) { (placement.len, placement.kda_len) = (len, len); }
+    fn replay_ready(&self) -> bool { self.engine.production_replay_ready() }
+}
+
+/// Runs a verify-timing probe on scratch sequences of an idle server: cold units that fit the
+/// free pool without evicting retained prefixes, no drafter ring, nothing captured or committed;
+/// every unit and KDA slot goes back before the next request.
+#[allow(clippy::too_many_arguments)]
+fn verify_timing<'a>(engine: &GlmfEngine<'_>, opened: &Opened, family: &GlmfPrefix<'_, 'a>,
+    cache: &mut PrefixCache<CudaCopyEngine<'a>>, selector: &mut TokenSelector<'_>, free_kda: &mut Vec<i32>,
+    job: NativeRequest, tokens: Vec<u32>, timing: Result<cuteafd_api::openai::probe::verify_timing::VerifyTiming>) {
+    let probe = job.probe.clone().expect("verify timing is a probe");
+    let mut placements: Vec<GlmfPlacement> = Vec::new();
+    let result = (|| -> Result<cuteafd_api::openai::probe::verify_timing::VerifyTimingRecord> {
+        let timing = timing?;
+        let capacity = timing.context + timing.max_rows() + 1;
+        anyhow::ensure!(capacity < engine.max_context, "verify timing rows exceed the context");
+        anyhow::ensure!(timing.sequences() <= free_kda.len(), "verify timing needs {} KDA slots, {} free",
+            timing.sequences(), free_kda.len());
+        probe::admitted(&job.probe, "glm5_flash", &tokens, 0);
+        for _ in 0..timing.sequences() {
+            let need = cache.pool().need_for(0..cache.pool().pages_for(capacity));
+            anyhow::ensure!(cache.pool().fits(need), "verify timing scratch units do not fit the free pool without eviction");
+            let kda = free_kda.pop().context("KDA slot")?;
+            match cache.admit_cold(family, capacity, capacity, |units| GlmfPlacement::new(units, kda)) {
+                Ok(admitted) => placements.push(admitted.placement),
+                Err(error) => { free_kda.push(kda); return Err(anyhow::anyhow!("{error:#}")); }
+            }
+        }
+        let mut target = TimingTarget { engine, library: &opened.library, selector, logits: None };
+        let library = target.library;
+        probe::verify_timing::run(&mut target, Some(library), "glm5_flash", &timing, &tokens, &mut placements)
+    })();
+    // Drained before release: the scratch units' last readers are complete.
+    let drained = engine.synchronize();
+    let mut slots = Vec::new();
+    for placement in &placements { release(family, cache, free_kda, &mut slots, placement, None); }
+    match result.and_then(|record| drained.map(|()| record)) {
+        Ok(record) => {
+            probe.verify_timing(record);
+            let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: Some(opened.view.fingerprint().to_owned()),
+                prompt_usage: PromptUsage { prompt_tokens: probe.record().prompt_ids.len(), prompt_cache_hit_tokens: 0 } }));
+            let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+        }
+        Err(error) => {
+            probe.fail(format!("verify timing: {error:#}"));
+            let _ = job.events.send(Err(NativeFailure::BadRequest(format!("verify timing: {error:#}"))));
+        }
+    }
 }
 
 /// Lane-owned decode state: GLM Flash's only lane (`LaneSupport::One`). Per

@@ -1767,6 +1767,8 @@ native_symbols! {
     cuteafd_cuda_event_elapsed_ms: CudaEventElapsedMsFn,
     cuteafd_cuda_graph_census_begin: unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char, u64, i32, i32, *mut *mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
+    cuteafd_nvtx_range_push: unsafe extern "C" fn(*const std::ffi::c_char) -> CuteafdStatus,
+    cuteafd_nvtx_range_pop: unsafe extern "C" fn() -> CuteafdStatus,
     cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
     cuteafd_cuda_graph_end_capture_topology: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize, *mut usize, *mut i32) -> CuteafdStatus,
@@ -3087,6 +3089,22 @@ impl NativeLibrary {
         let end: End = self.cuteafd_cuda_graph_census_end()?;
         let status = unsafe { end(token) };
         self.status_to_result("cuteafd_cuda_graph_census_end", status)
+    }
+
+    /// Opens an NVTX range named `name` on this thread (closed by [`Self::nvtx_range_pop`]).
+    pub fn nvtx_range_push(&self, name: &std::ffi::CStr) -> Result<()> {
+        let push = self.cuteafd_nvtx_range_push()?;
+        // SAFETY: the export copies the NUL-terminated name before returning.
+        let status = unsafe { push(name.as_ptr()) };
+        self.status_to_result("cuteafd_nvtx_range_push", status)
+    }
+
+    /// Closes this thread's innermost NVTX range.
+    pub fn nvtx_range_pop(&self) -> Result<()> {
+        let pop = self.cuteafd_nvtx_range_pop()?;
+        // SAFETY: the export takes no arguments.
+        let status = unsafe { pop() };
+        self.status_to_result("cuteafd_nvtx_range_pop", status)
     }
 
     #[track_caller]
