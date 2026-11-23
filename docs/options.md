@@ -119,13 +119,13 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | --- | --- | --- | --- | --- |
 | `DECODE_LANES` | V4.1 | `DECODE_LANES=1` (default `2`; one lane at `CONCURRENCY=1`) | One decode batch of up to `min(CONCURRENCY, 32)` requests instead of two independent lanes; the second lane's workspaces, graphs, Spark link and decode execution return to the KV pool. V4.1 max (2 RTX PRO 6000 + 6 Sparks, dSpark), one interleaved matched-prompt launch per arm on `53f461beff` (2026-11-23, no power-cap or thermal slowdown): one/two-lane code-decode ratio C1/C2/C4/C8/C16 0.97/1.03/1.02/0.78/0.98 under `DRAFT_POLICY=history` and 1.05/1.02/0.77/0.84/0.73 at `DRAFT_LENGTH=7`. KV pool 7,520,768 to 8,007,680 tokens (+6.5%). Strict lossless 10/10 on every arm (#2460). | No precision change; one lane splits the 64-row verify budget across all requests (4 rows/request at C16 instead of 8). |
 | `DRAFT_CONTEXT_WINDOW` | Kimi K3 | `DRAFT_CONTEXT_WINDOW=2048` (default `0`, native) | Bound full-context draft KV; unmeasured. Lithos K3.1 uses 40 MiB BF16 or 21.25 MiB FP8 per sequence at window 2048, instead of 20,480 or 10,880 bytes per token in the full-context pool. | Changes draft attention/acceptance, not verified target output. Native full context is retained at 0. |
-| `GRAPH_PREWARM` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash | `GRAPH_PREWARM=off` (default `on`) | Skip startup prewarm of rank-local graph sites; they capture lazily on first use. Spanning (cross-device) sites always prewarm, because they cannot be captured after readiness (#1878). With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). V4.1 max (2 RTX + 6 Sparks, dSpark): one prompt-matched launch per arm on dev `21376c2ded` (2026-11-19, no throttling), C1 173.8 → 180.6 tok/s (1.039×), C16 1010.6 → 1046.9 tok/s (1.036×), readiness 30.68 → 28.15 s, strict lossless 10/10 on both. `off` defers rank-local captures to first use in early serving, building a subset of the `on` warm set; startup graph arena fell from ~1.24 GB to 4–6 MiB per GPU. Neither arm captured during C1; C16 warm-up recorded 910 → 8,022 capture attempts and the timed wave 182 → 1,638 (#2506). Other two-GPU max cards (off/on ratios, one launch per arm on one seal, 2026-11-19, no throttling): GLM Flash C1 1.11 / C16 0.97; Kimi K3.1 MC C1 1.00 / C16 1.02; Inkling MC (split head) C1 1.12 / C16 1.05; readiness at most 1.5 s faster. Those pairs passed strict lossless 10/10 with identical fidelity. Other families unmeasured. | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
-| `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
-| `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | Require age > K + N below the soft cap; pressure keeps age > K. V4.1 min, 1 RTX PRO 6000 + 3 Sparks, DSpark, dev `0edd9b6c4` (2026-11-17), one warmed matched launch/arm: defaults / donor-always lag 0 / lag 16 C1 132.73/125.88/132.99, C16 556.17/499.76/527.38, post-C1 124.24/117.20/123.11 tok/s. Donor arms disable prewarm. Lag 16 cuts request-time updates/re-keys 164,366 to 47,057; physical graph charge 3.043/0.935/1.669 GB (admission reserve unchanged). Its C16/default ratio 0.948 meets the experiment's stop bar, not the 0.98 recovery goal; no further tuning. No thermal slowdown; C16 power-cap seconds 1.004/0/0, max temperatures 60/57/58 C, min T.Limit headroom 38/38/37 C; donor busy clocks unavailable (default 2805 MHz). Other families unmeasured. | Lag 16 retains more graph memory than lag 0; quality unchanged (baseline KL 0.01328, top-1 96.956%). Remains opt-in; no intended precision change. |
+| `GRAPH_PREWARM` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `GRAPH_PREWARM=off` (default `on`) | Skip startup prewarm of rank-local graph sites; they capture lazily on first use. Spanning (cross-device) sites always prewarm, because they cannot be captured after readiness (#1878). With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). V4.1 max (2 RTX + 6 Sparks, dSpark): one prompt-matched launch per arm on dev `21376c2ded` (2026-11-19, no throttling), C1 173.8 → 180.6 tok/s (1.039×), C16 1010.6 → 1046.9 tok/s (1.036×), readiness 30.68 → 28.15 s, strict lossless 10/10 on both. `off` defers rank-local captures to first use in early serving, building a subset of the `on` warm set; startup graph arena fell from ~1.24 GB to 4–6 MiB per GPU. Neither arm captured during C1; C16 warm-up recorded 910 → 8,022 capture attempts and the timed wave 182 → 1,638 (#2506). Other two-GPU max cards (off/on ratios, one launch per arm on one seal, 2026-11-19, no throttling): GLM Flash C1 1.11 / C16 0.97; Kimi K3.1 MC C1 1.00 / C16 1.02; Inkling MC (split head) C1 1.12 / C16 1.05; readiness at most 1.5 s faster. Those pairs passed strict lossless 10/10 with identical fidelity. Other families unmeasured. | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
+| `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
+| `GRAPH_DONOR_COLD_LAG` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16` (default `0`) | Require age > K + N below the soft cap; pressure keeps age > K. V4.1 min, 1 RTX PRO 6000 + 3 Sparks, DSpark, dev `0edd9b6c4` (2026-11-17), one warmed matched launch/arm: defaults / donor-always lag 0 / lag 16 C1 132.73/125.88/132.99, C16 556.17/499.76/527.38, post-C1 124.24/117.20/123.11 tok/s. Donor arms disable prewarm. Lag 16 cuts request-time updates/re-keys 164,366 to 47,057; physical graph charge 3.043/0.935/1.669 GB (admission reserve unchanged). Its C16/default ratio 0.948 meets the experiment's stop bar, not the 0.98 recovery goal; no further tuning. No thermal slowdown; C16 power-cap seconds 1.004/0/0, max temperatures 60/57/58 C, min T.Limit headroom 38/38/37 C; donor busy clocks unavailable (default 2805 MHz). Other families unmeasured. | Lag 16 retains more graph memory than lag 0; quality unchanged (baseline KL 0.01328, top-1 96.956%). Remains opt-in; no intended precision change. |
 | `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
 | `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
 | `ATTENTION_PRECISION` | V4, GLM 5.3 / ML4, GLM Flash | `ATTENTION_PRECISION=fp8` (default `bf16`) | Faster, lower-quality attention tier, only where the family has a qualified path. Model-level speed is unmeasured for this shared key. Prior SM120 MG microbench (#2146, 2752 rows, synthetic medium-entropy keys): BF16 latency / FP8 is GLM 1.07x, GLM Flash 1.03x, Kimi h96 1.08x / h48 1.03x; these are MG-only, not the shipping GLM native prefill baseline. | The optional path can add QK/PV rounding independently of KV storage loss. Same microbench output RMS vs F32: FP8 3.53-3.98% vs BF16 0.21-0.23%; not a Standard model fidelity result. |
-| `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse, Inkling, Hy4-flash | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
+| `CORE_VIEW` | GLM 5.3 / ML4, GLM Flash, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `CORE_VIEW=k8-compact`, `k6-compact` or `fp8-compact` (unset = original) | Stored MC core or generic load-time block FP8 of exactly the original variant's `core_tensors`; BF16 index only. GLM Flash K4 MC, 2 RTX PRO 6000 / 0 Sparks, DFlash2, fixed 425/425 W (2026-11-12): FP8 vs original C1/C16/8K prefill 171.12/741.93/7837.57 to 196.74/772.56/7741.92 tok/s (+15.0%/+4.1%/-1.2%); pool 1628160 to 2097152. K6 is non-inferior on both measured Standard-v2 paths, with +22.8% C1 and -12.5% 8K prefill vs original. Muse K4 MC `fp8-compact` is measured below (+15.2% C1, C16 flat, -5.1% 8K prefill; larger pool). GLM/Step whole-core FP8, 2 RTX PRO 6000 + 6 Sparks, 425 W/card (2026-11-16): GLM C1/C16/8K 49.04/180.68/3392 to 53.52/191.81/3122 tok/s (+9.1%/+6.2%/-8.0%), onboarded layers 5 to 8; Step 59.87/216.73/2740 to 68.98/266.95/2562 (+15.2%/+23.2%/-6.5%), onboarded layers 13 to 19. Both keep the 2,097,152-token pool; one warmed launch per arm, strict lossless 10/10. Step FP8 replay matches all 106 saved original prompt hashes. No thermal slowdown; prefill power-cap windows differ. Requires v52e exports. Other checkpoints unmeasured. | K8/K6 and FP8 quantize target weights. FP8 uses E4M3 + FP32 128x128 block scales. GLM generated Standard decode/prefill KL 0.03686/0.03100 to 0.04530/0.03880, top-1 94.544%/95.177% to 94.091%/94.775%; Step KL 0.01337/0.01164 to 0.01597/0.01429, top-1 96.069%/96.008% to 95.166%/95.811%. Absolute family bars pass; no paired non-inferiority claim. Original stays default. Matched Standard-v2 generated positions: FP8-minus-original KL to official BF16 ancestry +0.00289 decode/+0.00325 prefill, top-1 -0.013/-0.526 percentage points; absolute ancestry gates pass, paired decode non-inferiority passes but prefill fails (0.005 margin). Those figures ran W8A8 prefill over every group; W8A16 prefill (`FP8_PREFILL=off`) also fails prefill non-inferiority (top-1 loss 0.00263, upper95 0.00614). FP8 stays opt-in. Unsupported executor roles refuse by tensor name, never skip. Plain checkpoints refuse every compact selector, including the former plain Flash FP8 path. |
 | `KV_CACHE` | Muse | `KV_CACHE=fp8` (default `bf16`) | Muse K4 MC original, dev `5e28a1d30`, RTX PRO 6000 (2026-11-16): 1 RTX + 4 Sparks, speculation off, pool 510,272 to 1,056,768 tokens (2.071x), served context 510,272 to 1,048,576. Separate quiet 2 RTX + 6 Sparks pair with default NVIDIA DFlash2: C1 70.81 to 65.08 emitted tok/s (0.919x), C16 253.03 to 257.81 (1.019x), pool 2,009,216 to 2,097,152 and onboarded layers 0 to 9. One warmed launch per arm; no power-cap or thermal slowdown in timed windows. | Lossy native E4M3 target KV with per-token/head FP32 scales. Standard max generated decode: KL 0.00968 to 0.01689 (+0.00721), top-1 97.149% to 96.594% (-0.555 pp); prefill KL +0.00625, top-1 -0.716 pp. Absolute family bars pass, but paired quality and C1 default bars fail: remains opt-in. BF16 stays default; drafter storage is independent. |
 | `QWEN_FP8_HEAD` | Qwen4 | `QWEN_FP8_HEAD=on` (unset = BF16) | Converts the shared target/MTP head to one E4M3 backing. Historical combined measurement is in the decode row; standalone effect unmeasured. | Changes target logits; the draft reads the same head, not a separate draft-only FP8 copy. |
 | `MIMO_FP8_HEAD`, `MIMO_FP8_O_PROJ` | MiMo | Set either to `on` (unset/auto = checkpoint) | Explicitly converts a BF16 target head or O projection; native FP8 stays FP8. Unmeasured. | Target-weight quantization, independent of drafter precision. |
@@ -381,7 +381,9 @@ until its window is complete. Full-context paged drafters are unchanged.
 calibrated confidence head scores each drafted token. The example config's
 explicit off remains an override until its separate line change joins the next
 placement-input publication batch.
-`VISION=off` and `AUDIO=off` remain required.
+The bundled still tower serves with `VISION=auto` (`VISION_REPLICAS` and
+`MEDIA_CACHE_BYTES` apply); `AUDIO` accepts `auto` or `off` and starts none.
+`CORE_VIEW` selects a declared core view as for the other MC families.
 
 Shared launch keys keep their usual meanings. MiniMax accepts
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES`,
@@ -1096,12 +1098,12 @@ is involved. Unset or any value other than `1`: no thread, no handler, no counte
 Attention placement (`ATTENTION_PLACEMENT`; `auto` resolves through the
 family's planner and runtime policy):
 
-| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context | ✓ heads |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (two RTX) |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
 family's attention-placement error.
@@ -1122,10 +1124,10 @@ two GPUs, independent of the MLA placement.
 
 Token embedding placement (`EMBEDDING`; `cuteafd plan --embedding-placement`):
 
-| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `gpu` (default) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `host` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `gpu` (default) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `host` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 
 Host placement additionally requires an untied embedding/head. Kimi and Muse
 keep their admitted GPU embedding: host offload would save 2.19 GiB and
@@ -1135,18 +1137,18 @@ and serve refuse it rather than silently planning a GPU table. Step-5 likewise
 requires its embedding on the GPU entry owner. The launch-key table records
 whether a key is accepted at all, not whether all its values are supported.
 
-`EXPERT_USAGE` has a live adapter only for V4.1, V4, GLM 5.3 / ML4, MiMo
-and Kimi. Other families reject an explicit key instead of accepting a no-op;
+`EXPERT_USAGE` has a live adapter only for V4.1, V4, GLM 5.3 / ML4, MiMo,
+Kimi and MiniMax. Other families reject an explicit key instead of accepting a no-op;
 the `/experts` placeholder remains available without telemetry.
 
 Speculator (`SPECULATOR`):
 
-| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ (default) |
-| `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✗ |
-| `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ | ✗ |
+| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ (default) | ✓ |
+| `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✗ | ✓ (default) |
+| `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ | ✗ | ✗ |
 
 Qwen4 unset/`auto` selects native MTP whenever the checkpoint declares its MTP
 layer, independent of expert quantization, core view, repository revision or
@@ -1166,12 +1168,12 @@ whole layer ranges (`ATTENTION_PLACEMENT=layers`), independent of expert homes.
 
 KV precision (`KV_CACHE`; `SWA_KV_CACHE` is MiMo only):
 
-| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `bf16` | n/a (fixed) | n/a | n/a | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ | ✓ |
-| `fp8` | n/a | n/a | n/a | n/a | ✗ | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (opt-in) | ✓ (default) | ✓ (default) |
-| `int8` | n/a | n/a | n/a | n/a | ✓ (default) | ✗ | ✗ | ✗ | ✗ | n/a | n/a | n/a |
-| `SWA_KV_CACHE` `fp8` | n/a | n/a | n/a | n/a | ✓ | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `bf16` | n/a (fixed) | n/a | n/a | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ | ✓ | n/a |
+| `fp8` | n/a | n/a | n/a | n/a | ✗ | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (default) | ✓ (opt-in) | ✓ (default) | ✓ (default) | n/a (FP8 fixed) |
+| `int8` | n/a | n/a | n/a | n/a | ✓ (default) | ✗ | ✗ | ✗ | ✗ | n/a | n/a | n/a | n/a |
+| `SWA_KV_CACHE` `fp8` | n/a | n/a | n/a | n/a | ✓ | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 
 V4.1, V4, GLM 5.3/ML4 and GLM Flash fix their target cache formats. Muse
 accepts `KV_CACHE=bf16` (default) or experimental `fp8`: native E4M3 payloads
@@ -1188,10 +1190,10 @@ convolution marks stay FP32. Tail copies include the scales byte-exactly.
 
 Media:
 
-| Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
-| `AUDIO` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
+| Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | ✓ (`auto`/`off`; auto starts none) |
+| `AUDIO` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
 
 Native EXLR8 (`EXLR8_MANIFEST`): V4, GLM 5.3/ML4 and GLM Flash, MiMo (dense core
 only) and Qwen4. Placement is 1–2 RTX plus 1–8 Sparks; GLM Flash TP2 also
@@ -1209,195 +1211,195 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 weights and F32 block-128 scales; only `original` is accepted because its
 original core is already FP8, not an MC publication.
 
-| Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Identity** | | | | | | | | | | |  | |
-| `MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MODEL_REVISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SERVED_MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MODEL_VARIANT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXPERT_FORMAT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPARKINFER_EXL3` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `WIP_INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `WIP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `WIP_BUILD_SEED` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Placement** | | | | | | | | | | |  | |
-| `RTX_GPUS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `COORDINATOR_GPUS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `COORDINATOR_SPLIT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_HOSTS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_<rank>_HOST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_<rank>_LANE_A` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_<rank>_LANE_B` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXPERT_BACKEND` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `RTX_EXPERT_LAYERS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `RTX_EXPERT_PEER` | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EMBEDDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_PORT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_REDUCTION_MIN_ROWS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `HOST_ISA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `RDMA_BOND_BALANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MAPPED_SCALE_PRELOAD_GIB` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ENGRAM_WARM` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `CUDA_MODULE_LOADING` | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPARK_INTAKE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MIMO_WEIGHT_POLICY` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_HOST_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_PREFIX_DRAFT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_SNAPSHOT_WAIT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_PREFILL_CHUNK_S` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| **Memory and pools** | | | | | | | | | | |  | |
-| `KV_TARGET_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_MIN_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_MAX_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GPU_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GPU_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MEMORY_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_NODE_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_CARVEOUT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_DISABLE_LOW_MEM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_PREWARM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_DONOR_ALWAYS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_DONOR_COLD_LAG` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GPU_GRAPH_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GPU_GRAPH_RESERVE_EXTRA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GPU_GRAPH_RESERVE_EXTRA_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_GRAPH_RESERVE` | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GRAPH_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `FAMILY_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_POOL_TOKENS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `KV_POOL_SIZE` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `POOL_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Attention and KV** | | | | | | | | | | |  | |
-| `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ | ✗ |
-| `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PREFIX_CACHE_MARK_MIB` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `PREFIX_PARTIAL` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `PREFIX_POINT_BOUNDARIES` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_PREFIX_MARKS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_KDA_STATE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_INDEX_CACHE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_DECODE_ROWS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DECODE_LANES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `DECODE_SHARE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `DECODE_GRAPHS` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✓ | ✓ | ✗ | ✗ |
-| `KV_DECODE_RESERVE_CHUNK` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_RESERVE_DRAIN_BUFFER` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Speculation** | | | | | | | | | | |  | |
-| `SPECULATOR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPECULATOR_MODEL_ID` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
-| `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ |
-| `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
-| `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `DRAFT_CONTEXT_WINDOW` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
-| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ |
-| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
-| `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| **Prefill** | | | | | | | | | | |  | |
-| `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
-| `PREFILL_BATCH_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `FP8_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXPERT_PARTIAL_BF16_MAX_ROWS` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ |
-| `GLM5_FLASH_EXL3_SCHEDULE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_EXL3_WORKER_PATH` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_EXL3_ROUTE_DUMP` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| **Media** | | | | | | | | | | |  | |
-| `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ |
-| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ |
-| `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| **Precision** | | | | | | | | | | |  | |
-| `EXLR8_MANIFEST` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXLR8_PREFILL_ACTIVATIONS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `V41_FP8_HEAD` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `FP8_SCALES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `L2_PREFETCH` | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `QWEN_FP8_DECODE` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `QWEN_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `MIMO_FP8_O_PROJ` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_FP8_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_KDA_FP8` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_KDA_SPLIT` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_TARGET_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_ATTENTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_QUERY_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_OUTPUT_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_DSPARK_EXPERTS` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
-| **Concurrency and serving** | | | | | | | | | | |  | |
-| `ADDR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `CONCURRENCY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `HTTP_QUEUE_DEPTH` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `HTTP_QUEUE_WAIT_MS` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `API_KEY_FILE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
-| `CONSOLE_ASSETS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `CONSOLE_TEXT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `HOST_WAIT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `IDLE_PARK_SECONDS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `THERMAL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `LOOP_ABORT_RUN` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `LOOP_ABORT_COPIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `LOOP_FAST_SPAN` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `LOOP_FAST_COPIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROBE_DUMP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `COORDINATOR_DOCKER_INFERENCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `COORDINATOR_DOCKER_DEV` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_EXPERT_DOCKER_INFERENCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_EXPERT_DOCKER_DEV` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_PREFILL_REPLY_FORMAT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `SPARK_DECODE_REPLY_FORMAT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Profiling** | | | | | | | | | | |  | |
-| `PROFILE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NCU_KERNEL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NCU_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NCU_SET` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NCU_SKIP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NSYS_CPU` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NSYS_GRAPH_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_NSYS_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_EXPERT_INPUT_SAMPLE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_EXPERT_ROUTE_WEIGHTS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_RANKS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_NCU_KERNEL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_NCU_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_NCU_SET` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_NCU_SKIP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PROFILE_SPARK_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **Identity** | | | | | | | | | | |  | |  |
+| `MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MODEL_REVISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SERVED_MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MODEL_VARIANT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EXPERT_FORMAT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPARKINFER_EXL3` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `WIP_INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `WIP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `WIP_BUILD_SEED` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Placement** | | | | | | | | | | |  | |  |
+| `RTX_GPUS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `COORDINATOR_GPUS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `COORDINATOR_SPLIT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_HOSTS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_<rank>_HOST` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_<rank>_LANE_A` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_<rank>_LANE_B` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EXPERT_BACKEND` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `RTX_EXPERT_LAYERS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `RTX_EXPERT_PEER` | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EMBEDDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `EXPERT_PORT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_REDUCTION_MIN_ROWS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `HOST_ISA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `RDMA_BOND_BALANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MAPPED_SCALE_PRELOAD_GIB` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ENGRAM_WARM` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `CUDA_MODULE_LOADING` | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPARK_INTAKE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MIMO_WEIGHT_POLICY` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_HOST_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_PREFIX_DRAFT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_SNAPSHOT_WAIT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_PREFILL_CHUNK_S` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **Memory and pools** | | | | | | | | | | |  | |  |
+| `KV_TARGET_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_MIN_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_MAX_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MEMORY_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_NODE_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_CARVEOUT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_DISABLE_LOW_MEM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_PREWARM` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_DONOR_ALWAYS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GRAPH_DONOR_COLD_LAG` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_GRAPH_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_GRAPH_RESERVE_EXTRA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_GRAPH_RESERVE_EXTRA_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_GRAPH_RESERVE` | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GRAPH_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `FAMILY_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_POOL_TOKENS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `KV_POOL_SIZE` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `POOL_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Attention and KV** | | | | | | | | | | |  | |  |
+| `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ATTENTION_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `DRAFT_KV_CACHE` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ | ✗ | ✗ |
+| `PREFIX_CACHE_ENTRIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PREFIX_CACHE_MARK_MIB` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `PREFIX_PARTIAL` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `PREFIX_POINT_BOUNDARIES` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_PREFIX_MARKS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_KDA_STATE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_INDEX_CACHE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_DECODE_ROWS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `DECODE_LANES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DECODE_SHARE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DECODE_GRAPHS` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ |
+| `KV_DECODE_RESERVE_CHUNK` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_RESERVE_DRAIN_BUFFER` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Speculation** | | | | | | | | | | |  | |  |
+| `SPECULATOR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPECULATOR_MODEL_ID` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `DRAFT_LENGTH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DRAFT_CONTEXT_WINDOW` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| `DRAFT_POLICY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **Prefill** | | | | | | | | | | |  | |  |
+| `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| `PREFILL_BATCH_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `FP8_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EXPERT_PARTIAL_BF16_MAX_ROWS` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXL3_SCHEDULE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXL3_WORKER_PATH` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXL3_ROUTE_DUMP` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **Media** | | | | | | | | | | |  | |  |
+| `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| **Precision** | | | | | | | | | | |  | |  |
+| `EXLR8_MANIFEST` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EXLR8_PREFILL_ACTIVATIONS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `V41_FP8_HEAD` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `FP8_SCALES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `L2_PREFETCH` | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `QWEN_FP8_DECODE` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `QWEN_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_FP8_HEAD` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `MIMO_FP8_O_PROJ` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_FP8_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_KDA_FP8` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_KDA_SPLIT` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_TARGET_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TP2_ATTENTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TP2_QUERY_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TP2_OUTPUT_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TP2_DSPARK_EXPERTS` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ |
+| **Concurrency and serving** | | | | | | | | | | |  | |  |
+| `ADDR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `CONCURRENCY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `HTTP_QUEUE_DEPTH` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `HTTP_QUEUE_WAIT_MS` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `API_KEY_FILE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| `CONSOLE_ASSETS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `CONSOLE_TEXT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `HOST_WAIT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `IDLE_PARK_SECONDS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `THERMAL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `LOOP_ABORT_RUN` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `LOOP_ABORT_COPIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `LOOP_FAST_SPAN` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `LOOP_FAST_COPIES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROBE_DUMP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `COORDINATOR_DOCKER_INFERENCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `COORDINATOR_DOCKER_DEV` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_EXPERT_DOCKER_INFERENCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_EXPERT_DOCKER_DEV` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_PREFILL_REPLY_FORMAT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_DECODE_REPLY_FORMAT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Profiling** | | | | | | | | | | |  | |  |
+| `PROFILE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NCU_KERNEL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NCU_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NCU_SET` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NCU_SKIP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NSYS_CPU` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NSYS_GRAPH_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_NSYS_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_EXPERT_INPUT_SAMPLE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_EXPERT_ROUTE_WEIGHTS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_RANKS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_NCU_KERNEL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_NCU_COUNT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_NCU_SET` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_NCU_SKIP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `PROFILE_SPARK_NSYS_GPU_METRICS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 MiniMax one-RTX accepted keys and retained qualification gates are listed in
 [MiniMax Serving](#minimax-serving); its family column is listed separately until

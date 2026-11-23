@@ -182,6 +182,20 @@ def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_pat
     assert entry["config"] == "examples/configs/minimax-m31-flash-nvfp4-min.config"
 
 
+def test_minimax_forwards_core_view_and_still_media_keys(tmp_path: Path) -> None:
+    config = {"model_type": "minimax_m3_vl", "vision_config": {"depth": 2}, "text_config": {
+        "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+    three = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
+    keys = ("SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=auto\nAUDIO=off\nCORE_VIEW=original\n"
+            "VISION_REPLICAS=2\nMEDIA_CACHE_BYTES=2GiB\n" + three)
+    result = _family_launch_result(tmp_path, config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+        extra_args=("--wip", "minimax"), encoder_plan=PLANNED)
+    serve, plan = _line(result, "serve-minimax --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--core-view") == _flag(plan, "--core-view") == "original"
+    assert _flag(serve, "--vision-replicas") == _flag(plan, "--vision-replicas") == "2"
+    assert _flag(serve, "--media-cache-bytes") == _flag(plan, "--media-cache-bytes") == "2GiB"
+
+
 @pytest.mark.parametrize("gpus,placement", [(1, "auto"), (2, "layers"), (2, "heads")])
 @pytest.mark.parametrize("selection", [None, "auto", "dspark", "off"])
 def test_minimax_dspark_default_and_explicit_off_match_plan_and_serve(tmp_path, gpus, placement, selection):

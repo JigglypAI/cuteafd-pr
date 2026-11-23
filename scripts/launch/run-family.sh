@@ -1337,7 +1337,7 @@ detected_family="$(release_config_family "$config" "$core_view")"
 core_view_args=(--core-view "$core_view")
 serve_core_view_args=()
 case "$family" in
-  glm5|glm5_flash|kimi_k3|step5|muse_spark|inkling2|hy4_flash) serve_core_view_args=("${core_view_args[@]}") ;;
+  glm5|glm5_flash|kimi_k3|step5|muse_spark|minimax_m3|inkling2|hy4_flash) serve_core_view_args=("${core_view_args[@]}") ;;
   *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
 esac
 
@@ -1775,7 +1775,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
-if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 ]]; then
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 || "$family" == minimax_m3 ]]; then
   family_args+=(--vision-replicas "$vision_replicas")
 fi
 
@@ -1870,7 +1870,7 @@ case $family in
     family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
