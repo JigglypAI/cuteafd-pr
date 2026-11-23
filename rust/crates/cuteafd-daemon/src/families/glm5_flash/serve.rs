@@ -165,23 +165,28 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
     cuteafd_bench::context::set_resolved("draft-context-slots", &engine_args.draft_context_slots.unwrap_or(0).to_string());
 }
 
+pub(super) fn resolve_decode_rows(engine_args: &mut super::EngineArgs, max_sequences: usize, draft_length: Option<usize>) -> Result<u32> {
+    let verify_rows = cuteafd_loader::plan::resolve_decode_rows(
+        "glm5_flash",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: engine_args.decode_rows.as_option(),
+            concurrency: max_sequences as u64,
+            decode_lanes: 1,
+            rtx_gpus: 1 + usize::from(engine_args.split_device.is_some()),
+            draft_length: if engine_args.draft.is_some() { draft_length.map(|n| n as u32) } else { Some(0) },
+        },
+    )?;
+    engine_args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(verify_rows);
+    cuteafd_bench::context::set_resolved("decode-rows", &verify_rows.to_string());
+    Ok(verify_rows)
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     args.draft_length.report_inactive(args.engine.draft.is_some());
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("glm5_flash", max_sequences as u64)?;
-    let verify_rows = cuteafd_loader::plan::resolve_decode_rows(
-        "glm5_flash",
-        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
-            requested: args.engine.decode_rows.as_option(),
-            concurrency: max_sequences as u64,
-            decode_lanes: 1,
-            rtx_gpus: 1 + usize::from(args.engine.split_device.is_some()),
-            draft_length: if args.engine.draft.is_some() { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
-        },
-    )?;
-    args.engine.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(verify_rows);
-    cuteafd_bench::context::set_resolved("decode-rows", &verify_rows.to_string());
+    resolve_decode_rows(&mut args.engine, max_sequences, args.draft_length.draft_length)?;
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();

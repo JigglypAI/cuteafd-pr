@@ -494,6 +494,7 @@ mod draft_cli_tests {
             &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16);
+                serve::resolve_decode_rows(&mut args, 16, None)?;
                 native::normalize(&mut args);
                 native::publish_resolved(&args);
                 resolve_prefill(&mut args, true)?;
