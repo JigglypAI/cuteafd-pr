@@ -327,7 +327,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     // graph controller starts from the same non-graph allocation baseline.
     use super::graphs::DecodeGraphs;
     use cuteafd_loader::serving_capacity::inkling2_graphs;
-    let attach = |rank, stream: &crate::shared::memory::device::Stream<'_>|  {
+    let attach = |rank, stream: &crate::shared::memory::device::Stream<'a>| {
         let policy = inkling2_graphs::policy(rank, inputs.gpus)?;
         ensure!(inputs.graph_reserve[rank] == policy.bytes, "Inkling graph cache disagrees with admission");
         DecodeGraphs::new(stream, rank, policy)
