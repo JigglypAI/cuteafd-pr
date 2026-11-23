@@ -3414,44 +3414,54 @@ impl<'a> Hy4Engine<'a> {
             Ok(units)
         };
 
-        // 1. Prompt A solo at waves=1.
+        // 1. Prompt A solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
         self.reset()?;
         let units_a1 = make_solo_units(prompt_a.len(), 1)?;
         let mut p_a1 = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
         let mut logits_a_solo = vec![0f32; prompt_a.len() * vocab];
-        self.run_units(
-            &mut p_a1,
-            &[prompt_a],
-            &units_a1,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                logits_a_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                Ok(())
-            },
-        )?;
+        for mut unit in units_a1 {
+            unit.index = 0;
+            unit.slot = 0;
+            let src = &prompt_a[unit.rows.clone()];
+            self.run_units(
+                &mut p_a1,
+                &[src],
+                &[unit],
+                ReadPriority::Prefill,
+                |_| HeadMode::Suffix(0),
+                &mut |u, row_off, logits| {
+                    let tile = logits.to_host(library)?;
+                    let dst = (u.rows.start + row_off) * vocab;
+                    logits_a_solo[dst..dst + tile.len()].copy_from_slice(&tile);
+                    Ok(())
+                },
+            )?;
+        }
         let tail_a_solo = p_a1[0].engram_tail;
 
-        // 2. Prompt B solo at waves=1.
+        // 2. Prompt B solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
         self.reset()?;
         let units_b1 = make_solo_units(prompt_b.len(), 1)?;
         let mut p_b1 = [Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id)];
         let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
-        self.run_units(
-            &mut p_b1,
-            &[prompt_b],
-            &units_b1,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                logits_b_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                Ok(())
-            },
-        )?;
+        for mut unit in units_b1 {
+            unit.index = 0;
+            unit.slot = 0;
+            let src = &prompt_b[unit.rows.clone()];
+            self.run_units(
+                &mut p_b1,
+                &[src],
+                &[unit],
+                ReadPriority::Prefill,
+                |_| HeadMode::Suffix(0),
+                &mut |u, row_off, logits| {
+                    let tile = logits.to_host(library)?;
+                    let dst = (u.rows.start + row_off) * vocab;
+                    logits_b_solo[dst..dst + tile.len()].copy_from_slice(&tile);
+                    Ok(())
+                },
+            )?;
+        }
         let tail_b_solo = p_b1[0].engram_tail;
 
         // 3. Prompt A solo at waves=W (cross-wave boundary tail + logits check).
