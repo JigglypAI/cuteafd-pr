@@ -171,7 +171,7 @@ def test_every_pooled_draft_family_overrides_live_binding_quarantine():
             continue
         pooled.add(source.relative_to(families).as_posix())
         assert "fn quarantine_draft_pages(&self" in text, source
-    assert pooled == {"glm5/prefix.rs", "kimi_k3/prefix.rs", "qwen3_5/prefix.rs", "inkling2/cache.rs"}
+    assert pooled == {"glm5/prefix.rs", "kimi_k3/prefix.rs", "qwen3_5/prefix.rs", "inkling2/cache.rs", "inkling2_mini/cache.rs"}
     # Fixed draft rings/arrays are not DraftPagePool owners. A new owner must extend this audit.
     owners = set()
     daemon = root / "rust/crates/cuteafd-daemon/src"

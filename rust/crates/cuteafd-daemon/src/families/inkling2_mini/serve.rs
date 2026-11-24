@@ -259,3 +259,47 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     crate::shared::api::finish_scheduler(&mut worker, "inkling2_mini").await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn inkling2_mini_serve_startup_seam_resolves_settings_and_rejects_exact_packing() -> Result<()> {
+        let argv = [
+            "cuteafd",
+            "serve-inkling2-mini",
+            "--snapshot",
+            "/model",
+            "--native-lib",
+            "/native.so",
+            "--max-context-tokens",
+            "0",
+        ];
+        let crate::cli::Commands::ServeInkling2Mini(mut args) = crate::cli::Cli::try_parse_from(argv)?.command else {
+            anyhow::bail!("Inkling 2 Mini command not parsed")
+        };
+        assert_eq!((args.max_context, args.max_sequences), (Some(0), 16));
+        assert_eq!(args.prefill_packing, crate::shared::prefill_packing::PackingMode::Unrestricted);
+        let mut exact = argv.to_vec();
+        exact.extend(["--prefill-packing", "exact"]);
+        let crate::cli::Commands::ServeInkling2Mini(exact) = crate::cli::Cli::try_parse_from(exact)?.command else {
+            anyhow::bail!("Inkling 2 Mini command not parsed")
+        };
+        assert!(exact.prefill_packing.require_unrestricted("Inkling 2 Mini").is_err());
+        crate::commands::bench::assert_resolved_family_seam("serve-inkling2-mini", &[], || {
+            args.prefix.resolve_entries(args.max_sequences);
+            let prefill = args.prefill()?;
+            assert_eq!((prefill.unit_rows, prefill.waves), (4096, 1));
+            cuteafd_bench::context::ResolvedSettings::default()
+                .value("max-context-tokens", 262_144)
+                .value("pool-tokens", 2_097_152)
+                .value("prefill-rows", prefill.unit_rows)
+                .value("prefill-waves", prefill.waves)
+                .publish();
+            Ok(())
+        })?;
+        Ok(())
+    }
+}

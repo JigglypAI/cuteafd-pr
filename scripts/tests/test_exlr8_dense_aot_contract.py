@@ -762,7 +762,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     ]
     # Appended after every existing program, like MiniMax: the per-geometry loop skips it.
     source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
-    assert 'if name in ("minimax", "inkling2"):\n            continue' in source
+    assert 'if name in ("minimax", "inkling2", "inkling2_mini"):\n            continue' in source
     assert source.index('if "minimax" in geometries:') < source.index('if "inkling2" in geometries:')
 
     spec = importlib.util.spec_from_file_location("inkling2_fp8_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
@@ -820,7 +820,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     jobs = {name: (exporter, args) for name, exporter, args in placement.export_jobs()}
     args = jobs["programs"][1]
     geometries = args[args.index("--geometry") + 1].split(",")
-    assert geometries[-3:] == ["minimax", "inkling2", "native_experts"]
+    assert geometries[-4:] == ["minimax", "inkling2", "inkling2_mini", "native_experts"]
     for package, geometry in (("fp8-inkling2-mxfp8", "inkling2_mxfp8"), ("fp8-inkling2-nvfp4a4", "inkling2_nvfp4")):
         assert jobs["fp8/" + package] == ("package_fp8_moe_aot.py", [
             "--geometry", geometry, "--capacities", placement.fp8_capacities(),
