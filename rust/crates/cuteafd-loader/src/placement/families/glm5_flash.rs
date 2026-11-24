@@ -225,8 +225,6 @@ pub struct GlmfInputs<'a> {
     pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
-    /// Opt-in exact-row decode/verify graph policy (`GRAPH_EXACT_ROWS`).
-    pub exact_graph_rows: glmf_graphs::GlmfExactRows,
 }
 
 /// One drafter's exact device request lists on each candidate GPU: the resident
@@ -642,7 +640,7 @@ pub(crate) mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
             drafter_scratch: vec![0; ranks], drafter_requests: None, drafter_bridge: None, requested_pool: None, onboard: default_onboard(),
-            exact_graph_rows: glmf_graphs::GlmfExactRows::Off,
+
         }
     }
 
@@ -811,7 +809,7 @@ pub(crate) mod tests {
 
     /// Every coordinator device charges the launch's whole graph reserve as
     /// one fixed opaque owner, before KV sizing, with the launch's own
-    /// prewarm price behind it (`glmf_prewarm.json`'s measured 173,243 B/graph).
+    /// lag-8 working set plus its reserve margin behind it.
     #[test]
     fn contract_graph_reserve_is_one_fixed_opaque_owner_per_device() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
@@ -821,17 +819,9 @@ pub(crate) mod tests {
             let admitted = contract(&input).unwrap();
             assert_eq!(admitted.solved.phases,
                 planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
-            let context = input.max_context as usize;
-            let expected = glmf_graphs::glmf_graph_reserve(context, 262_144, cfg.dense_context(),
-                input.sequences.min(input.decode_rows) as usize, input.speculation, input.layers,
-                ranks, input.decode_rows as usize, 188, input.spark_ranks > 0);
-            assert_eq!(admitted.graphs.reserves, expected.reserves);
-            // One owner per device: the traced base plus its allocation tail, then the
-            // shared runtime capture headroom on top (500 MB capped at that base).
-            let whole: Vec<u64> = expected.reserves.iter().enumerate()
-                .map(|(gpu, &base)| crate::placement::graph_reserve::resolve_with_extra(
-                    None, None, None, gpu, false, base, expected.extra).unwrap().bytes).collect();
-            assert_eq!(admitted.graphs.charged, whole, "no override in the gate");
+            let expected = glmf_graphs::glmf_graph_reserve(ranks, input.spark_ranks > 0);
+            assert_eq!(admitted.graphs.reserves, [94 << 20, 92 << 20][..ranks]);
+            assert_eq!(admitted.graphs.charged, [190 << 20, 188 << 20][..ranks]);
             assert_eq!(admitted.graphs.executables, expected.executables);
             assert_eq!(admitted.graphs.bootstraps, expected.bootstraps);
             for gpu in 0..ranks {
@@ -883,21 +873,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// A smaller pool or served context rebuilds the reserve from the same
-    /// list and never charges more than the launch's maximum.
     #[test]
-    fn graph_reserve_follows_the_solved_pool_and_never_grows() {
+    fn graph_reserve_is_independent_of_the_solved_pool() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let input = inputs(&cfg, 1, 32 << 30);
-        let (placed, graphs) = admitted_case(&input, true, 170, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
+        let (placed, graphs, _) = admitted_case(&input, true, 170, true, None).unwrap();
         assert!(placed.pool_tokens < 1 << 20);
-        let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
-        let expected = glmf_graphs::glmf_graph_reserve(context, placed.pool_tokens as usize,
-            cfg.dense_context(), input.sequences.min(input.decode_rows) as usize, input.speculation,
-            input.layers, 1, input.decode_rows as usize, 170, input.spark_ranks > 0);
-        assert_eq!(graphs.reserves, expected.reserves);
-        assert_eq!(graphs.executables, expected.executables);
-        assert!(graphs.reserves[0] <= 2_313_158_656, "never above the reference arena");
+        assert_eq!(graphs.reserves, [94 << 20]);
+        assert_eq!(graphs.charged, [190 << 20]);
     }
 
     #[test]
@@ -1030,32 +1013,6 @@ pub(crate) mod tests {
             input.pool_marks = false;
             assert!(contract(&input).unwrap().placement.pool_tokens > bounded.placement.pool_tokens);
         }
-    }
-
-    /// The prewarm set is the launch's own: speculative graphs only where the
-    /// served policy has them, and the checked-in list covers every shape a
-    /// launch can key (a smaller context only drops geometries).
-    #[test]
-    fn copy_window_prewarm_shapes_follow_the_served_policy() {
-        let mut config = crate::plan::testing::glm5_flash_config(45);
-        config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
-            if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
-        let cfg = GlmNextConfig::from_hf(&config).unwrap();
-        // The traced min column: one device with Sparks attached.
-        let spec = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, true, 45, 1, 64, 188, true);
-        let plain = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, false, 45, 1, 64, 188, true);
-        assert!(spec.traced);
-        assert!(!spec.shapes.is_empty());
-        assert!(spec.shapes.len() > plain.shapes.len());
-        assert!(spec.shapes.iter().any(|shape| shape.1) && plain.shapes.iter().all(|shape| !shape.1));
-        // Rank 0 adds its head segment; the peer splits the same shapes.
-        let two = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, true, 45, 2, 64, 188, true);
-        assert_eq!(two.executables[0] - two.executables[1], two.shapes.len() as u64);
-        // A shorter served context keeps the pinned short shapes and can only
-        // drop longer geometries.
-        let short = glmf_graphs::glmf_graph_reserve(65_536, 65_536, cfg.dense_context(), 8, true, 45, 1, 64, 188, true);
-        assert!(short.shapes.len() <= spec.shapes.len());
-        for shape in &short.shapes { assert!(spec.shapes.contains(shape)); }
     }
 
     #[test]

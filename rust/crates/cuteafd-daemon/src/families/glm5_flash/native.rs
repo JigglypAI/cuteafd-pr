@@ -283,7 +283,7 @@ mod tests {
             experts: vec![], expert_workspace: 0,
             tp2_workspace: [0; 2], drafter_bytes: 0, drafter_weights: Default::default(), drafter_scratch: vec![0; ranks], drafter_requests: None,
             drafter_bridge: None, requested_pool: None, onboard: Onboard::Auto,
-            exact_graph_rows: Default::default() }
+        }
     }
 
     #[test]

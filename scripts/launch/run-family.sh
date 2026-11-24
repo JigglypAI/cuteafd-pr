@@ -485,21 +485,11 @@ case "$graph_donor_always" in
   off) ;;
   *) release_die 'GRAPH_DONOR_ALWAYS must be on or off' ;;
 esac
-graph_exact_rows=off
-if [[ "$family" == glm5_flash ]]; then
-  graph_exact_rows="$(get GRAPH_EXACT_ROWS off)"
-  case "$graph_exact_rows" in
-    off) ;;
-    on) graph_policy_args+=(--graph-exact-rows=on) ;;
-    prewarm) graph_policy_args+=(--graph-exact-rows=prewarm) ;;
-    *) release_die 'GRAPH_EXACT_ROWS must be off, on, or prewarm' ;;
-  esac
-fi
 if [[ "$family" == inkling2 && "$graph_donor_always" == on ]]; then cold_lag_default=8; fi
 graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG "$cold_lag_default")"
 [[ "$graph_donor_cold_lag" =~ ^[0-9]+$ ]] || release_die 'GRAPH_DONOR_COLD_LAG must be a non-negative integer'
 if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
-  [[ "$graph_donor_always" == on || "$graph_exact_rows" != off ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
+  [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
   graph_policy_args+=(--graph-donor-cold-lag "$graph_donor_cold_lag")
 fi
 if [[ "$family" == qwen3_5 ]]; then

@@ -4214,7 +4214,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
-            exact_graph_rows: crate::serving_capacity::glmf_graphs::GlmfExactRows::Off, };
+        };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(crate::serving_capacity::spark_memory::serving_bytes());
         process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();
@@ -4886,7 +4886,7 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
 }
 
 #[test]
-fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
+fn glm5_flash_disabled_draft_omits_arenas_and_preserves_the_graph_reserve() {
     use crate::families::glm5_flash::resident::GlmfHeadFormat;
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));
@@ -4909,7 +4909,7 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         assert_eq!(owner.basis, cuteafd_core::memory_layout::Basis::Calibrated);
         owner.bytes
     };
-    assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
+    assert_eq!(graphs(&disabled), graphs(&enabled));
     // Packed (including TP1 auto) and FP8 serve both projections natively;
     // only BF16 target Lt and its enabled drafter's GEMM borrow BLAS.
     for (layout, draft) in [(&enabled, true), (&disabled, false)] {

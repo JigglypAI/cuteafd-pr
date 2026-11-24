@@ -404,13 +404,13 @@ def test_optional_levers_are_default_off_and_documented():
                 assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "GRAPH_DONOR_ALWAYS":
                 assert default == "off"
-                assert lever["families"] == [family for family in COLUMNS if family != "Inkling"]
-                assert "`off`; Inkling `on`" in DOC.read_text()
+                assert lever["families"] == [family for family in COLUMNS if family not in {"Inkling", "GLM Flash"}]
+                assert "`off`; Inkling `on`; GLM Flash fixed `on`" in DOC.read_text()
             elif key == "GRAPH_DONOR_COLD_LAG":
                 assert default == "0"
-                assert lever["families"] == COLUMNS
+                assert lever["families"] == [family for family in COLUMNS if family != "GLM Flash"]
                 assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
-                assert "`0`; Inkling `8` with donor-always" in DOC.read_text()
+                assert "`0`; Inkling `8` with donor-always; GLM Flash fixed `8`" in DOC.read_text()
                 assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG "$cold_lag_default")"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DECODE_LANES":
                 # V4.1's default is two lanes; the lever is the one-lane opt-in.
@@ -452,6 +452,12 @@ def test_optional_levers_are_default_off_and_documented():
                 assert family in COLUMNS, f"lever {key} names unknown family column {family}"
                 assert MATRIX[key][family], f"lever {key} is not accepted by {family}"
     assert seen
+
+
+def test_glmf_documents_lazy_exact_rows_and_working_set_reserve():
+    text = DOC.read_text()
+    assert "GLM Flash uses exact live-row keys" in text
+    assert "working-set soft caps are 94/92 MiB" in text
 
 
 def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
