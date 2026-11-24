@@ -539,7 +539,8 @@ def test_kimi_example_config_is_the_max_card() -> None:
     assert values["MODEL_REVISION"] == "acba35b61a672561652b16a96fca1be85c1bd875"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"]) == ("2", "6")
     assert "RTX_EXPERT_LAYERS" not in values
-    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "off", "auto")
+    assert (values["SPECULATOR"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "auto")
+    assert "VISION" not in values  # Inherits the shared Auto policy.
     for absent in ("MAX_CONTEXT_TOKENS", "SPARK_MEMORY_CAP", "KV_CACHE", "CONCURRENCY"):
         assert absent not in values
     for rank in range(6):
