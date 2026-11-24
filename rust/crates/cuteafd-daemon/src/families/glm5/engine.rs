@@ -629,9 +629,7 @@ pub(crate) struct GlmEngine<'a> {
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
-    /// Prefill projections over the FP8 weights run W8A8 (E4M3 activations per
-    /// row and 128-K block, the official FP8 release's served numerics); false:
-    /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
+    /// Activation policy for selectable FP8 prefill projections; auto uses W8A8.
     pub fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
     /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): eager decode reads back each
     /// full indexer layer's top-k as logical tokens. None: no drain or copy.
