@@ -31,11 +31,17 @@ pub(crate) fn slot_sizes(hidden: usize, expert: usize, topk: usize, rows: usize,
     Ok(sizes)
 }
 
-/// Largest single decode/verify push, not the sum of receive slots.
-pub(crate) fn decode_peer_bytes(hidden: usize, expert: usize, topk: usize, onboarded: bool) -> Result<usize> {
-    Ok(slot_sizes(hidden, expert, topk,
-        cuteafd_loader::families::muse_spark::lane::HEAD_ROWS, onboarded)?
+/// Largest single decode/verify push at `rows` verify rows, not the sum of receive slots.
+pub(crate) fn decode_peer_bytes_for_rows(hidden: usize, expert: usize, topk: usize, rows: usize, onboarded: bool) -> Result<usize> {
+    Ok(slot_sizes(hidden, expert, topk, rows, onboarded)?
         .into_iter().max().context("Muse TP2 decode channels")?)
+}
+
+/// Largest single decode/verify push at the default 64-row decode budget.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_peer_bytes(hidden: usize, expert: usize, topk: usize, onboarded: bool) -> Result<usize> {
+    decode_peer_bytes_for_rows(hidden, expert, topk,
+        cuteafd_loader::families::muse_spark::lane::HEAD_ROWS, onboarded)
 }
 
 /// The pair's exchange (both ends); each rank uses it through [`RankEnd`].

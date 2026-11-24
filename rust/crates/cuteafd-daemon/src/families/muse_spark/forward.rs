@@ -14,7 +14,7 @@
 use super::{device::{PeerExchange, StepPlanes}, engine::RankResources, experts::SparkExperts, step::StepMetadata};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer as Buffer};
-use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
+use cuteafd_loader::families::muse_spark::MuseSparkConfig;
 use std::ffi::c_void;
 
 fn view(base: Buffer, offset: usize, bytes: usize) -> Buffer {
@@ -67,8 +67,8 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     let h = cfg.hidden;
     let device = rank.device_with(cfg, stream, lane);
     let count = rows.len();
-    ensure!(count > 0 && count <= HEAD_ROWS && rows.end <= lane.rows,
-        "Muse head rows {rows:?} outside the step or its {HEAD_ROWS}-row capacity");
+    ensure!(count > 0 && count <= rank.decode_rows && rows.end <= lane.rows,
+        "Muse head rows {rows:?} outside the step or its {}-row capacity", rank.decode_rows);
     let (staged, trimmed, logits) = head_planes(cfg, &rank.globals, count, stored_plane.buffer, trimmed.buffer)?;
     let hidden = view(lane.plane("hidden")?, rows.start * h * 2, count * h * 2);
     let normed = view(lane.plane("normed")?, rows.start * h * 2, count * h * 2);
@@ -77,8 +77,8 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
         device.programs.launch("final_norm", &[hidden, rank.globals.final_norm.buffer, normed],
             &[Scalar::I32(i32::try_from(count)?)], stream)?;
     }
-    // One launch scores at most HEAD_ROWS rows (the head program's capacity and its
-    // planes); the backend scores wider steps in calls of at most that many.
+    // `project_head` chunks head projections at 64 rows into the rank's
+    // `decode_rows`-sized logit planes, then crops and softcaps all `count` rows.
     project_head(cfg, rank, count, normed, staged, trimmed, logits, stream)?;
     Ok(logits)
 }

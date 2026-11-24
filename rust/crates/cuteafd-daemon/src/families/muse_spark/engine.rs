@@ -27,6 +27,8 @@ pub(crate) struct RankLoad<'c, 'a> {
     pub stream: *mut c_void,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
+    /// Resolved per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: usize,
     /// Prefill unit rows and waves in flight (the lane's span).
     pub unit_rows: usize,
     pub waves: usize,
@@ -50,8 +52,9 @@ pub(crate) struct RankResources<'a> {
     pub step: StepStorage<'a>,
     pub globals: GlobalWeights<'a>,
     /// Head rank: F32 rows at the selected head's stored width, then the
-    /// softcapped logits trimmed to the vocabulary (`lane::head_planes`).
+    /// softcapped logits trimmed to the vocabulary (`lane::head_planes_for_rows`).
     pub head: Option<(Allocation<'a>, Allocation<'a>)>,
+    pub decode_rows: usize,
     // Handle before its retained workspace: destruction must not outlive scratch.
     pub native_head: Option<DeviceOwner<'a, cuteafd_ffi::programs::VocabularyHead<'a>>>,
     _head_workspace: Option<Allocation<'a>>,
@@ -118,7 +121,7 @@ impl<'a> StepStorage<'a> {
 
 impl<'a> RankResources<'a> {
     pub(crate) fn load(device: Device<'a>, programs: &'a Programs<'a>, load: RankLoad<'_, 'a>) -> Result<Self> {
-        let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context, arena, stream } = load;
+        let RankLoad { cfg, checkpoint, built, placement, rank, slots, decode_rows, unit_rows, waves, context, arena, stream } = load;
         let tables = shared::step_tables(unit_rows, usize::try_from(slots)?, context, waves)?;
         let ranks = built.layouts.first().map_or(0, Vec::len);
         ensure!(rank < ranks && placement.items.len() == ranks, "Muse rank {rank} of {ranks} placement ranks");
@@ -153,8 +156,8 @@ impl<'a> RankResources<'a> {
         let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks, arena)?;
         let has_head = globals.head.is_some() || globals.head_bf16.is_some() || globals.head_native.is_some();
         let head = if has_head {
-            let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(
-                globals.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)?;
+            let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes_for_rows(
+                decode_rows, globals.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)?;
             Some((Allocation::new(device, stored, Tag::workspace("muse/head-logits"))?,
                 Allocation::new(device, trimmed, Tag::workspace("muse/head-logits"))?))
         } else { None };
@@ -169,7 +172,7 @@ impl<'a> RankResources<'a> {
 
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
-            globals, head, native_head, _head_workspace: head_workspace, head_stream: stream })
+            globals, head, decode_rows, native_head, _head_workspace: head_workspace, head_stream: stream })
     }
 
     pub(crate) fn check_head_stream(&self, stream: *mut c_void) -> Result<()> {

@@ -407,18 +407,28 @@ pub fn host_transport(cfg: &MuseSparkConfig, prefill: PrefillPlan, cutoff: crate
         intake })
 }
 
-/// Muse's typed Spark owners on the EXL3 ladder.
-pub fn spark_executions(waves: u64, unit_rows: u64) -> Result<cuteafd_core::SparkExecutions> {
+/// Muse's typed Spark owners on the EXL3 ladder at `decode_rows` verify rows.
+pub fn spark_executions_for_rows(waves: u64, unit_rows: u64, decode_rows: u32) -> Result<cuteafd_core::SparkExecutions> {
     let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest).exports();
-    crate::plan::spark_executions::admit_family("muse_spark", &exports, None, unit_rows, waves)
+    crate::plan::spark_executions::admit_family("muse_spark", &exports, Some(decode_rows), unit_rows, waves)
+}
+
+/// Muse's typed Spark owners on the EXL3 ladder at the default 64-row decode budget.
+pub fn spark_executions(waves: u64, unit_rows: u64) -> Result<cuteafd_core::SparkExecutions> {
+    spark_executions_for_rows(waves, unit_rows, crate::plan::decode_rows::DEFAULT_DECODE_ROWS)
+}
+
+/// The pre-placement Spark reserve at `decode_rows` verify rows: the runtime residual plus the typed owners.
+pub fn spark_reserve_bytes_for_rows(world: usize, waves: u64, unit_rows: u64, decode_rows: u32) -> Result<u64> {
+    let owners = spark_executions_for_rows(waves, unit_rows, decode_rows)?.workspace_bytes(|extent| owner_bytes(world, extent))?
+        .and_then(|bytes| bytes.total()).context("Muse Spark owner reserve overflow")?;
+    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .and_then(|bytes| bytes.checked_add(owners)).context("Muse Spark reserve overflow")
 }
 
 /// The pre-placement Spark reserve: the runtime residual plus the typed owners.
 pub fn spark_reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
-    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(|extent| owner_bytes(world, extent))?
-        .and_then(|bytes| bytes.total()).context("Muse Spark owner reserve overflow")?;
-    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
-        .and_then(|bytes| bytes.checked_add(owners)).context("Muse Spark reserve overflow")
+    spark_reserve_bytes_for_rows(world, waves, unit_rows, crate::plan::decode_rows::DEFAULT_DECODE_ROWS)
 }
 
 pub fn owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent) -> Result<cuteafd_core::OwnerBytes> {

@@ -198,7 +198,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
     let facts = shared::ProductionInput { kv_cache: opts.muse_kv, cfg, core: &model.core, projections, catalog, budgets, host, prefill,
-         bf16_target_head: opts.bf16_target_head, slots, mark_slots, context, pool,
+         bf16_target_head: opts.bf16_target_head, slots, decode_rows: opts.decode_rows, mark_slots, context, pool,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
     let prepared = match facts.prepare() {
@@ -293,7 +293,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             .and_then(|slots| muse_spark_io(&mut device, &working, prefill, slots, rings, cutoff)) {
             report.refuse_placement(format!("Muse Spark rank {rank} I/O: {error:#}"), "Fix the Spark ring geometry.");
         }
-        if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves) {
+        if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves, opts.decode_rows) {
             report.refuse_placement(format!("Muse Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         device.items.extend(admitted.media.spark_items[rank].iter().cloned());
@@ -350,9 +350,9 @@ fn muse_spark_io(device: &mut DeviceLayout, working: &SparkWorkingSet,
     Ok(())
 }
 
-fn muse_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
+fn muse_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64, decode_rows: u32) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
-    use crate::placement::families::muse_spark::{owner_bytes, spark_executions};
-    crate::plan::layout::spark_slots::charge_owners(device, &spark_executions(waves, unit_rows)?,
+    use crate::placement::families::muse_spark::{owner_bytes, spark_executions_for_rows};
+    crate::plan::layout::spark_slots::charge_owners(device, &spark_executions_for_rows(waves, unit_rows, decode_rows)?,
         |extent| owner_bytes(working.spark_ranks, extent))
 }

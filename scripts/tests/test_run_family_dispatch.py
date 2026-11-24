@@ -1199,7 +1199,9 @@ if family == "inkling2" and decode_rows > 128:
     sys.exit("inkling2 supports DECODE_ROWS up to 128 (missing inkling2_*_m256)")
 if family == "qwen4" and decode_rows > 128:
     sys.exit("qwen4 supports DECODE_ROWS up to 128 (missing qwen4_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3", "qwen4") and decode_rows > 64:
+if family == "muse_spark" and decode_rows > 128:
+    sys.exit("muse_spark supports DECODE_ROWS up to 128 (missing wider decode admission)")
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3", "qwen4", "muse_spark") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 if family == "kimi_k3" and decode_rows > 128:
     sys.exit("kimi_k3 supports DECODE_ROWS up to 128 (missing kimi_k3_*_m256)")
@@ -3481,6 +3483,27 @@ def test_inkling_decode_rows_are_forwarded_from_global_key(tmp_path, keys, expec
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     launch = next(line for line in lines if "serve-inkling2" in line and "--snapshot" in line)
+    if expected_flag is None:
+        assert "--decode-rows" not in launch, launch
+    else:
+        assert expected_flag in launch and launch.count("--decode-rows") == 1, launch
+    assert not any("--decode-rows" in line for line in lines if "cuteafd expertd-native" in line)
+
+
+@pytest.mark.parametrize("keys,expected_flag", [
+    ("", None),
+    ("DECODE_ROWS=auto\n", None),
+    ("DECODE_ROWS=64\n", "--decode-rows 64"),
+    ("DECODE_ROWS=128\n", "--decode-rows 128"),
+])
+def test_muse_decode_rows_are_forwarded_from_global_key(tmp_path, keys, expected_flag):
+    from test_serve_launch_new_families import MUSE
+    result = _family_launch_result(
+        tmp_path, MUSE, "test/muse", "RTX_GPUS=2\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + keys,
+        extra_args=("--wip", "muse-test"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "cuteafd serve-muse" in line)
     if expected_flag is None:
         assert "--decode-rows" not in launch, launch
     else:

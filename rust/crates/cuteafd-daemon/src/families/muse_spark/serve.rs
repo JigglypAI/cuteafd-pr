@@ -38,6 +38,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
+    /// Per-lane verify-row budget (`auto` = 64; up to 128 on 1 or 2 GPUs).
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[arg(long)] pub model_id: Option<String>,
     #[arg(long, default_value = "auto")] pub vision: cuteafd_loader::plan::MediaMode,
     #[arg(long, default_value = "auto")] pub audio: cuteafd_loader::plan::MediaMode,
@@ -97,12 +100,27 @@ impl ServeArgs {
         Ok(plan)
     }
 
+    pub(super) fn resolved_decode_rows(&self) -> Result<u32> {
+        let rows = cuteafd_loader::plan::resolve_decode_rows(
+            "muse_spark",
+            cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+                requested: self.decode_rows.as_option(),
+                concurrency: u64::from(self.max_sequences),
+                decode_lanes: 1,
+                rtx_gpus: self.devices().len(),
+                draft_length: self.draft_length.draft_length.map(|n| n as u32),
+            },
+        )?;
+        Ok(rows)
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
         ensure!(!self.tp2_dflash || (devices.len() == 2 && self.draft.is_some()),
             "Muse TP2 DFlash requires --split-device and --draft");
         cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
+        self.resolved_decode_rows()?;
         ensure!(devices.iter().all(|&device| device >= 0)
             && devices.iter().collect::<std::collections::HashSet<_>>().len() == devices.len(),
             "Muse Spark coordinator devices must be distinct");
@@ -156,7 +174,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
+    let decode_rows = args.resolved_decode_rows()?;
     cuteafd_bench::context::set_family(cfg.family_id());
+    cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     cuteafd_bench::context::set_resolved("kv-cache", match args.kv_cache {
         cuteafd_loader::families::muse_spark::cache::MuseKvCache::Bf16 => "bf16",
         cuteafd_loader::families::muse_spark::cache::MuseKvCache::Fp8 => "fp8",
@@ -213,7 +233,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
         headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: args.peers.len(), prefill: args.prefill()?,
-         slots: u64::from(args.max_sequences),
+         slots: u64::from(args.max_sequences), decode_rows,
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes_with_format(&cfg, 1, args.kv_cache) as usize) as u64,
         max_context: args.max_context.filter(|&tokens| tokens > 0),
@@ -280,7 +300,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
-    let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
+    let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len(), decode_rows)?;
     let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(),
         spark.model.clone(), None)?;
@@ -323,7 +343,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             usize::try_from(prefill.unit_rows)?, !onboarded.is_empty())?;
         super::peer::MusePeer::new(&library, [0, 1].map(|rank|
             crate::shared::peer_split::RankDevice { device: devices[rank].id, stream: streams[rank].raw }),
-            sizes, super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, !onboarded.is_empty())?)
+            sizes, super::peer::decode_peer_bytes_for_rows(cfg.hidden, cfg.expert_hidden, cfg.topk, decode_rows as usize, !onboarded.is_empty())?)
     }).transpose()?;
     let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
@@ -337,7 +357,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                            checkpoint: &checkpoint, built: &built, placement, rank, stream: streams[rank].raw, slots: sequences as u64, arena: &arenas[rank],
+                            checkpoint: &checkpoint, built: &built, placement, rank, stream: streams[rank].raw, slots: sequences as u64, decode_rows: decode_rows as usize, arena: &arenas[rank],
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
@@ -898,6 +918,30 @@ mod tests {
             assert!(args(&extra).is_err() || args(&extra)?.validate().is_err(), "{extra:?}");
         }
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_rows_defaults_to_64_and_supports_128_on_one_or_two_gpus() -> Result<()> {
+        for split in [vec![], vec!["--split-device", "1"]] {
+            let mut base = vec!["--peers", PEERS];
+            base.extend_from_slice(&split);
+            let auto = args(&base)?;
+            assert_eq!(auto.resolved_decode_rows()?, 64);
+            let mut r128 = base.clone();
+            r128.extend_from_slice(&["--decode-rows", "128"]);
+            let wide = args(&r128)?;
+            wide.validate()?;
+            assert_eq!(wide.resolved_decode_rows()?, 128);
+            // C1 demand is 1 * (7 + 1) = 8 -> ceiling 64, so 128 is refused.
+            let mut c1 = r128.clone();
+            c1.extend_from_slice(&["--max-sequences", "1"]);
+            assert!(args(&c1)?.validate().is_err());
+            // Above 128 is refused.
+            let mut r256 = base.clone();
+            r256.extend_from_slice(&["--max-sequences", "32", "--decode-rows", "256"]);
+            assert!(args(&r256)?.validate().is_err());
+        }
         Ok(())
     }
 }

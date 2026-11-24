@@ -62,22 +62,33 @@ impl StepTables {
     pub fn bytes(&self) -> usize { self.bank_offset(self.banks()) }
 }
 
-/// Rows the K6 head scores per launch (its program's capacity; wider steps run
-/// in chunks of this).
+/// Rows the K6/BF16/FP8 head scores per launch (its program's capacity; wider
+/// steps run in chunks of this).
 pub const HEAD_ROWS: usize = 64;
+/// Widest admitted decode/verify row budget for Muse Spark (`DECODE_ROWS`).
+pub const MAX_DECODE_ROWS: usize = 128;
 
-/// The head rank's logits planes: the K6 head's F32 output at its stored
-/// (N128-padded) width, and the softcapped logits trimmed to the vocabulary,
-/// each `HEAD_ROWS` rows, `ALIGN`-aligned.
-pub fn head_planes(stored: usize, vocab: usize) -> Result<(usize, usize)> {
+/// The head rank's logits planes for `rows` decode/verify rows: the head's F32
+/// output at its stored (N128-padded) width, and the softcapped logits trimmed
+/// to the vocabulary, each `rows` rows, `ALIGN`-aligned.
+pub fn head_planes_for_rows(rows: usize, stored: usize, vocab: usize) -> Result<(usize, usize)> {
+    ensure!((1..=MAX_DECODE_ROWS).contains(&rows), "Muse head rows {rows} outside 1..={MAX_DECODE_ROWS}");
     ensure!(stored >= vocab && vocab > 0, "Muse head stored width below the vocabulary");
-    Ok((HEAD_ROWS * stored * 4, HEAD_ROWS * vocab * 4))
+    Ok((rows * stored * 4, rows * vocab * 4))
+}
+
+/// The head rank's logits planes at the default 64-row decode budget.
+pub fn head_planes(stored: usize, vocab: usize) -> Result<(usize, usize)> {
+    head_planes_for_rows(HEAD_ROWS, stored, vocab)
 }
 
 #[cfg(test)]
 #[test]
 fn scoring_reuses_bounded_head_planes() {
     assert_eq!(head_planes(202112, 202048).unwrap(), (64 * 202112 * 4, 64 * 202048 * 4));
+    assert_eq!(head_planes_for_rows(128, 202112, 202048).unwrap(), (128 * 202112 * 4, 128 * 202048 * 4));
+    assert!(head_planes_for_rows(0, 202112, 202048).is_err());
+    assert!(head_planes_for_rows(129, 202112, 202048).is_err());
     assert!(head_planes(0, 202048).is_err());
 }
 
