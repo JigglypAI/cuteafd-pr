@@ -152,6 +152,7 @@ impl Routes<'_> {
                     if *bf16 {
                         ensure!(meta.dtype == DType::Bf16, "BF16 projection {name}");
                     } else {
+                        ensure!(meta.dtype == DType::F8E4M3, "{name}: expected native FP8 projection");
                         ensure!(
                             index + 1 == names.len() || n % 128 == 0,
                             "projection concatenation cuts a block {name}"
@@ -351,7 +352,9 @@ pub(super) fn layer_routes(
         .into_iter()
         .filter_map(|op| cfg.weight(layer, op))
         .collect::<Vec<_>>();
-    let bf16 = core_attention || r.native_bf16(&attention, native_bf16)?;
+    let bf16 = core_attention || cuteafd_loader::families::glm5::core::fused_bf16(
+        "attention", "glm_producer / glm_o", &attention, native_bf16,
+        |name| Ok(r.meta(name)?.dtype.clone()))?;
     for (key, op) in [("q_a_norm", Op::QANorm), ("kv_a_norm", Op::KvANorm)] {
         if let Some(name) = cfg.weight(layer, op) {
             r.push(true, key, Operation::Tensor(name))?;
@@ -443,7 +446,9 @@ pub(super) fn layer_routes(
     if (dense || !native_shared) && core.get_weight(&gate).is_none() && !core.native.contains_key(&gate) {
         let names = vec![r.weight(Op::Gate)?, r.weight(Op::Up)?];
         let down = vec![r.weight(Op::Down)?];
-        let bf16 = r.native_bf16(&[names.clone(), down.clone()].concat(), native_bf16)?;
+        let bf16 = cuteafd_loader::families::glm5::core::fused_bf16(
+            "FFN", "glm_ffn_i*", &[names.clone(), down.clone()].concat(), native_bf16,
+            |name| Ok(r.meta(name)?.dtype.clone()))?;
         r.push(
             false,
             "w_gate_up",

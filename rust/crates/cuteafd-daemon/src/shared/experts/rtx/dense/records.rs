@@ -154,6 +154,8 @@ pub(crate) enum Job {
     ResidualGate { temperature: f32, alpha: CuteafdDeviceBuffer, beta: CuteafdDeviceBuffer },
     /// BF16 `at..at + bytes` widened to F32 into `dst`.
     Widen { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Staged FP32 128x128 grid followed by its E4M3 rows, widened to BF16.
+    DequantBlockFp8 { rows: usize, cols: usize, dst: CuteafdDeviceBuffer },
     /// F32 `at..at + bytes` narrowed to BF16 (round to nearest even, NaN
     /// quieted: `OutputPrecision::Bf16::round`) into `dst`.
     NarrowF32Bf16 { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
@@ -570,6 +572,21 @@ impl Step {
                     ensure!(at + bytes <= staged.len(), "widening outside its step");
                     load_timing::quantize(bytes, || kernels.widen_from(&staged[at..at + bytes], dst, stream))?;
                 }
+                Job::DequantBlockFp8 { rows, cols, dst } => {
+                    let values = rows.checked_mul(cols).context("FP8 dequant extent overflow")?;
+                    let grid = rows.div_ceil(128).checked_mul(cols.div_ceil(128))
+                        .and_then(|n| n.checked_mul(4)).context("FP8 dequant grid overflow")?;
+                    ensure!(values > 0 && grid.checked_add(values) == Some(self.bytes())
+                        && values.checked_mul(2).is_some_and(|n| n <= dst.bytes)
+                        && dst.device_id == self.device, "FP8 dequant outside its step or operand");
+                    // SAFETY: the aligned, device-visible grid, source and destination
+                    // stay live until the shared staging drains before its next use.
+                    load_timing::quantize(values, || unsafe {
+                        library.fp8_block_dequant(staged[grid..].as_ptr().cast(), staged.as_ptr().cast(),
+                            dst.ptr, rows, cols, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
+                }
                 Job::Quant { ref rows, pitch, col0, cols, layout, rule, target } => {
                     load_timing::quantize(rows.len() * cols * 2, || kernels.quantize_from(staged, rows.clone(),
                         pitch, col0, cols, layout, rule, target, stream))?;
@@ -792,6 +809,11 @@ impl DenseSink {
         Ok(())
     }
     pub fn finish(&self, finish: Finish) { self.finishes.borrow_mut().push(finish); }
+    pub fn peer_copy(&self, source: CuteafdDeviceBuffer, destination: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+        self.peer_copies.borrow_mut().push(PeerCopy::new(source, destination, bytes)?);
+        Ok(())
+    }
+
     /// The recorded operands and steps (leaves the sink empty).
     pub fn take(&self) -> (Vec<Operand>, Vec<Step>) {
         assert!(self.finishes.borrow().is_empty() && self.peer_copies.borrow().is_empty(),

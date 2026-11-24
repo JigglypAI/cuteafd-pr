@@ -58,7 +58,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
         gpus, prefill, blas_head: serving::BlasHead::TensorLt, blas: vec![],
         target: TargetFacts {
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
-                core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
+                core_loading: Default::default(), dense_mount: Default::default() })],
             hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
                 native: None, core: None, shared_workspace: None, }).collect(),
             embedding_read: None, native_load: None,
@@ -170,8 +170,7 @@ fn target_checkpoint_facts_use_exact_inventory_and_preserve_embedding_alternativ
         assert_eq!(actual.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>(),
             expected.owners.iter().map(|owner| &owner.allocation).collect::<Vec<_>>());
         assert_eq!(actual.core_loading, expected.core_loading);
-        assert_eq!(actual.kv_b_loading, expected.kv_b_loading);
-        assert_eq!(actual.row_loading, expected.row_loading);
+        assert_eq!(actual.dense_mount, expected.dense_mount);
     }
     assert_eq!(target.hooks.iter().map(|hook| hook.device).collect::<Vec<_>>(), [0, 1]);
     assert_eq!(target.embedding_read.unwrap().pinned_bytes(),
@@ -776,8 +775,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
             value: WeightInventory {
                 ranks: 2,
                 core_loading: super::super::weights::CoreLoading::default(),
-                kv_b_loading: super::super::weights::KvBLoading::default(),
-                row_loading: super::super::weights::RowLoading::default(), attention_mount: Default::default(),
+                dense_mount: Default::default(),
                 owners: vec![super::super::weights::WeightOwner {
                     allocation: Allocation::buffer(
                         "glm.weights.embedding",
@@ -1206,14 +1204,6 @@ fn serialized_heap_max_follows_weight_case_and_adds_concurrent_prefetch() {
             heap_payload_bytes: 4096 * (index as u64 + 1),
             sync_upload_bytes: 1024,
         };
-        case.value.kv_b_loading = super::super::weights::KvBLoading {
-            heap_payload_bytes: 6144,
-            sync_upload_bytes: 512,
-        };
-        case.value.row_loading = super::super::weights::RowLoading {
-            heap_payload_bytes: 7168,
-            sync_upload_bytes: 256,
-        };
     }
     // The current loader reads the whole sparse file, including header and any
     // unused tensor payload. This is not an installed checkpoint measurement.
@@ -1256,7 +1246,7 @@ fn serialized_heap_max_follows_weight_case_and_adds_concurrent_prefetch() {
         };
         assert_eq!(
             opaque(Phase::Load),
-            file_bytes + (4096 * (embedding as u64 + 1)).max(7168)
+            file_bytes + 4096 * (embedding as u64 + 1)
         );
         assert_eq!(opaque(Phase::DraftLoad), file_bytes);
         assert!(facts.allowances.iter().any(|a| a.bytes == file_bytes
@@ -1751,7 +1741,7 @@ fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight
             assert_eq!(nonhost(&after.facts), nonhost(&before.facts),
                 "every PINNED/device owner, view, reservation and byte total is unchanged");
             assert!(before.facts.allowances.iter().any(|a|
-                a.source.contains("serialized target payload heap subset")));
+                a.source.contains("serialized K6 source")));
             assert!(before.facts.allowances.iter().any(|a| a.source.contains("DFlash whole-file")));
             let retained_host = after.facts.allocations.iter().chain(&after.facts.deferred)
                 .filter(|a| a.location == Location::HOST).collect::<Vec<_>>();
@@ -2281,20 +2271,16 @@ fn bf16_target_receipt_matches_selected_physical_representation() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_snapshot(dir.path(), &config, &tensors, None);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
-    let mut totals = Vec::new();
-    for bf16 in [false, true] {
-        let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, bf16,
-            &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
-        let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
-        let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
-        assert_eq!(device[0] - host[0], 64 * 256 * 2);
-        assert_eq!(device[1], host[1]);
-        assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
-        let groups = target.weights[0].1.resident_groups().unwrap();
-        assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
-        totals.push(device.into_iter().sum::<u64>());
-    }
-    assert!(totals[1] > totals[0], "native BF16 must not use the FP8 admission");
+    let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, true,
+        &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
+    let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
+    let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
+    assert_eq!(device[0] - host[0], 64 * 256 * 2);
+    assert_eq!(device[1], host[1]);
+    assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
+    let groups = target.weights[0].1.resident_groups().unwrap();
+    assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
+    assert!(target.weights[0].1.owners.iter().all(|owner| !owner.format.starts_with("fp8")));
 }
 
 #[test]

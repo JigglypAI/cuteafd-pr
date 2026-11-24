@@ -1453,7 +1453,7 @@ impl Opened {
                 let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        let mut model = planning.model(&self.cfg, layers, owners.as_deref(), native)?;
+                        let mut model = planning.model(&self.cfg, layers, owners.as_deref(), native, selected_target.weights[0].1.dense_mount)?;
                         if let Some(range) = &tp2_range {
                             planning.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
                         }
@@ -1610,7 +1610,7 @@ impl Opened {
                 let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        let mut model = loader.model(&self.cfg, layers, owners.as_deref(), native)?;
+                        let mut model = loader.model(&self.cfg, layers, owners.as_deref(), native, selected_target.weights[0].1.dense_mount)?;
                         if let Some(range) = &tp2_range {
                             loader.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
                         }

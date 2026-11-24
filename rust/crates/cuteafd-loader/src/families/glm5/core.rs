@@ -41,6 +41,17 @@ pub struct UnsupportedAttentionFormat {
     pub expected: &'static str,
 }
 
+/// Fused legacy programs bind one weight format for the entire group.
+pub fn fused_bf16(group: &str, program: &str, names: &[String], native_bf16: bool,
+    dtype: impl Fn(&str) -> Result<cuteafd_core::DType>) -> Result<bool> {
+    use cuteafd_core::DType;
+    let members = names.iter().map(|name| Ok((name, dtype(name)?))).collect::<Result<Vec<_>>>()?;
+    if native_bf16 && members.iter().all(|(_, dtype)| *dtype == DType::Bf16) { return Ok(true); }
+    ensure!(members.iter().all(|(_, dtype)| *dtype == DType::F8E4M3),
+        "GLM {group} group {members:?} cannot use one native weight format; add a mixed BF16/FP8 {program} program");
+    Ok(false)
+}
+
 pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &CoreInventory)
     -> std::result::Result<(), UnsupportedAttentionFormat> {
     if cfg.variant.is_glm() { return Ok(()); }

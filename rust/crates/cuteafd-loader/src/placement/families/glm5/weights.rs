@@ -48,75 +48,86 @@ impl CoreLoading {
     }
 }
 
-/// BF16 KV-B absorption still runs when the other attention weights use K6.
-/// Its source, transposed outputs and one rank's upload slice coexist.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct KvBLoading {
-    pub heap_payload_bytes: u64,
-    pub sync_upload_bytes: u64,
+/// A transform window holds only whole heads; any accompanying scale grid
+/// is charged in the same staging backing.
+pub fn kv_b_window(head_bytes: usize, grid_bytes: usize) -> Result<usize> {
+    use crate::shared::dense_read::STEP_BYTES;
+    let window = STEP_BYTES.checked_sub(grid_bytes).and_then(|n| n.checked_div(head_bytes))
+        .context("invalid GLM KV-B staging extent")?;
+    ensure!(window > 0, "a GLM KV-B head exceeds bounded staging");
+    Ok(window)
 }
 
-impl KvBLoading {
-    fn include(&mut self, source: u64, uk: u64, uv: u64, ranks: usize) -> Result<()> {
-        ensure!((1..=2).contains(&ranks) && uk > 0 && uv > 0
-            && uk % ranks as u64 == 0 && uv % ranks as u64 == 0,
-            "GLM BF16 KV-B load split");
-        let outputs = sum([uk, uv])?;
-        ensure!(outputs == source, "GLM BF16 KV-B source differs from absorbed outputs");
-        let upload = uk.max(uv) / ranks as u64;
-        let heap = sum([source, outputs, upload])?;
-        self.heap_payload_bytes = self.heap_payload_bytes.max(heap);
-        self.sync_upload_bytes = self.sync_upload_bytes.max(upload);
-        Ok(())
-    }
+/// Split on 128-row boundaries so a staged grid window keeps its block bases.
+pub fn dequant_window(cols: usize) -> Result<usize> {
+    use crate::shared::dense_read::STEP_BYTES;
+    let block = cols.checked_mul(128).and_then(|n| n.checked_add(cols.div_ceil(128) * 4))
+        .context("GLM FP8 dequant staging overflow")?;
+    let units = STEP_BYTES.checked_div(block).context("empty GLM FP8 dequant row")?;
+    ensure!(units > 0, "a GLM FP8 dequant block exceeds bounded staging");
+    Ok(units * 128)
 }
 
-/// The BF16 row reader holds all raw members while one FP8 member's raw
-/// block grid and device dequantization pair are live. Device owners join later.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RowLoading {
-    pub heap_payload_bytes: u64,
-    pub sync_upload_bytes: u64,
-}
-
-impl RowLoading {
-    fn include(&mut self, headers: &Headers<'_>, names: &[String]) -> Result<()> {
-        ensure!(!names.is_empty(), "empty GLM BF16 row source");
-        let mut source = 0;
-        let mut grid = 0;
-        let mut upload = 0;
-        let mut columns = None;
-        for name in names {
-            let header = headers.get(name)?;
-            let [n, k] = headers.matrix(name)?;
-            ensure!(columns.is_none_or(|columns| columns == k),
-                "GLM BF16 row sources differ in columns");
-            columns = Some(k);
-            let width = match header.dtype {
-                DType::Bf16 => 2,
-                DType::F8E4M3 => 1,
-                _ => anyhow::bail!("unsupported GLM BF16 row source {name}"),
-            };
-            ensure!(header.byte_length == product(&[n, k, width])?,
-                "GLM BF16 row source byte extent {name}");
-            source = sum([source, header.byte_length])?;
-            upload = upload.max(header.byte_length);
-            if header.dtype == DType::F8E4M3 {
-                let scale = headers.block_grid(name).with_context(|| format!("missing row block grid {name}"))?;
-                let shape = [n.div_ceil(128), k.div_ceil(128)];
-                ensure!(scale.dtype == DType::F32
-                    && scale.shape == shape.map(|n| n as usize)
-                    && scale.byte_length == product(&[shape[0], shape[1], 4])?,
-                    "GLM BF16 row source scale grid {name}");
-                grid = grid.max(scale.byte_length);
-                upload = upload.max(scale.byte_length);
-            }
+fn row_mount(headers: &Headers<'_>, names: &[String]) -> Result<crate::shared::dense_read::MountLoad> {
+    use crate::shared::dense_read::{MountLoad, PINNED_FLOOR_BYTES, ReadBatch, STEP_BYTES};
+    ensure!(!names.is_empty(), "empty GLM BF16 row source");
+    let mut load = MountLoad::default();
+    let mut columns = None;
+    let mut output = 0u64;
+    for name in names {
+        let header = headers.get(name)?;
+        let [n, k] = headers.matrix(name)?;
+        ensure!(columns.is_none_or(|cols| cols == k), "GLM BF16 row sources differ in columns");
+        columns = Some(k);
+        output = sum([output, product(&[n, k, 2])?])?;
+        let width = match header.dtype {
+            DType::Bf16 => 2,
+            DType::F8E4M3 => 1,
+            _ => anyhow::bail!("unsupported GLM BF16 row source {name}"),
+        };
+        ensure!(header.byte_length == product(&[n, k, width])?, "GLM BF16 row source byte extent {name}");
+        let [n, k] = [usize::try_from(n)?, usize::try_from(k)?];
+        if width == 2 {
+            load.merge(MountLoad::read(ReadBatch::new(n, k * 2, k * 2, STEP_BYTES)?));
+        } else {
+            let scale = headers.block_grid(name).with_context(|| format!("missing row block grid {name}"))?;
+            let [nb, kb] = [n.div_ceil(128), k.div_ceil(128)];
+            ensure!(scale.dtype == DType::F32 && scale.shape == [nb, kb]
+                && scale.byte_length == product(&[nb as u64, kb as u64, 4])?,
+                "GLM BF16 row source scale grid {name}");
+            let rows = n.min(dequant_window(k)?);
+            let packed = rows * k + rows.div_ceil(128) * kb * 4;
+            load.pinned_source = load.pinned_source.max(packed.max(PINNED_FLOOR_BYTES) as u64);
         }
-        let heap = sum([source, grid])?;
-        self.heap_payload_bytes = self.heap_payload_bytes.max(heap);
-        self.sync_upload_bytes = self.sync_upload_bytes.max(upload);
-        Ok(())
     }
+    Ok(load)
+}
+
+fn kv_b_mount(headers: &Headers<'_>, cfg: &GlmDsaConfig, layer: usize, parts: usize, bf16: bool)
+    -> Result<crate::shared::dense_read::MountLoad> {
+    use crate::shared::dense_read::{MountLoad, PINNED_FLOOR_BYTES};
+    let name = cfg.weight(layer, Op::KvB).context("GLM KV-B source")?;
+    let header = headers.get(&name)?;
+    let [n, k] = headers.matrix(&name)?;
+    let rows = cfg.nope_dim(layer).checked_add(cfg.v_head_dim).context("GLM KV-B head extent overflow")?;
+    ensure!(parts > 0 && cfg.heads % parts == 0 && n == product(&[cfg.heads as u64, rows as u64])?
+        && k == cfg.kv_lora_rank as u64, "GLM KV-B source geometry {name}");
+    let (width, grid) = if bf16 {
+        ensure!(header.dtype == DType::Bf16, "GLM BF16 KV-B source {name}");
+        (2, 0)
+    } else {
+        ensure!(header.dtype == DType::F8E4M3 && cfg.nope_dim(layer) % 64 == 0
+            && rows % 64 == 0 && k % 128 == 0, "GLM block FP8 KV-B source {name}");
+        let grid = headers.block_grid(&name).with_context(|| format!("missing KV-B block grid {name}"))?;
+        let [nb, kb] = [n.div_ceil(128), k / 128];
+        ensure!(grid.dtype == DType::F32 && grid.shape == [nb as usize, kb as usize]
+            && grid.byte_length == product(&[nb, kb, 4])?, "GLM KV-B block grid {name}");
+        (1, usize::try_from(grid.byte_length)?)
+    };
+    ensure!(header.byte_length == product(&[n, k, width])?, "GLM KV-B byte extent {name}");
+    let head = usize::try_from(product(&[rows as u64, k, width])?)?;
+    let count = (cfg.heads / parts).min(kv_b_window(head, grid)?);
+    Ok(MountLoad { pinned_source: (count * head + grid).max(PINNED_FLOOR_BYTES) as u64, ..Default::default() })
 }
 
 /// One native projection's serialized mount reader, including TP column reads.
@@ -155,9 +166,7 @@ pub struct WeightInventory {
     pub ranks: usize,
     pub owners: Vec<WeightOwner>,
     pub core_loading: CoreLoading,
-    pub kv_b_loading: KvBLoading,
-    pub row_loading: RowLoading,
-    pub attention_mount: crate::shared::dense_read::MountLoad,
+    pub dense_mount: crate::shared::dense_read::MountLoad,
 }
 
 impl WeightInventory {
@@ -197,9 +206,8 @@ impl WeightInventory {
         if maximum_pages == 0 {
             return Err(Refusal::InvalidFact("empty GLM load page domain".into()));
         }
-        let bytes = self.core_loading.heap_payload_bytes
-            .max(self.kv_b_loading.heap_payload_bytes).max(self.row_loading.heap_payload_bytes);
-        let mut components = self.attention_mount.allocations("glm.load.native_attention").into_iter()
+        let bytes = self.core_loading.heap_payload_bytes;
+        let mut components = self.dense_mount.allocations("glm.load.dense_mount").into_iter()
             .map(|owner| {
                 let curve = ByteCurve::fixed(owner.bytes, maximum_pages);
                 Component::allocation(owner, curve, false, maximum_pages)
@@ -212,7 +220,7 @@ impl WeightInventory {
                 location: Location::HOST,
                 bytes,
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
-                source: "GLM serialized target payload heap subset: max(K6 full four-member source including marker + local packed payload/suh/svh, BF16 KV-B source + full uk/uv outputs + largest single-rank upload slice, BF16 row reader all raw members + largest one-member FP32 grid); ordinary Rust heap, unmeasured assumption; excludes allocator/metadata/thread overhead, retained thread-local staging, device dequantization temporaries, other target operations, concurrent draft prefetch and embedding filler".into(),
+                source: "GLM serialized K6 source including marker + local packed payload/suh/svh; ordinary Rust heap, unmeasured assumption; excludes allocator/metadata overhead, other target operations, concurrent draft prefetch and embedding filler".into(),
                 assumed: true,
             }),
         });
@@ -461,8 +469,7 @@ impl WeightInventory {
             ranks,
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
-            kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(), attention_mount: Default::default(),
+            dense_mount: Default::default(),
         };
         for layer in 0..layers {
             let weight = |op| cfg.weight(layer, op).context("missing GLM variant operand");
@@ -474,34 +481,22 @@ impl WeightInventory {
             let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
                 .filter(|op| cfg.stem(layer, *op).is_some()).all(staged);
             crate::families::glm5::core::validate_attention_format(&cfg, layer, &core)?;
-            let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
+            let bf16 = core_attention || crate::families::glm5::core::fused_bf16(
+                "attention", "glm_producer / glm_o", &attention, native_bf16,
+                |name| Ok(headers.get(name)?.dtype.clone()))?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
             let native_layouts = core.layer_native(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
             if cfg.indexers[layer] == GlmIndexer::Full {
-                out.row_loading.include(&headers, &[
+                out.dense_mount.merge(row_mount(&headers, &[
                     cfg.weight(layer, crate::families::glm5::names::Operand::IndexK)
                         .context("GLM indexer row source")?,
                     cfg.weight(layer, crate::families::glm5::names::Operand::IndexWeights)
                         .context("GLM indexer row weights")?,
-                ])?;
+                ])?);
             }
-            if bf16 {
-                let name = weight(Op::KvB)?;
-                let header = headers.get(&name)?;
-                let shape = headers.matrix(&name)?;
-                let uk = product(&[cfg.heads as u64, cfg.kv_lora_rank as u64,
-                    cfg.nope_dim(layer) as u64, 2])?;
-                let uv = product(&[cfg.heads as u64, cfg.v_head_dim as u64,
-                    cfg.kv_lora_rank as u64, 2])?;
-                ensure!(header.dtype == DType::Bf16
-                    && product(&[shape[0], shape[1], 2])? == header.byte_length
-                    && shape == [product(&[cfg.heads as u64,
-                        sum([cfg.nope_dim(layer) as u64, cfg.v_head_dim as u64])?])?,
-                        cfg.kv_lora_rank as u64], "GLM BF16 kv_b source geometry");
-                out.kv_b_loading.include(header.byte_length, uk, uv,
-                    if owners.is_some() { 1 } else { ranks })?;
-            }
+            out.dense_mount.merge(kv_b_mount(&headers, &cfg, layer,
+                if owners.is_some() { 1 } else { ranks }, bf16)?);
             for rank in 0..ranks {
                 let prefix = format!("layer.{layer}.operand");
                 for (key, op) in [("input_norm", Op::InputNorm), ("post_norm", Op::PostAttentionNorm)] {
@@ -678,7 +673,9 @@ impl WeightInventory {
                 let group = if dense { "dense" } else { "shared_expert" };
                 if (dense || !native_shared) && core.get_weight(&names[0]).is_none()
                     && !core.native.contains_key(names[0].strip_suffix(".weight").unwrap()) {
-                    let shared_bf16 = native_bf16 && headers.all_bf16(&names)?;
+                    let shared_bf16 = crate::families::glm5::core::fused_bf16(
+                        "FFN", "glm_ffn_i*", &names, native_bf16,
+                        |name| Ok(headers.get(name)?.dtype.clone()))?;
                     headers.projection(
                         &mut out,
                         rank,
@@ -733,7 +730,7 @@ impl WeightInventory {
                 }
                 for (name, layout) in &native_layouts[rank] {
                     let source = core.native.get(&layout.stem).context("native attention source layout")?;
-                    out.attention_mount.merge(native_attention_mount(layout, source.shape,
+                    out.dense_mount.merge(native_attention_mount(layout, source.shape,
                         checkpoint.converts_to_fp8(&format!("{}.weight", layout.stem)))?);
                     let [n, k] = layout.shape.map(|n| n as u64);
                     let group = if matches!(*name, "gate" | "up" | "down") { group } else { "attention" };
@@ -774,7 +771,7 @@ impl WeightInventory {
             out.add(0,"native.head.values","lm_head","fp8",product(&[n as u64,k as u64])?.max(256))?;
             out.add(0,"native.head.scales","lm_head","fp8-scale",product(&[(n/128) as u64,(k/128) as u64,4])?.max(256))?;
             let source = headers.matrix(&format!("{}.weight",cfg.head()))?;
-            out.attention_mount.merge(native_attention_mount(&crate::formats::native_attention::NativeLayout {
+            out.dense_mount.merge(native_attention_mount(&crate::formats::native_attention::NativeLayout {
                 stem:cfg.head().into(),shape:head.shape,fp8:true,rank:0,ranks:1,
                 split:crate::formats::trellis_core::CoreSplit::Whole },
                 [usize::try_from(source[0])?,usize::try_from(source[1])?],true)?);
@@ -782,7 +779,7 @@ impl WeightInventory {
             let head_name = format!("{}.weight", cfg.head());
             let head = headers.get(&head_name)?;
             if head.dtype == DType::F8E4M3 {
-                out.row_loading.include(&headers, &[head_name.clone()])?;
+                out.dense_mount.merge(row_mount(&headers, &[head_name.clone()])?);
             }
             let bytes = if head.dtype == DType::F8E4M3 {
                 product(&[
@@ -811,7 +808,7 @@ impl WeightInventory {
         ensure!(plans.len() == self.ranks, "GLM native shared rank count");
         let mut owners = Self {
             ranks: self.ranks, owners: Vec::new(), core_loading: CoreLoading::default(),
-            kv_b_loading: KvBLoading::default(), row_loading: RowLoading::default(), attention_mount: Default::default(),
+            dense_mount: Default::default(),
         };
         for (rank, layers) in plans.iter().enumerate() {
             for plan in layers {
@@ -842,8 +839,7 @@ impl WeightInventory {
             ranks: plans.len(),
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
-            kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(), attention_mount: Default::default(),
+            dense_mount: Default::default(),
         };
         out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
         Ok(out)
@@ -865,8 +861,7 @@ impl WeightInventory {
             ranks: self.ranks,
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
-            kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(), attention_mount: Default::default(),
+            dense_mount: Default::default(),
         };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {
@@ -1080,10 +1075,7 @@ impl Headers<'_> {
                     "GLM FP8 split cuts a 128-element block {name}"
                 );
             }
-            if *dtype == DType::Bf16 {
-                native = false;
-                continue;
-            }
+            ensure!(*dtype == DType::F8E4M3, "{name}: expected native FP8 projection");
             if let Some(grid) = self.block_grid(name) {
                 ensure!(
                     grid.dtype == DType::F32
@@ -1108,7 +1100,7 @@ impl Headers<'_> {
             .map(|shape| product(&[shape[0].div_ceil(128), shape[1].div_ceil(128), 4]))
             .collect::<Result<Vec<_>>>()?)?
             / ranks as u64;
-        // fp8_split's converted row buffers and fp8_cols's value buffer are exact
+        // Non-block FP8 split row buffers and fp8_cols's value buffer are exact
         // requests; landing and ordinary uploads retain their 256-byte floor.
         let floor_values = ranks == 1 || native;
         let floor_grids = ranks == 1 || native || input_split;

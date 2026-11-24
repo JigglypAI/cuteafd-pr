@@ -171,17 +171,18 @@ fn digests(library: &NativeLibrary, layers: &[Vec<GlmLayer<'_>>], norm: &DeviceA
     Ok(out)
 }
 
-fn golden_arenas<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
-    cfg: &GlmDsaConfig) -> Result<std::rc::Rc<std::collections::BTreeMap<i32,
-        crate::shared::memory::weight_arena::DeviceWeightArena<'a>>>> {
+fn golden_inventory<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+    cfg: &GlmDsaConfig) -> Result<(std::rc::Rc<std::collections::BTreeMap<i32,
+        crate::shared::memory::weight_arena::DeviceWeightArena<'a>>>, cuteafd_loader::shared::dense_read::MountLoad)> {
     use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(catalog.snapshot())?;
-    let layouts = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None, false, false,
-        EmbeddingHome::Device(0))?.coordinator_arenas()?;
-    Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
+    let inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None, false, false,
+        EmbeddingHome::Device(0))?;
+    let layouts = inventory.coordinator_arenas()?;
+    Ok((std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
         Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
             Device { library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
-    }).collect::<Result<_>>()?))
+    }).collect::<Result<_>>()?), inventory.dense_mount))
 }
 
 /// Set CUTEAFD_WRITE_GLM5_OPERAND_GOLDEN=1 to regenerate (only from a loader
@@ -201,9 +202,10 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
+    let (arenas, mount) = golden_inventory(&library, &catalog, &cfg)?;
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: None };
-    let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(arenas), allocation_prefix: String::new(), push: None };
+    let (model, shares) = loader.model(&cfg, cfg.layers, None, false, mount)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
     let actual = digests(&library, &layers, &model.norm, model.head.bf16()?)?;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5/weights_golden.json");
@@ -237,9 +239,10 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
     let sink = std::rc::Rc::new(super::landing::PushSink::default());
+    let (arenas, mount) = golden_inventory(&library, &catalog, &cfg)?;
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: Some(sink.clone()) };
-    let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(arenas), allocation_prefix: String::new(), push: Some(sink.clone()) };
+    let (model, shares) = loader.model(&cfg, cfg.layers, None, false, mount)?;
     let (records, deferred) = sink.take();
     let (sparks, world) = (6usize, 8usize);
     for gpu in 0..2 {
@@ -255,6 +258,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)
         })?;
     }
+    crate::shared::experts::rtx::dense::run_peer_copies(&library, &records.peer_copies)?;
     for job in &deferred {
         crate::shared::memory::device::Device { library: &library, id: job.device }.run(|| job.run(&library, stream))?;
     }
