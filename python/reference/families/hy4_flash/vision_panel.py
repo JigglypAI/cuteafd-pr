@@ -37,7 +37,7 @@ WINDOWS = [
      "The diagram is labelled Synthetic pipeline and has four numbered boxes stacked vertically. The stages are "
      "1. INPUT, 2. DECODE, 3. ENCODE and 4. CACHE. Arrows point downward from each box to the next one, so data "
      "flows from input through decode and encode into the cache."),
-    ("img640x480", 0, (640, 480), "Describe the code screenshot in one or two sentences.",
+    ("img630x470", 0, (630, 470), "Describe the code screenshot in one or two sentences.",
      "The screenshot is titled REPOSITORY CODE and shows the first lines of a CUDA source file from this "
      "repository. It contains include directives and the start of a normalization kernel, rendered in a "
      "monospace font on a light background, with each line truncated to fit the image width."),
