@@ -226,8 +226,7 @@ case "$(get DRAFT_POLICY history)" in
 esac
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
-# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
-# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
+# (CUTEAFD_SPECULATION_TRACE; read by scripts/bench/speculation-replay.py).
 shared_trace_args() {
 trace_args=()
 trace="$(get SPECULATION_TRACE)"
