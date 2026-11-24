@@ -450,6 +450,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout,
             peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
+    if matches!(options.role, Role::Serve) {
+        crate::shared::draft::report::publish(admitted.drafter_report()?);
+    }
     let mut draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
     let off=crate::shared::vision::still::Options {vision:cuteafd_loader::plan::MediaMode::Off,..Default::default()};
     let mut media=crate::shared::vision::still::Ready::load(options.media.unwrap_or(&off),&checkpoint.snapshot,

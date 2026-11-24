@@ -565,6 +565,10 @@ fn with_backend<T>(args: &ServeArgs,
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
+    if mtp.is_some() {
+        use crate::shared::draft::report::{self, Kind, Placement};
+        report::publish(report::admitted(Kind::Mtp, Placement::Whole, u8::try_from(head_rank)?, &ids, &admission.solved)?);
+    }
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     let backend = backend.with_vision(crate::shared::vision::perception::Binding::new(&args.snapshot,
         cuteafd_loader::media::ImageFamily::Step5, media.preparer.is_some(), cfg.vocab as u32)?);

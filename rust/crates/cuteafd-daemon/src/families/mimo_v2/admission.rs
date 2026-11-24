@@ -18,6 +18,7 @@ pub(super) struct Preflight {
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
     pub prefill_rows: usize,
+    pub solved: cuteafd_loader::placement::planner::ResolvedPlan,
     pub expert_resident_bytes: [usize; 2],
 }
 
@@ -622,6 +623,7 @@ fn preflight_shape(
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: working,
         prefill_rows: args.prefill_rows,
+        solved: admitted.solved,
         expert_resident_bytes,
     })
 }

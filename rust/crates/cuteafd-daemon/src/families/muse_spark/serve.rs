@@ -242,6 +242,11 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
+    if let (Some(draft), Some(lead)) = (&built.drafter, built.draft_home) {
+        use crate::shared::draft::report::{self, Kind, Placement};
+        let placement = if draft.tp2.is_empty() { Placement::Whole } else { Placement::Split };
+        report::publish(report::admitted(Kind::Dflash2, placement, lead, &device_ids, &built.solved)?);
+    }
     let placement = &built.placement;
     {
         use sha2::{Digest, Sha256};

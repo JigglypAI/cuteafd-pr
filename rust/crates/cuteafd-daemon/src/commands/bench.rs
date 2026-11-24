@@ -340,7 +340,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     let mut context = cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: None, snapshot, settings, supports_thinking_off: None, derived: Vec::new() };
+        snapshot, settings, ..Default::default() };
     for name in derived { context.require_resolved(&name); }
     Ok(Some(context))
 }

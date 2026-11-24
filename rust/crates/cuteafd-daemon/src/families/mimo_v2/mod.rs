@@ -1476,6 +1476,17 @@ impl Opened {
             }
             engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
             if let Some(drafter) = &engine.drafter { drafter.prepare_workspace()?; }
+            if serving.is_some() {
+                use crate::shared::draft::report::{self, Kind, Placement};
+                let physical = std::iter::once(args.device).chain(peer_stream.map(|(id, _)| id)).collect::<Vec<_>>();
+                let draft = if let Some(draft) = &engine.drafter {
+                    Some((Kind::Dflash2, if draft.is_split() { Placement::Split } else { Placement::Whole }))
+                } else if engine.mtp.is_some() { Some((Kind::Mtp, Placement::Whole)) } else { None };
+                if let Some((kind, placement)) = draft {
+                    report::publish(report::from_plan(kind, placement, 0, &physical, &preflight.solved,
+                        |owner| owner.group == "draft.fp8_scratch" || owner.group.starts_with("mtp."))?);
+                }
+            }
             body(&engine, preflight.host_config)
         })();
         let submission_failed = engine.submission_failed();

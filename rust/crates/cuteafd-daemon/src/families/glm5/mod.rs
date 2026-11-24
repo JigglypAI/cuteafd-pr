@@ -1843,6 +1843,18 @@ impl Opened {
                 charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE Ready summary");
         }
         engine.usage_active.set(true);
+        if serving.is_some() {
+            use crate::shared::draft::report::{self, Kind, Placement};
+            if let Some(draft) = &engine.drafter {
+                let kind = if draft.token_only() { Kind::Dspark } else { Kind::Dflash2 };
+                let (placement, lead) = match draft {
+                    drafter::GlmDrafter::Local(_) => (Placement::Whole, 0),
+                    drafter::GlmDrafter::Remote(draft) => (Placement::Remote,
+                        cuteafd_loader::placement::planner::CoordinatorDevices::new(&devices)?.logical_rank(draft.draft.device.id)?),
+                };
+                report::publish(report::admitted(kind, placement, lead, &devices, &admitted.solved)?);
+            }
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         // Non-serving commands do not pass schedule's readiness boundary.
         drop(self.startup_audit.borrow_mut().take());

@@ -712,6 +712,8 @@ impl<'a> MimoDrafter<'a> {
         self.policy_scores.set(scored);
     }
 
+    pub(crate) fn is_split(&self) -> bool { self.peer.is_some() }
+
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
         if self.workspace.borrow().is_none() {
             *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);

@@ -801,6 +801,10 @@ fn worker(
             if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
             Ok(())
         }) }?;
+    if draft.is_some() {
+        use crate::shared::draft::report::{self, Kind, Placement};
+        report::publish(report::admitted(Kind::Dspark, Placement::Whole, 0, &[inventory.gpus[0].device], &pool.solved)?);
+    }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;

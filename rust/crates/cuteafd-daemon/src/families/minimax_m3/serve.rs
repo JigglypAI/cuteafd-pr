@@ -139,6 +139,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 prefix: &worker_args.prefix, expert_usage: worker_args.expert_usage,
                 usage_reader: worker_args.expert_usage_reader.clone(),
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
+            if loaded.owners.storage.draft_prefix.is_some() {
+                use crate::shared::draft::report::{self, Kind, Placement};
+                let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
+                let lead = u8::try_from(physical.len() - 1)?;
+                report::publish(report::admitted(Kind::Dspark, Placement::Whole, lead, &physical, &loaded.admitted.solved)?);
+            }
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
                 loaded.execution, served_context, loaded.host_prefix, worker_args.prefill_packing)?.with_probe_snapshot(&worker_args.snapshot)

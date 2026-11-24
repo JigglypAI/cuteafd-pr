@@ -396,6 +396,13 @@ impl<'a> Admission<'a> {
         super::draft::HeadReplica::allocate(device, layout, &self.core).map(Some)
     }
 
+    pub(crate) fn drafter_report(&self) -> Result<crate::shared::draft::report::DrafterLayout> {
+        use crate::shared::draft::report::DrafterLayout;
+        let Some(layout) = &self.draft else { return Ok(DrafterLayout::NONE); };
+        let home = draft::home(&self.placement).context("Kimi admitted draft home absent")?;
+        draft_layout_report(layout, home, &self.devices, &self.receipt)
+    }
+
     pub(crate) fn draft_layout(&self) -> Option<&DraftLayout> { self.draft.as_ref() }
 
     /// Hops, the peer exchange and Spark waves serve one prefill unit.
@@ -3371,4 +3378,47 @@ pub(super) mod tests {
             "cross-owner cancellation between MLA records and DSA index records must fail");
         Ok(())
     }
+}
+
+fn draft_layout_report(layout: &DraftLayout, home: u8, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let (kind, placement, lead) = match layout {
+        DraftLayout::BlockTp2 { lead, .. } => (Kind::Dspark, Placement::PairedBlock, u8::try_from(*lead)?),
+        DraftLayout::Block(_) => (Kind::Dspark, if home == 0 { Placement::Whole } else { Placement::Remote }, home),
+        DraftLayout::Mla(layout) => (Kind::Dflash2,
+            if layout.context_split() { Placement::Split } else if home == 0 { Placement::Whole } else { Placement::Remote }, home),
+    };
+    report::admitted(kind, placement, lead, devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn paired_block_report_uses_the_draft_selector_rank() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    use cuteafd_loader::{formats::block_dspark::{block_dspark_weight_recipe, BlockDsparkConfig}, plan::testing::{t, write_safetensors}};
+    let root = tempfile::tempdir()?;
+    let raw = serde_json::json!({"architectures":["DSparkDraftModel"], "speculators_model_type":"dspark",
+        "aux_hidden_state_layer_ids":[1,2], "block_size":2, "confidence_head_with_markov":true,
+        "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":256,
+        "mask_token_id":0, "sample_from_anchor":true, "sliding_window_non_causal":false,
+        "transformer_layer_config":{"attention_bias":false, "head_dim":128, "hidden_act":"silu",
+            "hidden_size":256, "intermediate_size":256, "layer_types":["sliding_attention"],
+            "max_position_embeddings":64, "model_type":"qwen3", "num_attention_heads":2, "num_hidden_layers":1,
+            "num_key_value_heads":2, "rms_norm_eps":1e-5, "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+            "sliding_window":32, "vocab_size":16}});
+    std::fs::write(root.path().join("config.json"), serde_json::to_vec(&raw)?)?;
+    let cfg = BlockDsparkConfig::read(root.path())?;
+    let shapes = std::cell::RefCell::new(Vec::new());
+    block_dspark_weight_recipe(&cfg, |name, shape| { shapes.borrow_mut().push(t(name, "BF16", shape)); Ok::<_, anyhow::Error>(()) },
+        |parts, cols| { for (name, rows) in parts { shapes.borrow_mut().push(t(*name, "BF16", &[*rows, cols])); } Ok(()) })?;
+    write_safetensors(&root.path().join("model.safetensors"), &shapes.into_inner());
+    let options = super::draft::Options { snapshot: root.path().to_owned(), fp8: false, tp2_dflash: false,
+        cache_format: cuteafd_core::MlaCacheFormat::Bf16, context_window: 0, draft_kv_cache: Default::default() };
+    let layout = options.layout(2, 64, 188, 1)?;
+    let reported = draft_layout_report(&layout, 1, &[5, 2], &plan(vec![owner(0, 100), owner(1, 200)]))?;
+    assert_eq!((reported.kind, reported.placement, reported.lead), (Kind::Dspark, Some(Placement::PairedBlock), Some(Rank::Gpu(2))));
+    assert_eq!(reported.ranks, [Rank::Gpu(5), Rank::Gpu(2)]);
+    assert_eq!(reported.arena_bytes, [100, 200]);
+    Ok(())
 }

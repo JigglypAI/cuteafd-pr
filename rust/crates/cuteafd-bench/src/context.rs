@@ -16,6 +16,7 @@ pub struct ServerContext {
     pub snapshot: Option<PathBuf>,
     pub settings: Vec<Setting>,
     pub supports_thinking_off: Option<bool>,
+    pub drafter: Option<crate::report::DrafterLayout>,
     /// Argument definitions whose launch values are not runtime facts.
     pub derived: Vec<String>,
 }
@@ -249,6 +250,14 @@ impl ResolvedSettings {
 
 pub fn set_thinking_off(supported: bool) {
     if let Ok(mut slot) = state().context.lock() { slot.supports_thinking_off = Some(supported); }
+}
+
+pub fn set_drafter(layout: crate::report::DrafterLayout) {
+    if let Ok(mut slot) = state().context.lock() { slot.drafter = Some(layout); }
+}
+
+pub fn drafter() -> Option<crate::report::DrafterLayout> {
+    state().context.lock().ok()?.drafter.clone()
 }
 
 pub fn get() -> ServerContext {

@@ -167,6 +167,7 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         .map_or(ResidentWeights::default(), |(_, bytes)| bytes);
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+    if mtp { publish_drafter(&[args.device], &solved)?; }
     publish_reconciliation(args, &inventory.gpus, &solved, sparks)?;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
@@ -184,6 +185,14 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
 /// for the family. Identity only: hashes of the native library and program
 /// manifest, the served layout, and one inventory sample per physical GPU in
 /// rank order (the capture indexes `devices` by the `rtxN` owner row).
+pub(super) fn publish_drafter(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    report::publish(report::from_plan(Kind::Mtp, Placement::Whole, 0, devices, plan, |owner|
+        matches!(owner.id.as_str(), "qwen.records.mtp" | "qwen.owner0.mtp.records" | "qwen.owner0.mtp.pending")
+            || owner.group.starts_with("MTP ") || owner.group == "prefill MTP step")?);
+    Ok(())
+}
+
 pub(super) fn publish_reconciliation(args: &EngineArgs, devices: &[RuntimeSample],
     solved: &cuteafd_loader::placement::planner::ResolvedPlan, spark_world: usize) -> Result<()> {
     use sha2::{Digest, Sha256};

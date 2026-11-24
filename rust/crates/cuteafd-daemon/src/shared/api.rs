@@ -120,7 +120,13 @@ impl ApiPolicy {
         cuteafd_bench::context::set_thinking_off(profile.encoding.supports_thinking_off());
         let profile = profile.with_tokenizer(snapshot)?;
         let mut profile = profile_with_health(profile);
-        profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats);
+        let drafter = cuteafd_bench::context::drafter().unwrap_or(cuteafd_bench::report::DrafterLayout::NONE);
+        tracing::info!(layout = %drafter.label(), "resolved serving drafter");
+        cuteafd_bench::context::set_drafter(drafter);
+        profile.stats_diagnostics = Some(|stats| {
+            crate::shared::probe::graph_capture_stats(stats);
+            stats["drafter"] = serde_json::json!(cuteafd_bench::context::drafter());
+        });
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };

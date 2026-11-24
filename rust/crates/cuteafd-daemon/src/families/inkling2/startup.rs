@@ -289,6 +289,10 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
                 rank.rank.rank,rank.rank.ranks,rank.rank.lead)?;
             rank.buffers.extend(projection);
         }
+        use crate::shared::draft::report::{self, Kind, Placement};
+        let lead = u8::try_from(layout.runtime.first().context("Inkling admitted draft ranks")?.rank.lead)?;
+        let placement = if layout.runtime.len() == 1 { Placement::Whole } else { Placement::Split };
+        report::publish(report::admitted(Kind::Dspark, placement, lead, &physical, &admitted.solved)?);
         let streams=std::iter::once(stream.clone()).chain(peer_stream.clone()).collect();
         execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,streams,draft_weights,layout,
             &admitted.solved,execution.target.projection("model.llm.unembed.weight")?,

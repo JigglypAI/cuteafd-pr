@@ -82,6 +82,10 @@ pub fn card_svg(report: &Report) -> String {
     sub.push(format!("speculator {}", c.speculator_label()));
     if !c.supports_thinking_off() { sub.insert(0, c.thinking_label().into()); }
     doc.text(pad, 182.0, Font::new(15.0, t.ink2), &fit(&sub.join(" · "), 15.0, WIDTH - 2.0 * pad));
+    if let Some(drafter) = &r.server.drafter {
+        let line = format!("Drafter: {}", drafter.label());
+        doc.text(pad, 208.0, Font::new(15.0, t.ink2), &fit(&line, 15.0, WIDTH - 2.0 * pad));
+    }
     let dim = if t.scary { 0.55 } else { 1.0 };
     let warn = if t.scary { "⚠" } else { "" };
     let baseline = r.baseline.as_ref();

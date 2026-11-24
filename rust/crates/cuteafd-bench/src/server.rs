@@ -232,6 +232,7 @@ fn server_info_from_context(model: &str, context: &ServerContext, hardware: Hard
         build: build_info(),
         hardware,
         configuration,
+        drafter: context.drafter.clone(),
         readiness_s: context::readiness_s(),
         started: Some(crate::report::rfc3339(context::started())),
     }
@@ -263,6 +264,9 @@ pub fn fingerprint(info: &ServerInfo) -> String {
         .map(Setting::chip).collect();
     options.sort();
     line("options", &options.join(" "));
+    if let Some(drafter) = &info.drafter {
+        line("drafter", &serde_json::to_string(drafter).expect("serializable drafter layout"));
+    }
     for gpu in info.hardware.gpus.iter().filter(|g| g.used) {
         line("gpu", &format!("{} {:?}", gpu.name, gpu.power_limit_w));
     }

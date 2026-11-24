@@ -574,6 +574,12 @@ pub(crate) fn with_engine<T>(
                 graph_reserves: admitted.graphs.reserves.clone(),
                 graph_bootstraps: admitted.graphs.bootstraps.clone() }.register();
         }
+        if !facts.draft.is_empty() {
+            use crate::shared::draft::report::{self, Kind, Placement};
+            let placement = if facts.draft_half.is_empty() { Placement::Whole } else { Placement::Split };
+            report::publish(report::from_plan(Kind::Dspark, placement, 0, &devices, &admitted.solved,
+                |owner| owner.id == "v4.tp1.0" || owner.id.starts_with("v4.tp2.draft."))?);
+        }
         let (placement, host_prefix, expert_usage, graphs) = (admitted.placement, admitted.host_prefix,
             admitted.expert_usage, admitted.graphs);
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;

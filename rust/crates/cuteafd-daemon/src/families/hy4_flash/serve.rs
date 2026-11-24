@@ -732,6 +732,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint, &cfg, config,
                     layout, worker_args.kv_format, worker_args.max_sequences,
                     decode_rows))?;
+                let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+                crate::shared::draft::report::publish(dfly2_report(&physical, &admitted.solved)?);
                 engine.attach_drafter(drafter)?;
                 scheduler::Drafts::Neural { depth }
             } else { scheduler::Drafts::None };
@@ -1238,4 +1240,23 @@ mod tests {
         assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &extra).is_err());
         Ok(())
     }
+}
+
+fn dfly2_report(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    // Even with split target heads, the bundled DFly2 runs wholly on the lead.
+    report::admitted(Kind::Dfly2, Placement::Whole, 0, devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn dfly2_report_does_not_confuse_target_head_split_with_draft_split() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    assert_eq!(resolve_attention_placement(2, "heads")?, "heads");
+    let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 1024)]))?;
+    assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Whole)));
+    assert_eq!(layout.ranks, [Rank::Gpu(5)]);
+    assert_eq!(layout.arena_bytes, [1024]);
+    Ok(())
 }
