@@ -397,7 +397,8 @@ def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypa
     assert 'build.lock' not in text and 'wip.sh --slot s --role both' in text
     assert arms['cand']['build_slot'] is True
     source = (ROOT / 'scripts/bench/wip-cards.py').read_text()
-    assert "if build_role == 'both' and arm['build_lock_mode'] == 'legacy-full-build':" in source
+    # No pre-build seed wait: wip.sh queues each seed and Spark step itself (#2724).
+    assert 'CUTEAFD_WIP_SEED_WAIT_S' not in source and "'--', 'true'" not in source
     wip = (ROOT / 'wip.sh').read_text()
     assert 'build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe' in wip
 

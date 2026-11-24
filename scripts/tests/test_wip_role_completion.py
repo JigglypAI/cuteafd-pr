@@ -569,35 +569,62 @@ distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
     assert ('docker start' in calls) == (running == 'false')
 
 
-def _distribution_script(tmp_path, held, targets):
+def _distribution_script(tmp_path, held, targets, *, bytes_='321798555', transfer=':'):
+    """wip_distribute_sealed_expert with the real hwlock.py and build-process.py on
+    a private lock directory. A spy hwlock records the argv and the ticket it
+    queued, then runs the real queue."""
     text = (ROOT / 'wip.sh').read_text()
-    start = text.index('wip_distribute_locks() {')
-    helpers = text[start:text.index('\nwip_build_selected_roles() {')]
+    start = text.index('# wip_distribute_bound BYTES:')
+    helpers = text[text.index('wip_distribute_locks() {'):start] + text[start:text.index('\nwip_build_selected_roles() {')]
     seed_lock = text[text.index('wip_seed_lock() {'):text.index('\n# Docker exec and SSH')]
     trace = tmp_path / 'trace'
+    locks = tmp_path / 'locks'
+    (locks / 'hwq').mkdir(parents=True)
     hw = tmp_path / 'scripts/hw'
     hw.mkdir(parents=True)
-    # A fake fair queue: record the requested locks, grant at once.
-    (hw / 'hwlock.py').write_text(f"""import sys
-open({str(trace)!r}, 'a').write('turn ' + sys.argv[sys.argv.index('--locks') + 1] + '\\n')
+    (tmp_path / 'scripts/build').mkdir(parents=True)
+    shutil.copy(ROOT / 'scripts/build/build-process.py', tmp_path / 'scripts/build/build-process.py')
+    shutil.copy(ROOT / 'scripts/hw/hwlock.py', hw / 'hwlock_real.py')
+    (hw / 'hwlock.py').write_text(f"""import importlib.util, json, sys
+trace = open({str(trace)!r}, 'a')
+trace.write('turn ' + json.dumps(sys.argv[1:]) + '\\n'); trace.flush()
+spec = importlib.util.spec_from_file_location('hwlock', {str(hw / 'hwlock_real.py')!r})
+hwlock = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hwlock)
+take = hwlock._take_ticket
+def recorded(queue, locks, max_run=None):
+    seq, path, handle = take(queue, locks, max_run)
+    trace.write('ticket ' + path.read_text() + '\\n'); trace.flush()
+    return seq, path, handle
+hwlock._take_ticket = recorded
+sys.exit(hwlock.main())
 """)
-    home = tmp_path / 'home'
-    (home / '.cache/cuteafd').mkdir(parents=True)
-    probe = (f"flock -n {home}/.cache/cuteafd/sparks.lock true && echo sparks-free >> '{trace}' "
+    probe = (f"flock -n {locks}/sparks.lock true && echo sparks-free >> '{trace}' "
              f"|| echo sparks-held >> '{trace}'")
-    return trace, home, f"""set -euo pipefail
-repo_root='{tmp_path}' wip_spark_leg=1 seed_host=kakapo spark_container=owned
+    return trace, locks, f"""set -euo pipefail
+repo_root='{tmp_path}' wip_spark_leg=1 seed_host=kakapo spark_container=owned slot=s1
 wip_target_hosts=({' '.join(targets)})
 CUTEAFD_HW_LOCKS_HELD='{held}'
 release_is_lan_seed() {{ [[ $1 == kakapo || $1 == cassowary ]]; }}
 release_die() {{ echo "die: $*" >> '{trace}'; exit 1; }}
-ssh() {{ echo true; }}
+ssh() {{ case "$*" in *'du -sb'*) printf '{bytes_}\\t/wip/slots/s1/spark-expert\\n' ;; *) echo true ;; esac; }}
 wip_check_expert_readiness() {{ :; }}
-distribute_expert_slot() {{ {probe}; echo distribute >> '{trace}'; }}
+distribute_expert_slot() {{ {probe}; echo "distribute ${{CUTEAFD_HW_LOCKS_HELD:-}} $slot ${{wip_target_hosts[*]}}" >> '{trace}'; {transfer}; }}
 {seed_lock}
 {helpers}
 wip_distribute_sealed_expert
 """
+
+
+def _run_distribution(tmp_path, held, targets, **kwargs):
+    trace, locks, script = _distribution_script(tmp_path, held, targets, **kwargs)
+    scratch = tmp_path / 'tmp'
+    scratch.mkdir()
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'TMPDIR': str(scratch)})
+    # The job script never outlives the step.
+    assert not list(scratch.iterdir())
+    return result, trace.read_text().splitlines() if trace.exists() else []
 
 
 @pytest.mark.parametrize('targets, locks', [
@@ -605,20 +632,75 @@ wip_distribute_sealed_expert
     (['ostrich', 'rhea', 'moa'], 'moa,rhea,sparks'),
     (['rhea'], 'rhea'),
 ])
-def test_distribution_takes_a_fair_turn_on_the_targets_serving_locks(tmp_path, targets, locks):
-    trace, home, script = _distribution_script(tmp_path, '', targets)
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
-                            env={**os.environ, 'HOME': str(home)})
+def test_distribution_runs_as_a_bounded_hwlock_child(tmp_path, targets, locks):
+    result, calls = _run_distribution(tmp_path, '', targets)
     assert result.returncode == 0, result.stderr
+    turn = json.loads(calls[0].removeprefix('turn '))
+    # The queued command is the real transfer under build-process.py, never `true`.
+    command = turn[turn.index('--') + 1:]
+    assert command[1].endswith('scripts/build/build-process.py') and command[-2] == 'bash'
+    assert 'true' not in command
+    assert turn[turn.index('--locks') + 1] == locks
+    assert turn[turn.index('--max-run') + 1] == '600'
+    ticket = json.loads(calls[1].removeprefix('ticket '))
+    canonical = ','.join(lock for lock in ('sparks', 'rhea', 'moa') if lock in locks.split(','))
+    # The ticket other waiters see carries the bound, so it may backfill.
+    ticket = json.loads(calls[1].removeprefix('ticket '))
+    assert ticket['max_run'] == 600 and ticket['locks'] == canonical.split(',')
+    assert ticket['argv'][:ticket['argv'].index('--')] == turn[:turn.index('--')]
+    # hwlock holds the flock across the transfer, which sees the held locks
+    # and wip.sh's own state.
+    assert calls[2:] == ['sparks-held' if 'sparks' in locks else 'sparks-free',
+                         f'distribute {canonical} s1 {" ".join(targets)}']
+    # No ticket or holder record is left behind.
+    assert not list((tmp_path / 'locks/hwq').glob('*.ticket')) and not list((tmp_path / 'locks/hwq').glob('*.held'))
+
+
+def test_distribution_failure_is_named(tmp_path):
+    result, calls = _run_distribution(tmp_path, '', ['ostrich'], transfer='exit 3')
+    assert result.returncode == 1
+    assert calls[-1] == 'die: Spark WIP slot distribution on sparks failed (exit 3)'
+
+
+def test_distribution_waits_out_a_busy_lock_and_names_the_timeout(tmp_path, monkeypatch):
+    import fcntl
+    monkeypatch.setenv('CUTEAFD_WIP_DISTRIBUTE_WAIT_S', '1')
+    trace, locks, script = _distribution_script(tmp_path, '', ['ostrich'])
+    with (locks / 'sparks.lock').open('w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60,
+                                env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+    assert result.returncode == 1
     calls = trace.read_text().splitlines()
-    assert calls[0] == 'turn ' + locks
-    # The flock is held across the transfer, and only there.
-    assert calls[1:] == (['sparks-held'] if 'sparks' in locks else ['sparks-free']) + ['distribute']
+    assert calls[-1] == 'die: no fair turn on sparks for Spark WIP slot distribution within 1s'
+    assert not any(call.startswith('distribute') for call in calls)
+
+
+@pytest.mark.parametrize('bytes_, bound', [
+    ('', 3600), ('unknown', 3600), ('0', 600), ('321798555', 600),
+    ('15000000000', 600), ('20000000000', 700), ('200000000000', 3600),
+])
+def test_distribution_bound_follows_the_slot_size(bytes_, bound):
+    text = (ROOT / 'wip.sh').read_text()
+    helper = text[text.index('wip_distribute_bound() {'):text.index('\n# wip_write_distribute_job FILE')]
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + helper + f'\nwip_distribute_bound "{bytes_}"'],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(bound)
 
 
 def test_distribution_under_held_locks_takes_no_second_turn(tmp_path):
-    trace, home, script = _distribution_script(tmp_path, 'sparks,gpu1', ['ostrich', 'dodo'])
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
-                            env={**os.environ, 'HOME': str(home)})
+    result, calls = _run_distribution(tmp_path, 'sparks,gpu1', ['ostrich', 'dodo'])
     assert result.returncode == 0, result.stderr
-    assert trace.read_text().splitlines() == ['sparks-free', 'distribute']
+    assert calls == ['sparks-free', 'distribute sparks,gpu1 s1 ostrich dodo']
+
+
+def test_no_hardware_queue_waits_on_true_then_takes_flocks():
+    """A fair turn covers the work it orders: hwlock runs the guarded step as its
+    child (with --max-run when it should backfill), never `-- true` followed by
+    the caller's own flocks, which hwlock cannot bound (#2724)."""
+    import re
+    for path in ('wip.sh', 'run.sh', 'build.sh', *[str(p.relative_to(ROOT)) for p in (ROOT / 'scripts').rglob('*')
+                                                    if p.suffix in ('.sh', '.py') and 'tests' not in p.parts]):
+        text = (ROOT / path).read_text()
+        assert not re.search(r"hwlock\.py.*(-- true\b|'--', 'true')", text), path
