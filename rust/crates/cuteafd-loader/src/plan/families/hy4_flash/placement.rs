@@ -126,6 +126,7 @@ pub(super) fn layout(
         prefix_mark_budget: opts.mimo_prefix_mark_bytes,
         prefix_slots: opts.prefix_slots,
         replies: opts.spark_reply_formats,
+        expert_usage: opts.expert_usage,
         resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
     };
     let inputs = match admission::gather(&facts_req) {

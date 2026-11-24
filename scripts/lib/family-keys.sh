@@ -131,7 +131,7 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
-  if [[ "$1" == deepseek_v4 || "$1" == mimo_v2 || "$1" == glm5 || "$1" == kimi_k3 || "$1" == minimax_m3 ]]; then
+  if [[ "$1" == deepseek_v4 || "$1" == mimo_v2 || "$1" == glm5 || "$1" == kimi_k3 || "$1" == minimax_m3 || "$1" == hy4_flash ]]; then
     printf '%s\n' EXPERT_USAGE
   fi
   # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract

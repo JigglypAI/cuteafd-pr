@@ -651,6 +651,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         prefix_mark_budget: 2u64 << 30,
         prefix_slots: None,
         replies,
+        expert_usage: false,
         resident_weight_limit: None,
     })?;
     let measured_inputs = admission::gather(&FactsRequest {
@@ -679,6 +680,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         prefix_mark_budget: 2u64 << 30,
         prefix_slots: None,
         replies,
+        expert_usage: false,
         resident_weight_limit: None,
     })?;
 
@@ -738,6 +740,7 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
         prefix_mark_budget: 2u64 << 30,
         prefix_slots: None,
         replies,
+        expert_usage: false,
         resident_weight_limit: None,
     })?;
 

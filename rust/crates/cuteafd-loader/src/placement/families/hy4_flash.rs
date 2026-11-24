@@ -150,6 +150,7 @@ pub struct Hy4Inputs {
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
     pub routed: Vec<usize>,
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub local: LocalPackage,
     pub spark: Vec<Vec<SparkCharge>>,
     pub links: Vec<crate::placement::PreparedSparkLink>,
@@ -660,6 +661,9 @@ impl Recipe for Hy4Inputs {
         let mut components = Vec::new();
         for gpu in 0..self.gpus {
             components.extend(self.rank_owners(gpu, maximum)?);
+        }
+        if let Some(geometry) = &self.expert_usage {
+            components.extend(crate::placement::expert_usage::components(geometry, &[0], maximum)?);
         }
         for reader in ["dense", "native"] {
             components.extend(self.target_mount_load.allocations(&format!("hy4_flash.{reader}.mount"))

@@ -201,6 +201,10 @@ impl<'a> Hy4Backend<'a> {
     /// Prewarm traced decode row geometries on disposable startup state before readiness.
     /// Rank-local sites skip startup prewarm when `GRAPH_PREWARM=off` (`--graph-no-prewarm`)
     /// and capture lazily on first use.
+    pub(crate) fn enable_expert_usage(&self) {
+        self.engine.borrow_mut().enable_expert_usage();
+    }
+
     pub(crate) fn warm_decode_graphs(
         &self,
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,

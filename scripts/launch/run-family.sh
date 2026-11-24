@@ -1755,7 +1755,7 @@ case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
 esac
-if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 || $family == minimax_m3 ]]; then
+if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 || $family == minimax_m3 || $family == hy4_flash ]]; then
   case "$(get EXPERT_USAGE on)" in
     on) family_args+=(--expert-usage) ;;
     off) family_args+=(--expert-usage=false) ;;
@@ -2068,6 +2068,7 @@ if [[ $family == inkling2 ]]; then
   fi
 fi
 if [[ $family == hy4_flash ]]; then
+  [[ -z "$(get L2_PREFETCH)" ]] || release_die "L2_PREFETCH is unsupported for Hy4-flash"
   hy4_kv="$(get KV_CACHE fp8)"
   case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$hy4_kv")

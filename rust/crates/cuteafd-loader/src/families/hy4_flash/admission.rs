@@ -86,6 +86,7 @@ pub struct FactsRequest<'a> {
     pub prefix_mark_budget: u64,
     pub prefix_slots: Option<u64>,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
+    pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
 }
 
@@ -589,6 +590,9 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         target_mount_load,
         placement: request.attention,
         modes,
+        expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry {
+            layers: cfg.layers, experts: cfg.experts, topk: cfg.topk, routed_layers: routed.clone(),
+        }),
         routed,
         local,
         spark,

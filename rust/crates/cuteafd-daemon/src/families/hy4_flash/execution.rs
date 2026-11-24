@@ -24,6 +24,7 @@ use crate::shared::token_io::DeviceLogits;
 use crate::shared::token_table::{enqueue as enqueue_table_h2d, CopyPlane};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{arena_class, ArenaTag};
+use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice, UsagePhase, UsageStorage};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
@@ -1151,6 +1152,7 @@ struct ActiveBatch {
     ffn_fused_layer: Option<usize>,
     post_attn_deferred: bool,
     decode_attention: bool,
+    usage_phase: UsagePhase,
     dump_rows: usize,
     use_a: bool,
     members: Vec<ActiveMember>,
@@ -1182,6 +1184,8 @@ pub(crate) struct Hy4Engine<'a> {
     swa_index_of: BTreeMap<usize, usize>,
     engram_index_of: BTreeMap<usize, usize>,
     golden_placement: Hy4Placement,
+    expert_usage: Option<ExpertUsage<'a>>,
+    count_expert_usage: bool,
     terminal: bool,
 }
 
@@ -1403,6 +1407,8 @@ impl<'a> Hy4Engine<'a> {
             swa_index_of,
             engram_index_of,
             golden_placement,
+            expert_usage: None,
+            count_expert_usage: false,
             terminal: false,
         };
         engine.assert_disjoint_wave_engram_buffers()?;
@@ -1699,7 +1705,41 @@ impl<'a> Hy4Engine<'a> {
         self.engram.drain()
     }
 
+    pub(crate) fn configure_expert_usage(&mut self, geometry: Option<&cuteafd_core::expert_usage::Geometry>,
+        reader: cuteafd_core::expert_usage::Reader) -> Result<()> {
+        if let Some(geometry) = geometry {
+            self.expert_usage = Some(ExpertUsage::new(self.library(), geometry.clone(),
+                &[UsageDevice { logical: 0, cuda: self.lead_device_id() }], reader)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enable_expert_usage(&mut self) {
+        self.count_expert_usage = self.expert_usage.is_some();
+    }
+
+    fn record_expert_usage(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
+        if !self.count_expert_usage || self.skip_routed_experts || self.cfg.dense_layer[layer] {
+            return Ok(());
+        }
+        let rank = &self.ranks[0];
+        let usage = self.expert_usage.as_ref().context("Hy4 expert usage owner missing")?;
+        let tally = usage.routes(rank.device.id, layer, batch.usage_phase)?;
+        // SAFETY: the canonical router wrote the exact row width on this stream;
+        // the engine drains all ranks before releasing counters and route storage.
+        rank.device.run(|| unsafe { tally.record(rank.shared.route_ids.buffer.ptr,
+            batch.rows, None, u32::MAX, true, rank.stream.raw) })
+    }
+
     pub(crate) fn inventory(&self, weights_inv: &mut Inventory<'_>, retained_inv: &mut Inventory<'_>) -> Result<()> {
+        if let Some(usage) = &self.expert_usage {
+            for owner in usage.allocation_receipts() {
+                match owner.storage {
+                    UsageStorage::Device(buffer) => retained_inv.device(&owner.owner, buffer)?,
+                    UsageStorage::Pinned(buffer) => retained_inv.pinned(&owner.owner, buffer)?,
+                }
+            }
+        }
         for (rank, r) in self.ranks.iter().enumerate() {
             r.weights.inventory(weights_inv, retained_inv)?;
             r.cache.inventory(retained_inv)?;
@@ -2093,6 +2133,10 @@ impl<'a> Hy4Engine<'a> {
             ffn_fused_layer: None,
             post_attn_deferred: false,
             decode_attention: priority == ReadPriority::Decode,
+            usage_phase: match priority {
+                ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
+                ReadPriority::Prefill | ReadPriority::PrefillFirst => UsagePhase::Prefill,
+            },
             dump_rows,
             use_a: true,
             members,
@@ -3036,7 +3080,8 @@ impl<'a> Hy4Engine<'a> {
                         .get_mut(unit.slot)
                         .and_then(Option::as_mut)
                         .context("Hy4 FFN without active unit")?;
-                    self.engine.run_layer_local_ffn(layer, batch)
+                    self.engine.run_layer_local_ffn(layer, batch)?;
+                    self.engine.record_expert_usage(layer, batch)
                 }
                 fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Option<WaveTicket>> {
                     let batch = self
@@ -3099,6 +3144,7 @@ impl<'a> Hy4Engine<'a> {
                             )
                         }
                     })?;
+                    self.engine.record_expert_usage(layer, batch)?;
                     Ok(Some(ticket))
                 }
                 fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
