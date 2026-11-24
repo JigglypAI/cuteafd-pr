@@ -82,6 +82,41 @@ void test_host_buffer_copy_roundtrip() {
   assert(host.flags == CUTEAFD_HOST_BUFFER_FLAG_NONE);
 }
 
+void test_small_and_large_h2d_batches() {
+  void* stream = nullptr;
+  const auto status = cuteafd_cuda_stream_create(&stream);
+  if (status == CUTEAFD_STATUS_CUDA_UNAVAILABLE) return;
+  assert(status == CUTEAFD_STATUS_OK);
+
+  constexpr size_t kMax = 13;
+  cuteafd_host_buffer_t src{};
+  cuteafd_device_buffer_t dst{};
+  assert(cuteafd_alloc_host_buffer(kMax, &src, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_device_buffer(kMax, &dst, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
+  auto* input = static_cast<unsigned char*>(src.ptr);
+  for (size_t i = 0; i < kMax; ++i) input[i] = static_cast<unsigned char>(i + 1);
+  for (size_t count : {size_t{1}, size_t{12}, kMax}) {
+    cuteafd_device_buffer_t destinations[kMax];
+    const void* sources[kMax];
+    size_t sizes[kMax];
+    for (size_t i = 0; i < count; ++i) {
+      destinations[i] = dst;
+      destinations[i].ptr = static_cast<unsigned char*>(dst.ptr) + i;
+      destinations[i].bytes = 1;
+      sources[i] = input + count - i - 1;
+      sizes[i] = 1;
+    }
+    assert(cuteafd_copy_h2d_batch_async(destinations, sources, sizes, count, stream) == CUTEAFD_STATUS_OK);
+    assert(cuteafd_cuda_stream_synchronize(stream) == CUTEAFD_STATUS_OK);
+    unsigned char result[kMax]{};
+    assert(cuteafd_copy_d2h(result, dst, count) == CUTEAFD_STATUS_OK);
+    for (size_t i = 0; i < count; ++i) assert(result[i] == input[count - i - 1]);
+  }
+  assert(cuteafd_free_device_buffer(&dst) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_free_host_buffer(&src) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_cuda_stream_destroy(stream) == CUTEAFD_STATUS_OK);
+}
+
 void test_error_propagation() {
   char tiny[4] = {};
   assert(cuteafd_native_version(tiny, sizeof(tiny)) == CUTEAFD_STATUS_BUFFER_TOO_SMALL);
@@ -297,6 +332,7 @@ int main() {
   test_allocate_copy_free_roundtrip();
   test_device_to_device_copy_roundtrip();
   test_host_buffer_copy_roundtrip();
+  test_small_and_large_h2d_batches();
   test_error_propagation();
   test_nccl_abi();
   test_rdma_destroy_failure_retains_registrations();

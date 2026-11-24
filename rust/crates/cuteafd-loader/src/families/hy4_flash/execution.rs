@@ -131,6 +131,22 @@ impl CacheLayout {
     }
 }
 
+/// Metadata uploaded to each rank before it consumes a wave. One pinned
+/// source backs both ranks, with the same capacities as the device views.
+pub const WAVE_METADATA: [&str; 12] = [
+    "positions_i64", "positions_i32", "dsa_slots_i64", "swa_slots_i64",
+    "dsa_page_table", "swa_page_table", "dsa_cu_seqlens", "swa_cu_seqlens",
+    "swa_seqlens", "idx_limits", "idx_group_pos", "idx_group_slots",
+];
+
+pub fn wave_metadata_layout(slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
+    let views = WAVE_METADATA.iter().map(|&name| {
+        let bytes = wave.view(name).with_context(|| format!("Hy4 metadata view {name} missing"))?.bytes();
+        Ok((name.to_owned(), bytes))
+    }).collect::<Result<Vec<_>>>()?;
+    WeightArenaLayout::new(format!("hy4_flash.wave.host_metadata.{slot}"), views)
+}
+
 /// One packed scratch arena per coordinator GPU per in-flight prefill wave slot.
 /// Holds every buffer that must survive across `PrefillHooks` boundaries for that slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +347,24 @@ impl UnitLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_metadata_covers_the_same_views_at_both_ranks() -> Result<()> {
+        let cfg = test_cfg();
+        let wave0 = WaveScratchLayout::new(&cfg, 0, 2, 2, 2752, 16_384, 16)?;
+        let wave1 = WaveScratchLayout::new(&cfg, 1, 2, 2, 2752, 16_384, 16)?;
+        let host = wave_metadata_layout(2, &wave0.arena)?;
+        assert_eq!(host.id(), "hy4_flash.wave.host_metadata.2");
+        assert_eq!(host.views().len(), WAVE_METADATA.len());
+        for name in WAVE_METADATA {
+            let view = host.view(name).expect("metadata plane");
+            assert_eq!(view.bytes(), wave0.arena.view(name).unwrap().bytes());
+            assert_eq!(view.bytes(), wave1.arena.view(name).unwrap().bytes());
+            assert!(view.offset() + view.bytes() <= host.bytes());
+        }
+        assert!(host.bytes() < wave0.arena.bytes());
+        Ok(())
+    }
 
     #[test]
     fn mla_split_partials_scale_with_resolved_rows_and_head_parts() {

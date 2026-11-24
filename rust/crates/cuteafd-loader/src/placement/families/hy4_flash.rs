@@ -20,7 +20,7 @@ use super::super::{
     ResidentWeights, TerminalHome, Tp2Range,
 };
 use crate::families::hy4_flash::execution::{
-    CacheLayout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+    wave_metadata_layout, CacheLayout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
 };
 use crate::families::hy4_flash::weight_layout::CoordinatorWeights;
 use crate::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
@@ -603,6 +603,13 @@ impl Hy4Inputs {
                 "Hy4-flash packed wave scratch arena",
                 maximum,
             ));
+            if gpu == 0 {
+                let host = wave_metadata_layout(slot, &wave.arena).map_err(refusal)?;
+                out.extend(buffer(
+                    host.id(), Location::PINNED, host.bytes() as u64, Lifetime::TARGET,
+                    Category::Staging, "hy4_flash/wave-metadata", maximum,
+                ));
+            }
         }
 
         // Canonical graph reserve, loaded code, and driver stream slabs.
