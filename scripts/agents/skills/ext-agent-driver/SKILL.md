@@ -208,10 +208,14 @@ stop bar, appropriate escalation), quality (review changes required),
 creativity (useful ideas/root cause), wall time from start to validated result,
 and number/type of steering messages. Distinguish worker latency, 503/backoff
 and driver overhead. Do not grade an unfinished or unverified task as correct.
-Both adapters require a visible prompt, no active spinner/busy footer, and
-at least two seconds without streaming output before declaring idle/asking.
-This debounce prevents the prompt that remains visible during thinking from
-ending the wait early; state remains a heuristic, so verify the deliverable.
+Both adapters require a visible prompt, no active spinner/busy footer or
+running background command (Grok's "N commands still running", Antigravity's
+`● [hh:mm:ss] … running` under the input box), and at least two seconds with
+the screen's content unchanged before declaring idle/asking. Content excludes
+footers, spinners and tips; raw stream growth alone does not count, since an
+idle Antigravity re-asserts terminal modes every ~2 s without drawing. Thought
+summaries, tool rows and queued-message lines never make a turn `asking`.
+State remains a heuristic, so verify the deliverable.
 The driver should spend most of its time blocked in wait, not deliberating.
 
 ## Stay reachable
