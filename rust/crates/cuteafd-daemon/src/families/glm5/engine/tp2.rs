@@ -120,7 +120,7 @@ impl<'a> GlmEngine<'a> {
         // A backend failure may occur with rank1 current; publish on the home device.
         crate::shared::memory::device::Device { library: self.library, id: self.device }.run(|| {
             let mut failures = Vec::new();
-            for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
+            for exchange in self.exchange.as_deref().into_iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
                 if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
             }
             if let Some(drafter) = &self.drafter {
@@ -167,7 +167,7 @@ impl<'a> GlmEngine<'a> {
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
+                for exchange in self.exchange.as_deref().into_iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
                     exchange.finish_terminal(drained);
                 }
                 if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }

@@ -13,6 +13,7 @@ const SPARK: SparkCharges = SparkCharges { wave_bytes: gib(190), basis: Basis::C
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    report.tp2_dflash = Some(options.tp2_dflash);
     let checkpoint = input.checkpoint();
     let mut fallback_note = None;
     let mut context_programs = None;
@@ -121,6 +122,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                 match checkpoint.require_untied_embedding(cfg.embedding()) {
                     Ok(()) => notes.push("embedding placement: host (single admitted pinned mapped copy)".into()),
                     Err(error) => notes.push(format!("host embedding ineligible: {error:#}; GPU residency retained")),
+                }
+            } else if let Some(crate::placement::planner::EmbeddingHome::Device(gpu)) = admitted.solved.decisions.embedding {
+                if ranks == 2 {
+                    notes.push(format!("embedding placement: gpu {gpu}"));
                 }
             }
             report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
@@ -436,28 +441,38 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
         options.host_cache_bytes != Some(0), options.mimo_prefix_entries);
     let mut mark_bytes = 0;
     let mut mark_slots = 0;
-    let draft = if options.glm5_drafter_disabled { DraftFacts::default() }
-        else if checkpoint.model_type() == Some("mistral_large4") {
-            let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
-            mark_bytes = glm::draft_window_mark_bytes(&layout)? as u64;
-            if options.mimo_prefix_entries > 0 {
-                mark_slots = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-                    concurrency as u64, options.mimo_prefix_entries, mark_bytes, options.mimo_prefix_mark_bytes,
-                    host_enabled));
-            }
-            DraftFacts::ml4(&layout)?
+    let draft = if options.glm5_drafter_disabled {
+        anyhow::ensure!(!options.tp2_dflash, "TP2 DFlash requires an active DFlash2 drafter");
+        DraftFacts::default()
+    } else if checkpoint.model_type() == Some("mistral_large4") {
+        anyhow::ensure!(!options.tp2_dflash, "TP2 DFlash applies to GQA DFlash2, not bundled Mistral Large 4 mtp_dspark");
+        let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
+        mark_bytes = glm::draft_window_mark_bytes(&layout)? as u64;
+        if options.mimo_prefix_entries > 0 {
+            mark_slots = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+                concurrency as u64, options.mimo_prefix_entries, mark_bytes, options.mimo_prefix_mark_bytes,
+                host_enabled));
+        }
+        DraftFacts::ml4(&layout)?
+    } else {
+        let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
+            let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+            crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok()
+                .and_then(|resolved| resolved.snapshot_path)
+        }).context("GLM shared admission needs the drafter's physical checkpoint headers; disable speculation or supply its snapshot")?;
+        let draft = crate::families::glm5::draft_physical::GlmDflashConfig::read(&snapshot)?;
+        let representation = if options.glm5_draft_bf16 { GlmDraftRepresentation::Bf16Only }
+            else { GlmDraftRepresentation::Fp8Only };
+        let capacity = GlmDraftCapacity::new(slots, sequences, draft.block)?;
+        if options.tp2_dflash {
+            anyhow::ensure!(gpus == 2 && options.drafter_bytes == 0,
+                "TP2 DFlash requires two coordinator GPUs and checkpoint-derived physical owners");
+            DraftFacts::gqa_tp2(&snapshot, representation, capacity, sms, 0, options.draft_kv_cache)?
         } else {
-            let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
-                let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
-                crate::resolve_snapshot_at_revision("incoai/GLM-5.3-DFlash2", Some(&home), None).ok()
-                    .and_then(|resolved| resolved.snapshot_path)
-            }).context("GLM shared admission needs the drafter's physical checkpoint headers; disable speculation or supply its snapshot")?;
-            let draft = crate::families::glm5::draft_physical::GlmDflashConfig::read(&snapshot)?;
-            DraftFacts::gqa(&snapshot, if options.glm5_draft_bf16 { GlmDraftRepresentation::Bf16Only }
-                else { GlmDraftRepresentation::Fp8Only }, GlmDraftCapacity::new(slots, sequences, draft.block)?,
-                sms, 0, options.draft_kv_cache)?
-        };
+            DraftFacts::gqa(&snapshot, representation, capacity, sms, 0, options.draft_kv_cache)?
+        }
+    };
     let host = super::recipe_host_memory(options)?;
     let cache = if let Some(ml4) = cfg.variant.ml4() {
         crate::serving_capacity::mistral_large4_cache_geometry(ml4, 1)?
@@ -550,10 +565,14 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         rows, lanes, exchange_f32, onboard, false, None)?;
     let owners = (attention == crate::placement::AttentionPlacement::Layers)
         .then(|| glm::attention_owners(&cfg, cfg.layers)).transpose()?;
-    let embedding = if options.host_embedding && checkpoint.require_untied_embedding(cfg.embedding()).is_ok() {
-        EmbeddingHome::HostPinned
-    } else { EmbeddingHome::Device(0) };
-    let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), true, &[embedding], core)?;
+    let embeddings = if options.host_embedding && checkpoint.require_untied_embedding(cfg.embedding()).is_ok() {
+        vec![EmbeddingHome::HostPinned]
+    } else if gpus == 2 {
+        vec![EmbeddingHome::Device(0), EmbeddingHome::Device(1)]
+    } else {
+        vec![EmbeddingHome::Device(0)]
+    };
+    let target = TargetFacts::checkpoint(checkpoint, cfg.layers, gpus, owners.as_deref(), true, &embeddings, core)?;
     let physical = LocalPhysicalInput { layers: (cfg.first_moe_layer..cfg.layers).collect(),
         max_rows: rows.max(glm::DECODE_ROWS) as usize, lanes: lanes as usize,
         storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
@@ -789,6 +808,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     }
     let admitted = prepared.admit(request)?;
     if let Some(report) = report {
+        report.tp2_dflash = Some(options.tp2_dflash);
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
         report.host_budget_bytes = prefix_quota;
     }

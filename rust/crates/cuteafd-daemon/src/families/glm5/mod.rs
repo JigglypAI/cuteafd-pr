@@ -68,7 +68,8 @@ pub(crate) struct EngineArgs {
     /// and the dense / shared-expert MLPs over --device and this second GPU,
     /// with the small latent projection, latent cache and DSA indexer
     /// replicated; the partial sums meet over peer memory. Router, routed
-    /// experts, LM head and drafter stay on --device.
+    /// experts and LM head stay on --device; DFlash2 splits across both GPUs
+    /// by default (`--tp2-dflash`).
     #[arg(long)]
     pub split_device: Option<i32>,
     /// Run only the first N layers (dense layers need no experts).
@@ -121,6 +122,9 @@ pub(crate) struct EngineArgs {
     /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
+    /// Split GQA drafter heads, KV and MLP over the target's peer GPUs (default with two GPUs and DFlash2).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
@@ -1022,6 +1026,9 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
+        ensure!(!args.tp2_dflash || (split_device.is_some() && args.draft.is_some()),
+            "TP2 DFlash requires --split-device and a GQA DFlash2 drafter (--draft)");
+        cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
         self.startup_probe(&devices, "glm/streams-before-programs", None, false)?;
         use cuteafd_loader::families::glm5::DensePrograms;
         let dense_programs = if native { DensePrograms::Exlr8 } else { DensePrograms::Fp8 };
@@ -1127,11 +1134,18 @@ impl Opened {
         };
         let draft_facts = match (&ml4_draft, args.draft.as_deref(), &provisional_drafter) {
             (Some(layout), _, _) => DraftFacts::ml4(layout)?,
-            (None, Some(snapshot), Some(draft)) => DraftFacts::gqa(snapshot,
-                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
-                cuteafd_loader::families::glm5::draft_representation::GlmDraftCapacity::new(
-                    args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, draft.block)?,
-                self.library.sm_count()? as usize, 0, args.draft_kv_cache)?,
+            (None, Some(snapshot), Some(draft)) => {
+                let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8);
+                let capacity = cuteafd_loader::families::glm5::draft_representation::GlmDraftCapacity::new(
+                    args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, draft.block)?;
+                if args.tp2_dflash {
+                    DraftFacts::gqa_tp2(snapshot, representation, capacity,
+                        self.library.sm_count()? as usize, 0, args.draft_kv_cache)?
+                } else {
+                    DraftFacts::gqa(snapshot, representation, capacity,
+                        self.library.sm_count()? as usize, 0, args.draft_kv_cache)?
+                }
+            }
             _ => DraftFacts::default(),
         };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
@@ -1214,8 +1228,11 @@ impl Opened {
         let storage = match push_policy { crate::shared::experts::rtx::push::PushPolicy::Mount => LocalStorage::Mount,
             crate::shared::experts::rtx::push::PushPolicy::Required => LocalStorage::Push };
         let target = if let Some(checkpoint) = &checkpoint {
+            let embedding_homes = if host_embedding { vec![EmbeddingHome::HostPinned] }
+                else if devices.len() == 2 { vec![EmbeddingHome::Device(0), EmbeddingHome::Device(1)] }
+                else { vec![EmbeddingHome::Device(0)] };
             TargetFacts::checkpoint(checkpoint, layers, devices.len(), owners.as_deref(), true,
-                &[if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) }], core.as_ref())?
+                &embedding_homes, core.as_ref())?
         } else {
             let config = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
             let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
@@ -1361,20 +1378,49 @@ impl Opened {
         let selected_peers = if !working.spark_layers.is_empty() { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
-        let draft_home = match cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])? {
-            None | Some(0) => DraftHome::Local,
-            Some(_) => {
-                let (device, stream) = peer_stream.context("admitted remote drafter needs the second GPU")?;
-                let rows = match (&ml4_draft, &provisional_drafter) {
-                    (Some(layout), _) => layout.capacity().block_rows,
-                    (None, Some(draft)) => args.draft_sequences.checked_mul(draft.block).context("GLM draft rows")?,
-                    (None, None) => anyhow::bail!("admitted remote drafter without a drafter"),
-                };
-                tracing::info!(device, rows, "GLM drafter admitted on GPU1 through the shared remote bridge");
-                DraftHome::Peer { device, stream, rows, bridge: draft_facts.bridge().to_vec() }
+        let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        let shared_exchange = if args.tp2_dflash {
+            let (peer_device, peer_stream) = peer_stream.context("TP2 DFlash requires the second GPU")?;
+            let core_bytes = match &core {
+                Some(core) if core.ranks.iter().any(|r| r.receive_suffix > 0) =>
+                    core.ranks.iter().map(|r| r.attention_partial_bytes).max().unwrap_or(0),
+                _ => 0,
+            };
+            let exchange_dtype = if tp2_range.is_some() && exchange_f32 {
+                crate::shared::experts::rtx::ExchangeDtype::F32
+            } else { crate::shared::experts::rtx::ExchangeDtype::Bf16 };
+            Some(engine::GlmEngine::new_peer_exchange(&self.library, &self.cfg, args.device, stream,
+                peer_device, peer_stream, prefill_lanes, args.prefill_rows, exchange_dtype, core_bytes)?)
+        } else { None };
+        let draft_home = if let Some(exchange) = &shared_exchange {
+            ensure!(cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])?.is_none(),
+                "TP2 DFlash cannot also admit a movable single-home drafter");
+            DraftHome::Tp2(exchange.clone())
+        } else {
+            match cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])? {
+                None | Some(0) => DraftHome::Local,
+                Some(_) => {
+                    let (device, stream) = peer_stream.context("admitted remote drafter needs the second GPU")?;
+                    let rows = match (&ml4_draft, &provisional_drafter) {
+                        (Some(layout), _) => layout.capacity().block_rows,
+                        (None, Some(draft)) => args.draft_sequences.checked_mul(draft.block).context("GLM draft rows")?,
+                        (None, None) => anyhow::bail!("admitted remote drafter without a drafter"),
+                    };
+                    tracing::info!(device, rows, "GLM drafter admitted on GPU1 through the shared remote bridge");
+                    DraftHome::Peer { device, stream, rows, bridge: draft_facts.bridge().to_vec() }
+                }
             }
         };
-        let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        let embedding_home = admitted.solved.decisions.embedding.unwrap_or(
+            if host_embedding { EmbeddingHome::HostPinned } else { EmbeddingHome::Device(0) });
+        let embedding_rank = match embedding_home {
+            EmbeddingHome::Device(rank) => usize::from(rank),
+            EmbeddingHome::HostPinned => 0,
+        };
+        let embedding_device = crate::shared::memory::device::Device {
+            library: &self.library,
+            id: devices[embedding_rank],
+        };
         if let Some(range) = &tp2_range {
             for (_, weights) in &mut selected_target.weights {
                 weights.add_peer_routers(&range.clone().collect::<Vec<_>>())?;
@@ -1383,9 +1429,11 @@ impl Opened {
         for (_, weights) in &mut selected_target.weights {
             weights.add_rotary(args.max_context as u64, self.cfg.qk_rope_head_dim)?;
         }
-        let arena_layouts = selected_target.weights[0].1.coordinator_arenas()?;
-        let reserved_weights = selected_target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
-            else { EmbeddingHome::Device(0) })?;
+        let target_weights = selected_target.weights.iter()
+            .find(|(home, _)| *home == embedding_home)
+            .context("admitted GLM embedding home missing from target inventory")?;
+        let arena_layouts = target_weights.1.coordinator_arenas()?;
+        let reserved_weights = selected_target.device_weight_bytes(embedding_home)?;
         let whole_range = (devices.len() == 1).then(|| placement.expert_ranges.first().copied())
             .flatten().filter(|range| range.layers > 0);
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
@@ -1450,16 +1498,18 @@ impl Opened {
             let sink = std::rc::Rc::new(landing::PushSink::default());
             let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
             let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
+                let (embedding, model) = embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        let mut model = planning.model(&self.cfg, layers, owners.as_deref(), native, selected_target.weights[0].1.dense_mount)?;
-                        if let Some(range) = &tp2_range {
-                            planning.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
-                        }
-                        Ok(model)
-                    }, |_, bytes| planning.allocate_owner("embedding", bytes))?;
-                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.0.head)?;
+                        dense_devices[0].run(|| {
+                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                            let mut model = planning.model(&self.cfg, layers, owners.as_deref(), native, target_weights.1.dense_mount)?;
+                            if let Some(range) = &tp2_range {
+                                planning.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
+                            }
+                            Ok(model)
+                        })
+                    }, |_, bytes| planning.allocate_owner("embedding", bytes)))?;
+                let drafter = dense_devices[0].run(|| self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.0.head))?;
                 Ok((embedding, model, drafter))
             })?;
             let (dense_records, deferred) = sink.take();
@@ -1607,15 +1657,17 @@ impl Opened {
                 planned_drafter = Some(drafter);
                 (embedding, model, pushed)
             } else {
-                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
+                let (embedding, model) = embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        let mut model = loader.model(&self.cfg, layers, owners.as_deref(), native, selected_target.weights[0].1.dense_mount)?;
-                        if let Some(range) = &tp2_range {
-                            loader.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
-                        }
-                        Ok(model)
-                    }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
+                        dense_devices[0].run(|| {
+                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                            let mut model = loader.model(&self.cfg, layers, owners.as_deref(), native, target_weights.1.dense_mount)?;
+                            if let Some(range) = &tp2_range {
+                                loader.peer_routers(&self.cfg, model.1.first_mut().context("peer layers")?, range.clone())?;
+                            }
+                            Ok(model)
+                        })
+                    }, |_, bytes| loader.allocate_owner("embedding", bytes)))?;
                 (embedding, model, None)
             };
             let tp2 = if let Some(range) = tp2_range.clone() {
@@ -1650,9 +1702,11 @@ impl Opened {
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
         let embedding_bytes = embedding.device_owner_bytes();
-        let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
+        let actual_weights = std::iter::once(bytes as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
-            .enumerate().map(|(rank, bytes)| bytes + rotary[rank].buffer.bytes as u64
+            .enumerate().map(|(rank, bytes)| bytes
+                + if rank == embedding_rank { embedding_bytes as u64 } else { 0 }
+                + rotary[rank].buffer.bytes as u64
                 + native_owners.get(rank).map_or(0, |owner| owner.resident_bytes() as u64))
             .collect::<Vec<_>>();
         ensure!(actual_weights == reserved_weights,
@@ -1694,7 +1748,7 @@ impl Opened {
         }
         if let Some((device, stream)) = peer_stream {
             let peer_layers = shares.pop().context("head-split shares")?;
-            engine.attach_peer(device, stream, peer_layers, rotary.remove(0))?;
+            engine.attach_peer_with_exchange(device, stream, peer_layers, rotary.remove(0), shared_exchange)?;
         }
         // Both rotary tables now own the generated values; release the load-only source.
         engine.weights.rope_alpha = None;
@@ -1873,33 +1927,74 @@ impl Opened {
 }
 
 
-/// The drafter's admitted home: beside the target (GPU0), or GPU1 through the
-/// shared device-driven bridge with the admitted bridge owners.
-pub(crate) enum DraftHome {
+/// The drafter's admitted home: beside the target (GPU0), GPU1 through the
+/// shared device-driven bridge, or tensor-parallel across both target GPUs over
+/// the shared target peer exchange.
+pub(crate) enum DraftHome<'a> {
     Local,
     Peer { device: i32, stream: *mut c_void, rows: usize, bridge: Vec<cuteafd_loader::placement::Demand> },
+    Tp2(std::rc::Rc<crate::shared::peer_split::PeerExchange<'a>>),
 }
 
 impl Opened {
-    /// The admitted single drafter copy. A GPU1 `home` loads the common executor
-    /// on the bridge's own GPU1 stream; GPU0 keeps the embedding and head.
+    /// The admitted drafter: single-GPU (GPU0 or GPU1 via bridge), or TP2 split
+    /// across both target GPUs on the shared `PeerExchange`.
     #[allow(clippy::too_many_arguments)]
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
-        home: &DraftHome, head: &weights::GlmHead<'_>) -> Result<Option<drafter::GlmDrafter<'s>>> {
+        home: &DraftHome<'s>, head: &weights::GlmHead<'_>) -> Result<Option<drafter::GlmDrafter<'s>>> {
+        let target_projection = dflash::TargetProjection::from_bf16(matches!(head, weights::GlmHead::Bf16(_)));
+        if let DraftHome::Tp2(exchange) = home {
+            let snapshot = args.draft.as_deref().context("TP2 DFlash requires --draft")?;
+            let started = Instant::now();
+            let cfg = dflash::DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+            let mask = draft_mask_row(embedding, cfg.mask_token)?;
+            tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
+            let file = if crate::shared::experts::rtx::dense::is_recording() {
+                Vec::new()
+            } else {
+                draft_file.take().unwrap_or_else(|| dflash::prefetch(snapshot)).join()
+                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??
+            };
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let devices = [args.device, exchange.device(1)];
+            let arenas: std::collections::BTreeMap<_, _> = dflash::DflashDrafter::arena_requests(
+                snapshot, representation, &devices, 0)?.into_iter().map(|(id, requests)| {
+                let rank = usize::from(id != args.device);
+                let device = crate::shared::memory::device::Device { library: &self.library, id };
+                let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                    format!("glm/draft/{rank}"), requests)?;
+                Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                    device, layout, cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?))
+            }).collect::<Result<_>>()?;
+            let drafter = dflash::DflashDrafter::load_tp2_with(&self.library, programs, target_projection,
+                snapshot, file, args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)),
+                args.draft_sequences, mask, false, representation, args.fp8_scales,
+                crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache, exchange.clone(),
+                |id, name, bytes| {
+                    arenas.get(&id).context("GLM TP2 draft arena absent for device")?.view(name, bytes)
+                })?;
+            if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                draft_head = "tensor", tp2_dflash = true, "DFlash2 TP2 drafter resident");
+            return Ok(Some(drafter::GlmDrafter::Local(drafter)));
+        }
         let prepared = match home {
             DraftHome::Local => None,
             DraftHome::Peer { device, stream: peer_stream, rows, .. } => Some(crate::shared::draft::remote::Prepared::new(
                 &self.library, crate::shared::peer_split::RankDevice { device: args.device, stream },
                 crate::shared::peer_split::RankDevice { device: *device, stream: *peer_stream }, 0, drafter::IDENTITY,
                 crate::shared::draft::remote::decode_extent(*rows, self.cfg.hidden, self.cfg.vocab_size, 0)?)?),
+            DraftHome::Tp2(_) => unreachable!(),
         };
         let draft_stream = prepared.as_ref().map_or(stream, |prepared| prepared.stream.raw);
         let draft_device = crate::shared::memory::device::Device { library: &self.library,
             id: prepared.as_ref().map_or(args.device, |prepared| prepared.stream.device.id) };
-        let target_projection = dflash::TargetProjection::from_bf16(matches!(head, weights::GlmHead::Bf16(_)));
         let draft_projection = if prepared.is_some() { dflash::TargetProjection::Native } else { target_projection };
         let common = draft_device.own(|| self.load_common_drafter(args, programs, draft_projection,
             embedding, draft_stream, ml4_draft, draft_file))?;
@@ -2004,7 +2099,7 @@ impl Opened {
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
-        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome,
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome<'s>,
         shared_plans: Vec<crate::shared::experts::exlr8::NativePlan>, peer_routers: Option<std::ops::Range<usize>>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
             Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>,
@@ -2503,8 +2598,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             }
             Ok(taps)
         };
-        return dflash::replay(drafter, &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
-            engine.weights.head.bf16()?.buffer.ptr, start);
+        return dflash::replay_with(drafter, &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
+            &|seqs, _| Ok(drafter.draft_device_diagnostic(seqs, &engine.embedding, engine.draft_target_head()?)?
+                .into_iter().map(|d| d.tokens).collect()), start);
     }
     if let Some(rows) = args.bench_verify {
         return bench_verify(args, engine, transport, runtime, rows);

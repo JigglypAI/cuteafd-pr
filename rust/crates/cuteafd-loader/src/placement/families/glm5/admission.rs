@@ -494,6 +494,10 @@ pub struct DraftFacts {
     weights: Vec<ResidentWeight>,
     arena: Option<crate::serving_capacity::WeightArenaLayout>,
     arena_weights: u64,
+    /// Fixed two-rank TP2 GQA DFlash weight backings (one per coordinator GPU).
+    /// Non-empty means the drafter is head/MLP-sharded across both GPUs rather
+    /// than a single movable copy behind a remote bridge.
+    tp2_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, u64)>,
     loading: Vec<Sequential>,
     prefetch: Option<DflashPrefetch>,
     /// Target-side staging and exchange controls of the shared device-driven
@@ -517,6 +521,59 @@ impl DraftFacts {
         facts.prefetch = Some(DflashPrefetch::from_snapshot(snapshot)?);
         let cfg = crate::families::glm5::draft_physical::GlmDflashConfig::read(snapshot)?;
         facts.bridge = Self::bridge_demands(cfg.hidden, cfg.vocab, cfg.taps.len(), capacity.block_rows)?;
+        Ok(facts)
+    }
+
+    /// Fixed two-GPU tensor-parallel GQA DFlash2 owners (query/KV heads and MLP
+    /// neurons sharded; residual/conv/norm replicated; selector/head on GPU0).
+    pub fn gqa_tp2(snapshot: &std::path::Path,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        sm_count: usize, fp8_mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
+        -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        use cuteafd_core::memory_layout::Category;
+        let mut facts = Self::default();
+        for rank in 0..2 {
+            let layout = crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read_tp(
+                snapshot, representation, capacity, sm_count, fp8_mode, kv_cache, rank, 2)?;
+            let prefix = if rank == 0 { "glm.draft" } else { "glm.draft.peer" };
+            let location = Location::coordinator(rank as u8);
+            let arena = crate::serving_capacity::WeightArenaLayout::new(
+                format!("glm/draft/{rank}"),
+                crate::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                    snapshot, representation, rank, 2)?)?;
+            let mut immutable = BTreeSet::new();
+            let mut rank_weights = 0u64;
+            let mut source = Sequential { id: format!("glm.draft.load.rank.{rank}.sources"), members: vec![] };
+            for owner in layout.weight_owners() {
+                immutable.insert(format!("{prefix}.{}", owner.id));
+                rank_weights = rank_weights.checked_add(owner.bytes)
+                    .context("GLM TP2 draft logical weight overflow")?;
+                facts.sync_upload_bytes = facts.sync_upload_bytes.max(owner.bytes);
+                if let Some(matrix) = owner.id.strip_suffix(".values") {
+                    let bytes = owner.bytes.checked_mul(2)
+                        .context("GLM TP2 draft BF16 source overflow")?.max(256);
+                    facts.sync_upload_bytes = facts.sync_upload_bytes.max(bytes);
+                    source.members.push(Allocation::buffer(
+                        format!("glm.draft.load.rank.{rank}.{matrix}.source"),
+                        location, bytes,
+                        Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
+                        Category::Staging, "prefetched TP2 GQA draft FP8 conversion source"));
+                }
+            }
+            let all = layout.allocations(prefix, location);
+            let removed = all.iter().filter(|owner| immutable.contains(&owner.id))
+                .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes)
+                    .context("GLM TP2 draft immutable owner overflow"))?;
+            ensure!(removed == arena.payload_bytes() as u64,
+                "GLM TP2 draft rank {rank} immutable owners differ from shared arena requests: {removed}/{}",
+                arena.payload_bytes());
+            facts.owners.extend(all.into_iter().filter(|owner| !immutable.contains(&owner.id)));
+            facts.tp2_arenas.push((arena, rank_weights));
+            if !source.members.is_empty() { facts.loading.push(source); }
+        }
+        facts.prefetch = Some(DflashPrefetch::from_snapshot(snapshot)?);
         Ok(facts)
     }
 
@@ -633,14 +690,20 @@ impl DraftFacts {
             taps as u64, rows as u64, 0)?.demands)
     }
 
+    pub fn is_tp2(&self) -> bool {
+        !self.tp2_arenas.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.owners.is_empty() && self.weights.is_empty() && self.arena.is_none()
-            && self.loading.is_empty() && self.prefetch.is_none()
+            && self.tp2_arenas.is_empty() && self.loading.is_empty() && self.prefetch.is_none()
     }
 
     /// Ordered homes: GPU1 needs a second coordinator and the bridge inventory.
+    /// TP2 DFlash has fixed per-rank owners across both GPUs, not a single movable home.
     pub fn homes(&self, gpus: usize) -> Vec<u8> {
-        if self.is_empty() { vec![] } else if gpus == 2 && !self.bridge.is_empty() { vec![0, 1] } else { vec![0] }
+        if self.is_empty() || self.is_tp2() { vec![] }
+        else if gpus == 2 && !self.bridge.is_empty() { vec![0, 1] } else { vec![0] }
     }
 
     /// Prefix window marks follow the drafter they snapshot.
@@ -706,6 +769,46 @@ impl DraftFacts {
                     Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, demand.category, demand.group.clone())
             }), maximum_pages));
         }
+        Ok(out)
+    }
+
+    /// Fixed per-rank owners for a TP2 head/MLP-split GQA drafter, including each
+    /// rank's packed weight arena and exact standalone allocation-granularity tails.
+    pub fn tp2_components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        if maximum_pages == 0 { return Err(invalid("zero draft fact pool extent")); }
+        if self.tp2_arenas.len() != 2 || !self.bridge.is_empty() {
+            return Err(invalid("TP2 DFlash requires two fixed rank owners, not a movable"));
+        }
+        let mut out = Vec::new();
+        for owner in self.owners.iter().cloned().filter(|owner| owner.bytes > 0) {
+            if matches!(owner.location.device, Device::Coordinator(_)) {
+                if let Some(tail) = exact_owner_tail(format!("{}.tail", owner.id), owner.id.clone(),
+                    owner.location, owner.lifetime, vec![owner.bytes], maximum_pages)? {
+                    out.push(tail);
+                }
+            }
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            out.push(Component::allocation(owner, bytes, false, maximum_pages));
+        }
+        for (rank, (arena, weights)) in self.tp2_arenas.iter().enumerate() {
+            let location = Location::coordinator(rank as u8);
+            let lifetime = Lifetime::RESIDENT;
+            let mut components = weight_arena_extent_components(arena.id(), arena.bytes() as u64,
+                location, lifetime, maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
+            components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+            let root = Allocation::buffer(arena.id(), location, arena.bytes() as u64,
+                lifetime, cuteafd_core::memory_layout::Category::Drafter, "weight arena");
+            components.push(Component::resident_weight(ResidentWeight::from_allocation(&root,
+                crate::placement::ResidentWeights(*weights)),
+                ByteCurve::fixed(*weights, maximum_pages)));
+            out.extend(components);
+        }
+        out.extend(self.loading.iter().cloned().map(|group| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(group.peak(), maximum_pages),
+            kind: ComponentKind::Sequential(group),
+        }));
+        if let Some(prefetch) = &self.prefetch { out.extend(prefetch.components(maximum_pages)?); }
         Ok(out)
     }
 }
@@ -971,15 +1074,20 @@ impl<'a> ProductionInput<'a> {
             recipe.owners.push(Case { when: vec![], value: owners });
         }
         recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
-        for home in recipe.draft_homes.clone() {
-            recipe.owners.push(Case { when: vec![When::DraftHome(home)],
-                value: self.draft.components(home, maximum_pages)? });
+        if self.draft.is_tp2() {
+            if self.gpus != 2 { return Err(invalid("TP2 DFlash requires two coordinator GPUs")); }
+            recipe.owners.push(Case { when: vec![], value: self.draft.tp2_components(maximum_pages)? });
+        } else {
+            for home in recipe.draft_homes.clone() {
+                recipe.owners.push(Case { when: vec![When::DraftHome(home)],
+                    value: self.draft.components(home, maximum_pages)? });
+            }
         }
         if let Some(load) = &native_load {
             recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
         }
         for (home, weights) in &weights {
-            let filler = embedding_read.filter(|_| *home == EmbeddingHome::Device(0));
+            let filler = embedding_read.filter(|_| matches!(home, EmbeddingHome::Device(_)));
             let sync = self.sync_upload_bytes.max(self.draft.sync_upload_bytes)
                 .max(native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
                 .max(weights.core_loading.sync_upload_bytes)
@@ -1011,6 +1119,7 @@ impl<'a> ProductionInput<'a> {
                 physical_devices: [0, 1], maximum_pages,
                 receive_bytes: vec![receive; (4 * self.prefill.waves) as usize],
                 terminal_abort: true, diagnostics: self.peer_diagnostics,
+                peer_resident: self.draft.is_tp2(),
                 context: self.context_scratch.map(|scratch| super::exchanges::ContextOwners {
                     extent: self.context, prefill: self.prefill, scratch }),
             } });

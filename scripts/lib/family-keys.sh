@@ -232,7 +232,7 @@ EOF
   _spark_slot_keys HOST LANE_A
   # EXLR8 checkpoints exist only for GLM 5.3 / ML4 and GLM Flash (plan::exlr8::architecture).
   [[ "$1" != glm5 && "$1" != glm5_flash ]] || printf '%s\n' EXLR8_MANIFEST EXLR8_PREFILL_ACTIVATIONS
-  [[ "$1" != mimo_v2 && "$1" != kimi_k3 && "$1" != glm5_flash ]] || printf '%s\n' TP2_DFLASH
+  [[ "$1" != glm5 && "$1" != mimo_v2 && "$1" != kimi_k3 && "$1" != glm5_flash ]] || printf '%s\n' TP2_DFLASH
   case "$1" in
     deepseek_v4)
       cat <<'EOF'

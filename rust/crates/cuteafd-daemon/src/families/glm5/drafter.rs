@@ -39,6 +39,10 @@ impl<'a> GlmDrafter<'a> {
 
     pub fn is_remote(&self) -> bool { matches!(self, Self::Remote(_)) }
 
+    pub fn is_tp2(&self) -> bool {
+        match self { Self::Local(d) => d.is_head_split(), Self::Remote(_) => false }
+    }
+
     /// A GPU1 drafter's own stream (the bridge's draft side).
     pub fn stream(&self) -> Option<*mut c_void> {
         match self { Self::Local(_) => None, Self::Remote(d) => Some(d.draft_stream()) }
@@ -122,11 +126,11 @@ impl<'a> GlmDrafter<'a> {
     }
 
     pub fn require_live(&self) -> Result<()> {
-        match self { Self::Local(_) => Ok(()), Self::Remote(d) => d.require_live() }
+        match self { Self::Local(d) => d.require_live(), Self::Remote(d) => d.require_live() }
     }
 
     pub fn publish_abort(&self) -> Result<()> {
-        match self { Self::Local(_) => Ok(()), Self::Remote(d) => d.publish_abort() }
+        match self { Self::Local(d) => d.publish_abort_head_split(), Self::Remote(d) => d.publish_abort() }
     }
 
     pub fn finish_request(&self) -> Result<()> {

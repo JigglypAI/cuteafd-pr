@@ -377,6 +377,88 @@ fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
 }
 
 #[test]
+fn tp2_gqa_draft_splits_arenas_charges_standalone_tails_and_balances_embedding() {
+    use crate::families::glm5::{
+        draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout},
+        draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
+    };
+    use crate::plan::{testing::{t, write_safetensors, write_snapshot}, Checkpoint};
+    let draft_dir = tempfile::tempdir().unwrap();
+    let draft_cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
+        kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
+        mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
+        row_window: false, sample_from_anchor: false };
+    std::fs::write(draft_dir.path().join("config.json"), serde_json::to_vec(&serde_json::json!({
+        "hidden_size": draft_cfg.hidden, "intermediate_size": draft_cfg.intermediate,
+        "num_hidden_layers": draft_cfg.layers, "num_attention_heads": draft_cfg.heads,
+        "num_key_value_heads": draft_cfg.kv_heads, "head_dim": draft_cfg.head_dim,
+        "rms_norm_eps": draft_cfg.eps, "rope_theta": draft_cfg.theta,
+        "sliding_window": draft_cfg.window, "vocab_size": draft_cfg.vocab,
+        "dflash_config": { "block_size": draft_cfg.block, "conv_group_size": draft_cfg.group,
+            "conv_kernel_size": 2, "mask_token_id": draft_cfg.mask_token,
+            "selector_rank": draft_cfg.rank, "selector_top_k": 16, "target_layer_ids": draft_cfg.taps }
+    })).unwrap()).unwrap();
+    write_safetensors(&draft_dir.path().join("model.safetensors"), &draft_cfg.tensor_shapes().iter()
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_config = crate::plan::testing::glm5_config();
+    let target_tensors = crate::plan::testing::glm5_tensors(|n, r, k| crate::plan::testing::fp8(n, r, k, None));
+    write_snapshot(target_dir.path(), &target_config, &target_tensors, None);
+    let checkpoint = Checkpoint::open(target_dir.path()).unwrap();
+    let cfg = GlmDsaConfig::from_hf(&target_config).unwrap();
+    let capacity = GlmDraftCapacity::new(20, 16, draft_cfg.block).unwrap();
+    for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+        let facts = DraftFacts::gqa_tp2(draft_dir.path(), representation, capacity, 188, 0,
+            crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+        assert!(facts.is_tp2());
+        assert!(facts.homes(2).is_empty());
+        assert!(facts.weights.is_empty());
+        let expected_ranks = [0usize, 1].map(|rank| GlmDflashPhysicalLayout::read_tp(
+            draft_dir.path(), representation, capacity, 188, 0,
+            crate::families::qwen4::Qwen4KvCache::Fp8, rank, 2).unwrap());
+        let mut input = production_input(&cfg, 2, 2, PrefillShape { rows: 128, waves: 3 });
+        input.target = TargetFacts::checkpoint(&checkpoint, cfg.layers, 2, None, false,
+            &[EmbeddingHome::Device(0), EmbeddingHome::Device(1)], None).unwrap();
+        input.draft = facts.clone();
+        let admitted = input.prepare().unwrap().admit(request()).unwrap();
+        let solved = &admitted.solved;
+        assert_eq!(solved.decisions.draft_home, None);
+        assert_eq!(solved.decisions.embedding, Some(EmbeddingHome::Device(1)),
+            "embedding must float to GPU1 to balance GPU0 fixed burdens ({representation:?})");
+        let embedding_read = solved.facts.allocations.iter()
+            .find(|owner| owner.id == "glm.load.embedding.read").unwrap();
+        assert_eq!(embedding_read.location, Location::PINNED);
+        // Peer exchange stays resident while TP2 DFlash shares it across pre-KV load.
+        let peer_recv = solved.facts.allocations.iter()
+            .find(|owner| owner.id.ends_with(".peer.recv.0") || owner.id == "peer.recv.0").unwrap();
+        assert_eq!(peer_recv.lifetime, Lifetime::RESIDENT);
+        for rank in 0..2 {
+            let root = solved.facts.allocations.iter()
+                .find(|owner| owner.id == format!("glm/draft/{rank}")).unwrap();
+            assert_eq!(root.location, Location::coordinator(rank as u8));
+            assert_eq!(root.lifetime, Lifetime::RESIDENT);
+            let rw = solved.facts.resident_weights.iter()
+                .find(|owner| owner.id == format!("glm/draft/{rank}")).unwrap();
+            assert_eq!(rw.weights.0, expected_ranks[rank].resident_weights().0);
+            assert!(solved.facts.allocation_granularity.iter().any(|tail|
+                tail.backings.iter().any(|backing| backing.backing == root.id)));
+        }
+        // Every standalone coordinator device owner has its granularity tail when independent and non-zero.
+        for owner in facts.owners.iter().filter(|owner| owner.bytes > 0
+            && matches!(owner.location.device, Device::Coordinator(_))) {
+            let has_tail = solved.facts.allocation_granularity.iter()
+                .any(|tail| tail.id == format!("{}.tail", owner.id));
+            let expected_tail = planner::independent_request(owner.bytes)
+                && planner::allocation_granularity_forecast(&[owner.bytes]).unwrap() > 0;
+            assert_eq!(has_tail, expected_tail, "owner {}", owner.id);
+        }
+        assert_eq!(solved.facts.sequential.iter().filter(|group|
+            group.id.starts_with("glm.draft.load.rank.")).count(),
+            if representation == GlmDraftRepresentation::Fp8Only { 2 } else { 0 });
+    }
+}
+
+#[test]
 fn native_load_keeps_exact_banks_and_serializes_ranks_without_host_cache_double_charge() {
     use crate::plan::exlr8::{dense::DensePlan, residency::{ExpertSet, Residency}};
     use super::super::local_physical::LocalStorage;
@@ -758,6 +840,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                 receive_bytes: vec![shape.rows * cfg.hidden as u64 * 2; (4 * shape.waves) as usize],
                 terminal_abort: true,
                 diagnostics: true,
+                peer_resident: false,
                 context: Some(super::super::exchanges::ContextOwners {
                     extent: recipe.context,
                     prefill: shape,

@@ -2245,8 +2245,21 @@ impl<'a> DflashDrafter<'a> {
         unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
+    pub(crate) fn is_head_split(&self) -> bool {
+        self.head_split.is_some()
+    }
+
     pub(crate) fn require_live(&self) -> Result<()> {
         self.head_split.as_ref().map_or(Ok(()), |split| split.exchange.require_live())
+    }
+
+    pub(crate) fn publish_abort_head_split(&self) -> Result<()> {
+        match &self.head_split {
+            Some(split) if split.exchange.terminal_state() == crate::shared::peer_split::TerminalState::Active => {
+                split.exchange.publish_abort()
+            }
+            _ => Ok(()),
+        }
     }
 
     fn checked_head_split<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {

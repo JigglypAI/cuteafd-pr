@@ -229,7 +229,7 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
     fixture.extent_only(&library)?;
     fixture.quiet_events(&library, true)?;
     for device in 0..2 { fixture.configure_memory(&library, device, 96usize << 30)?; }
-    for repo in ["incoai/GLM-5.3-Flash-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"] {
+    for repo in ["incoai/GLM-5.3-DFlash2", "incoai/GLM-5.3-Flash-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"] {
         let snapshot = installed_snapshot(repo)?;
         let cfg = DflashConfig::read(&snapshot)?;
         let local = cfg.for_tp(2)?;
