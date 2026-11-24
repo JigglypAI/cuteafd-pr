@@ -164,6 +164,13 @@ def test_deployment_preserves_release_container_commands(
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
                 if "--split-device" in before["command"] and "--dspark" in before["command"]:
                     before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
+            if entry["family"] == "glm5":
+                position = after["command"].index("--tp2-dflash")
+                assert after["command"].count("--tp2-dflash") == 1
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
+                assert after["command"][position + 1] == tp2_dflash
+                del after["command"][position:position + 2]
             if entry["family"] == "glm5_flash":
                 # Plan and serve defer auto to the shared checkpoint/topology resolver.
                 # The server publishes the resolved head in report settings and its load log.

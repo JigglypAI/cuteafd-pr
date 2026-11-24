@@ -213,13 +213,18 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let layer_owners = (gpus == 2).then(||
             crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap());
+        let embed_gpu = if gpus == 2 { 1 } else { 0 };
+        if gpus == 2 {
+            assert!(memory.notes.iter().any(|note| note == "embedding placement: gpu 1"),
+                "{ranks}+{gpus}: {:?}", memory.notes);
+        }
         let mut weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
             &checkpoint, gpus, cfg.layers, layer_owners.as_deref(),
             true, false,
-            crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+            crate::placement::planner::EmbeddingHome::Device(embed_gpu as u8)).unwrap();
         weights.add_rotary(1 << 20, cfg.qk_rope_head_dim).unwrap();
         let arenas = weights.coordinator_arenas().unwrap();
-        assert_eq!(arenas[0].view("glm.weights.embedding").unwrap().bytes() as u64,
+        assert_eq!(arenas[embed_gpu].view("glm.weights.embedding").unwrap().bytes() as u64,
             checkpoint.tensors.iter().find(|tensor| tensor.meta.name == cfg.embedding()).unwrap().meta.byte_length);
         for (device, arena) in memory.devices.iter().take(gpus).zip(&arenas) {
             testing::assert_weight_arena_items(device, &[(arena, cuteafd_core::memory_layout::MemoryKind::Weights)]);
@@ -413,7 +418,17 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
                     && phase.phase == crate::placement::planner::Phase::Ready).unwrap().owned;
             let host_total = report.phase_ledger.as_ref().unwrap().budgets.iter()
                 .find(|budget| budget.id == "coordinator host RAM").unwrap().physical_bytes;
-            assert_eq!(host_ready(&report) - host_ready(&off), (8u64 << 30).min(host_total / 20),
+            let off_baseline = if memory.pool_tokens == off.memory_layout.as_ref().unwrap().pool_tokens {
+                off.clone()
+            } else {
+                // Match the smaller RTX-vision pool so pinned upload page-table sizing is identical.
+                let mut matched = layout_options(ranks, 2);
+                matched.vision = MediaMode::Off;
+                matched.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
+                matched.layout.as_mut().unwrap().pool_tokens = Some(memory.pool_tokens);
+                input.plan(&matched).unwrap()
+            };
+            assert_eq!(host_ready(&report) - host_ready(&off_baseline), (8u64 << 30).min(host_total / 20),
                 "both local and remote towers charge their coordinator embedding cache");
             println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
                 memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);

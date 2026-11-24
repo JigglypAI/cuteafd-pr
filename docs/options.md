@@ -1190,10 +1190,10 @@ Speculator (`SPECULATOR`):
 
 DFlash tensor parallelism (`TP2_DFLASH`) on active two-RTX DFlash2 layouts:
 
-| Layout | GLM Flash | MiMo | Kimi K3 | Muse |
-| --- | --- | --- | --- | --- |
-| Two RTX with DFlash2 | `on` | `on` | checkpoint geometry | `on` |
-| One RTX or no DFlash2 | `off` | `off` | `off` | `off` |
+| Layout | GLM 5.3 / ML4 | GLM Flash | MiMo | Kimi K3 | Muse |
+| --- | --- | --- | --- | --- | --- |
+| Two RTX with DFlash2 | `on` | `on` | `on` | checkpoint geometry | `on` |
+| One RTX or no DFlash2 | `off` | `off` | `off` | `off` | `off` |
 
 Qwen4 unset/`auto` selects native MTP whenever the checkpoint declares its MTP
 layer, independent of expert quantization, core view, repository revision or
