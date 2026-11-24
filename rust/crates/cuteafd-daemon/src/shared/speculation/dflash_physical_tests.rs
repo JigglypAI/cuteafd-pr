@@ -566,7 +566,7 @@ fn with_mla_arena_fixture_config(complete: bool, windows_only: bool, mut verify:
             let stream = Stream::new(device)?;
             let mut bound = Vec::new();
             let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
-                DflashDrafter::load_mla_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, "kimik3", snapshot, Vec::new(), stream.raw,
+                DflashDrafter::load_mla_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, "kimik3", snapshot, stream.raw,
                     layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
                     |physical, name, bytes| {
                         assert_eq!(physical, 1);
@@ -791,4 +791,408 @@ fn mla_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
         assert_eq!(aliases.iter().map(|receipt| receipt.allocation.bytes).sum::<u64>(), root.allocation.bytes);
         Ok(())
     })
+}
+
+#[test]
+fn mla_mount_and_push_bound_device_staging_to_step_bytes_and_free_before_return() -> Result<()> {
+    use cuteafd_core::memory_layout::MemoryKind;
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::{formats::dflash::MlaDflashConfig, plan::testing::{t, write_safetensors},
+        serving_capacity::WeightArenaLayout};
+    use crate::shared::{experts::rtx::dense::{self, STEP_BYTES},
+        memory::{device::Stream, weight_arena::DeviceWeightArena}};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.extent_only(&library)?;
+    fixture.quiet_events(&library, true)?;
+    fixture.configure_memory(&library, 1, 96usize << 30)?;
+    let device = Device { library: &library, id: 1 };
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let snapshot = root.path();
+    // 2 taps -> fc.weight is [7168, 14336] BF16 = 196 MiB >> STEP_BYTES (32 MiB).
+    std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&serde_json::json!({
+        "architectures":["DFlash2DraftModel"], "hidden_size":7168,
+        "intermediate_size":128, "num_hidden_layers":2, "num_attention_heads":64,
+        "num_key_value_heads":64, "q_lora_rank":1536, "kv_lora_rank":512,
+        "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
+        "rms_norm_eps":1e-5, "vocab_size":256, "draft_vocab_size":256,
+        "max_position_embeddings":65536, "num_target_layers":93,
+        "layer_types":["sliding_attention","full_attention"], "sliding_window":4096,
+        "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
+        "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
+        "rope_parameters":{"rope_type":"yarn", "rope_theta":50000., "factor":32.,
+            "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
+            "mscale":1., "mscale_all_dim":1.},
+        "dflash_config":{"attention_mode":"mla", "block_size":8,
+            "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
+            "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":0}
+    }))?)?;
+    let cfg = MlaDflashConfig::read(snapshot)?;
+    write_safetensors(&snapshot.join("model.safetensors"), &cfg.tensor_shapes().iter()
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    let cache = cuteafd_core::MlaCacheFormat::Fp8;
+    let peak_staging = |events: &[AllocationEvent], space: Space, owner: &str| -> (usize, usize) {
+        let (mut cur, mut peak, mut allocs) = (0usize, 0usize, 0usize);
+        for event in events {
+            match event {
+                AllocationEvent::Allocated(rec) if rec.key.space == space
+                    && rec.key.tag.kind == MemoryKind::Staging && rec.key.tag.owner == owner => {
+                    cur += rec.bytes;
+                    peak = peak.max(cur);
+                    allocs += 1;
+                }
+                AllocationEvent::Freed(rec) if rec.key.space == space
+                    && rec.key.tag.kind == MemoryKind::Staging && rec.key.tag.owner == owner => {
+                    cur = cur.saturating_sub(rec.bytes);
+                }
+                _ => {}
+            }
+        }
+        (peak, allocs)
+    };
+    for (label, representation, complete) in [
+        ("partial-fp8", GlmDraftRepresentation::Fp8Only, false),
+        ("complete-fp8", GlmDraftRepresentation::Fp8Only, true),
+        ("bf16-only", GlmDraftRepresentation::Bf16Only, false),
+    ] {
+        let layout = if complete {
+            cfg.complete_fp8_runtime_layout(GlmDraftCapacity::new(2, 1, 8)?, 8192, 16384, library.sm_count()?, 0, cache)?
+        } else {
+            cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?, 8192, 16384,
+                library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)?
+        };
+        let p = layout.program();
+        let shapes = [(7168, 256), (128, 7168), (14336, 7168), (7168, 1792)]
+            .into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mut entries = shapes.into_iter().map(|(k, n)| serde_json::json!({
+            "name":format!("draft_bf16_k{k}_n{n}"), "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+            "scalars":[{"name":"rows","type":"int32"}], "scratch_bytes_at_capacity":{},
+            "capacity_rows":TAP_ROWS, "geometry":{"width":k,"outputs":n,
+                "output_dtype":"torch.bfloat16", "reduction":"ordered_k16", "tiles_by_rows":[[16,1,4,16,64,6]]}
+        })).collect::<Vec<_>>();
+        for (index, suffix, pointers, scalars, window) in [
+            (0,"producer",vec!["x","kv_slots","positions","inv_freq","w_qkv_a","q_a_norm","kv_a_norm",
+                "w_q_b","w_uk","kv_cache","query","q_resid","scratch"],"fi",None),
+            (1,"attention_full",vec!["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"],"iilif",None),
+            (1,"attention_w4096",vec!["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"],"iilif",Some(4096)),
+            (2,"output",vec!["attn","w_uv","w_o","out","scratch"],"i",None),
+        ] {
+            let mut geometry = serde_json::json!({"name":"mla_block_draft", "heads":64,"hidden":7168,
+                "q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_dim":128,"qk_rope_dim":64,
+                "v_head_dim":128,"page_rows":64,"norm_eps":1e-5,"window_size":window,"kv_cache":cache.label()});
+            match index {
+                0 => { geometry["rotary_style"] = "interleaved".into(); geometry["rotary_dim"] = 64.into(); }
+                1 => {
+                    for (key, value) in [("max_context", p.context), ("num_splits", p.splits),
+                        ("chunks_per_split", p.chunks_per_split), ("partial_output_bytes", p.partial_output_bytes),
+                        ("partial_lse_bytes", p.partial_lse_bytes), ("scratch_bytes", p.scratch[1])] { geometry[key] = value.into(); }
+                    geometry["noncausal_block"] = true.into();
+                }
+                _ => geometry["output_gate"] = false.into(),
+            }
+            let (suffix, pointers) = if complete && index != 1 {
+                geometry["weight_dtype"] = "fp8".into();
+                geometry["projection_scale_k"] = 128.into();
+                geometry["batched_scale_k"] = 64.into();
+                if index == 0 {
+                    ("producer_fp8_weights", vec!["x","kv_slots","positions","inv_freq","w_qkv_a","s_qkv_a",
+                        "q_a_norm","kv_a_norm","w_q_b","s_q_b","w_uk","s_uk","kv_cache","query","q_resid","scratch"])
+                } else { ("output_fp8_weights", vec!["attn","w_uv","s_uv","w_o","s_o","out","scratch"]) }
+            } else { (suffix, pointers) };
+            let cache_suffix = if index == 2 { "" } else { cache.program_suffix() };
+            entries.push(serde_json::json!({"name":format!("kimik3_mla_draft_{suffix}{cache_suffix}_m64"),
+                "pointers":pointers.iter().map(|name| serde_json::json!({"name":name})).collect::<Vec<_>>(),
+                "scalars":scalars.bytes().enumerate().map(|(i, kind)| serde_json::json!({"name":format!("s{i}"),
+                    "type":match kind { b'i'=>"int32", b'l'=>"int64", _=>"float32" }})).collect::<Vec<_>>(),
+                "capacity_rows":64,"geometry":geometry,"scratch_bytes_at_capacity":{"scratch":p.scratch[index]}}));
+        }
+        fixture.register_programs(&library, &entries)?;
+        let manifest = snapshot.join("programs.json");
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let planned = WeightArenaLayout::new("kimi/draft/1", layout.weight_arena_requests())?;
+        let stream = Stream::new(device)?;
+        // 1. Mount mode: must stream through bounded STEP_BYTES device/pinned staging and free before return.
+        let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
+        let audit = AllocationAudit::begin();
+        let mount_drafter = device.run(|| DflashDrafter::load_mla_with(&library, &programs,
+            crate::shared::speculation::dflash::TargetProjection::Native, "kimik3", snapshot, stream.raw,
+            layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+            |_, name, bytes| arena.view(name, bytes)))?;
+        let history = audit.finish();
+        let expected_dev = if representation == GlmDraftRepresentation::Fp8Only { STEP_BYTES } else { 0 };
+        let (dev_peak, dev_allocs) = peak_staging(&history.events, Space::Device,
+            cuteafd_loader::shared::dense_read::DEVICE_STAGING_OWNER);
+        let (full_src_peak, _) = peak_staging(&history.events, Space::Device, "shared/drafter-source");
+        let (pinned_peak, _) = peak_staging(&history.events, Space::Pinned, "staging/coordinator-dense");
+        assert_eq!(full_src_peak, 0, "{label} mount must never allocate full source matrix on device");
+        assert_eq!(dev_peak, expected_dev, "{label} mount device staging peak");
+        assert_eq!(dev_allocs, usize::from(expected_dev > 0), "{label} mount device staging allocated once and reused");
+        assert!(pinned_peak > 0 && pinned_peak <= STEP_BYTES, "{label} mount pinned peak {pinned_peak}");
+        assert!(!history.final_allocations.iter().any(|rec|
+            matches!(rec.key.tag.owner, "staging/coordinator-dense-device" | "staging/coordinator-dense" | "shared/drafter-source")),
+            "{label} mount must free transient staging before load_mla_with returns");
+        drop(arena);
+        stream.drain()?;
+        drop(mount_drafter);
+        // 2. Push mode (recording): records bounded steps (<= STEP_BYTES) and allocates 0 device staging.
+        let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
+        let audit = AllocationAudit::begin();
+        let (push_drafter, records) = device.run(|| dense::recording(||
+            DflashDrafter::load_mla_with(&library, &programs,
+                crate::shared::speculation::dflash::TargetProjection::Native, "kimik3", snapshot, stream.raw,
+                layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+                |_, name, bytes| arena.view(name, bytes))))?;
+        let history = audit.finish();
+        assert!(records.steps.iter().all(|step| step.bytes() <= STEP_BYTES), "{label} push step exceeds STEP_BYTES");
+        assert_eq!(peak_staging(&history.events, Space::Device,
+            cuteafd_loader::shared::dense_read::DEVICE_STAGING_OWNER).0, 0, "{label} push recording allocates 0 device staging");
+        assert_eq!(peak_staging(&history.events, Space::Device, "shared/drafter-source").0, 0);
+        if representation == GlmDraftRepresentation::Fp8Only {
+            assert!(records.steps.iter().any(|step| step.jobs.iter().any(|j| matches!(j, dense::Job::W8a16Pack { .. }))));
+        } else {
+            assert!(records.steps.iter().all(|step| step.jobs.iter().all(|j| matches!(j, dense::Job::Absorb { .. }))));
+        }
+        drop(arena);
+        stream.drain()?;
+        drop(push_drafter);
+        fixture.finish_ordered_uploads(&library)?;
+        assert_eq!(fixture.mapped_bytes(&library)?, 0);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires sealed native library, programs manifest, real MLA drafter snapshot and one RTX GPU via golden-run --native-test"]
+fn mla_drafter_load_peak_and_weight_hash_on_gpu() -> Result<()> {
+    use cuteafd_core::memory_layout::MemoryKind;
+    use cuteafd_ffi::memory_ledger::{AllocationAudit, AllocationEvent, Space};
+    use cuteafd_loader::{formats::dflash::MlaDflashConfig, serving_capacity::WeightArenaLayout};
+    use crate::shared::{experts::rtx::dense::{self, STEP_BYTES},
+        memory::{device::Stream, weight_arena::DeviceWeightArena}};
+    use sha2::{Digest, Sha256};
+
+    let env = |name| std::env::var(name).with_context(|| format!("MLA drafter GPU check needs {name}"));
+    let snapshot = std::path::PathBuf::from(env("CUTEAFD_KIMI_DRAFT_SNAPSHOT")?);
+    let native_lib = std::path::PathBuf::from(env("CUTEAFD_NATIVE_LIB")?);
+    let manifest = std::path::PathBuf::from(env("CUTEAFD_PROGRAM_MANIFEST")?);
+    // SAFETY: golden-run supplies the sealed library and every borrower drops before it.
+    let library = unsafe { cuteafd_ffi::NativeLibrary::load(&native_lib)? };
+    let programs = library.programs()?.with_manifest(&manifest)?;
+    let device = Device { library: &library, id: 0 };
+    let stream = Stream::new(device)?;
+    let native = MlaDflashConfig::read(&snapshot)?;
+    let namespace = if native.kind == cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 {
+        "kimik31"
+    } else {
+        "kimik3"
+    };
+    let sms = device.run(|| library.sm_count())?;
+    let cap = GlmDraftCapacity::new(2, 1, native.block)?;
+    let cache = cuteafd_core::MlaCacheFormat::Fp8;
+
+    let hash_arena = |arena: &DeviceWeightArena<'_>, planned: &WeightArenaLayout| -> Result<String> {
+        let mut views: Vec<_> = planned.views().iter().collect();
+        views.sort_by_key(|(_, v)| v.offset());
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 32 << 20];
+        device.run(|| -> Result<()> {
+            for (name, view) in views {
+                let alloc = arena.view(name, view.bytes())?;
+                let mut offset = 0usize;
+                while offset < view.bytes() {
+                    let n = (view.bytes() - offset).min(buf.len());
+                    let slice = CuteafdDeviceBuffer {
+                        ptr: unsafe { alloc.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                        bytes: n,
+                        ..alloc.buffer
+                    };
+                    library.copy_d2h(&mut buf[..n], slice)?;
+                    hasher.update(&buf[..n]);
+                    offset += n;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(format!("{:x}", hasher.finalize()))
+    };
+
+    let staging_peaks = |events: &[AllocationEvent]| -> (usize, usize, usize, usize) {
+        let peak_of = |space: Space, owner: &str| -> usize {
+            let (mut cur, mut peak) = (0usize, 0usize);
+            for ev in events {
+                match ev {
+                    AllocationEvent::Allocated(r) if r.key.space == space
+                        && r.key.tag.kind == MemoryKind::Staging && r.key.tag.owner == owner => {
+                        cur += r.bytes;
+                        peak = peak.max(cur);
+                    }
+                    AllocationEvent::Freed(r) if r.key.space == space
+                        && r.key.tag.kind == MemoryKind::Staging && r.key.tag.owner == owner => {
+                        cur = cur.saturating_sub(r.bytes);
+                    }
+                    _ => {}
+                }
+            }
+            peak
+        };
+        let (mut cur_dev, mut peak_dev) = (0usize, 0usize);
+        for ev in events {
+            match ev {
+                AllocationEvent::Allocated(r) if r.key.space == Space::Device
+                    && r.key.tag.kind == MemoryKind::Staging => {
+                    cur_dev += r.bytes;
+                    peak_dev = peak_dev.max(cur_dev);
+                }
+                AllocationEvent::Freed(r) if r.key.space == Space::Device
+                    && r.key.tag.kind == MemoryKind::Staging => {
+                    cur_dev = cur_dev.saturating_sub(r.bytes);
+                }
+                _ => {}
+            }
+        }
+        (
+            peak_dev,
+            peak_of(Space::Device, "shared/drafter-source"),
+            peak_of(Space::Device, cuteafd_loader::shared::dense_read::DEVICE_STAGING_OWNER),
+            peak_of(Space::Pinned, "staging/coordinator-dense"),
+        )
+    };
+
+    // Untimed warm-up (CUDA kernels + page cache) on complete-fp8.
+    {
+        let layout = native.complete_fp8_runtime_layout(cap, 8192, 16384, sms, 0, cache)?;
+        let planned = WeightArenaLayout::new("kimi/draft/warm", layout.weight_arena_requests())?;
+        let arena = DeviceWeightArena::new(device, planned, crate::shared::memory::TEST_ARENA)?;
+        let warm = device.run(|| DflashDrafter::load_mla_with(&library, &programs,
+            crate::shared::speculation::dflash::TargetProjection::Native, namespace, &snapshot, stream.raw,
+            layout, GlmDraftRepresentation::Fp8Only, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+            |_, name, bytes| arena.view(name, bytes)))?;
+        stream.drain()?;
+        drop(warm);
+        drop(arena);
+    }
+
+    for (label, representation, complete) in [
+        ("complete-fp8", GlmDraftRepresentation::Fp8Only, true),
+        ("partial-fp8", GlmDraftRepresentation::Fp8Only, false),
+        ("bf16-only", GlmDraftRepresentation::Bf16Only, false),
+    ] {
+        let layout = if complete {
+            native.complete_fp8_runtime_layout(cap, 8192, 16384, sms, 0, cache)?
+        } else {
+            native.runtime_layout(representation, cap, 8192, 16384, sms,
+                fp8_linear::Fp8Rows::W8a16.code() as u8, cache)?
+        };
+        let planned = WeightArenaLayout::new("kimi/draft/0", layout.weight_arena_requests())?;
+        let resident_gb = planned.bytes() as f64 / 1e9;
+        let expected_dev = if representation == GlmDraftRepresentation::Fp8Only { STEP_BYTES } else { 0 };
+
+        // 1. Legacy dev mount path (std::fs::read + Load::with_prefetched full-matrix staging).
+        let (legacy_hash, legacy_s, legacy_peaks, legacy_used_delta) = {
+            let (free_before, total) = device.run(|| library.cuda_memory_info())?;
+            let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
+            let audit = AllocationAudit::begin();
+            let t0 = std::time::Instant::now();
+            let file = std::fs::read(snapshot.join("model.safetensors"))?;
+            let weights = device.run(|| -> Result<_> {
+                let mut alloc = |_: i32, name: &str, bytes: usize| arena.view(name, bytes);
+                let load = super::super::weights::Load::with_prefetched(&library, &snapshot, file)?
+                    .with_allocator(&mut alloc);
+                use super::super::weights::MlaMatrix;
+                let w = cuteafd_loader::families::glm5::draft_physical::mla_weight_recipe_with_attention(&native,
+                    |parts| load.tensor_parts(parts),
+                    |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only,
+                        fp8_linear::Fp8Scales::Amax, stream.raw),
+                    |parts, cols| if complete {
+                        load.mla_fp8_matrix(parts, cols, fp8_linear::Fp8Scales::Amax, stream.raw).map(MlaMatrix::Fp8)
+                    } else { load.concat(parts, cols).map(MlaMatrix::Bf16) },
+                    |name| if complete {
+                        let (uk, uv) = load.mla_fp8_absorb(name, native.mla.heads, native.mla.nope,
+                            native.mla.value, native.mla.kv_rank, fp8_linear::Fp8Scales::Amax, stream.raw)?;
+                        Ok((MlaMatrix::Fp8(uk), MlaMatrix::Fp8(uv)))
+                    } else {
+                        let (uk, uv) = load.absorb(name, native.mla.heads, native.mla.nope,
+                            native.mla.value, native.mla.kv_rank, stream.raw)?;
+                        Ok((MlaMatrix::Bf16(uk), MlaMatrix::Bf16(uv)))
+                    })?;
+                drop(load);
+                stream.drain()?;
+                Ok(w)
+            })?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            let history = audit.finish();
+            let (free_after, _) = device.run(|| library.cuda_memory_info())?;
+            let hash = hash_arena(&arena, &planned)?;
+            drop(weights);
+            drop(arena);
+            (hash, elapsed, staging_peaks(&history.events), (total - free_after).saturating_sub(total - free_before))
+        };
+
+        // 2. HEAD bounded mount path (DflashDrafter::load_mla_with via Load::open).
+        let (mount_hash, mount_s, mount_peaks, mount_used_delta) = {
+            let (free_before, total) = device.run(|| library.cuda_memory_info())?;
+            let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
+            let audit = AllocationAudit::begin();
+            let t0 = std::time::Instant::now();
+            let drafter = device.run(|| DflashDrafter::load_mla_with(&library, &programs,
+                crate::shared::speculation::dflash::TargetProjection::Native, namespace, &snapshot, stream.raw,
+                layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+                |_, name, bytes| arena.view(name, bytes)))?;
+            stream.drain()?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            let history = audit.finish();
+            let (free_after, _) = device.run(|| library.cuda_memory_info())?;
+            assert!(!history.final_allocations.iter().any(|r|
+                matches!(r.key.tag.owner, "staging/coordinator-dense-device" | "staging/coordinator-dense" | "shared/drafter-source")),
+                "{label}: transient staging still live after load_mla_with returned");
+            let hash = hash_arena(&arena, &planned)?;
+            drop(drafter);
+            drop(arena);
+            (hash, elapsed, staging_peaks(&history.events), (total - free_after).saturating_sub(total - free_before))
+        };
+
+        // 3. HEAD push path (dense::recording + dense::testing::replay).
+        let (push_hash, push_s, push_peaks) = {
+            let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
+            let audit = AllocationAudit::begin();
+            let t0 = std::time::Instant::now();
+            let (drafter, records) = device.run(|| dense::recording(||
+                DflashDrafter::load_mla_with(&library, &programs,
+                    crate::shared::speculation::dflash::TargetProjection::Native, namespace, &snapshot, stream.raw,
+                    layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+                    |_, name, bytes| arena.view(name, bytes))))?;
+            let rank_layout = dense::RankLayout::new(records.operands, records.steps, device.id)?;
+            let (push_root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+            dense::testing::replay(device, rank_layout, &push_root, 1, 0)?;
+            stream.drain()?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            let history = audit.finish();
+            let hash = hash_arena(&arena, &planned)?;
+            drop(drafter);
+            drop(arena);
+            (hash, elapsed, staging_peaks(&history.events))
+        };
+
+        eprintln!(
+            "MLA_GPU_RECEIPT mode={label} resident_bytes={} admitted_staging={} \
+             legacy_dev_peak={} legacy_src_peak={} legacy_dense_peak={} legacy_pinned_peak={} legacy_s={:.3} legacy_s_per_gb={:.3} legacy_cuda_delta={} \
+             mount_dev_peak={} mount_src_peak={} mount_dense_peak={} mount_pinned_peak={} mount_s={:.3} mount_s_per_gb={:.3} mount_cuda_delta={} \
+             push_dev_peak={} push_dense_peak={} push_pinned_peak={} push_s={:.3} push_s_per_gb={:.3} \
+             sha256_legacy={} sha256_mount={} sha256_push={}",
+            planned.bytes(), layout.weights().max_load_staging,
+            legacy_peaks.0, legacy_peaks.1, legacy_peaks.2, legacy_peaks.3, legacy_s, legacy_s / resident_gb, legacy_used_delta,
+            mount_peaks.0, mount_peaks.1, mount_peaks.2, mount_peaks.3, mount_s, mount_s / resident_gb, mount_used_delta,
+            push_peaks.0, push_peaks.2, push_peaks.3, push_s, push_s / resident_gb,
+            legacy_hash, mount_hash, push_hash
+        );
+        assert_eq!(layout.weights().max_load_staging, expected_dev as u64, "{label} admitted staging");
+        assert_eq!(mount_peaks.1, 0, "{label} HEAD mount must not allocate shared/drafter-source");
+        assert_eq!(mount_peaks.0, expected_dev, "{label} HEAD mount device staging must equal admitted bound");
+        assert!(mount_peaks.3 <= STEP_BYTES, "{label} HEAD mount pinned staging <= STEP_BYTES");
+        assert_eq!(push_peaks.0, expected_dev, "{label} HEAD push device staging must equal admitted bound");
+        assert_eq!(mount_hash, legacy_hash, "{label} HEAD mount weights must be byte-exact vs legacy dev");
+        assert_eq!(push_hash, legacy_hash, "{label} HEAD push weights must be byte-exact vs legacy dev");
+    }
+    Ok(())
 }

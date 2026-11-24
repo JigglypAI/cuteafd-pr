@@ -281,13 +281,11 @@ impl<'a> NativeDraft<'a> {
                     layout.capacity().block_rows, layout.target_hidden(), layout.target_vocab(), head)?)?))
         };
         let head_replica = admission.allocate_draft_head(bridge.stream().device)?;
-        // Recording preserves admitted allocation order; the shared group fills
-        // these owners before target binding without a host payload read.
-        let file = if matches!(layout,DraftLayout::Block(_)) || crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
-            else { std::fs::read(options.snapshot.join("model.safetensors"))? };
+        // Recording preserves admitted allocation order; mount and push both
+        // stream through bounded STEP_BYTES staging without prefetching the file.
         let mut draft = match layout {
             DraftLayout::Mla(_) => {
-                let draft=admission.allocate_draft(bridge.stream().device,programs,&options.snapshot,file,
+                let draft=admission.allocate_draft(bridge.stream().device,programs,&options.snapshot,
                     bridge.stream().raw,options.representation(),Fp8Scales::Amax,Fp8Rows::W8a16,exchange)?;
                 let device=draft.device;
                 device.own(|| Ok(CommonDraft::Mla(draft.into_inner())))?

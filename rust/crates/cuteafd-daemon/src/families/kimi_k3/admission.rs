@@ -225,7 +225,7 @@ impl<'a> Admission<'a> {
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn allocate_draft(&mut self, device: Device<'a>,
         programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &std::path::Path,
-        file: Vec<u8>, stream: *mut std::ffi::c_void,
+        stream: *mut std::ffi::c_void,
         representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
         scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>)
@@ -253,7 +253,7 @@ impl<'a> Admission<'a> {
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout, ArenaTag::drafter_weights("kimi/draft"))?;
             let namespace=if layout.kind()==cuteafd_core::coordinator_programs::MlaDraftKind::CausalDflash2 { "kimik31" } else { "kimik3" };
             DflashDrafter::load_mla_with(device.library, programs,
-                target_projection, namespace, snapshot, file, stream, layout,
+                target_projection, namespace, snapshot, stream, layout,
                 representation, scales, rows, split, |physical, name, bytes| {
                     ensure!(physical == device.id, "Kimi draft arena physical owner changed");
                     arena.view(name, bytes)

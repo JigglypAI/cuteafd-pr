@@ -1239,6 +1239,14 @@ int cuteafd_fp8_row_quant_rule(const void *weight, void *out, void *scale,
     return pack_status;
 }
 
+int cuteafd_fp8_row_quant_repeat(const void *weight, void *out, void *scale,
+                                 int rows, int cols, int rule, int scale_repeat, void *stream) {
+    (void)weight; (void)out; (void)scale; (void)rows; (void)cols;
+    (void)rule; (void)scale_repeat; (void)stream;
+    event('Q');
+    return pack_status;
+}
+
 int cuteafd_last_error(char *out, size_t bytes) {
     snprintf(out, bytes, "injected CPU fixture failure");
     return 0;

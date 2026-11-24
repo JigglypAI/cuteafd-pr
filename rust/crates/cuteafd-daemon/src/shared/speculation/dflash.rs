@@ -1280,19 +1280,19 @@ impl<'a> DflashDrafter<'a> {
     /// Programs and headers are checked before the exact arenas are allocated.
     #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn load_mla(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
-        program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
+        program_namespace: &str, snapshot: &Path, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows,
         split: Option<context_split::ContextOwner<'a>>) -> Result<Self> {
-        Self::load_mla_with(library, programs, target_projection, program_namespace, snapshot, file, stream, layout,
+        Self::load_mla_with(library, programs, target_projection, program_namespace, snapshot, stream, layout,
             representation, scales, fp8_rows, split,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_mla_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
-        program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
+        program_namespace: &str, snapshot: &Path, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, split: Option<context_split::ContextOwner<'a>>,
@@ -1313,7 +1313,7 @@ impl<'a> DflashDrafter<'a> {
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
-        let load = super::weights::Load::with_prefetched(library, snapshot, file)?.with_allocator(&mut allocate);
+        let load = super::weights::Load::open(library, snapshot)?.with_allocator(&mut allocate);
         load.validate(native.tensor_shapes())?;
         let programs = native.windows.iter().map(|window| -> Result<_> {
             let window = match window { Some(1024) => MlaDraftWindow::CausalSliding1024,
@@ -1345,6 +1345,7 @@ impl<'a> DflashDrafter<'a> {
                     native.mla.value, native.mla.kv_rank, stream)?;
                 Ok((MlaMatrix::Bf16(uk), MlaMatrix::Bf16(uv)))
             })?;
+        drop(load);
         let mut layers = Vec::with_capacity(cfg.layers);
         for (index, (program, weight)) in programs.into_iter().zip(weights.layers).enumerate() {
             let (qkv_a, sqkv) = weight.qkv_a.into_parts();
