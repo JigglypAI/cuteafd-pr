@@ -1,7 +1,7 @@
 //! Inkling 2 Mini 48-visit TP1 unit executor on the shared `PrefillHooks` pipeline.
 use super::{
     experts::Dispatcher,
-    graphs::{self, DecodeGraphs, Mode, Section},
+    graphs::{self, DecodeGraphs, Mode},
     layers::{self, MiniKernels},
     owners::{PackedMember, PackedVisitUnit, UnitBuffers, UnitOwner},
     weights::MiniTargetWeights,
@@ -21,6 +21,9 @@ pub(crate) trait UnitIo<'a> {
     fn end(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()>;
     fn tap(&mut self, _visit_idx: usize, _unit: &Unit, _owner: &UnitOwner<'a>) -> Result<()> {
         Ok(())
+    }
+    fn has_taps(&self) -> bool {
+        false
     }
 }
 
@@ -137,6 +140,10 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
                 .entry(visit_idx, owner.buffer("partial")?, unit.rows.len())?;
         }
         Ok(())
+    }
+
+    fn has_taps(&self) -> bool {
+        self.draft.is_some()
     }
 
     fn begin(
@@ -310,6 +317,64 @@ impl Stateful<'_, '_> {
             }),
             "Inkling 2 Mini prefill unit differs from admitted requests"
         );
+        // Monolithic 48-visit TP1 decode/verify graph path: upload metadata once outside
+        // capture, run all 48 visits (taps + attention + routes + local experts + join)
+        // inside a single kernel-only CUDA graph, then run head/commit outside.
+        if self.graphs.is_some() {
+            ensure!(
+                units.len() == 1 && self.owners.len() == 1 && units[0].slot == 0,
+                "Inkling 2 Mini graphed step requires one single-slot decode/verify unit"
+            );
+            let unit = &units[0];
+            let owner = &self.owners[0];
+            let uploads = &mut self.uploads[0];
+            self.io.begin(unit, owner, uploads)?;
+            let packed = build_packed_members(self.cfg, self.cache, self.placements, unit)?;
+            owner.packed_metadata(self.cache, &packed, uploads)?;
+            let rows = unit.rows.len();
+            let mode = if owner.replaying() {
+                Mode::Verify
+            } else {
+                Mode::Decode
+            };
+            let has_taps = self.io.has_taps();
+            let visits = self.visits;
+            let kernels = self.kernels;
+            let cache = self.cache;
+            let target = self.target;
+            let cfg = self.cfg;
+            let local = self.local;
+            let io = &mut self.io;
+            graphs::step(self.graphs.as_deref_mut(), &owner.stream, rows, mode, has_taps, || {
+                for (visit_idx, &visit) in visits.iter().enumerate() {
+                    io.tap(visit_idx, unit, owner)?;
+                    let state = PackedVisitUnit {
+                        unit: owner,
+                        cache,
+                        cache_slot: visit.cache_slot,
+                        members: &packed,
+                    };
+                    layers::begin_visit(kernels, &state, target, cfg, visit, rows)?;
+                    let experts = local[visit.layer].as_ref();
+                    layers::prepare_routes(kernels, owner, target, experts, visit.layer, rows)?;
+                    layers::dispatch_experts(owner, experts, rows)?;
+                    layers::join_visit(kernels, &state, target, cfg, visit, rows)?;
+                }
+                Ok(())
+            })?;
+            self.io.end(unit, owner)?;
+            for member in members(unit) {
+                let placement = &mut self.placements[member.sequence];
+                ensure!(
+                    placement.state_len == member.tokens.start,
+                    "Inkling 2 Mini causal commit is out of order"
+                );
+                placement.state_len = member.tokens.end;
+                placement.len = member.tokens.end;
+            }
+            return Ok(());
+        }
+
         let waves = self.owners.len();
         let mut prepared = PreparedUnitRunner {
             cfg: self.cfg,
@@ -320,7 +385,6 @@ impl Stateful<'_, '_> {
             uploads: self.uploads,
             members: vec![Vec::new(); waves],
             ops: StatefulOps {
-                graphs: &mut self.graphs,
                 kernels: self.kernels,
                 target: self.target,
                 local: self.local,
@@ -358,7 +422,6 @@ trait VisitOps<'a> {
 }
 
 struct StatefulOps<'p, 's, 'a> {
-    graphs: &'p mut Option<&'s mut DecodeGraphs<'a>>,
     kernels: &'s MiniKernels<'a>,
     target: &'s MiniTargetWeights<'a>,
     local: &'s [Box<dyn Dispatcher + 'a>],
@@ -385,25 +448,12 @@ impl<'a> VisitOps<'a> for StatefulOps<'_, '_, 'a> {
     ) -> Result<()> {
         self.io.tap(visit_idx, unit, state.unit)?;
         let rows = unit.rows.len();
-        let mode = if state.unit.replaying() {
-            Mode::Verify
-        } else {
-            Mode::Decode
-        };
-        graphs::local(
-            self.graphs.as_deref_mut(),
-            state.stream(),
-            visit_idx,
-            rows,
-            Section::VisitAttention,
-            mode,
-            || layers::begin_visit(self.kernels, state, self.target, cfg, visit, rows),
-        )
+        layers::begin_visit(self.kernels, state, self.target, cfg, visit, rows)
     }
 
     fn local_ffn(
         &mut self,
-        visit_idx: usize,
+        _visit_idx: usize,
         visit: LoopVisit,
         unit: &Unit,
         cfg: &Inkling2MiniConfig,
@@ -411,30 +461,9 @@ impl<'a> VisitOps<'a> for StatefulOps<'_, '_, 'a> {
     ) -> Result<()> {
         let rows = unit.rows.len();
         let experts = self.local[visit.layer].as_ref();
-        graphs::local(
-            self.graphs.as_deref_mut(),
-            &state.unit.stream,
-            visit_idx,
-            rows,
-            Section::Routes,
-            Mode::Decode,
-            || layers::prepare_routes(self.kernels, state.unit, self.target, experts, visit.layer, rows),
-        )?;
+        layers::prepare_routes(self.kernels, state.unit, self.target, experts, visit.layer, rows)?;
         layers::dispatch_experts(state.unit, experts, rows)?;
-        let mode = if state.unit.replaying() {
-            Mode::Verify
-        } else {
-            Mode::Decode
-        };
-        graphs::local(
-            self.graphs.as_deref_mut(),
-            state.stream(),
-            visit_idx,
-            rows,
-            Section::VisitFinish,
-            mode,
-            || layers::join_visit(self.kernels, state, self.target, cfg, visit, rows),
-        )
+        layers::join_visit(self.kernels, state, self.target, cfg, visit, rows)
     }
 
     fn end_io(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()> {

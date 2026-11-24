@@ -236,12 +236,19 @@ type PeerCopyFn = unsafe extern "C" fn(*mut c_void,*const c_void,u64,*mut c_void
 /// SM-issued peer copy, avoiding DMA queue coupling across lane-local event waits.
 type PeerRowsFn = unsafe extern "C" fn(*mut c_void,*const c_void,u64,u64,u64,u64,*mut c_void)->i32;
 pub struct V41PeerCopy<'a> { _library: &'a NativeLibrary, launch: PeerCopyFn, rows: PeerRowsFn }
+/// Neutral shared alias for the generic SM 1D/2D row-copy kernel (`cuteafd_peer_copy_*`),
+/// used by families to keep captured CUDA graphs kernel-only without depending on a V4.1 name.
+pub type DeviceRowCopy<'a> = V41PeerCopy<'a>;
 impl NativeLibrary {
     pub fn v41_peer_copy(&self) -> Result<V41PeerCopy<'_>> {
         let initialize=unsafe { *self.lib.get::<unsafe extern "C" fn()->i32>(b"cuteafd_peer_copy_initialize")? };
         ensure!(unsafe { initialize() }==0,"peer copy initialization failed");
         Ok(V41PeerCopy { _library:self,launch:unsafe { *self.lib.get(b"cuteafd_peer_copy_async")? },
             rows:unsafe { *self.lib.get(b"cuteafd_peer_copy_rows_async")? } })
+    }
+
+    pub fn device_row_copy(&self) -> Result<DeviceRowCopy<'_>> {
+        self.v41_peer_copy()
     }
 }
 impl V41PeerCopy<'_> {

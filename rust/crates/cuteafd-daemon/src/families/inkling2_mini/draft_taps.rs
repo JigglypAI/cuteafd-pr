@@ -12,6 +12,7 @@ pub(crate) struct TapBuffer<'a> {
     pub stream: Rc<Stream<'a>>,
     pub output: Allocation<'a>,
     narrow: Allocation<'a>,
+    copy: cuteafd_ffi::DeviceRowCopy<'a>,
     capacity: usize,
     hidden: usize,
     taps: usize,
@@ -33,11 +34,13 @@ impl<'a> TapBuffer<'a> {
             rows * hidden * 2,
             Tag::drafter_workspace("inkling2_mini/target-tap-narrow"),
         )?;
+        let copy = stream.device.run(|| stream.device.library.device_row_copy())?;
         let visits = config.taps.iter().copied().enumerate().map(|(tap, site)| (site, tap)).collect();
         Ok(Self {
             stream,
             output,
             narrow,
+            copy,
             capacity: rows,
             hidden,
             taps,
@@ -54,20 +57,22 @@ impl<'a> TapBuffer<'a> {
             "Inkling 2 Mini tap source exceeds owner"
         );
         let library = self.stream.device.library;
-        // SAFETY: live F32 partial on same stream narrowed & scattered into BF16 tap buffer.
+        let row_bytes = self.hidden * 2;
+        // SAFETY: live F32 partial on same stream narrowed & scattered into BF16 tap buffer
+        // via the shared SM row-copy kernel so captured decode graphs stay kernel-only.
         unsafe {
             library.load_narrow_f32_bf16(raw_partial.ptr, self.narrow.buffer.ptr, rows * self.hidden, self.stream.raw)?;
-            library.copy_d2d_2d_async(
+            self.copy.launch_rows(
                 Buffer {
-                    ptr: self.output.buffer.ptr.wrapping_byte_add(tap * self.hidden * 2),
-                    bytes: self.output.buffer.bytes - tap * self.hidden * 2,
+                    ptr: self.output.buffer.ptr.wrapping_byte_add(tap * row_bytes),
+                    bytes: self.output.buffer.bytes - tap * row_bytes,
                     ..self.output.buffer
                 },
-                self.taps * self.hidden * 2,
                 self.narrow.buffer,
-                self.hidden * 2,
-                self.hidden * 2,
+                row_bytes,
                 rows,
+                self.taps * row_bytes,
+                row_bytes,
                 self.stream.raw,
             )
         }

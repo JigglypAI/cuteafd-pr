@@ -26,6 +26,7 @@ pub(crate) struct Resident<'a> {
     layer: usize,
     backend: Rc<std::cell::RefCell<Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>>>,
     stream: Rc<Stream<'a>>,
+    copy: Rc<cuteafd_ffi::DeviceRowCopy<'a>>,
 }
 
 impl<'a> Resident<'a> {
@@ -45,10 +46,12 @@ impl<'a> Resident<'a> {
             !backend.output().is_null() && backend.workspace_bytes() >= HIDDEN * element,
             "Inkling 2 Mini resident workspace cannot hold one output row"
         );
+        let copy = Rc::new(stream.device.run(|| stream.device.library.device_row_copy())?);
         Ok(Self {
             layer,
             backend: Rc::new(std::cell::RefCell::new(backend)),
             stream,
+            copy,
         })
     }
 
@@ -69,6 +72,7 @@ impl<'a> Resident<'a> {
                 layer,
                 backend: owner.backend.clone(),
                 stream: owner.stream.clone(),
+                copy: owner.copy.clone(),
             })
             .collect())
     }
@@ -152,7 +156,9 @@ impl Dispatcher for Resident<'_> {
                 ..output
             };
             ensure!(source.ptr != output.ptr, "Inkling 2 Mini resident output aliases backend storage");
-            // SAFETY: distinct buffers on the same ordered stream.
+            // SAFETY: distinct buffers on the same ordered stream. Use the shared SM row-copy
+            // kernel (`DeviceRowCopy`) instead of `copy_d2d_async` so the monolithic 48-visit
+            // decode graph stays 100% kernel-only (no captured `cudaMemcpyAsync` nodes).
             unsafe {
                 if element == 4 {
                     stream
@@ -160,10 +166,8 @@ impl Dispatcher for Resident<'_> {
                         .library
                         .cuda_f32_to_bf16_async(source, output, rows * HIDDEN, stream.raw)
                 } else {
-                    stream
-                        .device
-                        .library
-                        .copy_d2d_async(output, source, source.bytes, stream.raw)
+                    self.copy
+                        .launch_rows(output, source, source.bytes, 1, source.bytes, source.bytes, stream.raw)
                 }
             }
         })

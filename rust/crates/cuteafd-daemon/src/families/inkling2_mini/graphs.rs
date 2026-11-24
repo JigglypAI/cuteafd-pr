@@ -1,4 +1,8 @@
-//! Exact-row per-visit decode graphs on the shared #2697 soft-cap device graph bank.
+//! Monolithic 48-visit exact-row decode/verify graphs on the shared #2697 soft-cap device graph bank.
+//!
+//! All 48 loop visits (draft taps, attention, routing, local NVFP4/MXFP8 experts via
+//! `DeviceRowCopy`, and residual/conv join) capture into one kernel-only graph per
+//! `(rows, mode, taps)`, keeping metadata H2D uploads and head projection outside.
 use crate::shared::{
     decode_graph::{
         self,
@@ -18,18 +22,10 @@ pub(super) enum Mode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Section {
-    VisitAttention,
-    Routes,
-    VisitFinish,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Key {
-    visit: usize,
     rows: usize,
-    section: Section,
     mode: Mode,
+    taps: bool,
 }
 
 pub(super) struct DecodeGraphs<'a> {
@@ -52,12 +48,12 @@ impl<'a> DecodeGraphs<'a> {
             device,
             policy.bytes,
             Site {
-                name: "inkling2_mini.section",
+                name: "inkling2_mini.step",
                 cycle: Cycle::Decode,
                 preference: Preference::Adaptive,
                 bootstrap: 2 << 20,
                 basis: Basis::Bytes,
-                spans_devices: super::graph_sites::spans("inkling2_mini.section", false),
+                spans_devices: super::graph_sites::spans("inkling2_mini.step", false),
             },
         )?;
         device::set_reserve_policy(device, policy)?;
@@ -83,13 +79,13 @@ impl<'a> DecodeGraphs<'a> {
         self.bank.cache_tick();
     }
     pub(super) fn visit(&mut self, visit: &mut device::GraphVisitor<'_>) -> Result<()> {
-        visit(self.device, "inkling2_mini.section", false, &mut self.bank)
+        visit(self.device, "inkling2_mini.step", false, &mut self.bank)
     }
     pub(super) fn clear_drained(&mut self) {
         self.bank.cache_clear_drained();
     }
 
-    fn run(&mut self, key: Key, stream: &Stream<'a>, work: impl Fn() -> Result<()>) -> Result<()> {
+    fn run(&mut self, key: Key, stream: &Stream<'a>, mut work: impl FnMut() -> Result<()>) -> Result<()> {
         if self.unsupported.contains(&key) {
             return work();
         }
@@ -141,7 +137,7 @@ impl<'a> DecodeGraphs<'a> {
             };
             // SAFETY: execution owns all captured persistent storage and drains before drop.
             let graph = unsafe { GraphOwner::new(library, self.device, raw, ())? };
-            self.bank.census_capture_key("section", 0, None, &key, raw);
+            self.bank.census_capture_key("step", 0, None, &key, raw);
             self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans);
             // SAFETY: bank owns executable through this ordered launch.
             unsafe { decode_graph::launch(library, raw, stream.raw) }
@@ -149,25 +145,18 @@ impl<'a> DecodeGraphs<'a> {
     }
 }
 
-pub(super) fn local<'a>(
+pub(super) fn step<'a>(
     graphs: Option<&mut DecodeGraphs<'a>>,
     stream: &Stream<'a>,
-    visit: usize,
     rows: usize,
-    section: Section,
     mode: Mode,
-    work: impl Fn() -> Result<()>,
+    taps: bool,
+    mut work: impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let Some(graphs) = graphs else {
         return work();
     };
-    // The router and MXFP8 wire quantizer do not touch the optional FIR replay backing.
-    let mode = if section == Section::Routes {
-        Mode::Decode
-    } else {
-        mode
-    };
-    graphs.run(Key { visit, rows, section, mode }, stream, work)
+    graphs.run(Key { rows, mode, taps }, stream, work)
 }
 
 #[cfg(test)]
@@ -175,27 +164,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mini_graph_key_distinguishes_all_three_loop_passes_rows_sections_and_verify() {
-        // Physical core layer 6 executes across three distinct visits (6, 18, 30) with
-        // different cache slots and cross-pass controller routes; none may alias.
+    fn mini_monolithic_graph_key_distinguishes_rows_verify_and_taps() {
         let base = Key {
-            visit: 6,
             rows: 4,
-            section: Section::VisitAttention,
             mode: Mode::Decode,
+            taps: false,
         };
         assert_eq!(
             HashSet::from([
                 base,
-                Key { visit: 18, ..base },
-                Key { visit: 30, ..base },
                 Key { rows: 8, ..base },
-                Key { section: Section::Routes, ..base },
-                Key { section: Section::VisitFinish, ..base },
                 Key { mode: Mode::Verify, ..base },
+                Key { taps: true, ..base },
+                Key {
+                    mode: Mode::Verify,
+                    taps: true,
+                    ..base
+                },
             ])
             .len(),
-            7
+            5
         );
     }
 }

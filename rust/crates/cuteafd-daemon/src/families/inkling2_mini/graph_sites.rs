@@ -2,9 +2,9 @@
 use crate::shared::decode_graph::sites::{Scope, Table};
 
 pub(super) const SITES: &Table = &[(
-    "inkling2_mini.section",
+    "inkling2_mini.step",
     Scope::Local,
-    "prefill.rs: rank-local TP1 arithmetic per visit; packed metadata uploads stay outside captured sections",
+    "prefill.rs: monolithic 48-visit TP1 kernel-only decode/verify graph (attention, routes, local experts, draft taps); metadata uploads stay outside",
 )];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {
@@ -17,6 +17,6 @@ mod tests {
     fn mini_site_is_classified_local_and_unknown_spans() {
         crate::shared::decode_graph::sites::testing::assert_classified("inkling2_mini", super::SITES);
         assert!(super::spans("new-unreviewed-site", false));
-        assert!(!super::spans("inkling2_mini.section", false));
+        assert!(!super::spans("inkling2_mini.step", false));
     }
 }
