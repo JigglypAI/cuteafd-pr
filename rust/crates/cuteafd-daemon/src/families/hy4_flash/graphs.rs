@@ -125,16 +125,12 @@ impl<'a> Hy4Graphs<'a> {
         self.bank.borrow().count(|key| key.rows == rows)
     }
 
-    pub(crate) fn needs_boundary(&self) -> bool {
-        self.first_touch_pending.get() || self.bank.borrow().cache_needs_boundary()
+    pub(crate) fn first_touch_pending(&self) -> bool {
+        self.first_touch_pending.get()
     }
 
     pub(crate) fn observed(&self) {
         self.first_touch_pending.set(false);
-    }
-
-    pub(crate) fn tick(&self) {
-        self.bank.borrow_mut().cache_tick();
     }
 
     pub(crate) fn visit(&self, visit: &mut device::GraphVisitor<'_>) -> Result<()> {
@@ -320,5 +316,82 @@ mod tests {
                 ..key
             }
         );
+    }
+
+    #[test]
+    fn observe_completed_advances_serial_epoch_for_cold_donor_reuse() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // Unique ordinal for this fixture; device cache registry is process-global.
+        const DEV: i32 = 9;
+        fixture.configure_memory_usage(&library, DEV, 256 << 20, 0)?;
+        let mut bank: GraphBank<Key, GraphOwner<'_, ()>> = GraphBank::with_family("hy4_flash");
+        bank.attach_device(
+            &library,
+            DEV,
+            4 << 20,
+            Site {
+                name: "hy4_flash.section",
+                cycle: Cycle::Verify,
+                preference: Preference::Adaptive,
+                bootstrap: 2 << 20,
+                basis: Basis::Bytes,
+                spans_devices: false,
+            },
+        )?;
+        let k1 = Key { layer: 0, rows: 1, section: Section::DsaPartial };
+        let mut t1 = bank.cache_ticket(&k1, false, None).expect("initial capture admitted");
+        // SAFETY: CPU fixture records no device work or captured allocations.
+        let src1 = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw1, nodes1, width1, spans1, _) = t1.complete_source(&library, src1, std::ptr::null_mut())?;
+        // SAFETY: fixture graph owns no device storage.
+        let owner1 = unsafe { GraphOwner::new(&library, DEV, raw1, ())? };
+        bank.cache_commit(k1, owner1, t1, nodes1 as u64, width1, spans1);
+        // Simulate soft-cap pressure (2 MiB observed growth during k2 against 4 MiB reserve / 2 MiB soft cap).
+        let k2 = Key { layer: 0, rows: 2, section: Section::DsaPartial };
+        let mut t2 = bank.cache_ticket(&k2, false, None).expect("second capture crosses soft cap");
+        // SAFETY: CPU fixture records no device work.
+        let src2 = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw2, nodes2, width2, spans2, _) = t2.complete_source(&library, src2, std::ptr::null_mut())?;
+        let owner2 = unsafe { GraphOwner::new(&library, DEV, raw2, ())? };
+        fixture.configure_memory_usage(&library, DEV, 256 << 20, 3 << 20)?;
+        bank.cache_commit(k2, owner2, t2, nodes2 as u64, width2, spans2);
+        assert!(!bank.cache_needs_boundary(), "cache_commit already settled measurement");
+        let after_k2 = device::snapshots().into_iter().find(|s| s.device == DEV).unwrap();
+        assert!(after_k2.charged >= after_k2.soft.limit, "expected soft cap crossed: {after_k2:?}");
+
+        // Two hit-only steps completed through observe_completed must advance the serial epoch
+        // even though cache_needs_boundary() is false, aging k1 into an eligible cold donor.
+        for _ in 0..2 {
+            // SAFETY: fixture owners hold no device allocations.
+            unsafe {
+                device::observe_completed(&library, |visit| {
+                    visit(DEV, "hy4_flash.section", false, &mut bank)
+                })?;
+            }
+        }
+        let k3 = Key { layer: 0, rows: 3, section: Section::DsaPartial };
+        let mut t3 = bank.cache_ticket(&k3, false, None).expect("cold donor update admitted");
+        let src3 = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw3, nodes3, width3, spans3, _) = t3.complete_source(&library, src3, std::ptr::null_mut())?;
+        let owner3 = unsafe { GraphOwner::new(&library, DEV, raw3, ())? };
+        bank.cache_commit(k3, owner3, t3, nodes3 as u64, width3, spans3);
+
+        let snap = device::snapshots().into_iter().find(|s| s.device == DEV).unwrap();
+        let verify = snap.cycles[&Cycle::Verify];
+        assert!(verify.updates_soft >= 1, "expected cold donor update, got {verify:?}");
+        assert_eq!(verify.eager_soft_room, 0, "expected no eager_soft_room fallback, got {verify:?}");
+        assert_eq!(verify.no_cold_donor_soft, 0, "expected no donor starvation, got {verify:?}");
+        bank.cache_clear_drained();
+        Ok(())
+    }
+
+    #[test]
+    fn graph_completed_always_advances_serial_boundary() {
+        let src = include_str!("execution.rs");
+        let start = src.find("pub(super) fn graph_completed(").expect("graph_completed present");
+        let body = &src[start..start + 900];
+        assert!(body.contains("observe_completed("), "graph_completed must call observe_completed");
+        assert!(!body.contains("r.graphs.tick()"), "graph_completed must not bypass serial_boundary via tick()");
     }
 }

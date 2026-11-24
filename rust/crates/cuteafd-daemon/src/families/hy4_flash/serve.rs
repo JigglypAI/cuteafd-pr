@@ -151,7 +151,7 @@ fn resolve_expert_package(
     Ok(base.join("exl3").join(exl3.package_name("hy4f")).join(format!("rtx-tp{gpus}")))
 }
 
-fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<(&'static str, AttentionPlacement)> {
+pub(super) fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<(&'static str, AttentionPlacement)> {
     match (gpus, setting) {
         (1, "auto" | "heads") => Ok(("whole", AttentionPlacement::Heads)),
         (1, other) => anyhow::bail!(

@@ -504,7 +504,7 @@ impl FamilyModel for Model {
         }
         let gpus = options.coordinator_ranks;
         let attention = placement_hy4::HY4_FLASH
-            .check_attention(options.attention_placement, gpus, false)
+            .check_attention(options.attention_placement, gpus, gpus == 2)
             .map_err(|_| CacheGeometryError::Unsupported {
                 family: "hy4_flash",
                 what: "unsupported attention placement",

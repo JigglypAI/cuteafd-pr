@@ -1134,9 +1134,9 @@ family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context | ✓ heads |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context⁵ | ✓ heads |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓⁵ | ✓ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓⁵ | ✗ |
 | `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (two RTX) |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
@@ -1154,7 +1154,10 @@ explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
 mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
 `context` and `layers` for MLA layers on two GPUs; `auto` selects `context`
 on two GPUs and retains whole-owned layers on one. KDA stays head-split on
-two GPUs, independent of the MLA placement.
+two GPUs, independent of the MLA placement. ⁵ Hy4-flash `auto` selects
+`context` (ContextSplit, parity-owned KV/index) for MLA/DSA layers and
+head-split for SWA-512 layers on two GPUs, and retains whole-owned layers on
+one; explicit `heads` opts into replicated-KV head-split across all layers.
 
 Token embedding placement (`EMBEDDING`; `cuteafd plan --embedding-placement`):
 

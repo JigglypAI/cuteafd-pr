@@ -367,12 +367,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             "hy4f-golden --prefill-waves {prefill_waves} requires 64-row-aligned --prefill-units (got {unit})"
         );
     }
-    let attention = match (devices.len(), args.attention_placement.as_str()) {
-        (1, "auto" | "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
-        (2, "auto" | "context") => cuteafd_loader::placement::AttentionPlacement::Context,
-        (2, "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
-        (gpus, other) => anyhow::bail!("hy4f-golden does not support --attention-placement {other} on {gpus} GPU(s)"),
-    };
+    let (_, attention) = super::serve::resolve_attention_placement(devices.len(), args.attention_placement.as_str())?;
     let context_split = attention == cuteafd_loader::placement::AttentionPlacement::Context;
     let local_pages = if context_split { max_pages.div_ceil(2).max(16) } else { max_pages };
     let mut engine = if !args.resume_at.is_empty() || args.verify_waves {

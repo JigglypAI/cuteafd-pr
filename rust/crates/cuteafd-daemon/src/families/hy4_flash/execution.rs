@@ -2121,15 +2121,13 @@ impl<'a> Hy4Engine<'a> {
         if !self.graphs_active() {
             return Ok(());
         }
-        if !self.ranks.iter().any(|r| r.graphs.needs_boundary()) {
-            for r in &self.ranks {
-                r.graphs.tick();
-            }
-            return Ok(());
+        if self.ranks.iter().any(|r| r.graphs.first_touch_pending()) {
+            self.drain()?;
         }
-        self.drain()?;
-        // SAFETY: every rank stream is drained; graph owners hold no allocations and
-        // engine weights/cache/scratch outlive all banks (cleared in terminate()).
+        // SAFETY: every Hy4-flash graph owner pins `()` over persistent engine storage
+        // (weights, cache, scratch, EXL3) cleared only after terminal drain in terminate().
+        // Calling observe_completed every step advances the serial cycle epoch so cold
+        // donors age out for update reuse and persistent victims retire without draining.
         unsafe {
             graph_device::observe_completed(self.ranks[0].device.library, |visit| {
                 for r in &self.ranks {
