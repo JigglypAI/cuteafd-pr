@@ -20,13 +20,14 @@
 //! each logical page consists of disjoint owner-local layer records across both GPUs; tail
 //! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
-use crate::shared::memory::{DeviceAllocation, Tag};
+use crate::shared::memory::{device::{Device, Event}, DeviceAllocation, HostAllocation, Tag};
 use crate::shared::prefix::{view, PrefixCopies, Reader};
 use anyhow::Result;
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
     TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
+use std::cell::RefCell;
 
 /// Index-key page: 64 rows x 128 E4M3, then 64 FP32 scales.
 const INDEX_KEY_BYTES: usize = 128;
@@ -99,6 +100,8 @@ use cuteafd_loader::placement::families::glm5::DRAFT_MARK_HEADER;
 
 struct DraftMarks<'a> {
     storage: DeviceAllocation<'a>,
+    header: RefCell<HostAllocation<'a>>,
+    landed: Event<'a>,
     /// One slot's draft windows (every window layer's ring).
     windows: usize,
     slots: usize,
@@ -140,13 +143,15 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
                 let bytes = draft_mark_bytes(true, windows).checked_mul(mark_slots)
                     .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
                 // Marks snapshot the drafter's rings and live on its admitted GPU.
-                let storage = match drafter.device() {
-                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256),
-                        Tag::prefix("glm/prefix-draft-marks")))?,
-                    None => DeviceAllocation::new(engine.library, bytes.max(256),
-                        Tag::prefix("glm/prefix-draft-marks"))?,
+                let device = if let Some(device) = drafter.device() { device } else {
+                    Device { library: engine.library, id: engine.on(0, || engine.library.cuda_get_device())? }
                 };
-                Some(DraftMarks { storage, windows, slots: mark_slots })
+                Some(device.run(|| Ok(DraftMarks {
+                    storage: DeviceAllocation::new(engine.library, bytes.max(256), Tag::prefix("glm/prefix-draft-marks"))?,
+                    header: RefCell::new(HostAllocation::new(engine.library, DRAFT_MARK_HEADER,
+                        Tag::prefix("glm/prefix-draft-header"))?),
+                    landed: Event::new(device)?, windows, slots: mark_slots,
+                }))?)
             }
             _ => None,
         };
@@ -162,7 +167,10 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.prefix",
             Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Prefix, "prefix owners");
         inventory.device("scratch", self.scratch.buffer)?;
-        if let Some(marks) = &self.draft_marks { inventory.device("draft_marks", marks.storage.buffer)?; }
+        if let Some(marks) = &self.draft_marks {
+            inventory.device("draft_marks", marks.storage.buffer)?;
+            inventory.pinned("draft_header", marks.header.borrow().buffer)?;
+        }
         // Paged descriptors borrow target KV/index storage; charge only their host container here.
         inventory.host("paged_descriptors", &self.paged)?;
         self.copies.allocation_receipts(&mut inventory, "copies")?;
@@ -194,28 +202,48 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         drafter.copy_mla_windows(slot, &views, capture)
     }
 
-    /// Synchronous header copies run on the marks' (drafter's) device.
-    fn on_marks<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
-        match self.engine.drafter.as_ref().and_then(|drafter| drafter.device()) {
-            Some(device) => device.run(work),
-            None => work(),
-        }
+    /// Use the drafter's window-copy stream. The cache publishes marks synchronously,
+    /// so join the event before publication or before inspecting a restored header.
+    fn transfer_draft_header<T>(&self, mark: MarkSlot,
+        transfer: impl FnOnce(&mut HostAllocation<'a>, CuteafdDeviceBuffer, *mut std::ffi::c_void) -> Result<()>,
+        finish: impl FnOnce(&HostAllocation<'a>) -> T) -> Result<T> {
+        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
+        let device_header = view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?;
+        let stream = self.engine.drafter.as_ref().and_then(|d| d.stream()).unwrap_or_else(|| self.engine.stream_of(0));
+        let library = self.engine.library;
+        marks.landed.device.run(|| {
+            let mut header = marks.header.borrow_mut();
+            let submitted = transfer(&mut header, device_header, stream);
+            // SAFETY: both allocations outlive the event and the stream belongs to this device.
+            let joined = unsafe { library.cuda_event_record(marks.landed.raw, stream)
+                .and_then(|()| library.cuda_event_synchronize(marks.landed.raw)) };
+            if joined.is_err() {
+                // SAFETY: the cache cannot reuse a mark with a DMA still in flight.
+                crate::shared::decode_graph::fatal_drain(unsafe { library.cuda_stream_synchronize(stream) },
+                    "GLM draft mark header");
+            }
+            submitted.and(joined)?;
+            Ok(finish(&header))
+        })
     }
 
-    fn write_draft_header(&self, mark: MarkSlot, frontier: Option<usize>) -> Result<()> {
-        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
-        let mut header = [0u8; DRAFT_MARK_HEADER];
-        header[..8].copy_from_slice(&frontier.map_or(u64::MAX, |f| f as u64).to_le_bytes());
-        self.on_marks(|| self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header))?;
-        Ok(())
+    fn write_draft_header(&self, mark: MarkSlot, warm: Option<(usize, usize)>) -> Result<()> {
+        self.transfer_draft_header(mark, |header, dst, stream| {
+            if let Some((slot, _)) = warm { self.move_draft_windows(mark, slot, true)?; }
+            header.bytes_mut()[..8].copy_from_slice(&warm.map_or(u64::MAX, |(_, len)| len as u64).to_le_bytes());
+            // SAFETY: the pinned source and device destination remain owned until the event lands.
+            unsafe { self.engine.library.copy_h2d_async(dst, header.bytes(), stream) }
+        }, |_| ())
     }
 
     fn read_draft_header(&self, mark: MarkSlot) -> Result<Option<usize>> {
-        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
-        let mut header = [0u8; DRAFT_MARK_HEADER];
-        self.on_marks(|| self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?))?;
-        let frontier = u64::from_le_bytes(header[..8].try_into().unwrap());
-        Ok((frontier != u64::MAX).then_some(frontier as usize))
+        self.transfer_draft_header(mark, |header, src, stream| {
+            // SAFETY: the pinned landing buffer is not read until the event lands.
+            unsafe { self.engine.library.copy_d2h_host_buffer_async(header.buffer, src, DRAFT_MARK_HEADER, stream) }
+        }, |header| {
+            let frontier = u64::from_le_bytes(header.bytes()[..8].try_into().unwrap());
+            (frontier != u64::MAX).then_some(frontier as usize)
+        })
     }
 
     /// Host bytes of one logical page: one complete layer set, replicated under heads,
@@ -344,14 +372,11 @@ impl PrefixDevice for NativePrefix<'_, '_> {
     /// canonical `(0, len)`, the frontier a restore resumes them at.
     fn capture(&self, slot: MarkSlot, placement: &GlmPlacement, len: usize) -> Result<(), BoxError> {
         if self.draft_marks.is_none() { return Err("GLM 5.3 snapshots have no mark".into()); }
-        let canonical = match self.draft_of(placement) {
-            Some((drafter, draft_slot)) if drafter.mla_frontier(draft_slot)? == (0, len) => {
-                self.move_draft_windows(slot, draft_slot, true)?;
-                Some(len)
-            }
+        let warm = match self.draft_of(placement) {
+            Some((drafter, draft_slot)) if drafter.mla_frontier(draft_slot)? == (0, len) => Some((draft_slot, len)),
             _ => None,
         };
-        Ok(self.write_draft_header(slot, canonical)?)
+        Ok(self.write_draft_header(slot, warm)?)
     }
 
     /// The target pages are the snapshot's own bytes. A window-ring drafter resumes warm from

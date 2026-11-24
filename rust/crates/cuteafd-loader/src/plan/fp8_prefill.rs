@@ -80,6 +80,22 @@ pub const GLMF_GROUPS: &[Group] = &[
     Group::auto("mla"), Group::auto("ffn"), Group::opt_in("kda-in"), Group::opt_in("kda-o"), Group::auto("experts"),
 ];
 
+pub const GLM_GROUPS: &[Group] = &[Group::auto("mla"), Group::auto("index"), Group::auto("ffn"), Group::auto("experts")];
+pub const ML4_GROUPS: &[Group] = &[Group::auto("index"), Group::auto("experts")];
+
+/// Explicit groups must have a selectable program on this family. Native
+/// formats without a choice (e.g. ModelOpt static W8A8) keep their own numerics.
+pub fn validate_glm_groups(policy: &Policy, ml4: bool) -> Result<(), String> {
+    let groups = if ml4 { ML4_GROUPS } else { GLM_GROUPS };
+    if let Policy::Groups(requested) = policy {
+        if let Some(group) = requested.iter().find(|name| !groups.iter().any(|group| group.name == name.as_str())) {
+            return Err(format!("FP8_PREFILL group {group} has no selectable {} prefill program",
+                if ml4 { "ML4" } else { "GLM 5.3" }));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode { W8a8, W8a16, Unchanged }
@@ -175,6 +191,16 @@ mod tests {
         }
         for value in ["", "all", "none", "auto,mla", "ffn,ffn", "mla,", " ml a"] {
             assert!(value.parse::<Policy>().is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn glm_prefill_groups_follow_the_selectable_programs() {
+        assert!(validate_glm_groups(&"mla,index,ffn,experts".parse().unwrap(), false).is_ok());
+        assert!(validate_glm_groups(&"index,experts".parse().unwrap(), true).is_ok());
+        assert!(validate_glm_groups(&"mla".parse().unwrap(), true).unwrap_err().contains("FP8_PREFILL"));
+        assert!(validate_glm_groups(&"kda-in".parse().unwrap(), false).is_err());
+        for groups in [GLM_GROUPS, ML4_GROUPS] {
+            assert!(groups.iter().all(|&group| Policy::Auto.requests(group) && !Policy::Off.requests(group)));
         }
     }
     #[test]

@@ -183,6 +183,7 @@ impl Family for MistralLarge4 {
     fn native_head_widths(&self) -> &'static [usize] {
         crate::families::glm5::core::ML4_CORE_WIDTHS
     }
+    fn fp8_prefill_groups(&self) -> &'static [crate::plan::fp8_prefill::Group] { crate::plan::fp8_prefill::ML4_GROUPS }
     fn id(&self) -> &'static str { "mistral_large4" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {

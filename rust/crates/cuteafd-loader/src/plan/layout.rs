@@ -169,6 +169,7 @@ pub struct LayoutOptions {
     /// MiMo segmented decode graphs (runtime default: on).
     pub mimo_decode_graphs: bool,
     pub step5_decode_graphs: bool,
+    pub glm_decode_graphs: bool,
     /// Physical SM count for scratch when simulating a smaller memory budget.
     pub physical_sms: Option<u32>,
     /// MiMo bundled drafter representation; launch cards select single-copy FP8.
@@ -363,6 +364,7 @@ impl Default for LayoutOptions {
             draft_context_slots: None,
             mimo_decode_graphs: true,
             step5_decode_graphs: true,
+            glm_decode_graphs: true,
             physical_sms: None,
             mimo_draft_bf16: false,
             mimo_drafter_disabled: false,

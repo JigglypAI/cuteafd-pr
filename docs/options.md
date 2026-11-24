@@ -814,7 +814,7 @@ The old `-HQA` checkpoints were withdrawn from Hugging Face. Historical results 
 | `DECODE_ROWS` | `auto` (64) | `auto`, `1..=CONCURRENCY×(max_draft+1)` | Global decode/verify row budget per decode lane for every family. `auto` resolves to `64`. Values above `64` require exported coordinator decode programs for that family and topology (V4.1 up to `256` on 1 or 2 GPUs; GLM Flash up to `128` on 1 GPU; other families refuse `>64` naming the missing exports). Admission charges the resolved rows once across workspaces, verify logits and Spark decode owners, reducing KV headroom accordingly. |
 | `DECODE_LANES` | V4.1 `2`, others `1` | `1`, `2` | Independent decode lanes, each with its own workspaces, graphs, Spark link and decode execution. V4.1 accepts `1` or `2` and resolves one lane at `CONCURRENCY=1`; one lane holds up to `min(CONCURRENCY, 32)` requests in one batch within the `DECODE_ROWS` budget (default `64`), and the second lane's bytes return to the KV pool. Every other family runs one lane and refuses `2`. |
 | `DECODE_SHARE` | `0.2` | `[0, 1)` | Share of time running requests keep while prompts prefill; 0 prefills whole prompts. |
-| `DECODE_GRAPHS` | MiMo, dense Qwen, Muse, Step-5 and Inkling `on` | `on`, `off` | Dense Qwen graphs complete rank-local decode/verify layers on one or two RTX GPUs; shared residual hops between whole-layer owners and prefill stay eager. Two-rank layouts use separate untraced bootstrap reserves, never single-rank trace pins. With graphs off, its graph reserve is zero and page-table geometry stays on the original eager path. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Muse Spark defaults to `on` for bounded rank-local decode/verify segments; its prefill stays eager. Step-5 bounds decode/verify sections around eager KV staging and host joins; prefill remains eager. Step-5 selects trace-owned row geometries per native format, dense core, RTX count and Spark count from `step5_prewarm.json`, fitting pinned-first then a heat-ordered prefix across all ranks; startup uses disposable full-step transactions without publishing KV state. The shipped EXL3 K4+Core-K6 layouts (1 RTX + 3 Sparks and 2 RTX + 6 Sparks) retain their historical measured geometry pins. The shipped min/max traces select 58/59 replayed row geometries, respectively; min pins sustained row46 and max has no sustained pins. Capture-only rows remain lazy. Other Step-5 layouts have no borrowed pins or measured base. Inkling uses exact live-row rank-local attention and FFN sections for decode and verify on one or two RTX GPUs; prefill, all peer exchanges and expert dispatch stay eager. `off` removes its graph allowance from admission and disables capture and replay. Inkling captures lazily with no startup pins, and the launcher defaults to donor-always with lag 8. Standalone `plan --mimo-decode-graphs on\|off` and `--step5-decode-graphs on\|off` match serving defaults. |
+| `DECODE_GRAPHS` | GLM 5.3 / ML4, MiMo, dense Qwen, Muse, Step-5 and Inkling `on` | `on`, `off` | Dense Qwen graphs complete rank-local decode/verify layers on one or two RTX GPUs; shared residual hops between whole-layer owners and prefill stay eager. Two-rank layouts use separate untraced bootstrap reserves, never single-rank trace pins. With graphs off, its graph reserve is zero and page-table geometry stays on the original eager path. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Muse Spark defaults to `on` for bounded rank-local decode/verify segments; its prefill stays eager. Step-5 bounds decode/verify sections around eager KV staging and host joins; prefill remains eager. Step-5 selects trace-owned row geometries per native format, dense core, RTX count and Spark count from `step5_prewarm.json`, fitting pinned-first then a heat-ordered prefix across all ranks; startup uses disposable full-step transactions without publishing KV state. The shipped EXL3 K4+Core-K6 layouts (1 RTX + 3 Sparks and 2 RTX + 6 Sparks) retain their historical measured geometry pins. The shipped min/max traces select 58/59 replayed row geometries, respectively; min pins sustained row46 and max has no sustained pins. Capture-only rows remain lazy. Other Step-5 layouts have no borrowed pins or measured base. Inkling uses exact live-row rank-local attention and FFN sections for decode and verify on one or two RTX GPUs; prefill, all peer exchanges and expert dispatch stay eager. `off` removes its graph allowance from admission and disables capture and replay. Inkling captures lazily with no startup pins, and the launcher defaults to donor-always with lag 8. GLM 5.3 / ML4 `off` runs eagerly and overrides coordinator graph reserves; standalone `plan --glm-decode-graphs on\|off` matches serving. Standalone `plan --mimo-decode-graphs on\|off` and `--step5-decode-graphs on\|off` match serving defaults. |
 | `KV_DECODE_RESERVE_CHUNK` | unset | tokens | Decode-chunk KV reserve top-up. |
 | `KV_RESERVE_DRAIN_BUFFER` | unset | 0 = whole remaining output | Drain buffer. |
 | `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | unset | `-1` or non-negative | Early termination floor. |
@@ -871,12 +871,12 @@ when the server has no drafter or its effective draft policy is `off`.
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `PREFILL_PACKING` | engine default | `unrestricted`, `exact` | Pack short prompts directly; `exact` preserves expert arithmetic routes. GLM Flash uses this option alone (default `unrestricted`), currently on one RTX only; TP2 packing is tracked in #1865. |
-| `PREFILL_BATCH_TOKENS` | `2048` | 80–4096 | Prefill chunk size. |
+| `PREFILL_BATCH_TOKENS` | `2048` | 80–4096 | Prefill chunk size. GLM 5.3 / ML4 use `PREFILL_ROWS` for per-unit rows. |
 | `PREFILL_ROWS` | planner | multiple of 64, ≤4096 | Per-unit rows override. |
 | `PREFILL_WAVES` | planner | 0–4 | Units in flight. |
 | `PREFILL_SPAN_ROWS` | planner | positive int | GLM/MiMo shared span. |
 | `TARGET_HEAD` | `tensor` | `tensor`, `exact` | BF16 target head: tensor cores with FP32 accumulation, or the exact FP32 GEMM diagnostic. |
-| `FP8_PREFILL` | unset (= `auto`) | `auto`, `off`, comma-separated projection groups | Shared prefill activation policy over already-resident FP8 weights; never converts BF16/K6/K8. GLM Flash groups: `mla`, `ffn`, `kda-in`, `kda-o`, `experts`. Auto preserves W8A8 MLA+FFN and leaves KDA opt-in. Missing W8A8 geometry falls back to W8A16 with a plan hint. Quantization scratch aliases the admitted program workspace, charged once. Experts auto preserves native input-format defaults; explicit `experts` selects W8A8 for FP8 experts, global `off` selects W8A16. Experts groups not named keep their native default; `experts` must be named to force W8A8. MXFP4, NVFP4 and BF16 expert math is untouched. Other dense-family routes follow incrementally. |
+| `FP8_PREFILL` | unset (= `auto`) | `auto`, `off`, comma-separated projection groups | Shared prefill activation policy over already-resident FP8 weights; never converts BF16/K6/K8. GLM Flash groups: `mla`, `ffn`, `kda-in`, `kda-o`, `experts`. Auto preserves W8A8 MLA+FFN and leaves KDA opt-in. Missing W8A8 geometry falls back to W8A16 with a plan hint. Quantization scratch aliases the admitted program workspace, charged once. Experts auto preserves native input-format defaults; explicit `experts` selects W8A8 for FP8 experts, global `off` selects W8A16. Experts groups not named keep their native default; `experts` must be named to force W8A8. MXFP4, NVFP4 and BF16 expert math is untouched. GLM 5.3 has selectable `mla`, `index`, `ffn`, and `experts` routes; ML4 has selectable `index` and `experts` routes. Both refuse unavailable explicit groups and preserve calibrated or fixed native precision. Other dense-family routes follow incrementally. |
 | `EXPERT_INPUT` | family default | `fp8`, `bf16`, `bf16-decode` | MiMo Spark expert inputs. |
 | `EXPERT_PARTIAL_BF16_MAX_ROWS` | engine | row count | BF16 expert partials up to this row count. |
 | `MIMO_PREFILL_CHUNK_S` | unset | seconds | MiMo prefill chunk time. |
@@ -893,7 +893,7 @@ when the server has no drafter or its effective draft policy is `off`.
 | `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
 | `AUDIO` | `auto` | `auto`, `off` | Bundled audio tower. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
-| `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |
+| `MEDIA_CACHE_BYTES` | engine | byte size | Host embedding-cache quota for an enabled media tower. On the GLM engine this applies to ML4 vision only (default min(8 GiB, 5% of host RAM)); the same quota goes to plan and serve. |
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
@@ -1005,7 +1005,7 @@ Keys here that are optional and off by default are also listed under
 | --- | --- | --- | --- |
 | `ADDR` | `0.0.0.0:8000` | `HOST:PORT` | Listen address. |
 | `CONCURRENCY` | boot-time derivation | 1–64 | Decode batch concurrency; every C-dependent size follows it. |
-| `HTTP_QUEUE_DEPTH` | `CONCURRENCY` | positive int | Accepted request queue. |
+| `HTTP_QUEUE_DEPTH` | `CONCURRENCY` | positive int | Accepted request queue; GLM 5.3 / ML4 accept 1–4096. |
 | `HTTP_QUEUE_WAIT_MS` | `25000` | ms | Queue wait before refusal. |
 | `API_KEY_FILE` | unset | readable file | API key; env `API_KEY_FILE` also works. |
 | `ENABLE_BENCH` | `off` | `on`, `off` | Enable the in-server bench endpoints. |
@@ -1259,7 +1259,7 @@ original core is already FP8, not an MC publication.
 | `SPARK_<rank>_LANE_B` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `EXPERT_BACKEND` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `RTX_EXPERT_LAYERS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `RTX_EXPERT_PEER` | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `RTX_EXPERT_PEER` | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `EMBEDDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `EXPERT_PORT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `HOST_ISA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1316,7 +1316,7 @@ original core is already FP8, not an MC publication.
 | `DECODE_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DECODE_LANES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `DECODE_SHARE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `DECODE_GRAPHS` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `DECODE_GRAPHS` | ✗ | ✗ | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ |
 | `KV_DECODE_RESERVE_CHUNK` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_RESERVE_DRAIN_BUFFER` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1335,13 +1335,13 @@ original core is already FP8, not an MC publication.
 | `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Prefill** | | | | | | | | | | |  | |  |
 | `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `PREFILL_BATCH_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `PREFILL_BATCH_TOKENS` | ✓ | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `FP8_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `EXPERT_INPUT` | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `EXPERT_PARTIAL_BF16_MAX_ROWS` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_EXL3_SCHEDULE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_EXL3_WORKER_PATH` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -1355,7 +1355,7 @@ original core is already FP8, not an MC publication.
 | `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Precision** | | | | | | | | | | |  | |  |
 | `EXLR8_MANIFEST` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `EXLR8_PREFILL_ACTIVATIONS` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -1378,8 +1378,8 @@ original core is already FP8, not an MC publication.
 | **Concurrency and serving** | | | | | | | | | | |  | |  |
 | `ADDR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONCURRENCY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `HTTP_QUEUE_DEPTH` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `HTTP_QUEUE_WAIT_MS` | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `HTTP_QUEUE_DEPTH` | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `HTTP_QUEUE_WAIT_MS` | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `API_KEY_FILE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

@@ -36,6 +36,9 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 pub(crate) struct EngineArgs {
     #[command(flatten)]
     pub(crate) attention: crate::cli::CoreViewArgs,
+    /// Enable GLM/ML4 decode graphs; off reserves no graph memory.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    pub decode_graphs: String,
     /// Count executed expert routes; --expert-usage=false disables telemetry.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
         num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -137,12 +140,6 @@ pub(crate) struct EngineArgs {
     /// coordinator alone. Outputs are not the model's.
     #[arg(long, hide = true)]
     pub skip_routed_experts: bool,
-    /// Prefill projections over the checkpoint's FP8 weights run W8A16 (the
-    /// weights widened to BF16 in-kernel: the former BF16 prefill bit for bit)
-    /// instead of W8A8 (E4M3 activations per row and 128-K block with FP32
-    /// scales, the official FP8 release's served numerics).
-    #[arg(long)]
-    pub prefill_w8a16: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
     /// Attention over the two GPUs: auto (the recorded default: context where this build
@@ -907,16 +904,18 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 struct ResolvedEngineArgs {
     args: EngineArgs,
     context: cuteafd_loader::placement::planner::Context,
+    fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
 }
 
 impl ResolvedEngineArgs {
     fn new(args: &EngineArgs) -> Result<Self> {
+        let fp8_prefill = cuteafd_loader::plan::fp8_prefill::Policy::from_env().map_err(anyhow::Error::msg)?;
         let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let mut resolved = args.clone();
         resolve_prefill(&mut resolved)?;
         resolved.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
-        Ok(Self { context: cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context), args: resolved })
+        Ok(Self { context: cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context), args: resolved, fp8_prefill })
     }
 }
 
@@ -954,7 +953,9 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
         media_owners: (Option<(i32, u64, u64)>, u64),
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
-        let ResolvedEngineArgs { args, context: serving_context } = resolved;
+        let ResolvedEngineArgs { args, context: serving_context, fp8_prefill } = resolved;
+        cuteafd_loader::plan::fp8_prefill::validate_glm_groups(fp8_prefill, self.cfg.variant.ml4().is_some())
+            .map_err(anyhow::Error::msg)?;
         let expert_usage = args.expert_usage_reader.configure(args.expert_usage, args.skip_routed_experts)
             .map_err(anyhow::Error::msg)?;
         let native = self.native;
@@ -1303,7 +1304,7 @@ impl Opened {
         let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-        let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
+        let mut admitted = ProductionInput { decode_graphs: args.decode_graphs == "on", expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             pool, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
                 && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some())), blas, target,
@@ -1731,7 +1732,7 @@ impl Opened {
             // The solver charged staging over the compiled extent it was given.
             engine.attach_context(args.max_context, &manifest)?;
         }
-        engine.prefill_w8a8 = !args.prefill_w8a16;
+        engine.fp8_prefill = fp8_prefill.clone();
         if args.skip_routed_experts {
             engine.skip_routed_experts()?;
         }
@@ -1811,10 +1812,9 @@ impl Opened {
         let graph_reserves = admitted.graphs.reserves().map_err(|e| anyhow::anyhow!("{e}"))?;
         let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
             .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
-        engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
+        engine.configure_graph_cache(&admitted.graphs, &graph_reserves, &graph_bootstraps)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let (base, tail) = admitted.graphs.default_reserve();
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            let reserve = admitted.graphs.reserve_policy(rank)?;
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
                 base = reserve.base_bytes, base_source = reserve.base_source,
                 extra = reserve.extra_bytes, extra_source = reserve.extra_source,
@@ -1827,15 +1827,14 @@ impl Opened {
         // Current startup shapes are a best-effort prewarm list. Admission keeps
         // the entire graph reserve charged; measured warmup never shrinks it.
         if engine.selection_dump.is_none() && engine.weights.layers.len() == self.cfg.layers
-            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
+            && graph_reserves.iter().any(|&bytes| bytes > 0)
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
             engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let (base, tail) = admitted.graphs.default_reserve();
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            let reserve = admitted.graphs.reserve_policy(rank)?;
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
                 base = reserve.base_bytes, base_source = reserve.base_source,
                 extra = reserve.extra_bytes, extra_source = reserve.extra_source,

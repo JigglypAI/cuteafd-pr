@@ -53,6 +53,12 @@ pub(crate) struct ServeArgs {
     /// Sequences decoding at once (at most the decode programs' 64 rows).
     #[arg(long)]
     pub max_sequences: Option<usize>,
+    /// Bounded pending API requests; defaults to concurrency.
+    #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH", value_parser = clap::value_parser!(u32).range(1..=4096))]
+    pub http_queue_depth: Option<u32>,
+    /// Time a caller waits for a pending-queue permit.
+    #[arg(long, env = "CUTEAFD_HTTP_QUEUE_WAIT_MS", default_value_t = 25_000)]
+    pub http_queue_wait_ms: u64,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
@@ -144,7 +150,10 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         chat_encoding(&snapshot, args.thinking_off)?,
     );
     profile.expert_usage = args.engine.expert_usage_reader.clone();
-    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
+    let depth = args.http_queue_depth.map_or_else(|| cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize,
+        |depth| depth as usize);
+    cuteafd_bench::context::set_resolved("http-queue-depth", &depth.to_string());
+    let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
@@ -170,7 +179,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     }
     let limits = args.prefix.reserve.limits(max_context)?;
     cuteafd_bench::context::phase("engine loaded");
-    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_millis(args.http_queue_wait_ms),
         hub.clone(), api.serve(profile.clone(), &snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
@@ -346,9 +355,8 @@ struct Active<'a> {
     job: NativeRequest,
     /// The prompt's image spans (the turn snapshot keys its rows like the prompt's).
     spans: Vec<cuteafd_loader::media::MediaSpan>,
-    /// Serial number (the trace's request id).
+    /// Serial number for routed-expert logging.
     id: u64,
-    prompt_tokens: usize,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
     /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
@@ -458,36 +466,6 @@ impl Active<'_> {
         }
         self.ticket.finishing();
         self.send(InferenceChunk::Finish { finish_reason: finish })
-    }
-}
-
-/// Per-cycle speculation trace (CUTEAFD_SPECULATION_TRACE=path, JSON lines): every
-/// verify of a sequence (position, rows, committed rows, planned DFlash2
-/// drafts, whether a copy window replaced them, the full DFlash2 draft and
-/// its selector features, step ms) and every finished request's generated
-/// tokens. At temperature 0 the output is the target's greedy sequence, so
-/// the trace scores any draft-count policy offline.
-struct Trace(crate::shared::speculation_trace::Trace);
-
-impl Trace {
-    fn open() -> Result<Option<Self>> {
-        Ok(crate::shared::speculation_trace::Trace::open()?.map(Self))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn cycle(&mut self, id: u64, position: usize, rows: usize, committed: usize, planned: usize, copy: bool,
-        draft: Option<&crate::shared::speculation::dflash::Draft>, verify_ms: f64) -> Result<()> {
-        let line = crate::shared::speculation_trace::record! {kind: "cycle", id: id, position: position, rows: rows,
-            committed: committed, planned: planned, copy: copy, verify_ms: verify_ms,
-            draft: draft.map(|d| d.tokens.clone()), features: draft.map(|d| d.features.clone())};
-        self.0.write(line)?;
-        Ok(())
-    }
-
-    fn done(&mut self, id: u64, prompt_tokens: usize, generated: &[u32]) -> Result<()> {
-        self.0.write(crate::shared::speculation_trace::record! {kind: "done", id: id, prompt_tokens: prompt_tokens,
-            generated: generated.to_vec()})?;
-        Ok(())
     }
 }
 
@@ -662,7 +640,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     // rows), verify, select (sampling + streaming), drafter context update;
     // then steps and verified rows.
     let mut phases = [0f64; 8];
-    let mut trace = Trace::open()?;
+    let trace = crate::shared::speculation_trace::Trace::open()?;
+    let mut trace_round = 0;
     if let Some(drafter) = drafter {
         { let (traced, scored) = crate::shared::draft::history::score_readback(policy.length.control());
             drafter.set_selector_readback(traced && trace.is_some(), scored); }
@@ -1032,7 +1011,6 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     let mut request = Active {
                         spans: spans.clone(),
                         id: p.id,
-                        prompt_tokens: p.tokens.len(),
                         history: p.tokens,
                         slot,
                         counts: [0; 3],
@@ -1053,7 +1031,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         (Some(first), _) => first,
                         (None, Some(logits)) => {
                             if probe::wants_first(&request.job.probe) {
-                                probe::host_row(&request.job.probe, request.prompt_tokens, logits);
+                                probe::host_row(&request.job.probe, request.history.len(), logits);
                             }
                             request.select(logits)?
                         }
@@ -1113,7 +1091,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,
-            &mut free_slots, &mut trace)))? else { continue };
+            &mut free_slots, trace.as_ref(), &mut trace_round)))? else { continue };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1121,9 +1099,6 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let mut request = active.remove(index);
             if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
             request.ticket.done(request.generated);
-            if let Some(trace) = trace.as_mut() {
-                trace.done(request.id, request.prompt_tokens, &request.history[request.prompt_tokens..])?;
-            }
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
@@ -1264,7 +1239,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     transport: &mut Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, phases: &mut [f64; 8],
     active: &mut Vec<Active<'_>>, shared: &mut Option<DraftPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
-    free_slots: &mut Vec<usize>, trace: &mut Option<Trace>) -> Result<Option<Vec<bool>>> {
+    free_slots: &mut Vec<usize>, trace: Option<&crate::shared::speculation_trace::Trace>,
+    trace_round: &mut u64) -> Result<Option<Vec<bool>>> {
     let drafter = engine.drafter.as_ref();
     let mut tally = console::Step::begin(lease.index());
     let (phases_before, engine_before) = (*phases, tally.live().then(|| *engine.profile.borrow()));
@@ -1306,27 +1282,30 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         }
         _ => vec![None; active.len()],
     };
-    phases[0] += timer.elapsed().as_secs_f64();
+    let draft_s = timer.elapsed().as_secs_f64();
+    phases[0] += draft_s;
     let timer = Instant::now();
     // Cut each draft to its plan, extend agreeing ones with a history copy, fit the row budget.
     let mut proposals: Vec<Vec<u32>> = drafted.iter().zip(&depths).map(|(draft, &depth)|
         draft.as_ref().map_or_else(Vec::new, |d| d.tokens[..depth.min(d.tokens.len())].to_vec())).collect();
-    let neural_lengths = match shared.as_mut() {
-        Some(policy) => {
-            let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), d)| Proposal {
-                id: a.ticket.id(), tokens, head: d.as_ref().map(|d| d.confidence.as_slice()), history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
-            let min_end = active.iter().map(|a| a.placement.len + 1).max().unwrap_or(1);
-            let max_end = active.iter().zip(&limits).map(|(a, &room)| a.placement.len + room + 1).max().unwrap_or(min_end);
-            policy.shape_with_padding(&mut shaped, DECODE_ROWS, |rows|
-                Some(engine.verify_explore_bucket(rows, min_end, max_end)))
-        }
-        None => vec![0; active.len()],
-    };
+    if let Some(policy) = shared.as_mut() {
+        let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), d)| Proposal {
+            id: a.ticket.id(), tokens, head: d.as_ref().map(|d| d.confidence.as_slice()), history: &a.history, greedy: a.job.sampling.is_greedy() }).collect();
+        let min_end = active.iter().map(|a| a.placement.len + 1).max().unwrap_or(1);
+        let max_end = active.iter().zip(&limits).map(|(a, &room)| a.placement.len + room + 1).max().unwrap_or(min_end);
+        policy.shape_with_padding(&mut shaped, DECODE_ROWS, |rows|
+            Some(engine.verify_explore_bucket(rows, min_end, max_end)));
+    }
     let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, proposal)| {
         let mut rows: Vec<u32> = std::iter::once(a.next).chain(proposal.iter().copied()).collect();
         if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
         Ok(rows)
     }).collect::<Result<_>>()?;
+    let copy_windows = trace.map(|_| active.iter().zip(&drafted).map(|(a, d)| {
+        let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
+            d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
+        crate::shared::speculation_trace::record! {start: start, matched_suffix: suffix, tokens: tokens.to_vec()}
+    }).collect::<Vec<_>>());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
@@ -1365,8 +1344,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     let timer = Instant::now();
     let mut offset = 0;
     let mut context = Vec::new();
-    let draft_list = &drafted;
-    let trace_ref = &mut *trace;
     let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
     // A normal finish's turn snapshot keeps the row that produced the last token.
     let retain_turn = cache.enabled();
@@ -1421,13 +1398,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         request.counts[0] += 1;
         request.counts[1] += drafted;
         request.counts[2] += accepted;
-        if let Some(trace) = trace_ref.as_mut() {
-            let copy = drafted > neural_lengths[i];
-            if let Err(error) = trace.cycle(request.id, *start, rows.len(), committed, proposals[i].len(), copy,
-                draft_list[i].as_ref(), verify_ms) {
-                tracing::warn!("trace: {error:#}");
-            }
-        }
         finished
     }).collect();
     phases[4] += timer.elapsed().as_secs_f64();
@@ -1437,10 +1407,29 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     if let Some(policy) = shared.as_mut() {
         let outcomes: Vec<_> = active.iter().zip(&verified).map(|(a, &(rows, accepted, censored))|
             history::outcome(a.ticket.id(), rows, accepted, censored)).collect();
-        // GLM 5.3's round time is its verify step, as its trace's `verify_ms` records.
-        policy.observe_timed(&outcomes, Some(history::RoundTiming { lane: tally.lane(),
-            round_us: (1e3 * verify_ms) as u64, draft_us: 0, verify_us: (1e3 * verify_ms) as u64,
-            context: starts.clone() }));
+        policy.observe_timed(&outcomes, Some(history::RoundTiming::since(tally.lane(),
+            tally.started(), draft_s, verify_ms / 1e3, starts.clone())));
+    }
+    if let Some(trace) = trace {
+        *trace_round += 1;
+        let line = crate::shared::speculation_trace::record! {
+            round: *trace_round, spec: sequences.iter().any(|rows| rows.len() > 1),
+            request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            starts: starts.clone(),
+            prompt_ids: active.iter().zip(&starts).map(|(a, &start)|
+                (a.counts[0] == 1).then(|| a.history[..start].to_vec())).collect::<Vec<_>>(),
+            lengths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+            accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            neural_features: drafted.iter().map(|d| d.as_ref().map(|d| d.features.clone())).collect::<Vec<_>>(),
+            copy_windows: copy_windows,
+            verify_tokens: sequences.clone(),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            finished: finished.clone(),
+        };
+        if let Err(error) = trace.write(line) {
+            tracing::warn!(%error, "GLM speculation trace write failed");
+        }
     }
     for (i, request) in active.iter().enumerate() {
         let proposal = &sequences[i][1..];
@@ -1570,6 +1559,22 @@ mod draft_tests {
             assert_eq!(spec.positions, 3);
         }
         Ok(())
+    }
+
+    #[test]
+    fn http_queue_options_default_and_validate_depth() {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: ServeArgs }
+        use clap::Parser;
+        let base = ["test", "--snapshot", "/unused", "--native-lib", "/unused"];
+        let default = Cli::try_parse_from(base).unwrap().args;
+        assert_eq!((default.http_queue_depth, default.http_queue_wait_ms), (None, 25_000));
+        let configured = Cli::try_parse_from(base.into_iter().chain([
+            "--http-queue-depth", "32", "--http-queue-wait-ms", "0"])).unwrap().args;
+        assert_eq!((configured.http_queue_depth, configured.http_queue_wait_ms), (Some(32), 0));
+        for invalid in ["0", "4097"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(["--http-queue-depth", invalid])).is_err());
+        }
     }
 
     #[test]

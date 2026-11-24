@@ -632,7 +632,7 @@ pub(crate) struct GlmEngine<'a> {
     /// Prefill projections over the FP8 weights run W8A8 (E4M3 activations per
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
-    pub prefill_w8a8: bool,
+    pub fp8_prefill: cuteafd_loader::plan::fp8_prefill::Policy,
     /// `CUTEAFD_DIAG_SELECTION_DUMP` (diagnostic): eager decode reads back each
     /// full indexer layer's top-k as logical tokens. None: no drain or copy.
     pub(super) selection_dump: Option<std::sync::Arc<crate::shared::selection_dump::SelectionDump>>,
@@ -793,7 +793,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true, selection_dump: None })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, fp8_prefill: Default::default(), selection_dump: None })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -1620,9 +1620,7 @@ impl<'a> GlmEngine<'a> {
             return Ok(Vec::new());
         };
         let all_shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
-        let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
-        let policies = (0..self.ranks()).map(|rank|
-            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail))
+        let policies = (0..self.ranks()).map(|rank| inventory.reserve_policy(rank))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let bases: Vec<_> = policies.iter().map(|policy| policy.base_bytes).collect();
         let costs = |selected: &[usize]| -> Vec<u64> {
@@ -1696,7 +1694,8 @@ impl<'a> GlmEngine<'a> {
         Ok(captures)
     }
 
-    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
+    pub fn configure_graph_cache(&self, inventory: &cuteafd_loader::placement::families::glm5::admission::StartupGraphs,
+        reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
         use crate::shared::decode_graph::device::{Cycle, Preference, Site};
         if self.graph_basis() == crate::shared::decode_graph::device::Basis::Bytes {
             tracing::warn!("GLM graph cache uses per-site byte estimates: local/TP2 or non-HQA node counts uncalibrated");
@@ -1710,8 +1709,7 @@ impl<'a> GlmEngine<'a> {
                 basis: self.graph_basis(),
                 spans_devices: super::graph_sites::spans("glm5.segment", self.ranks() > 1),
             })?;
-            let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
-            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            let policy = inventory.reserve_policy(rank)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
@@ -3161,15 +3159,6 @@ impl<'a> GlmEngine<'a> {
                     w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
                     self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, cuteafd_ffi::MlaPrefillKernel::Bf16, self.stream_of(rank))
             })?;
-            if mla_prefill_check() {
-                // SAFETY: as above; the check synchronizes the stream.
-                let (stats, bf16) = self.on(rank, || unsafe {
-                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, kv.ptr, w.indices.buffer.ptr,
-                        w.lengths.buffer.ptr, tables.positions.len(), heads, self.cfg.index_topk, 656,
-                        scale * std::f32::consts::LOG2_E, self.stream_of(rank))
-                })?;
-                print_mla_check(index, &stats, bf16);
-            }
         } else {
             let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
             let prefill_scalars = [rows];
@@ -3222,7 +3211,7 @@ impl<'a> GlmEngine<'a> {
         ensure!(!self.weights.layers.iter().any(|l| l.attention_owner.is_some_and(|gpu| gpu != 0)),
             "{} refuses layers placement on GLM 5.3", crate::shared::selection_dump::ENV_DIR);
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0,
-            "{} refuses attached CUDA graphs: set CUTEAFD_GLM_WARM_GRAPHS=0 and GPU_GRAPH_RESERVE=0",
+            "{} refuses attached CUDA graphs: use --decode-graphs off (DECODE_GRAPHS=off in the launcher)",
             crate::shared::selection_dump::ENV_DIR);
         self.selection_dump = Some(dump);
         Ok(())
@@ -3306,7 +3295,7 @@ impl<'a> GlmEngine<'a> {
         producer.extend(weight(layer, "w_uk", cap)?);
         producer.extend([("kv_cache", kv.ptr), ("query", query), ("q_resid", w.q_resid.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr)]);
-        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap) };
+        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap, "mla") };
         self.run_on(rank, &Self::program(layer, &variant), &producer, &scalars)
     }
 
@@ -3331,7 +3320,7 @@ impl<'a> GlmEngine<'a> {
             ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr)]);
         let name = if bf16 { format!("glm_index_producer_bf16_{cap}") } else { format!("glm_index_producer_{cap}") };
-        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap) };
+        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap, "index") };
         self.run_on(rank, &name, &pointers, &scalars)
     }
 
@@ -3352,18 +3341,22 @@ impl<'a> GlmEngine<'a> {
         o.extend(weight(layer, "w_o", cap)?);
         o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         let name = if bf16 { format!("glm_o_bf16_{cap}") } else { format!("glm_o_{cap}") };
-        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap) };
+        let scalars = if bf16 { vec![rows] } else { self.projection_scalars(rows, cap, "mla") };
         self.run_on(rank, &Self::program(layer, &name), &o, &scalars)
     }
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
     /// programs' `fp8_rows` (1: W8A8, 0: W8A16).
-    pub(super) fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
+    pub(super) fn projection_scalars(&self, rows: Scalar, cap: &str, group: &'static str) -> Vec<Scalar> {
         if cap == "m64" {
             vec![rows]
         } else {
-            vec![rows, Scalar::I32(i32::from(self.prefill_w8a8))]
+            vec![rows, Scalar::I32(i32::from(self.fp8_group(group)))]
         }
+    }
+
+    fn fp8_group(&self, group: &'static str) -> bool {
+        self.fp8_prefill.requests(cuteafd_loader::plan::fp8_prefill::Group::auto(group))
     }
 
     /// SwiGLU MLP (dense layers, or the shared expert) into `out`.
@@ -3391,7 +3384,7 @@ impl<'a> GlmEngine<'a> {
         }
         let intermediate = intermediate / if layer.split { 2 } else { 1 };
         let declared_w8a8 = layer.mlp_numerics == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8;
-        if declared_w8a8 || (cap != "m64" && self.prefill_w8a8 && tensor_fp8_prefill()
+        if declared_w8a8 || (cap != "m64" && self.fp8_group("ffn")
             && layer.range("w_gate_up_tscale").is_some()) {
             // ModelOpt per-tensor FP8: static W8A8 with the checkpoint's input and weight scales.
             let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
@@ -3410,7 +3403,7 @@ impl<'a> GlmEngine<'a> {
                 &[rows]);
         }
         self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_{cap}")), &pointers,
-            &self.projection_scalars(rows, cap))
+            &self.projection_scalars(rows, cap, "ffn"))
     }
 }
 
@@ -3426,27 +3419,6 @@ impl<'a> GlmEngine<'a> {
     }
 
 
-}
-
-/// Optional static per-tensor prefill route for undeclared FP8 modules.
-/// Declared W8A8 modules always use their calibrated static path at every row
-/// count; CUTEAFD_GLM_TENSOR_FP8=block does not override that contract.
-pub(crate) fn tensor_fp8_prefill() -> bool {
-    static TENSOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
-}
-
-/// CUTEAFD_MLA_PREFILL_CHECK=1 compares the available native kernels against Q2P2
-/// on the actual prefill inputs (diagnostics; synchronizes and allocates).
-pub(crate) fn mla_prefill_check() -> bool {
-    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CHECK.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL_CHECK").is_ok_and(|v| v == "1"))
-}
-
-pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 2], bf16: Option<[f64; 3]>) {
-    let bf16 = bf16.map_or_else(String::new, |[rel, max, _]| format!("; bf16 rel {rel:.2e} max {max:.2e}"));
-    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): f16 rel {:.2e} max {:.2e}{bf16}",
-        stats[1][2], stats[0][0], stats[0][1]);
 }
 
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds

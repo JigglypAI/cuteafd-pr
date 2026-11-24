@@ -700,6 +700,9 @@ pub(crate) struct PlanArgs {
     /// Step-5 decode/verify layer sections (matches serving; on by default).
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     pub(crate) step5_decode_graphs: String,
+    /// Enable GLM/ML4 decode graphs; off reserves no graph memory.
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
+    pub(crate) glm_decode_graphs: String,
     /// Physical coordinator SM count for memory-budget simulations.
     #[arg(long)]
     pub(crate) physical_sms: Option<u32>,

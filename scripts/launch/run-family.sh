@@ -1413,6 +1413,10 @@ if [[ "$family" == mistral_large4 ]]; then
     *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
   esac
 fi
+# Refuse GLM/ML4's unsupported keys before inspecting their values or staging anything.
+if [[ "$family" == glm5 ]]; then
+  release_reject_unused_keys "$family" $(_family_allowed_keys "$family" "$checkpoint_family")
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -1905,9 +1909,18 @@ if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $fami
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
-if [[ $family == mimo_v2 ]]; then
+if [[ $family == mimo_v2 || $family == glm5 ]]; then
   [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
   [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
+fi
+if [[ $family == glm5 ]]; then
+  glm_decode_graphs="$(get DECODE_GRAPHS on)"
+  case "$glm_decode_graphs" in
+    on|off) family_args+=(--decode-graphs "$glm_decode_graphs") ;;
+    *) release_die "DECODE_GRAPHS must be on or off" ;;
+  esac
+fi
+if [[ $family == mimo_v2 ]]; then
   [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
@@ -2517,6 +2530,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == glm5 ]]; then
+    plan_draft_args+=(--glm-decode-graphs "$glm_decode_graphs")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
@@ -2562,7 +2576,7 @@ audio_encoder_hash=""
     'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
     key_name="${pair%%:*}"; flag="${pair#*:}"
-    [[ "$family:$key_name" != mimo_v2:PREFILL_BATCH_TOKENS ]] || continue
+    [[ "$key_name" != PREFILL_BATCH_TOKENS || ( "$family" != mimo_v2 && "$family" != glm5 ) ]] || continue
     value="$(get "$key_name")"
     if [[ -n "$value" && "$value" != auto && " ${plan_draft_args[*]} " != *" $flag "* ]]; then
       plan_draft_args+=("$flag" "$value")
