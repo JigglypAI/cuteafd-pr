@@ -826,7 +826,9 @@ pub(crate) struct Qwen4Engine<'a> {
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
-    /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, DECODE_ROWS].
+    /// Active decode/verify row capacity (`64` or `128`).
+    pub decode_rows: usize,
+    /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, decode_rows].
     mtp_drafts: Dev<'a>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
 }
@@ -874,14 +876,29 @@ type LayerHook<'h> = Option<&'h mut dyn FnMut(usize, &[u8]) -> Result<()>>;
 type Forced<'h> = Option<&'h dyn Fn(usize) -> Option<Vec<u8>>>;
 
 impl<'a> Qwen4Engine<'a> {
+    pub(crate) fn decode_cap(&self) -> &'static str {
+        if self.decode_rows <= DECODE_ROWS { "m64" } else { "m128" }
+    }
+
+    fn is_decode_cap(cap: &str) -> bool {
+        matches!(cap, "m64" | "m128")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        Self::new_with_decode_rows(library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, DECODE_ROWS, kv_format, embedding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_decode_rows(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
+        ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
+        pages: usize, slots: usize, decode_rows: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let device = Device { library, id: library.cuda_get_device()? };
         let owners = vec![0; weights.layers.len()];
-        Self::new_placed(library, cfg, weights, ple, &owners, &[(device, programs, stream)],
-            max_context, prefill_rows, pages, slots, kv_format, embedding)
+        Self::new_placed_with_decode_rows(library, cfg, weights, ple, &owners, &[(device, programs, stream)],
+            max_context, prefill_rows, pages, slots, decode_rows, kv_format, embedding)
     }
 
     /// Whole-width attention owners; head, embedding and MTP remain on rank zero.
@@ -892,6 +909,19 @@ impl<'a> Qwen4Engine<'a> {
         ranks: &[(Device<'a>, &'a Programs<'a>, *mut c_void)], max_context: usize,
         prefill_rows: usize, pages: usize, slots: usize,
         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        Self::new_placed_with_decode_rows(library, cfg, weights, ple, owners, ranks, max_context, prefill_rows,
+            pages, slots, DECODE_ROWS, kv_format, embedding)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_placed_with_decode_rows(library: &'a NativeLibrary, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
+        ple: Option<super::ple::PleTable<'a>>, owners: &[usize],
+        ranks: &[(Device<'a>, &'a Programs<'a>, *mut c_void)], max_context: usize,
+        prefill_rows: usize, pages: usize, slots: usize, decode_rows: usize,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let decode_rows = cuteafd_loader::families::qwen4::decode_capacity(decode_rows);
+        let decode_cap = if decode_rows <= DECODE_ROWS { "m64" } else { "m128" };
+        let gdn_commit_program = if decode_rows <= DECODE_ROWS { "qwen4_gdn_commit" } else { "qwen4_gdn_commit_m128" };
         ensure!(!ranks.is_empty() && ranks.len() <= 2, "Qwen supports one or two attention owners");
         ensure!(ranks.iter().all(|(device, _, _)| std::ptr::eq(device.library, library)),
             "Qwen attention owners use different native libraries");
@@ -910,7 +940,7 @@ impl<'a> Qwen4Engine<'a> {
         let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
         let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
         for (owner, &(_, owner_programs, _)) in ranks.iter().enumerate() {
-            for cap in ["m64", "m4096"] {
+            for cap in [decode_cap, "m4096"] {
                 for layer in weights.layers.iter().enumerate()
                     .filter(|(global, _)| owners[*global] == owner).map(|(_, layer)| layer)
                     .chain(weights.mtp.iter().filter(|_| owner == 0).map(|m| &m.layer))
@@ -951,7 +981,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         let gdn_banks = ranks.iter().enumerate().map(|(owner, &(device, programs, stream))|
-            device.own(|| GdnBank::new(library, programs, stream, cfg.gdn_geometry(), state_map.gdn_layers[owner], slots, "qwen4_gdn_commit")))
+            device.own(|| GdnBank::new_with_replay_rows(library, programs, stream, cfg.gdn_geometry(), state_map.gdn_layers[owner], slots, gdn_commit_program, decode_rows)))
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.head.allocations().iter().all(|a| a.device.id == home.id)
             && weights.mixer.iter().all(|a| a.device.id == home.id), "Qwen head must stay on owner zero");
@@ -966,7 +996,7 @@ impl<'a> Qwen4Engine<'a> {
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
             let _ple_scope = ranks[ple_owner.context("Qwen PLE state owner")?].0.enter()?;
             (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-state"))?),
-             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-replay"))?))
+             Some(zeroed(decode_rows * cfg.hc_width() * 2, Tag::kv("qwen4/ple-replay"))?))
         } else {
             (None, None)
         };
@@ -996,7 +1026,8 @@ impl<'a> Qwen4Engine<'a> {
             w8a8_prefill: false, spark_bf16: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
-            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
+            decode_rows,
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * decode_rows * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
@@ -1100,7 +1131,7 @@ impl<'a> Qwen4Engine<'a> {
                     self.library, ranks, 1, 256, 256)?);
             }
             let mut link = crate::shared::peer_split::hop::HopLink::new(self.library, ranks, &hops,
-                spec, DECODE_ROWS * spec.row_bytes as usize)?;
+                spec, self.decode_rows * spec.row_bytes as usize)?;
             experts.with_peer(|peer| link.attach_abort([
                 peer.abort_word(0)?.context("Qwen rank zero abort")?,
                 peer.abort_word(1)?.context("Qwen rank one abort")?]))?.context("Qwen dual terminal owner")?;
@@ -1126,14 +1157,14 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(!self.host_memory_admitted, "Qwen host memory was already admitted");
         let (config, scoring, headroom) = match &args.planner_host_prefix {
             Some((prefix, lanes)) => {
-                let prefix = prefix.with_scoring(DECODE_ROWS,
+                let prefix = prefix.with_scoring(self.decode_rows,
                     self.prefill_rows, self.cfg.vocab_size)?;
                 let layout = super::prefix::Qwen4Prefix::geometry(self)?;
                 (prefix.resolve_host_config(layout, self.max_context, *lanes)?, prefix.scoring_host_bytes,
                     prefix.host_cache_headroom_bytes)
             }
             None => (None, cuteafd_core::memory_layout::host_logits_bytes(
-                DECODE_ROWS as u64,
+                self.decode_rows as u64,
                 self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
         };
         let tables = self.future_host_workspaces()?;
@@ -1173,9 +1204,9 @@ impl<'a> Qwen4Engine<'a> {
         for owner in 0..self.gdn_banks.len() {
             for decode in [false, true] {
                 if self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }
-                let rows = if decode { DECODE_ROWS } else { self.prefill_shape
+                let rows = if decode { self.decode_rows } else { self.prefill_shape
                     .map_or(self.prefill_rows, |shape| shape.unit_rows as usize) };
-                let logits = if decode { DECODE_ROWS } else { 1 };
+                let logits = if decode { self.decode_rows } else { 1 };
                 let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
                     if decode { 0 } else { self.prefill_shape.map_or(0, |shape| shape.waves as usize) },
                     self.has_sparks(), self.weights.mtp.is_some(), ple_ids, logits, self.gdn_banks.len() == 1)?;
@@ -1225,8 +1256,8 @@ impl<'a> Qwen4Engine<'a> {
                 self.on_owner(owner, || {
                     let slot = self.workspace_slot(owner, decode)?;
                     if slot.borrow().is_none() {
-                        let rows = if decode { DECODE_ROWS } else { self.prefill_rows };
-                        let logits = if decode { DECODE_ROWS } else { 1 };
+                        let rows = if decode { self.decode_rows } else { self.prefill_rows };
+                        let logits = if decode { self.decode_rows } else { 1 };
                         *slot.borrow_mut() = Some(self.workspace(rows, decode, logits)?);
                     }
                     Ok(())
@@ -1358,6 +1389,17 @@ impl<'a> Qwen4Engine<'a> {
         self.drain_state()
     }
 
+    /// Enable lazy graph capture/replay in golden wide-batch verification without
+    /// running the startup prewarm pass over unrelated narrow shapes.
+    pub(super) fn enable_lazy_graphs_for_golden(&self) -> Result<()> {
+        if !self.use_graphs { return Ok(()); }
+        ensure!(self.graph_capture.get(), "Qwen graphs must be configured before enabling lazy capture");
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
+        }
+        self.graph_warmed.set(true);
+        Ok(())
+    }
     /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
     /// Called only for the opt-in per-cycle trace, after the device work completes.
     pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
@@ -1367,7 +1409,8 @@ impl<'a> Qwen4Engine<'a> {
         let splits = if hint == 1 { 64 } else if hint <= 4 { 32 } else { 16 };
         let program = self.kv_stem("sparse_gqa");
         let record_bytes = self.kv_record_bytes;
-        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"program": format!("qwen4_{program}_m64"),
+        let cap = self.decode_cap();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"program": format!("qwen4_{program}_{cap}"),
             "route": "selected_split", "physical_rows": rows, "splits": splits,
             "qk_tile": [16, 32, 16], "pv_tile": [16, 256, 16], "kv_warps": 2,
             "record_bytes": record_bytes, "target_full_layers": full_layers,
@@ -1711,7 +1754,7 @@ impl<'a> Qwen4Engine<'a> {
         self.allow_workspace_creation()?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
-        let cap = if decode { "m64" } else { "m4096" };
+        let cap = if decode { self.decode_cap() } else { "m4096" };
         let ple = if self.ple.as_ref().is_some_and(|p| p.fp8) { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
         let mut scratch = 0;
         for name in ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(),
@@ -2118,9 +2161,9 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     pub(super) fn packed_table_budget(&self) -> crate::shared::prefill_packing::TableBudget {
-        // Admission charges DECODE_ROWS full-pool metadata rows. A sequence can
+        // Admission charges decode_rows full-pool metadata rows. A sequence can
         // use no more than one such row, regardless of shared physical pages.
-        crate::shared::prefill_packing::TableBudget([DECODE_ROWS * self.pages, DECODE_ROWS * self.pool_pages])
+        crate::shared::prefill_packing::TableBudget([self.decode_rows * self.pages, self.decode_rows * self.pool_pages])
     }
 
     pub(crate) fn prefill_packed(&self, sequences: &mut [crate::shared::qwen::scheduler::PrefillSeq<'_,
@@ -2145,7 +2188,7 @@ impl<'a> Qwen4Engine<'a> {
             // verify cannot submit reentrantly from a head callback. Captured
             // pointers stay fixed and step_inner rewrites both planes before replay.
             let mut decode = self.decode_workspace.try_borrow_mut()?;
-            if decode.is_none() { *decode = Some(self.workspace(DECODE_ROWS, true, DECODE_ROWS)?); }
+            if decode.is_none() { *decode = Some(self.workspace(self.decode_rows, true, self.decode_rows)?); }
             let decode = decode.as_ref().context("Qwen packed decode metadata owner")?;
             let (mut pages, mut pools) = (Vec::new(), Vec::new());
             for s in sequences.iter() {
@@ -2285,7 +2328,7 @@ impl<'a> Qwen4Engine<'a> {
         // has submitted its last read of the borrowed planes.
         drop(self.decode_workspace.try_borrow()?);
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= self.decode_rows, "decode step of {rows} rows");
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
         let live_tokens = sequences.iter().map(|(p, t)| p.len + t.len()).max().unwrap_or(1);
         let allocated = |n, unit| crate::shared::context::decode_allocation_units(n, live_tokens, unit);
@@ -2329,10 +2372,10 @@ impl<'a> Qwen4Engine<'a> {
         if n == 0 {
             return Ok(());
         }
-        ensure!(n <= DECODE_ROWS, "commit of {n} sequences");
+        ensure!(n <= self.decode_rows, "commit of {n} sequences");
         let mut table = vec![0i32; 3 * n];
         for (i, &(slot, first, keep)) in accepted.iter().enumerate() {
-            ensure!(first + keep <= REPLAY_ROWS && usize::try_from(slot).is_ok_and(|s| s < self.slots),
+            ensure!(first + keep <= self.decode_rows && usize::try_from(slot).is_ok_and(|s| s < self.slots),
                 "commit of rows {first}+{keep} in slot {slot}");
             (table[i], table[n + i], table[2 * n + i]) = (slot, i32::try_from(first)?, i32::try_from(keep)?);
         }
@@ -2345,8 +2388,9 @@ impl<'a> Qwen4Engine<'a> {
         if let (Some(state), Some(replay)) = (&self.ple_state, &self.ple_replay) {
             let bank = self.gdn_banks.iter().find(|bank| bank.device.id == state.device.id)
                 .context("Qwen PLE commit owner")?;
+            let ple_commit = if self.decode_rows <= DECODE_ROWS { "qwen4_ple_commit" } else { "qwen4_ple_commit_m128" };
             bank.device.run(|| {
-                let program = bank.programs.program("qwen4_ple_commit", &["conv_state", "replay", "tables"])?;
+                let program = bank.programs.program(ple_commit, &["conv_state", "replay", "tables"])?;
                 // SAFETY: PLE pools and this bank's uploaded commit table belong to the same owner.
                 unsafe { program.launch(&[state.buffer.ptr, replay.buffer.ptr, bank.commit_tables.buffer.ptr],
                     &[i32s(n)?], bank.stream) }
@@ -2429,7 +2473,7 @@ impl<'a> Qwen4Engine<'a> {
         let (kv, keys, blocks) = self.mtp_kv.as_ref().context("MTP pools")?;
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
         let t: usize = groups.iter().map(|g| g.rows.len()).sum();
-        let capacity = if decode { DECODE_ROWS } else { self.mtp_prefill_rows() };
+        let capacity = if decode { self.decode_rows } else { self.mtp_prefill_rows() };
         let token_rows = match tokens { MtpTokens::Host(t) => t.len(), MtpTokens::Drafts { index, .. } => index.len() };
         ensure!(t > 0 && t <= capacity && heads.len() <= t && token_rows == t, "MTP step of {t} rows");
         let mut tables = StepTables { decode, ..Default::default() };
@@ -2485,7 +2529,7 @@ impl<'a> Qwen4Engine<'a> {
         let separate = !decode && self.prefill_shape.is_some();
         let slot = if decode { &self.decode_workspace } else if separate { &self.mtp_prefill_workspace } else { &self.workspace };
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(capacity, decode, if decode { DECODE_ROWS } else { 1 })?);
+            *slot.borrow_mut() = Some(self.workspace(capacity, decode, if decode { self.decode_rows } else { 1 })?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
@@ -2526,10 +2570,10 @@ impl<'a> Qwen4Engine<'a> {
         match tokens {
             MtpTokens::Host(tokens) => self.stage_embedding(w, tokens, 1, &w.x, false)?,
             MtpTokens::Drafts { step, index } => {
-                ensure!(step < MTP_DEFERRED_STEPS && index.iter().all(|&i| (i as usize) < DECODE_ROWS),
+                ensure!(step < MTP_DEFERRED_STEPS && index.iter().all(|&i| (i as usize) < self.decode_rows),
                     "MTP chain step reads draft step {step}");
                 self.stage_table(w, &w.ids, index)?;
-                let drafts = Self::region(&self.mtp_drafts, step * DECODE_ROWS * 4, DECODE_ROWS * 4);
+                let drafts = Self::region(&self.mtp_drafts, step * self.decode_rows * 4, self.decode_rows * 4);
                 // SAFETY: the drafts of `step` and the staged indices are ordered on this
                 // stream before the gather; `x` holds t rows.
                 unsafe { self.embedding.embed_device_ids(drafts, Some((w.ids.buffer.ptr.cast_const(), index)), t, 1,
@@ -2542,7 +2586,7 @@ impl<'a> Qwen4Engine<'a> {
             self.inject_media(w, &media, &tables.seq_first, &w.x, t, 1)?;
         }
         let rows = Scalar::I32(t as i32);
-        let cap = if decode { "m64" } else { "m4096" };
+        let cap = if decode { self.decode_cap() } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
             ("embed", w.live(&w.x, self.cfg.hidden * 2)), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
             ("norm_embed", mtp.norm_embed.buffer.ptr), ("fc_hidden", mtp.fc_hidden.buffer.ptr),
@@ -2576,7 +2620,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         let n = heads.len();
-        ensure!(n <= DECODE_ROWS, "{n} MTP head rows");
+        ensure!(n <= self.decode_rows, "{n} MTP head rows");
         // The target's head (one representation shared with the drafts).
         self.logits(w, w.live(&w.delta, self.cfg.hidden * 2), n)?;
         // SAFETY: the logits and the argmax outputs are live buffers of these shapes.
@@ -2588,7 +2632,7 @@ impl<'a> Qwen4Engine<'a> {
         let logits = match output {
             MtpOut::Defer { step } => {
                 ensure!(step < MTP_DEFERRED_STEPS, "deferred MTP step {step}");
-                let at = Self::region(&self.mtp_drafts, step * DECODE_ROWS * 4, n * 4);
+                let at = Self::region(&self.mtp_drafts, step * self.decode_rows * 4, n * 4);
                 // SAFETY: both regions are live; the stream orders the copy after the argmax.
                 unsafe { crate::shared::memory::device::copy_device_ordered(self.library, at, Self::region(&w.argmax, 0, n * 4), n * 4, self.execution_stream())? };
                 return Ok((Vec::new(), None));
@@ -2605,10 +2649,10 @@ impl<'a> Qwen4Engine<'a> {
     /// The deferred drafts of a cycle's steps: `counts[s]` drafts of step `s`
     /// (synchronizes).
     pub fn mtp_drafts(&self, counts: &[usize]) -> Result<Vec<Vec<u32>>> {
-        ensure!(counts.len() <= MTP_DEFERRED_STEPS && counts.iter().all(|&n| n <= DECODE_ROWS), "deferred drafts");
-        let bytes = self.download(&self.mtp_drafts, counts.len() * DECODE_ROWS * 4)?;
+        ensure!(counts.len() <= MTP_DEFERRED_STEPS && counts.iter().all(|&n| n <= self.decode_rows), "deferred drafts");
+        let bytes = self.download(&self.mtp_drafts, counts.len() * self.decode_rows * 4)?;
         Ok(counts.iter().enumerate().map(|(s, &n)| (0..n).map(|i| {
-            let at = (s * DECODE_ROWS + i) * 4;
+            let at = (s * self.decode_rows + i) * 4;
             u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
         }).collect()).collect())
     }
@@ -2657,13 +2701,13 @@ impl<'a> Qwen4Engine<'a> {
             return self.step_placed(tables, tokens, logit_rows, on_layer, forced, media, graphs);
         }
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
-        let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
+        let (slot, capacity) = if tables.decode { (&self.decode_workspace, self.decode_rows) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
             self.allow_workspace_creation()?;
             *slot.borrow_mut() = None;
         }
         if slot.borrow().is_none() {
-            let rows = if tables.decode { DECODE_ROWS } else { logit_rows.max(1) };
+            let rows = if tables.decode { self.decode_rows } else { logit_rows.max(1) };
             *slot.borrow_mut() = Some(self.workspace(capacity, tables.decode, rows)?);
         }
         let workspace = slot.borrow();
@@ -2700,7 +2744,7 @@ impl<'a> Qwen4Engine<'a> {
         if graphed {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
         }
-        let cap = if tables.decode { "m64" } else { "m4096" };
+        let cap = if tables.decode { self.decode_cap() } else { "m4096" };
         let layers = &self.weights.layers;
         let mut cur = 0usize;
         let spec = tables.spec;
@@ -2785,7 +2829,7 @@ impl<'a> Qwen4Engine<'a> {
         let hops = self.hops.as_ref().context("Qwen dual residual hops")?;
         let (t, h) = (tables.kv_slots.len(), self.cfg.hidden);
         ensure!(tokens.len() == t && logit_rows <= t, "invalid Qwen owner step rows");
-        let capacity = if tables.decode { DECODE_ROWS } else { self.prefill_rows };
+        let capacity = if tables.decode { self.decode_rows } else { self.prefill_rows };
         for owner in 0..2 {
             self.on_owner(owner, || {
                 let slot = self.workspace_slot(owner, tables.decode)?;
@@ -2796,7 +2840,7 @@ impl<'a> Qwen4Engine<'a> {
                 }
                 if slot.borrow().is_none() {
                     *slot.borrow_mut() = Some(self.workspace(capacity, tables.decode,
-                        if tables.decode { DECODE_ROWS } else { logit_rows.max(1) })?);
+                        if tables.decode { self.decode_rows } else { logit_rows.max(1) })?);
                 }
                 let workspace = slot.borrow();
                 let w = workspace.as_ref().context("Qwen owner workspace")?;
@@ -2816,7 +2860,7 @@ impl<'a> Qwen4Engine<'a> {
             self.inject_media(work[0], media, &tables.seq_first, &work[0].streams[0], t, HC)
         })?;
         let rows = Scalar::I32(i32::try_from(t)?);
-        let cap = if tables.decode { "m64" } else { "m4096" };
+        let cap = if tables.decode { self.decode_cap() } else { "m4096" };
         if graphed { return self.decode_placed(work, tables, t, rows, logit_rows); }
         let mut cur = [0; 2];
         let layers = &self.weights.layers;
@@ -2934,8 +2978,8 @@ impl<'a> Qwen4Engine<'a> {
                         self.enter(w, &mut c, Some(()), layer, index, rows, tables.spec)?;
                     }
                     match layer.attention {
-                        Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, "m64", tables.spec)?,
-                        Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
+                        Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, self.decode_cap(), tables.spec)?,
+                        Qwen4Attention::Full => self.full(w, index, layer, rows, self.decode_cap(), tables)?,
                     }
                     self.post_pre(w, c, layer, "mlp", rows)?;
                     // Routed experts run between segments (and outside capture).
@@ -3111,8 +3155,8 @@ impl<'a> Qwen4Engine<'a> {
                     self.enter(w, &mut c, Some(()), layer, index, rows, spec)?;
                 }
                 match layer.attention {
-                    Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, "m64", spec)?,
-                    Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
+                    Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, self.decode_cap(), spec)?,
+                    Qwen4Attention::Full => self.full(w, index, layer, rows, self.decode_cap(), tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
                 // Routed experts run between segments (and outside capture).
@@ -3315,7 +3359,7 @@ impl<'a> Qwen4Engine<'a> {
     /// plus `fp8_rows` for FP8-only prefill programs.
     fn w8_scalars(&self, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str) -> Vec<Scalar> {
         let mut scalars = vec![rows];
-        if Self::w8(layer) && cap != "m64" {
+        if Self::w8(layer) && !Self::is_decode_cap(cap) {
             scalars.push(Scalar::I32(i32::from(self.w8a8_prefill)));
         }
         scalars
@@ -3355,7 +3399,7 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend([("conv_state", conv), ("state", state), ("slots", w.row_table(&w.slots, 4)),
             ("seq_first", w.first_table()), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
-        let decode = cap == "m64";
+        let decode = Self::is_decode_cap(cap);
         if decode {
             pointers.push(("replay", replay));
         }
@@ -4209,7 +4253,7 @@ mod prefill_unit_tests {
                         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, manifest: None,
                         prefill_rows: span, prefill_shape: Some(shape), slots: 8, mark_bytes: 0,
                         ple: mapped.map(|width| (width, width == 160)),
-                        future_expert_bytes: 0, headroom: 0,
+                        future_expert_bytes: 0, headroom: 0, decode_rows: 64,
                     })?;
                     let planned = admitted.items.iter().find(|item| item.1 == "prefill step").unwrap().2;
                     assert_eq!(planned, runtime, "{shape:?}, MTP {mtp}, PLE {mapped:?}");

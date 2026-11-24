@@ -74,7 +74,7 @@ fn prefill_chunk_from(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, star
     ensure!(placement.mtp_frontier.get() == start, "MTP prefill requires contiguous canonical history");
     ensure!(n > 0 && seq.pending.is_empty(), "MTP prefill of an empty chunk or behind pending rows");
     let decode = engine.last_target_decode();
-    let (known, capacity) = prefill_rows(decode, n, next, engine.mtp_prefill_rows())?;
+    let (known, capacity) = prefill_rows_with_decode(decode, n, next, engine.decode_rows, engine.mtp_prefill_rows())?;
     if next.is_none() {
         // Stash first: the MTP step reuses the target streams' buffer.
         if !matches!(source, MtpSource::Pending) {
@@ -106,7 +106,11 @@ fn prefill_chunk_from(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, star
 }
 
 fn prefill_rows(decode: bool, rows: usize, next: Option<u32>, prefill_capacity: usize) -> Result<(usize, usize)> {
-    let capacity = if decode { DECODE_ROWS } else { prefill_capacity };
+    prefill_rows_with_decode(decode, rows, next, DECODE_ROWS, prefill_capacity)
+}
+
+fn prefill_rows_with_decode(decode: bool, rows: usize, next: Option<u32>, decode_rows: usize, prefill_capacity: usize) -> Result<(usize, usize)> {
+    let capacity = if decode { decode_rows } else { prefill_capacity };
     ensure!(rows > 0 && capacity > 0 && (!decode || rows <= capacity), "MTP target chunk exceeds its workspace");
     Ok((rows - usize::from(next.is_none()), capacity))
 }
@@ -129,14 +133,18 @@ struct PendingCapacityError {
 }
 
 fn pending_groups(counts: &[usize]) -> Result<Vec<std::ops::Range<usize>>> {
+    pending_groups_with_limit(counts, DECODE_ROWS)
+}
+
+fn pending_groups_with_limit(counts: &[usize], decode_rows: usize) -> Result<Vec<std::ops::Range<usize>>> {
     let (mut first, mut rows) = (0, 0);
     let mut groups = Vec::new();
     for (sequence, &count) in counts.iter().enumerate() {
-        if count > MTP_PENDING_ROWS || count > DECODE_ROWS {
+        if count > MTP_PENDING_ROWS || count > decode_rows {
             return Err(PendingCapacityError { sequence, rows: count,
-                capacity: MTP_PENDING_ROWS.min(DECODE_ROWS) }.into());
+                capacity: MTP_PENDING_ROWS.min(decode_rows) }.into());
         }
-        if rows + count > DECODE_ROWS {
+        if rows + count > decode_rows {
             groups.push(first..sequence);
             first = sequence;
             rows = 0;
@@ -147,10 +155,10 @@ fn pending_groups(counts: &[usize]) -> Result<Vec<std::ops::Range<usize>>> {
     Ok(groups)
 }
 
-fn grouped_drafts<T>(counts: &[usize], mut work: impl FnMut(std::ops::Range<usize>) -> Result<Vec<T>>)
+fn grouped_drafts<T>(counts: &[usize], decode_rows: usize, mut work: impl FnMut(std::ops::Range<usize>) -> Result<Vec<T>>)
     -> Result<Vec<T>> {
     let mut output = Vec::with_capacity(counts.len());
-    for group in pending_groups(counts)? {
+    for group in pending_groups_with_limit(counts, decode_rows)? {
         let expected = group.len();
         let values = work(group)?;
         ensure!(values.len() == expected, "MTP group returned {} of {expected} sequences", values.len());
@@ -164,7 +172,7 @@ pub(crate) fn draft(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing:
     -> Result<Vec<Vec<u32>>> {
     let counts: Vec<_> = seqs.iter().map(|s| s.seq.pending.len()).collect();
     // A group's complete chain must finish before another group reuses its hidden rows and draft offsets.
-    grouped_drafts(&counts, |group| draft_group(engine, &mut seqs[group], timing))
+    grouped_drafts(&counts, engine.decode_rows, |group| draft_group(engine, &mut seqs[group], timing))
 }
 
 fn draft_group(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing: &mut DraftTiming)
@@ -195,7 +203,7 @@ fn draft_group(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing: &mut
         }
         groups.push(MtpGroup { placement: s.placement, rows });
     }
-    ensure!(row <= DECODE_ROWS, "{row} pending MTP rows exceed a decode step");
+    ensure!(row <= engine.decode_rows, "{row} pending MTP rows exceed a decode step");
     if groups.is_empty() {
         return Ok(drafts);
     }
@@ -371,7 +379,7 @@ mod request_state_tests {
                 pending[0] += rows - count;
                 assert_eq!(pending_groups(&pending)?, vec![0..count]);
                 let mut calls = Vec::new();
-                let actual = grouped_drafts(&pending, |group| {
+                let actual = grouped_drafts(&pending, DECODE_ROWS, |group| {
                     calls.push(group.clone());
                     Ok(group.collect::<Vec<_>>())
                 })?;
@@ -381,6 +389,8 @@ mod request_state_tests {
         }
         assert_eq!(pending_groups(&[0, 64, 0])?, vec![0..3]);
         assert!(pending_groups(&[])?.is_empty());
+        assert_eq!(pending_groups_with_limit(&[4; 32], 128)?, vec![0..32]);
+        assert_eq!(pending_groups_with_limit(&[4; 33], 128)?, vec![0..32, 32..33]);
         Ok(())
     }
 
@@ -397,7 +407,7 @@ mod request_state_tests {
             assert!(groups.windows(2).all(|pair| pair[0].end == pair[1].start));
             let mut last_hidden = vec![usize::MAX; DECODE_ROWS];
             let mut deferred = vec![vec![usize::MAX; DECODE_ROWS]; 3];
-            let actual = grouped_drafts(&pending, |group| {
+            let actual = grouped_drafts(&pending, DECODE_ROWS, |group| {
                 assert!(pending[group.clone()].iter().sum::<usize>() <= DECODE_ROWS);
                 let mut row = 0;
                 let mut previous = Vec::new();

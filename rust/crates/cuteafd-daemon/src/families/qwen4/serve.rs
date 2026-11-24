@@ -101,7 +101,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;
+    let decode_rows = engine_args.resolved_decode_rows(args.max_sequences as u64)?;
     cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     cuteafd_bench::context::set_resolved("mtp", &engine_args.mtp.min(DECODE_ROWS - 1).to_string());
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
@@ -294,7 +296,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "qwen4", vocab_size: self.engine.cfg.vocab_size,
-            max_context: self.engine.max_context, slots: self.engine.slots, decode_rows: DECODE_ROWS,
+            max_context: self.engine.max_context, slots: self.engine.slots, decode_rows: self.engine.decode_rows,
             prefill_rows: self.engine.prefill_rows }
     }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library }

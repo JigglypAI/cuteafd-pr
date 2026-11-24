@@ -23,9 +23,9 @@ impl Family for Qwen {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            128,
             3,
-            "Qwen4 coordinator decode programs cover 64 rows (missing qwen4_*_m128 export)",
+            "Qwen4 coordinator decode programs cover up to 128 rows (qwen4_*_m64 / qwen4_*_m128)",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

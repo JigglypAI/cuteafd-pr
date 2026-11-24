@@ -1197,7 +1197,9 @@ if family == "minimax_m3" and decode_rows > 128:
     sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
 if family == "inkling2" and decode_rows > 128:
     sys.exit("inkling2 supports DECODE_ROWS up to 128 (missing inkling2_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3") and decode_rows > 64:
+if family == "qwen4" and decode_rows > 128:
+    sys.exit("qwen4 supports DECODE_ROWS up to 128 (missing qwen4_*_m256)")
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3", "qwen4") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 if family == "kimi_k3" and decode_rows > 128:
     sys.exit("kimi_k3 supports DECODE_ROWS up to 128 (missing kimi_k3_*_m256)")

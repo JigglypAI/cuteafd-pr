@@ -12,6 +12,8 @@ impl Opened {
         ensure!(peer != args.device, "Qwen dual devices must differ");
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let mtp = args.mtp > 0 && layers == self.cfg.layers;
+        let decode_rows = args.resolved_decode_rows(args.slots as u64)?;
+        cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
         cuteafd_bench::context::set_resolved("mtp", &if mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
         let devices = [args.device, peer].map(|id| Device { library: &self.library, id });
         let _entry = devices[0].enter()?;
@@ -26,7 +28,7 @@ impl Opened {
         for program in &programs {
             program.capacities().require_context("qwen4", args.max_context)?;
             super::programs::validate_all(&self.cfg, program, args.max_context)?;
-            for name in required_fp8_programs(args) { program.spec(&name)?; }
+            for name in required_fp8_programs(args, decode_rows) { program.spec(&name)?; }
         }
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library,
             &[args.device, peer], crate::shared::inventory::InventoryPhase::PreWeight, |id| {
@@ -44,7 +46,7 @@ impl Opened {
         let manifests = qwen4::dual_program_manifests(&manifest,
             [u32::try_from(sms[0])?, u32::try_from(sms[1])?], plan)?;
         let catalog = self.experts.as_ref().context("Qwen TP2 needs the selected expert catalog")?;
-        let rows = args.prefill_wave_rows().max(engine::DECODE_ROWS);
+        let rows = args.prefill_wave_rows().max(decode_rows);
         let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
         let mut experts = qwen4::QwenExperts::read(catalog, &args.native_lib, layers, 2, rows as u64)?;
         experts.remap_devices(&[args.device, peer])?;
@@ -59,7 +61,7 @@ impl Opened {
         let ple_info = self.checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
             .map(|t| (weights.resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
         let inputs = admission::inputs(args, &self.cfg, layers, mtp, Some(&manifests[0]), ple_info, 0)?;
-        let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&self.cfg, layers, mtp, args.kv_format)?;
+        let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry_rows(&self.cfg, layers, mtp, args.kv_format, decode_rows)?;
         let mark_bytes = geometry.ranks[0].retained_mark_bytes;
         ensure!(mark_bytes > 0 && inputs.mark_bytes % mark_bytes == 0, "Qwen prefix reservation must name complete marks");
         let code = if catalog.exl3().is_some() { "exl3" } else { "fp8" };
@@ -164,7 +166,7 @@ impl Opened {
         let ple = match self.cfg.ple_layers.first().copied().filter(|&layer| layer < layers) {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
                 &self.cfg, layer, args.prefill_wave_rows(), args.resolved_prefill()?.waves as usize,
-                engine::DECODE_ROWS))?), None => None,
+                decode_rows))?), None => None,
         };
         weights::arena::probe(&self.library, &[devices[0].id, devices[1].id], &model, &embedding)?;
         let admitted = admission::ExpertAdmission { placement: placement.clone(),
@@ -173,8 +175,8 @@ impl Opened {
         let pool = usize::try_from(placement.pool_tokens)?;
         let context = crate::shared::context::pool_context("qwen4", context, pool)?;
         let engine_ranks = [(devices[0], &programs[0], streams[0].raw), (devices[1], &programs[1], streams[1].raw)];
-        let mut engine = engine::Qwen4Engine::new_placed(&self.library, self.cfg.clone(), model, ple, &owners,
-            &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, args.kv_format, embedding)?;
+        let mut engine = engine::Qwen4Engine::new_placed_with_decode_rows(&self.library, self.cfg.clone(), model, ple, &owners,
+            &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, decode_rows, args.kv_format, embedding)?;
         engine.prefill_shape = args.prefill_shape()?;
         engine.attention_plan = plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

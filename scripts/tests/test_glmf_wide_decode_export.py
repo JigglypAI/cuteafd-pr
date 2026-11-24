@@ -302,6 +302,23 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
         assert calls[f"attn_producer_w8_kv_fp8_m{cap}"] == {
             "max_rows": cap, "fp8_only": mode, "kv_format": "fp8"}
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
+    assert calls["ple_commit_m128"] == {"replay_rows": 128}
+    assert calls["gdn_commit_m128"] == {"replay_rows": 128}
+    assert calls["gdn_m128"] == {"max_rows": 128, "decode": True}
+    assert calls["attn_producer_m128"] == {"max_rows": 128}
+    assert calls["index_topk_m128"] == {"max_rows": 128, "max_context": 262144}
+    assert calls["sparse_gqa_m128"] == {"max_rows": 128, "route": "decode"}
+    assert calls["attn_o_m128"] == {"max_rows": 128}
+    assert calls["gdn_fp8_m128"] == {"max_rows": 128, "fp8": True}
+    assert calls["attn_producer_fp8_m128"] == {"max_rows": 128, "fp8": True}
+    assert calls["attn_o_fp8_m128"] == {"max_rows": 128, "fp8": True}
+    assert calls["gdn_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
+    assert calls["attn_producer_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
+    assert calls["attn_o_w8_m128"] == {"max_rows": 128, "fp8_only": "decode"}
+    assert calls["attn_producer_kv_fp8_m128"] == {"max_rows": 128, "kv_format": "fp8"}
+    assert calls["sparse_gqa_kv_fp8_m128"] == {"max_rows": 128, "kv_format": "fp8", "route": "decode"}
+    assert calls["attn_producer_fp8_kv_fp8_m128"] == {"max_rows": 128, "fp8": True, "kv_format": "fp8"}
+    assert calls["attn_producer_w8_kv_fp8_m128"] == {"max_rows": 128, "fp8_only": "decode", "kv_format": "fp8"}
 
 
 @pytest.mark.parametrize("name", ["qwen35_9b", "qwen38_27b"])

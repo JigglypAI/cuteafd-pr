@@ -201,7 +201,8 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let checkpoint = input.checkpoint();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
     let mtp = shape.mtp && cfg.mtp_layers > 0;
-    let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
+    let decode_rows = options.decode_rows as usize;
+    let geometry = crate::serving_capacity::qwen_cache_geometry_rows(&cfg, cfg.layers, mtp, options.qwen_kv, decode_rows)?;
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
         options.prefix_entries("qwen4"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
@@ -255,7 +256,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)),
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
-            ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4") },
+            ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4"), decode_rows },
         capacity_bytes: options.rtx_bytes[0], baseline: Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks, host, encoders,
@@ -286,7 +287,8 @@ fn host_sample(options: &LayoutOptions) -> Result<(u64, u64)> {
 fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::super::PlanInput,
     cfg: &Qwen4Config, owners: usize, span_rows: u64, mtp: bool) -> Result<qwen4::QwenHost> {
     use crate::placement::families::qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs,
-        mtp_pinned_logits_bytes, pinned_logits_bytes, scoring_logits_bytes};
+        mtp_pinned_logits_bytes, pinned_logits_bytes_rows, scoring_logits_bytes_rows};
+    let decode_rows = options.decode_rows as usize;
     let checkpoint = input.checkpoint();
     let (total, available) = host_sample(options)?;
     let all_onboarded = cfg.layers > 0
@@ -299,11 +301,11 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         let tensor = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
             .context("Qwen mapped PLE layer without table headers")?;
         anyhow::ensure!(tensor.meta.shape.len() == 2 && tensor.meta.shape[0] > 0, "Qwen PLE table is not a nonempty matrix");
-        Some(PleHost::new(cfg, unit_rows, waves, tensor.meta.byte_length / tensor.meta.shape[0] as u64)?)
+        Some(PleHost::new_with_decode_rows(cfg, unit_rows, waves, tensor.meta.byte_length / tensor.meta.shape[0] as u64, decode_rows)?)
     } else { None };
     let uploads = UploadInputs { prefill_rows: usize::try_from(unit_rows)?, waves: usize::try_from(waves)?,
         spark: ranks > 0, mtp: mtp && cfg.mtp_layers > 0 && options.native_mtp_layers > 0, ple_ids: !mapped, packed_decode_tables: owners == 1 };
-    let (bounds, mtp_upload) = uploads.bounds(cfg)?;
+    let (bounds, mtp_upload) = uploads.bounds_with_decode_rows(cfg, decode_rows)?;
     let spark = if ranks > 0 {
         let intake_rows = if waves == 1 { unit_rows } else {
             crate::serving_capacity::PrefillShape { unit_rows, waves }.validate()?.slot_rows() };
@@ -332,9 +334,9 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
     Ok(QwenHost {
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
-        pinned_logits: pinned_logits_bytes(owners, cfg.vocab_size as u64)?,
+        pinned_logits: pinned_logits_bytes_rows(owners, cfg.vocab_size as u64, decode_rows)?,
         mtp_pinned_logits: mtp_pinned_logits_bytes(waves > 1, uploads.mtp, cfg.vocab_size as u64)?,
-        scoring_logits: scoring_logits_bytes(span_rows, cfg.vocab_size as u64)?,
+        scoring_logits: scoring_logits_bytes_rows(span_rows, cfg.vocab_size as u64, decode_rows)?,
         prefix_quota, prefix_chunk, loaded_media_cache: 0,
         host_embedding,
         table_reactor: crate::formats::mapped_table::table_reactor_workspace_bytes(report.mapped_placement.mapped) as u64,
@@ -614,7 +616,8 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     fixed.extend(qwen4::dual_projection_load_staging(selected));
     if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, unit_rows.max(64))?); }
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
-    let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
+    let decode_rows = options.decode_rows as usize;
+    let geometry = crate::serving_capacity::qwen_cache_geometry_rows(&cfg, cfg.layers, mtp, options.qwen_kv, decode_rows)?;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(concurrency,
         options.prefix_entries("qwen4"), geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
@@ -627,7 +630,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
-            ple, future_expert_bytes: 0, headroom },
+            ple, future_expert_bytes: 0, headroom, decode_rows },
         gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], reserve_bytes: headroom,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: devices[rank].used_bytes() } }),
         arenas: &arenas, layer_experts: &costs, layer_extra: &extra, fixed,
