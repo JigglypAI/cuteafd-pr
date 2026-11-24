@@ -57,6 +57,19 @@ def test_nvfp4_fouroversix_chooses_smallest_block_error_and_per_token_scale():
     assert torch.equal(model.quantize_nvfp4(rows), rows)
 
 
+
+def test_nvfp4_scale_division_does_not_round_via_reciprocal_multiply():
+    block = torch.tensor([float.fromhex(v) for v in (
+        "0x1.d74f54p+0", "0x1.3696c0p+2", "-0x1.6b615ap+1", "0x1.3fb5d8p+1",
+        "0x1.1796acp+0", "0x1.3e88bap+0", "0x1.9a6f64p-1", "-0x1.fd129ap+0",
+        "0x1.5b7c24p+2", "-0x1.a0fb5ep+3", "-0x1.131224p+2", "0x1.2f7a24p+2",
+        "0x1.13015ep+1", "0x1.150cfcp+0", "-0x1.77c082p+2", "0x1.99cc62p+1",
+    )])
+    actual = model.quantize_nvfp4(block.unsqueeze(0))
+    # Reciprocal-multiply instead yields 6.5153427 for this lane.
+    assert actual[0, 8].item() == 4.34356164932251
+
+
 @pytest.mark.parametrize("window", [None, 4])
 def test_mini_attention_matches_scalar_and_preserves_prefix_rows(window):
     rng = torch.Generator().manual_seed(3)
