@@ -440,9 +440,14 @@ impl ContextLoad {
                 // Never retry failures sequentially: that would pretend a queued
                 // or rejected wide batch achieved the requested concurrency.
                 let before = occupancy(ctx.client);
+                let thermal_mark = ctx.client.thermal_mark();
                 let graph_before = common::phase_counters(ctx.client).graph;
                 let (results, samples) = measured_wave(ctx.client, bodies("timed"));
                 let graph_after = common::phase_counters(ctx.client).graph;
+                // As in the short sweep: one throttle window per timed wave.
+                if let Some(thermal) = ctx.client.thermal_since(thermal_mark) {
+                    point["thermal"] = thermal;
+                }
                 if let Some(graph) = common::graph_interval(graph_before.as_ref(), graph_after.as_ref()) {
                     point["graph"] = graph;
                 }
@@ -533,7 +538,14 @@ fn record(bases: &[Value], points: &[Value]) -> Value {
             ]
         })
         .collect();
-    json!({"bases": bases, "points": points, "table": table(&["context", "C", "status", "aggregate tok/s", "median tok/s", "TTFT ms", "cached tokens", "prompt tokens", "suffix tokens", "uncached rows", "cold TTFT ms", "restore pages", "reason"], rows)})
+    json!({"bases": bases, "points": points, "graph_bands": graph_bands(points), "table": table(&["context", "C", "status", "aggregate tok/s", "median tok/s", "TTFT ms", "cached tokens", "prompt tokens", "suffix tokens", "uncached rows", "cold TTFT ms", "restore pages", "reason"], rows)})
+}
+
+/// One `common::graph_band` row per timed point with graph counters, labelled
+/// `context <tokens> C<c>`, with that wave's throttle summary.
+fn graph_bands(points: &[Value]) -> Vec<Value> {
+    points.iter().filter(|p| p["graph"].is_object()).map(|p| common::graph_band(
+        format!("context {} C{}", p["context"], p["c"]), &p["graph"], p.get("thermal"))).collect()
 }
 
 #[cfg(test)]
@@ -631,6 +643,30 @@ mod tests {
             .validate()
             .is_err());
         }
+    }
+    #[test]
+    fn record_lists_one_graph_band_per_timed_point_with_its_thermals() {
+        let graph = json!({"available": true, "captures": 0, "zero_captures": true, "devices": [{"device": 0,
+            "totals": {"captures": 0, "misses": 3, "eager_runs": 3},
+            "sites": {"v41.exchange": {"totals": {"misses": 3, "eager_runs": 3}, "spans_devices": true}}}]});
+        let thermal = json!({"seconds": 20.0, "gpus": [{"index": 1, "throttle_s": {"sw_power_cap": 2.0, "hw_thermal": 0.5},
+            "busy": {"sm_clock_mean_mhz": 2400.0}, "temperature_c": {"max": 81.0}, "tlimit_margin_c": {"min": 6.0}}]});
+        let points = vec![
+            json!({"context": 32768, "c": 8, "status": "ok", "graph": graph, "thermal": thermal}),
+            json!({"context": 32768, "c": 16, "status": "skipped", "reason": "pool"}),
+            json!({"context": 131072, "c": 1, "status": "ok", "graph": {"available": false, "reason": "no start sample"}})];
+        let bands = record(&[], &points)["graph_bands"].as_array().unwrap().clone();
+        assert_eq!(bands.len(), 2, "a skipped point has no band");
+        assert_eq!(bands[0]["band"], "context 32768 C8");
+        assert_eq!(bands[0]["eager_runs"], 3);
+        assert_eq!(bands[0]["sites"][0]["site"], "v41.exchange");
+        assert_eq!(bands[0]["sites"][0]["spans_devices"], true);
+        assert_eq!(bands[0]["thermal"]["power_cap_s"], 2.0);
+        assert_eq!(bands[0]["thermal"]["thermal_slowdown_s"], 0.5);
+        assert_eq!(bands[0]["thermal"]["min_tlimit_headroom_c"], 6.0);
+        assert_eq!(bands[1]["band"], "context 131072 C1");
+        assert_eq!(bands[1]["available"], false);
+        assert!(bands[1]["thermal"].is_null());
     }
     #[test]
     fn occupancy_requires_full_concurrency_to_claim_sharing() {

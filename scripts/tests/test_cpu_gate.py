@@ -811,6 +811,137 @@ def test_gate_lease_counts_waiters_and_releases(tmp_path):
             assert reused['slot'] == 1
 
 
+def _queued_waiter(tmp_path, slots, timeout=30):
+    """A gate_lease waiter in a child process; prints 'acquired SLOT' and holds until stdin closes."""
+    code = (f'import importlib.machinery, importlib.util, sys\n'
+            f'from pathlib import Path\n'
+            f'loader = importlib.machinery.SourceFileLoader("cpu_gate", {str(ROOT / "scripts/dev/cpu-gate")!r})\n'
+            f'spec = importlib.util.spec_from_loader("cpu_gate", loader)\n'
+            f'gate = importlib.util.module_from_spec(spec); loader.exec_module(gate)\n'
+            f'gate.GATE_LEASE_POLL = 0.05\n'
+            f'with gate.gate_lease(Path({str(tmp_path)!r}), slots={slots}, timeout={timeout}) as lease:\n'
+            f'    print("acquired", lease["slot"], flush=True)\n'
+            f'    sys.stdin.read()\n')
+    return subprocess.Popen([sys.executable, '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+def _tickets(tmp_path):
+    return sorted(path.name for path in (tmp_path / 'cpu-gate-q').glob('*.ticket'))
+
+
+def _wait_for(predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, 'condition not reached'
+        time.sleep(0.02)
+
+
+def _release(process):
+    process.stdin.close()
+    process.wait(timeout=10)
+
+
+def test_gate_lease_honours_arrival_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
+    waiters = []
+    try:
+        with gate.gate_lease(tmp_path, slots=1, timeout=0):
+            for _ in range(2):
+                waiters.append(_queued_waiter(tmp_path, slots=1))
+                _wait_for(lambda: len(_tickets(tmp_path)) == len(waiters))
+            early, late = waiters
+            # The later waiter sees the free slot too, but the earlier ticket is ahead of it.
+        assert early.stdout.readline().split() == ['acquired', '0']
+        time.sleep(0.3)
+        assert late.poll() is None and len(_tickets(tmp_path)) == 1
+        _release(early)
+        assert late.stdout.readline().split() == ['acquired', '0']
+        _wait_for(lambda: not _tickets(tmp_path))
+        _release(late)
+    finally:
+        for process in waiters:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_gate_lease_queue_position_blocks_a_newer_waiter_when_a_slot_frees(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
+    queue = tmp_path / 'cpu-gate-q'
+    queue.mkdir()
+    hw = gate.HWLOCK
+    # An older live waiter (flocked ticket) is ahead, so a free slot is not ours to take.
+    older, handle = hw._publish(queue, hw._next_seq(queue), 'ticket', dict(pid=os.getpid(), created=time.time()))
+    try:
+        with pytest.raises(TimeoutError):
+            with gate.gate_lease(tmp_path, slots=1, timeout=0):
+                pytest.fail('jumped an older live ticket')
+        assert _tickets(tmp_path) == [older.name]
+    finally:
+        handle.close()
+    older.unlink()
+    with gate.gate_lease(tmp_path, slots=1, timeout=0) as lease:
+        assert lease['slot'] == 0
+
+
+def test_gate_lease_skips_and_removes_dead_tickets(tmp_path):
+    queue = tmp_path / 'cpu-gate-q'
+    queue.mkdir()
+    dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+    dead.wait()
+    stale = queue / f'{1:012d}.{dead.pid}.ticket'
+    stale.write_text(json.dumps(dict(pid=dead.pid, created=time.time() - 60)))
+    (queue / 'seq').write_text('1')
+    with gate.gate_lease(tmp_path, slots=1, timeout=0) as lease:
+        assert lease['slot'] == 0 and lease['ticket'] == 2
+        assert not stale.exists() and not _tickets(tmp_path)
+
+
+def test_gate_lease_timeout_removes_its_ticket(tmp_path):
+    with gate.gate_lease(tmp_path, slots=1, timeout=0):
+        with pytest.raises(TimeoutError, match='no gate lease free'):
+            with gate.gate_lease(tmp_path, slots=1, timeout=0):
+                pytest.fail('a second gate acquired the only lease')
+        assert not _tickets(tmp_path)
+    assert not _tickets(tmp_path)
+
+
+def test_gate_lease_stopping_removes_its_ticket(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, 'STOPPING', gate.threading.Event())
+    gate.STOPPING.set()
+    with gate.gate_lease(tmp_path, slots=1, timeout=60):
+        with pytest.raises(KeyboardInterrupt, match='terminated while waiting'):
+            with gate.gate_lease(tmp_path, slots=1, timeout=60):
+                pytest.fail('a stopped gate acquired a lease')
+        assert not _tickets(tmp_path)
+
+
+def test_gate_lease_admits_the_oldest_n_waiters(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
+    waiters = []
+    try:
+        with gate.gate_lease(tmp_path, slots=2, timeout=0), gate.gate_lease(tmp_path, slots=2, timeout=0):
+            for _ in range(3):
+                waiters.append(_queued_waiter(tmp_path, slots=2))
+                _wait_for(lambda: len(_tickets(tmp_path)) == len(waiters))
+        first, second, third = waiters
+        first_slot, second_slot = (process.stdout.readline().split()[1] for process in (first, second))
+        assert {first_slot, second_slot} == {'0', '1'}
+        time.sleep(0.3)
+        assert third.poll() is None and len(_tickets(tmp_path)) == 1
+        _release(second)
+        assert third.stdout.readline().split() == ['acquired', second_slot]
+        _wait_for(lambda: not _tickets(tmp_path))
+        _release(first)
+        _release(third)
+    finally:
+        for process in waiters:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
 def test_compiler_cache_setup_retains_cache_configuration(tmp_path):
     wrapper = tmp_path / 'kache'
     wrapper.write_text('#!/bin/sh\n[ "$1" = --version ] && exit 0\nexit 1\n')

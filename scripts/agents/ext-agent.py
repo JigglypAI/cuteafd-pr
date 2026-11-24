@@ -18,6 +18,10 @@ import uuid
 ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
 POLL = 0.5
+# Idle/asking must hold for this long after the last content change on screen.
+# Raw stream growth is not a signal: Antigravity re-asserts terminal modes
+# (bracketed paste, modifyOtherKeys) every ~2 s while idle without drawing
+# anything, which kept an idle worker flapping back to busy.
 IDLE_SETTLE = 2.0
 
 
@@ -75,6 +79,13 @@ def event(path, kind, **fields):
 
 class Adapter:
     prompt = r'^\s*[>❯]\s*$'
+    # Lines that redraw on their own without new work: spinners, tips, and the
+    # animated "N commands still running" glyph. They never count as content.
+    animated = r'^\s*[⠀-⣿]|^\s*└ Tip:|^\s*[◎◉○]\s*[0-9]+ commands? still running'
+    # Tool/thought narration that is never a question to the driver.
+    narration = r'(?!)'
+    # A background command listed under the input box keeps the turn alive.
+    background = r'(?!)'
     busy = r'(?i)esc to cancel|escape to interrupt|esc to interrupt|ctrl\+c to interrupt'
     error = r'(?i)eligibility check failed|\bUNAVAILABLE\b.*503|authentication failed|not signed in|rate limit|connection failed|\bError:'
     transient = r'(?i)Eligibility check failed:\s*UNAVAILABLE|UNAVAILABLE\s*\(code 503\)'
@@ -86,7 +97,13 @@ class Adapter:
     def state(self, text, meta):
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         body = '\n'.join(lines)
-        if (re.search(r'^[\s]*[⠁-⣿]', '\n'.join(lines[-5:]), re.M) or
+        # The input box sits above background-task, queue and tip lines, so
+        # find the prompt near the bottom rather than in a fixed tail.
+        prompts = [i for i in range(max(0, len(lines) - 10), len(lines)) if re.search(self.prompt, lines[i])]
+        prompt_at = prompts[-1] if prompts else None
+        spinner = lines[max(0, prompt_at - 8):] if prompt_at is not None else lines[-5:]
+        if (re.search(r'^[\s]*[⠁-⣿]', '\n'.join(spinner), re.M) or
+                (prompt_at is not None and any(re.search(self.background, line) for line in lines[prompt_at + 1:])) or
                 re.search(self.busy, '\n'.join(lines[-2:])) or
                 re.search(r'\b[1-9][0-9]* queued\b|edit queued messages', '\n'.join(lines[-2:])) or
                 # Grok shows its prompt while a background command runs.
@@ -97,25 +114,40 @@ class Adapter:
             return 'asking'
         # Only inspect the current turn, not old questions/errors in scrollback.
         marker = message_marker(meta.get('last_message', ''))
+        start = 0
         if marker:
             indices = [i for i, line in enumerate(lines) if marker in line]
             if indices:
-                body = '\n'.join(lines[indices[-1] + 1:])
+                start = indices[-1] + 1
+                body = '\n'.join(lines[start:])
         if re.search(self.error, body):
             return 'error'
-        prompt = any(re.search(self.prompt, line) for line in lines[-5:])
-        if prompt:
-            content = [line.strip() for line in body.splitlines()
-                       if not re.search(self.prompt, line) and not self.footer(line)]
+        if prompt_at is not None:
+            # Only the conversation above the input box can ask a question;
+            # status lines below it (tasks, queue, footer) cannot.
+            content = [line.strip() for line in lines[start:prompt_at] if not self.chrome(line)]
             if content and (content[-1].endswith('?') or re.search(self.asking, '\n'.join(content[-4:]))):
                 return 'asking'
             return 'idle'
-        if re.search(self.asking, '\n'.join(lines[-8:])):
+        # No input box: an approval menu or similar. Its option rows may look
+        # like narration, so only drop self-animating chrome here.
+        if re.search(self.asking, '\n'.join(line for line in lines[-8:] if not re.search(self.animated, line))):
             return 'asking'
         return 'busy' if meta.get('submitted_at') else 'starting'
 
     def footer(self, line):
         return bool(re.search(r'^[\s─-╿]+$|Worked for |minimal .* /help|ctrl\+o transcript|for shortcuts|Gemini .* (?:high|medium|low)$|Grok .*always-approve', line))
+
+    def chrome(self, line):
+        return bool(re.search(self.prompt, line) or self.footer(line) or
+                    re.search(self.animated, line) or re.search(self.narration, line))
+
+    def normalize(self, text):
+        """The screen's content: what the idle debounce compares. Terminal mode
+        redraws, spinners, tips and footers change without the worker doing
+        anything new, so they are dropped."""
+        return '\n'.join(line.rstrip() for line in text.splitlines()
+                         if line.strip() and not self.footer(line) and not re.search(self.animated, line))
 
 
 class Grok(Adapter):
@@ -134,6 +166,12 @@ class Grok(Adapter):
 
 
 class Agy(Adapter):
+    # Thought summaries, tool rows, queued driver messages and the post-
+    # interrupt "What should Antigravity CLI do instead?" are not questions.
+    narration = r'^\s*(?:[○●▸⎿]|… [0-9]+ more actions)'
+    # "● [09:32:53] sleep 30 running" under the input box: agy resumes on its own
+    # when that command ends, so the turn is not over.
+    background = r'^\s*● \[[0-9]{1,2}:[0-9]{2}:[0-9]{2}\] .*\brunning$'
     # Antigravity's own default model changes underneath us (it drifted to
     # Argon/medium), and Carbon carries its effort in the model name. Always
     # pin a model: an explicit --model wins, otherwise --effort selects the
@@ -169,6 +207,22 @@ def screen(meta, lines=80):
     return clean(tmux('capture-pane', '-p', '-t', meta['pane'], '-S', '-' + str(lines), check=False)).rstrip()
 
 
+def debounce(tool, text, reading, meta, now):
+    """Settle the adapter's reading of one screen capture.
+
+    The fingerprint is the screen without self-animating chrome, plus the
+    reading itself, so a spinner that vanishes without new text still counts
+    as a change. Idle/asking after a submission holds only once that
+    fingerprint has been stable for IDLE_SETTLE. Returns the settled state and
+    the fingerprint fields to record."""
+    content = hashlib.sha256((reading + '\0' + ADAPTERS[tool].normalize(text)).encode()).hexdigest()
+    changed_at = now if content != meta.get('content_hash') else meta.get('last_content_at', meta['created_at'])
+    state = reading
+    if reading in ('idle', 'asking') and meta.get('submitted_at') and now - changed_at < IDLE_SETTLE:
+        state = 'busy'
+    return state, {'content_hash': content, 'last_content_at': changed_at}
+
+
 def snapshot(path, lines=30):
     meta = read_meta(path)
     info = pane(meta) if meta.get('pane') else None
@@ -180,10 +234,10 @@ def snapshot(path, lines=30):
         state = 'exited'
     quiet = max(0, time.time() - meta.get('last_output_at', meta['created_at']))
     if state in ('idle', 'asking') and meta.get('submitted_at'):
-        raw = path / 'transcript.raw'
-        size = raw.stat().st_size if raw.exists() else 0
-        if quiet < IDLE_SETTLE or size != meta.get('raw_size'):
-            state = 'busy'
+        # The supervisor captures 200 lines; compare like with like. A change it
+        # has not recorded yet is fresh content and keeps the worker busy.
+        current = text if lines <= 200 else screen(meta, 200)
+        state, _ = debounce(meta['tool'], current, state, meta, time.time())
     context = re.findall(r'\b([0-9.]+[KM]?)\s*/\s*([0-9.]+[KM]?)\s*\(([0-9]+)%\)', text, re.I)
     usage = {'used': context[-1][0], 'limit': context[-1][1], 'percent': int(context[-1][2])} if context else None
     return {'context_usage': usage, 'name': meta['name'], 'tool': meta['tool'], 'state': state,
@@ -252,7 +306,7 @@ def spawn(path):
     tmux('set-option', '-t', pane_id, 'remain-on-exit', 'on')
     tmux('set-option', '-t', pane_id, 'history-limit', '50000')
     tmux('pipe-pane', '-t', pane_id, 'cat >> ' + shlex.quote(str(path / 'transcript.raw')))
-    save(path, pane=pane_id, state='starting', screen_hash='', retry_at=None, error=None)
+    save(path, pane=pane_id, state='starting', screen_hash='', content_hash='', retry_at=None, error=None)
     tmux('wait-for', '-S', token)
     event(path, 'launch', command=adapter.command(meta))
 
@@ -336,20 +390,20 @@ def supervise(path):
             text = screen(meta, 200) if info else ''
             adapter = ADAPTERS[meta['tool']]
             fingerprint = hashlib.sha256(text.encode()).hexdigest()
-            raw = path / 'transcript.raw'
-            size = raw.stat().st_size if raw.exists() else 0
-            changed = fingerprint != meta.get('screen_hash') or size != meta.get('raw_size')
-            if changed:
-                meta = save(path, screen_hash=fingerprint, raw_size=size, last_output_at=time.time())
+            if fingerprint != meta.get('screen_hash'):
+                # Re-reads meta under the lock: a submit that raced this capture
+                # must be visible to the state reading below.
+                meta = save(path, screen_hash=fingerprint, last_output_at=time.time())
+            reading = adapter.state(text, meta) if info and not info['dead'] else 'exited'
+            state, fields = debounce(meta['tool'], text, reading, meta, time.time())
+            if fields['content_hash'] != meta.get('content_hash'):
+                meta = save(path, **fields)
             if 'Do you trust the contents' in text and meta.get('auto_approve') and not trust_sent:
                 tmux('send-keys', '-t', meta['pane'], adapter.trust_key)
                 trust_sent = True
                 event(path, 'trust', cwd=meta['cwd'])
                 time.sleep(POLL)
                 continue
-            state = adapter.state(text, meta) if info and not info['dead'] else 'exited'
-            if state in ('idle', 'asking') and meta.get('submitted_at') and time.time() - meta['last_output_at'] < IDLE_SETTLE:
-                state = 'busy'
             # Old 503 output must not trigger retries after a later successful turn.
             current = text
             marker = message_marker(meta.get('last_message', ''))
@@ -452,12 +506,16 @@ def wait(args):
         result = snapshot(path, args.lines)
         if args.progress_interval and time.monotonic() >= progress_at:
             size = raw.stat().st_size if raw.exists() else 0
+            delta = ''
             if size > offset:
                 with raw.open('rb') as handle:
                     handle.seek(offset)
                     # Do not advance the driver's incremental transcript cursor.
                     delta = clean(handle.read().decode('utf-8', errors='replace'))
                     offset = handle.tell()
+            # Bare terminal-mode escapes (an idle Antigravity's ~2 s heartbeat)
+            # clean to nothing and are not new output.
+            if delta.strip():
                 notable = ADAPTERS[read_meta(path)['tool']].tools + r'|(?i:error|warning:|panicked|test result)'
                 markers = list(dict.fromkeys(line.strip()[:160] for line in delta.splitlines()
                                             if re.search(notable, line)))

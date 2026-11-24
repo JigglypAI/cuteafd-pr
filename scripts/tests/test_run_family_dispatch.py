@@ -5875,14 +5875,12 @@ def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_pa
         assert stop < probe_at
 @pytest.mark.parametrize("prewarm,donor,lag", [("on", "off", "0"), ("off", "on", "0"), ("off", "on", "16")])
 def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
-              "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm",
+        f"GRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
-        if "serve-glmf" in line and "--snapshot" in line))
+        if "serve-glm" in line and "--snapshot" in line))
     assert ("--graph-no-prewarm" in serve) == (prewarm == "off")
     assert ("--graph-donor-always" in serve) == (donor == "on")
     assert "CUTEAFD_GRAPH_PREWARM" not in result.stderr
@@ -5918,14 +5916,28 @@ def test_inkling_graph_donors_default_to_qualified_lag(tmp_path, overrides, dona
     ("cold", "on", "must be a non-negative integer"),
 ])
 def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm",
+        f"GRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    assert result.returncode == 2, result.stderr
+    assert error in result.stderr
+    assert "serve-glm --snapshot" not in result.stderr
+
+
+@pytest.mark.parametrize("extra", [
+    "GRAPH_DONOR_ALWAYS=on\n",
+    "GRAPH_DONOR_ALWAYS=off\n",
+    "GRAPH_DONOR_COLD_LAG=8\n",
+    "GRAPH_DONOR_ALWAYS=on\nGRAPH_DONOR_COLD_LAG=16\n",
+    "GRAPH_EXACT_ROWS=on\n",
+])
+def test_glmf_refuses_fixed_graph_donor_and_removed_mode_keys(tmp_path, extra):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"RTX_GPUS=2\n{extra}")
     assert result.returncode == 2, result.stderr
-    assert error in result.stderr
-    assert "serve-glmf --snapshot" not in result.stderr
+    assert "serve-glmf" not in result.stderr
 
 
 @pytest.mark.parametrize("config,model,extra,command", [
@@ -5946,54 +5958,6 @@ def test_graph_prewarm_rejects_other_values(tmp_path):
     result = _family_launch_result(tmp_path, config, "test/glm", "GRAPH_PREWARM=lazy\n")
     assert result.returncode == 2, result.stderr
     assert "GRAPH_PREWARM must be on or off" in result.stderr
-
-
-@pytest.mark.parametrize("mode,expected", [
-    ("off", None),
-    ("on", "--graph-exact-rows=on"),
-    ("prewarm", "--graph-exact-rows=prewarm"),
-])
-def test_graph_exact_rows_dispatches_typed_cli_on_glmf(tmp_path, mode, expected):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"RTX_GPUS=2\nGRAPH_EXACT_ROWS={mode}\n")
-    assert result.returncode == 0, result.stderr
-    assert "CUTEAFD_GRAPH_EXACT_ROWS" not in result.stderr
-    serve = shlex.split(next(line for line in result.stderr.splitlines()
-        if "serve-glmf" in line and "--snapshot" in line))
-    if expected is None:
-        assert not any(arg.startswith("--graph-exact-rows") for arg in serve)
-    else:
-        assert expected in serve
-
-
-def test_graph_exact_rows_rejects_invalid_and_other_families(tmp_path):
-    glmf = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
-            "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    bad_dir = tmp_path / "bad"
-    bad_dir.mkdir()
-    bad = _family_launch_result(bad_dir, glmf, "test/glmf", "RTX_GPUS=2\nGRAPH_EXACT_ROWS=lazy\n")
-    assert bad.returncode == 2, bad.stderr
-    assert "GRAPH_EXACT_ROWS must be off, on, or prewarm" in bad.stderr
-    glm = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
-    unused_dir = tmp_path / "unused"
-    unused_dir.mkdir()
-    unused = _family_launch_result(unused_dir, glm, "test/glm", "GRAPH_EXACT_ROWS=on\n")
-    assert unused.returncode != 0, unused.stderr
-    assert "unused configuration key" in unused.stderr
-
-
-def test_graph_exact_rows_allows_donor_cold_lag_override(tmp_path):
-    glmf = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
-            "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, glmf, "test/glmf",
-                                   "RTX_GPUS=2\nGRAPH_EXACT_ROWS=on\nGRAPH_DONOR_COLD_LAG=16\n")
-    assert result.returncode == 0, result.stderr
-    serve = shlex.split(next(line for line in result.stderr.splitlines()
-        if "serve-glmf" in line and "--snapshot" in line))
-    assert "--graph-exact-rows=on" in serve
-    idx = serve.index("--graph-donor-cold-lag")
-    assert serve[idx + 1] == "16"
 
 
 @pytest.mark.parametrize("precision,flag", [("on", "true"), ("off", "false")])

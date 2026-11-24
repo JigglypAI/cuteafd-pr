@@ -4604,3 +4604,24 @@ def test_summary_lists_graph_captures_per_timed_band(tmp_path):
     assert '| c | candidate | 1 | levels C16 | 2 | 1 | 3 | 1 | NO |' in text
     assert 'unavailable: no start sample' in text
     assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['graph_bands'] == bands
+
+
+def test_summary_lists_context_load_bands_with_thermals_and_eager_sites(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:context_load'}, tmp_path)
+    reports = Path(job['state']) / 'reports' / 'context'
+    reports.mkdir(parents=True)
+    thermal = dict(seconds=20.0, power_cap_s=2.5, thermal_slowdown_s=0.5, busy_sm_clock_mhz=2400.0,
+                   max_temperature_c=81.0, min_tlimit_headroom_c=6.0, gpus=[])
+    bands = [dict(band='context 32768 C8', available=True, captures=0, device_captures=0, misses=4, eager_runs=4,
+                  zero_captures=True, thermal=thermal,
+                  sites=[dict(site='v41.exchange', eager_runs=3, misses=3, spans_devices=True),
+                         dict(site='v41.decode', eager_runs=1, misses=1, spans_devices=False),
+                         dict(site='v41.verify', eager_runs=0, updates=2)])]
+    (reports / 'report.json').write_text(json.dumps({'status': 'done', 'panels': [
+        {'id': 'context_load', 'passes': [{'points': [{'context': 32768, 'c': 8, 'status': 'ok'}], 'graph_bands': bands}]}]}))
+    row = cards.summarize_job(job, 0)
+    assert row['graph_bands'] == bands and 'context_graph_bands' not in row
+    cards.write_summary(tmp_path, [{**row, 'card': 'c', 'arm': 'candidate', 'repeat': 1, 'status': 'pass'}], {'candidate': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert ('| c | candidate | 1 | context 32768 C8 | 0 | 0 | 4 | 4 | yes | 2.5 | 0.5 | 2400 | 81 | 6 '
+            '| v41.exchange* 3, v41.decode 1 |') in text

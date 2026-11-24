@@ -433,7 +433,6 @@ async fn run() -> Result<()> {
                 }
                 if let Commands::Plan(args) = &mut cli.command {
                     args.spark_memory_samples = cli.spark_memory_samples.clone();
-                    args.graph_exact_rows = cli.graph_exact_rows;
                     if let Some((_, options)) = matches.subcommand() {
                         args.explicit_settings = options.ids().filter(|id| matches!(options.value_source(id.as_str()),
                             Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)))
@@ -445,7 +444,7 @@ async fn run() -> Result<()> {
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
                     cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem,
-                    (cli.graph_no_prewarm, cli.graph_donor_always, cli.graph_donor_cold_lag, cli.graph_exact_rows))
+                    (cli.graph_no_prewarm, cli.graph_donor_always, cli.graph_donor_cold_lag))
             },
             Err(error) => error.exit(),
         }
@@ -468,17 +467,13 @@ async fn run() -> Result<()> {
     };
     // Spanning graph sites always prewarm, so `off` is safe on every layout (#2303).
     let no_prewarm = initial_graph_policy.0 || family_graph_policy.0;
-    let exact_rows = if family_graph_policy.3.is_enabled() { family_graph_policy.3 } else { initial_graph_policy.3 };
-    let explicit_donor_always = initial_graph_policy.1 || family_graph_policy.1;
-    let explicit_lag = initial_graph_policy.2.max(family_graph_policy.2);
-    // Exact-row mode defaults to donor-always with cold lag 8 unless overridden.
-    let donor_always = explicit_donor_always || exact_rows.is_enabled();
-    let donor_cold_lag = if exact_rows.is_enabled() && explicit_lag == 0 && !explicit_donor_always {
-        8
+    // Flash's exact-row working set is qualified with the fixed lag-8 donor policy.
+    let (donor_always, donor_cold_lag) = if matches!(&command, Commands::ServeGlmf(_) | Commands::GlmfGolden(_)) {
+        (true, 8)
     } else {
-        explicit_lag
+        (initial_graph_policy.1 || family_graph_policy.1, initial_graph_policy.2.max(family_graph_policy.2))
     };
-    shared::decode_graph::configure(no_prewarm, donor_always, donor_cold_lag, exact_rows)?;
+    shared::decode_graph::configure(no_prewarm, donor_always, donor_cold_lag)?;
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
             std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())

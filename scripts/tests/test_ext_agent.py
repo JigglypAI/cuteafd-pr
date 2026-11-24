@@ -48,8 +48,15 @@ idle('Do you trust the contents of this directory?' if os.environ.get('FAKE_TRUS
 message = ''
 inside = False
 pending = b''
+heartbeat = float(os.environ.get('FAKE_HEARTBEAT', '0'))
+beat_at = time.monotonic() + heartbeat
 try:
     while True:
+        if heartbeat and time.monotonic() >= beat_at:
+            # Antigravity re-asserts terminal modes while idle: raw bytes, no glyphs.
+            sys.stdout.write('\x1b[?2004h\x1b[>4;2m')
+            sys.stdout.flush()
+            beat_at = time.monotonic() + heartbeat
         if not select.select([fd], [], [], 0.1)[0]:
             continue
         pending += os.read(fd, 4096)
@@ -549,3 +556,129 @@ def test_wait_wake_flags_are_wired():
     assert "result['woke'] = 'progress'" in source
     assert "result['woke'] = 'context'" in source
     assert "result['woke'] = 'quiet'" in source
+
+
+# Screens captured from Antigravity 1.5.15 (account and path redacted). Idle,
+# it redraws nothing: only invisible terminal-mode escapes reach the stream.
+AGY_HEADER = """      ▄▀▀▄        Antigravity CLI 1.5.15
+     ▀▀▀▀▀▀       user@example.com
+    ▀▀▀▀▀▀▀▀      Gemini 4 Neon (High)
+   ▄▀▀    ▀▀▄     /work/play
+  ▄▀▀      ▀▀▄
+────────────────────────────────────────────────────────────
+> Reply with the single word PONG. Do not run any tools.
+"""
+RULE = '─' * 100
+AGY_IDLE = AGY_HEADER + '  PONG\n' + RULE + '\n>\n' + RULE + '\n? for shortcuts' + ' ' * 80
+AGY_BUSY = AGY_HEADER + '⢿  Generating...\n' + RULE + '\n>\n' + RULE + '\nesc to cancel' + ' ' * 80
+AGY_META = {'created_at': 0.0, 'submitted_at': 1.0,
+            'last_message': 'Reply with the single word PONG. Do not run any tools.'}
+
+
+def settle(tool, frames, step=driver.POLL):
+    """Drive the supervisor's debounce over screen frames sampled every step."""
+    meta, states = dict(AGY_META), []
+    for i, frame in enumerate(frames):
+        now = 10.0 + i * step
+        reading = driver.ADAPTERS[tool].state(frame, meta)
+        state, fields = driver.debounce(tool, frame, reading, meta, now)
+        meta.update(fields)
+        states.append(state)
+    return states
+
+
+def test_agy_idle_screen_with_only_chrome_changes_stays_idle():
+    # The real idle capture repeated, with self-redrawing chrome varying: tip
+    # rotation, an ANSI-only difference, and the model footer appearing.
+    tips = ['└ Tip: You can switch conversations with /resume.', '└ Tip: Use /diff to view uncommitted changes.']
+    frames = [AGY_BUSY] * 3 + [AGY_IDLE] * 6
+    frames += [AGY_IDLE.replace('PONG\n', 'PONG\n' + tips[i % 2] + '\n') for i in range(20)]
+    frames += [AGY_IDLE.replace('? for shortcuts', '\x1b[2m? for shortcuts\x1b[0m')] * 10
+    frames += [AGY_IDLE.rstrip() + '   Gemini 4 Neon · high'] * 10
+    frames = [driver.clean(frame) for frame in frames]
+    states = settle('agy', frames)
+    first = states.index('idle')
+    # Idle once, after IDLE_SETTLE of stable content, and never flips back.
+    assert first == 3 + int(driver.IDLE_SETTLE / driver.POLL)
+    assert set(states[first:]) == {'idle'}
+
+
+def test_agy_new_content_line_goes_busy_until_settled():
+    later = AGY_IDLE.replace('  PONG\n', '  PONG\n● Ran (git status) (ctrl+o to expand)\n')
+    states = settle('agy', [AGY_IDLE] * 8 + [later] * 8)
+    assert states[7] == 'idle'
+    # A real tool line is activity even though the prompt never left the screen.
+    assert states[8] == 'busy'
+    assert states[-1] == 'idle'
+
+
+def test_agy_spinner_frames_are_busy_and_reset_the_settle():
+    spins = [AGY_BUSY.replace('⢿', glyph) for glyph in '⣻⣽⣾⣷⣯⣟⡿⢿']
+    states = settle('agy', spins * 3 + [AGY_IDLE] * 6)
+    assert set(states[:24]) == {'busy'}
+    assert states[24:28] == ['busy'] * 4 and states[-1] == 'idle'
+
+
+def test_agy_spinner_above_tip_and_queued_message_is_busy():
+    text = ('● Edited 6 files (run-family.sh, options.md) (ctrl+o to expand)\n'
+            '⣻  `cuteafd-core` compiled without issues.\n'
+            '└ Tip: You can switch conversations with /resume.\n'
+            '▸ DESIGN APPROVED by main with two changes:... (alt+m to send immediately)\n'
+            + RULE + '\n>\n' + RULE + '\n? for shortcuts')
+    assert driver.Agy().state(text, {'submitted_at': 1}) == 'busy'
+
+
+def test_agy_background_command_under_prompt_is_busy():
+    # Antigravity resumes by itself when the listed command ends.
+    running = ('○ Running (sleep 30; echo BGDONE) (ctrl+o to expand)\n  STARTED\n' + RULE + '\n>\n' + RULE +
+               '\n  ● [09:32:53] sleep 30; echo BGDONE running\n' + RULE + '\n? for shortcuts')
+    assert driver.Agy().state(running, {'submitted_at': 1}) == 'busy'
+    done = running.replace('  ● [09:32:53] sleep 30; echo BGDONE running\n' + RULE + '\n', '')
+    assert driver.Agy().state(done, {'submitted_at': 1}) == 'idle'
+
+
+@pytest.mark.parametrize('above', [
+    '○ Thought for 43.8s (The `cpu-gate` task needs to execute to confirm that both suites pass...)',
+    '▸ Should I confirm the pin first?... (alt+m to send immediately)',
+    '  ⎿  Interrupted · What should Antigravity CLI do instead?',
+    '… 3 more actions (2 reads, 1 command: 1 failed) …',
+])
+def test_agy_narration_and_footer_never_ask(above):
+    text = '> task\n' + above + '\n' + RULE + '\n>\n' + RULE + '\n  ● [09:15:30] confirm? done\n? for shortcuts   Gemini 4 Neon · high'
+    assert driver.Agy().state(text, {'last_message': 'task'}) == 'idle'
+
+
+def test_agy_real_question_still_asks():
+    text = ('> task\n  1. Merge first.\n  2. Snapshot now.\n  Ready to proceed as soon as you confirm 1 or 2.\n'
+            + RULE + '\n>\n' + RULE + '\n? for shortcuts')
+    assert driver.Agy().state(text, {'last_message': 'task'}) == 'asking'
+    assert driver.Agy().state(text.replace('confirm 1 or 2.', 'pick one: 1 or 2?'), {'last_message': 'task'}) == 'asking'
+
+
+def test_grok_debounce_unchanged():
+    footer = '\nGrok 4.7 (high) · always-approve · 117K / 256K (46%) · ctrl+o transcript'
+    idle = '❯ task\n┃ Done: fixed both tests.\n❯' + footer
+    running = ['❯ task\n' + glyph + ' 1 command still running · send a message to interrupt\n❯' + footer for glyph in '◎◉○◎']
+    later = idle.replace('┃ Done', '┃ Also pushed.\n┃ Done')
+    states = settle('grok', running * 3 + [idle] * 8 + [later] * 8)
+    assert set(states[:12]) == {'busy'}
+    assert states[12:16] == ['busy'] * 4 and states[19] == 'idle'
+    assert states[20] == 'busy' and states[-1] == 'idle'
+    assert driver.Grok().state('⠸ Waiting for response… 0.8s\n❯' + footer, {'submitted_at': 1}) == 'busy'
+
+
+def test_idle_heartbeat_does_not_flap(cli, monkeypatch):
+    name, call, root = cli
+    monkeypatch.setenv('FAKE_HEARTBEAT', '0.3')
+    call('start', name, '--tool', 'agy', '--cwd', str(root))
+    call('send', name, 'heartbeat turn')
+    result = call('wait', name, '--until', 'idle', '--timeout', '8')
+    assert result['state'] == 'idle' and not result.get('timed_out')
+    raw = root / 'runs' / name / 'transcript.raw'
+    size = raw.stat().st_size
+    time.sleep(3)
+    assert raw.stat().st_size > size  # The heartbeat really grows the stream.
+    assert call('status', name)['state'] == 'idle'
+    events = [json.loads(line) for line in (root / 'runs' / name / 'events.jsonl').read_text().splitlines()]
+    states = [e['state'] for e in events if e['event'] == 'state']
+    assert states[-1] == 'idle' and states.count('idle') == 2, states  # startup idle + the one real end

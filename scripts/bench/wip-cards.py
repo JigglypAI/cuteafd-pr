@@ -2362,6 +2362,7 @@ def summarize_job(job, exit_code):
             latest = records[-1] if records else {}
             if any(p.get('status') == 'failed' for p in latest.get('points', [])):
                 fail(row, 'context_load: request or prefix-reuse failure', 'measurement')
+            row['context_graph_bands'] = latest.get('graph_bands', [])
         lossless = lossless_set_result(report)
         if lossless:
             row['lossless_set'] = lossless
@@ -2451,6 +2452,8 @@ def summarize_job(job, exit_code):
                                     **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
                                        if p.get('mapped_tables')}}
             row['graph_bands'] = sweep.get('graph_bands', [])
+    # context_load's timed points join the sweep's bands in one per-band table.
+    row['graph_bands'] = [*row.get('graph_bands', []), *row.pop('context_graph_bands', [])]
     row['peaks'] = peaks(dest)
     row['spark_memory'] = spark_memory_report(dest)
     row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
@@ -2783,13 +2786,23 @@ def write_summary(state, rows, arms):
         text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
     if any(r.get('graph_bands') for r in rows):
         # Steady state captures no graphs (AGENTS.md): every timed band should be capture-free.
-        text += '## Graph Captures Per Timed Band\n\n/v1/stats read just before and after each timed band.\n\n'
-        text += '| Card | Arm | Repeat | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free |\n| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |\n'
+        text += ('## Graph Captures Per Timed Band\n\n/v1/stats and /v1/thermal read just before and after each timed band '
+                 '(sweep bands and context_load points). Throttle columns are the worst GPU: power-cap = software cap + power brake '
+                 'seconds, thermal = software + hardware slowdown seconds. Eager sites: eager runs per site, spanning sites marked *.\n\n')
+        text += ('| Card | Arm | Repeat | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free '
+                 '| Power-cap s | Thermal s | Busy SM MHz | Max C | Min headroom C | Eager sites |\n'
+                 '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |\n')
         for r in rows:
             for band in r.get('graph_bands', []):
                 free = {True: 'yes', False: 'NO'}.get(band.get('zero_captures'), 'unavailable: ' + str(band.get('reason')))
+                thermal = band.get('thermal') or {}
+                sites = ', '.join(f"{s['site']}{'*' if s.get('spans_devices') else ''} {s.get('eager_runs', 0)}"
+                                  for s in band.get('sites') or [] if s.get('eager_runs'))
                 text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], band.get('band'), band.get('captures'),
-                                                   band.get('device_captures'), band.get('misses'), band.get('eager_runs'), free])) + ' |\n'
+                                                   band.get('device_captures'), band.get('misses'), band.get('eager_runs'), free,
+                                                   thermal.get('power_cap_s'), thermal.get('thermal_slowdown_s'),
+                                                   thermal.get('busy_sm_clock_mhz'), thermal.get('max_temperature_c'),
+                                                   thermal.get('min_tlimit_headroom_c'), sites])) + ' |\n'
         text += '\n'
     if any(r.get('spark_memory') for r in rows):
         text += '## Spark Host Memory\n\nHost /proc/meminfo; no Spark CUDA context. Sampled phase labels, not exact wave boundaries. Minima are bytes.\n\n'

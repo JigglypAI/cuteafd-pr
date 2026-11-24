@@ -366,7 +366,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-            exact_graph_rows: options.glmf_exact_graph_rows,
+
              };
         let host = super::recipe_host_memory(options)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
@@ -483,8 +483,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selected.solved));
         report.host_budget_bytes = quota;
-        notes.push(format!("graph reserve by GPU: {:?} bytes ({} prewarm shapes)",
-            selected.graphs.charged, selected.graphs.shapes));
+        notes.push(format!("exact-row graph reserve by GPU: {:?} bytes (lazy capture)",
+            selected.graphs.charged));
         let (placed, working) = (selected.placement, selected.working);
         let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
         if replicas > 0 {
