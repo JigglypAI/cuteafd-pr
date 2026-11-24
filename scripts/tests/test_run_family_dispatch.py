@@ -5924,6 +5924,22 @@ def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error
     assert "serve-glm --snapshot" not in result.stderr
 
 
+@pytest.mark.parametrize("extra", [
+    "GRAPH_DONOR_ALWAYS=on\n",
+    "GRAPH_DONOR_ALWAYS=off\n",
+    "GRAPH_DONOR_COLD_LAG=8\n",
+    "GRAPH_DONOR_ALWAYS=on\nGRAPH_DONOR_COLD_LAG=16\n",
+    "GRAPH_EXACT_ROWS=on\n",
+])
+def test_glmf_refuses_fixed_graph_donor_and_removed_mode_keys(tmp_path, extra):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"RTX_GPUS=2\n{extra}")
+    assert result.returncode == 2, result.stderr
+    assert "serve-glmf" not in result.stderr
+
+
 @pytest.mark.parametrize("config,model,extra,command", [
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", "", "serve-glm"),
     ({"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
