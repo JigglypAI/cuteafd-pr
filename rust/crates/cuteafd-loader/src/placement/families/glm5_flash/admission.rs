@@ -1353,9 +1353,9 @@ mod tests {
             let layouts = process.draft_tp2.clone();
             let arenas = process.draft_arenas.clone();
             let admitted = prepare(&input, 188, true, process)?.admit()?;
-            assert_eq!(admitted.graphs.charges(), [194 << 20, 192 << 20]);
-            for (policy, soft) in admitted.graphs.policies.iter().zip([186, 184]) {
-                assert_eq!(policy.base_bytes, soft << 20);
+            assert_eq!(admitted.graphs.charges(), [198 << 20; 2]);
+            for policy in &admitted.graphs.policies {
+                assert_eq!(policy.base_bytes, 190 << 20);
                 assert_eq!(policy.growth_headroom, Some(8 << 20));
             }
             let facts = admitted.solved.facts;

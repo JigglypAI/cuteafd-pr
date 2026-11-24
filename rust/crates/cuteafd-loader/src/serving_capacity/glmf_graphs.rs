@@ -12,9 +12,9 @@ pub fn working_set(gpus: usize, split_draft: bool, rank: usize) -> crate::placem
     use crate::placement::graph_reserve::WorkingSet;
     let (w1_mib, step_growth) = match (gpus, split_draft, rank) {
         (1, _, _) => (74, 8_339_064),
-        // Shipping split DFlash census at auto KV: closed short/32K C1 bound.
-        (2, true, 0) => (90, 8 << 20),
-        (2, true, _) => (88, 8 << 20),
+        // Explicit TP2 DFlash A-on census (short and 32K C1).
+        (2, true, 0) => (94, 9_789_077),
+        (2, true, _) => (94, 9_629_699),
         (_, _, 0) => (94, 9_755_762),
         _ => (92, 9_566_036),
     };
