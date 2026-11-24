@@ -144,10 +144,10 @@ def test_dense_candidate_cards_are_zero_spark_and_do_not_change_release_matrix()
     names = ['qwen35-9b-bf16-min', 'qwen38-27b-bf16-min']
     dense = json.loads((ROOT / 'scripts/tests/fixtures/matrix-dense-qwen.json').read_text())['entries']
     assert [card['name'] for card in dense] == names
-    assert [cards.config(card['config'])['MODEL_ID'] for card in dense] == [
+    assert [cards.config(ROOT / 'scripts/bench/kits/gate' / card['config'])['MODEL_ID'] for card in dense] == [
         'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.8-27B']
     for card in dense:
-        values = cards.config(card['config'])
+        values = cards.config(ROOT / 'scripts/bench/kits/gate' / card['config'])
         assert card['family'] == 'qwen3_5' and card['sparks'] == [] and card['gpus'] == [1]
         assert values['SPARK_COUNT'] == '0' and values['EXPERT_BACKEND'] == 'local'
         assert values['CONCURRENCY'] == '8' and values['POOL_TOKENS'] == 'auto'
@@ -1628,6 +1628,7 @@ def test_gate_muse_mc_cards_are_separate_from_legacy_support(size, count):
         assert values['MAX_CONTEXT_TOKENS'] == 'auto'
 
 
+@pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
 def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, count):
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'glm53-mc-original-{size}'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
@@ -1638,9 +1639,9 @@ def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, cou
     assert card['gpus'] == gpus and card['sparks'] == list(cards.HOSTS[:count])
 
 
-def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
-    kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['v41-flash-sim5090'])[0]
+def test_archived_v41_sim5090_matches_pinned_tp4_reproduction():
+    entries = json.loads((ROOT / 'scripts/tests/fixtures/retired-gate-cards.json').read_text())['entries']
+    card = next(e for e in entries if e['name'] == 'v41-flash-sim5090')
     values = {**cards.config(ROOT / card['config']), **card['set']}
     assert card['gpus'] == [0]
     assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
@@ -1655,7 +1656,6 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
     assert 'PREFILL_BATCH_TOKENS' not in values and 'PREFILL_ROWS' not in values
     assert [values[f'SPARK_{rank}_HOST'] for rank in range(4)] == card['sparks']
-    entries = json.loads((kit / 'matrix-gate.json').read_text())['entries']
     for key in ('ADDR', 'EXPERT_PORT'):
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
 

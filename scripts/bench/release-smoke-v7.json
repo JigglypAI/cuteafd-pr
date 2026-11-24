@@ -1315,70 +1315,70 @@
       "name": "v41-flash-min",
       "config": "examples/configs/deepseek-v41-mxfp4-min.config",
       "report": "benchmarks/deepseek_v41/2026-11-19-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "v41-flash-max",
       "config": "examples/configs/deepseek-v41-mxfp4-max.config",
       "report": "benchmarks/deepseek_v41/2026-11-19-smoke-deepseek-v4-1-flash-1017-2rtx-6spark-v41-flash-max",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "v4-flash-min",
       "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
       "report": "benchmarks/deepseek_v4/2026-11-19-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "glm53-exlr8-min",
       "config": "examples/configs/glm53-exlr8-min.config",
       "report": "benchmarks/glm5/2026-11-19-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "glmf-exlr8-k4-max",
       "config": "examples/configs/glm53-flash-exlr8-k4-max.config",
       "report": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "inkling2-nvfp4-min",
       "config": "examples/configs/inkling2-nvfp4-min.config",
       "report": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-1rtx-4spark-inkling2-nvfp4-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "inkling2-mxfp8-max",
       "config": "examples/configs/inkling2-mxfp8-max.config",
       "report": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-mxfp8-2rtx-4spark-inkling2-mxfp8-max",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "qwen35-9b-bf16-min",
       "config": "examples/configs/qwen35-9b-bf16-min.config",
       "report": "benchmarks/qwen3_5/2026-11-19-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "qwen38-27b-bf16-min",
       "config": "examples/configs/qwen38-27b-bf16-min.config",
       "report": "benchmarks/qwen3_5/2026-11-19-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     },
     {
       "name": "qwen38-27b-fp8-min",
       "config": "examples/configs/qwen38-27b-fp8-min.config",
       "report": "benchmarks/qwen3_5/2026-11-19-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min",
-      "release": "v6.0.0-rc1",
+      "release": "v6.0.0",
       "release_note": "retired for v7 (TJ 2026-11-24)"
     }
   ]
