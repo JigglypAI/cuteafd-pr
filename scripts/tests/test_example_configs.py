@@ -870,6 +870,13 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
         assert set(study["views"]) == compare | {"k8-compact"}
         row = next(row for row in published["cells"] if row["checkpoint"] == study["checkpoint"])
         assert study["views"]["k8-compact"] == row["2rtx"].get("report")
+        base = bases[(study["family"], study["checkpoint"])]
+        revision = _effective(base, main)["MODEL_REVISION"]
+        for view, directory in study["views"].items():
+            if directory is not None:
+                report = json.loads((ROOT / directory / "report.json").read_text())
+                snapshot = Path(report["server"]["configuration"]["snapshot"])
+                assert snapshot.name == revision, (study["checkpoint"], view, snapshot.name, revision)
         if study["checkpoint"] == HY4_MC:
             assert not any(study["views"].values())
 
