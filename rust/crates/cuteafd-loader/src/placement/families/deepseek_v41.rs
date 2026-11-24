@@ -637,23 +637,24 @@ mod tests {
                     }
                 }
                 let admitted = prepared.admit(request)?;
-                assert_eq!(admitted.solved.decisions.encoder, Some(0));
+                let selected = ordered.iter().position(|kind| *kind != EncoderKind::Off).unwrap();
+                assert_eq!(admitted.solved.decisions.encoder, Some(selected));
                 let handles = admitted.solved.facts.allocations.iter().filter(|owner|
                     owner.group.starts_with("cuBLAS handles:")
                         && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
                     .collect::<Vec<_>>();
                 // Spark media is covered by its existing measured overhead (#1568).
-                assert_eq!(handles.len(), usize::from(matches!(ordered[0], EncoderKind::Rtx { .. })));
+                assert_eq!(handles.len(), usize::from(matches!(ordered[selected], EncoderKind::Rtx { .. })));
                 assert!(handles.iter().all(|owner| matches!(owner.location.device, Device::Coordinator(_))));
                 let mapped = devices.remap_plan_weight_arenas(&admitted.solved)?;
                 let roots = mapped.facts.allocations.iter().filter(|owner|
                     owner.id.starts_with("v41.encoder.") && owner.id.ends_with(".weights")).collect::<Vec<_>>();
-                let expected_copies = match ordered[0] {
+                let expected_copies = match ordered[selected] {
                     EncoderKind::Off => 0, EncoderKind::Spark { .. } => 2, _ => 1,
                 };
                 assert_eq!(roots.len(), expected_copies);
                 for (copy, root) in roots.iter().enumerate() {
-                    assert_eq!(root.id, format!("v41.encoder.0.{copy}.weights"));
+                    assert_eq!(root.id, format!("v41.encoder.{selected}.{copy}.weights"));
                     assert_eq!((root.bytes, root.group.as_str()), (extent, "weight arena"));
                     assert_eq!(root.lifetime, Lifetime::RESIDENT);
                     assert!(root.view.is_none());
@@ -677,7 +678,7 @@ mod tests {
                         _ => panic!("unexpected tower location"),
                     }
                     let scratch = mapped.facts.allocations.iter().find(|owner|
-                        owner.id == format!("v41.encoder.0.{copy}.scratch")).unwrap();
+                        owner.id == format!("v41.encoder.{selected}.{copy}.scratch")).unwrap();
                     assert_eq!((scratch.location, scratch.bytes), (root.location, 333));
                 }
             }
