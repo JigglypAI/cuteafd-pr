@@ -274,8 +274,30 @@ mod tests {
             "/model",
             "--native-lib",
             "/native.so",
+            "--listen",
+            "0.0.0.0:8823",
+            "--max-sequences",
+            "16",
             "--max-context-tokens",
-            "0",
+            "auto",
+            "--embedding-placement",
+            "gpu",
+            "--token-select",
+            "device",
+            "--kv-cache",
+            "fp8",
+            "--dspark",
+            "true",
+            "--draft-kv-cache",
+            "fp8",
+            "--prefix-cache-entries",
+            "20",
+            "--host-cache-bytes",
+            "auto",
+            "--prefill-rows",
+            "2048",
+            "--prefill-waves",
+            "2",
         ];
         let crate::cli::Commands::ServeInkling2Mini(mut args) = crate::cli::Cli::try_parse_from(argv)?.command else {
             anyhow::bail!("Inkling 2 Mini command not parsed")
@@ -291,15 +313,19 @@ mod tests {
         crate::commands::bench::assert_resolved_family_seam("serve-inkling2-mini", &[], || {
             args.prefix.resolve_entries(args.max_sequences);
             let prefill = args.prefill()?;
-            assert_eq!((prefill.unit_rows, prefill.waves), (4096, 1));
-            cuteafd_bench::context::ResolvedSettings::default()
+            assert_eq!((prefill.unit_rows, prefill.waves), (2048, 2));
+            cuteafd_bench::context::ResolvedSettings::prefill(prefill)
                 .value("max-context-tokens", 262_144)
                 .value("pool-tokens", 2_097_152)
-                .value("prefill-rows", prefill.unit_rows)
-                .value("prefill-waves", prefill.waves)
                 .publish();
             Ok(())
         })?;
+        for invalid in ["0", "01", "1048577"] {
+            let mut bad = argv.to_vec();
+            let at = bad.iter().position(|value| *value == "--max-context-tokens").unwrap();
+            bad[at + 1] = invalid;
+            assert!(crate::cli::Cli::try_parse_from(bad).is_err());
+        }
         Ok(())
     }
 }
