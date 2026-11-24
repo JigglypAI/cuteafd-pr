@@ -71,9 +71,18 @@ def main():
     del config.quantization_config
     # Async copying eagerly materializes every large expert before conversion.
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+    # Expanded expert weights alone exceed 90 GiB. Accelerate's hooks
+    # page in one expert bank at a time, without changing its F32 math.
+    placement = {"": a.device}
+    offload = None
+    if torch.device(a.device).type == "cuda":
+        offload = a.out.parent / "hf-offload"
+        placement["model.vision_tower"] = "disk"
+        placement.update({f"model.language_model.layers.{i}.mlp.experts": "disk"
+                          for i in range(0, cfg.num_hidden_layers, 2)})
     model, info = Inkling2LoopForConditionalGeneration.from_pretrained(
-        a.snapshot, config=config, dtype=torch.float32, device_map={"": a.device},
-        local_files_only=True, attn_implementation="eager", output_loading_info=True)
+        a.snapshot, config=config, dtype=torch.float32, device_map=placement,
+        offload_folder=offload, local_files_only=True, attn_implementation="eager", output_loading_info=True)
     if any(info.get(k) for k in ("missing_keys", "mismatched_keys", "error_msgs", "conversion_errors")):
         raise ValueError(f"HF didn't load the checkpoint: {info}")
     model.eval()
@@ -90,7 +99,12 @@ def main():
     for i, layer in enumerate(model.model.language_model.layers):
         fmt = weights.formats[TEXT + f"layers.{i}.mlp.experts.w13_weight"]
         qdq = quantize_nvfp4 if fmt == "nvfp4" else quantize_mxfp8
-        layer.mlp.experts.forward = MethodType(native_expert_control(qdq), layer.mlp.experts)
+        expert = layer.mlp.experts
+        implementation = MethodType(native_expert_control(qdq), expert)
+        if hasattr(expert, "_hf_hook"):
+            expert._old_forward = implementation
+        else:
+            expert.forward = implementation
     matched = [model(input_ids=ids[None], use_cache=False).logits[0].cpu() for ids in batches]
     checks = [{"prompt": text, "native_vs_hf_qdq_control": compare(ours, adapted),
                "native_vs_hf_stock": compare(ours, raw), "without_qdq_vs_hf_stock": compare(no_qdq, raw),
