@@ -599,9 +599,9 @@ def test_serve_glm_standard_option_contract(checkpoint_family):
     assert result.returncode == 0, result.stderr
     keys = set(result.stdout.split())
     assert {"FP8_PREFILL", "DECODE_GRAPHS", "HTTP_QUEUE_DEPTH", "HTTP_QUEUE_WAIT_MS", "MEDIA_CACHE_BYTES",
-            "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS"} <= keys
+            "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS", "TP2_DFLASH"} <= keys
     assert not {"CHAT_TEMPLATE_FROM", "EXPERT_INPUT", "RTX_EXPERT_PEER",
-                "PREFILL_BATCH_TOKENS", "TP2_DFLASH"} & keys
+                "PREFILL_BATCH_TOKENS"} & keys
 
 
 
