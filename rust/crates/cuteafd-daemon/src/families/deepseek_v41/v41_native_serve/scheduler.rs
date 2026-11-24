@@ -272,7 +272,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // leaves never adds one (#2475).
         "link_resets": round_failure::resets(),
         // Serve-loop phase counters, and the requests decoding at this publish.
-        "phases": phase_stats::GLOBAL.snapshot(&crate::shared::prefill_share::round_stats::GLOBAL, decoding),
+        "phases": phase_stats::GLOBAL.snapshot(&crate::shared::prefill_share::round_stats::GLOBAL,
+            &crate::shared::decode_graph::stats::GLOBAL, decoding),
         // The coordinator<->expert exchange and each rank's prefill unit pace.
         "exchange": crate::shared::spark_waves::exchange_stats::GLOBAL.snapshot(),
     });
@@ -1300,9 +1301,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_due: cycle.map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
-        // The round's wall time, whether prompts were waiting to prefill behind it, and
+        // The call's wall time, whether prompts were waiting to prefill behind it, and
         // its member rows.
-        phase_stats::GLOBAL.record_decode_round(decode_started.elapsed().as_nanos() as u64, cycle.is_some(),
+        phase_stats::GLOBAL.record_decode_call(decode_started.elapsed().as_nanos() as u64, cycle.is_some(),
             members.iter().map(Vec::len).sum::<usize>() as u64);
         if let Some(started) = cycle { prefills.stepped(started.elapsed().as_secs_f64()); }
         if let Some(started) = census_started {
@@ -1457,32 +1458,34 @@ pub(super) mod sampling_stats {
 /// Always-on serve-loop phase counters, published in `/v1/stats` `phases`.
 ///
 /// Monotonic counters read by the stats publisher: a clock pair and a few relaxed adds per
-/// decode round, per idle wait, per graph instantiation and per queued prompt. No
-/// allocation, no lock, no log line.
+/// decode call, per idle wait and per queued prompt. No allocation, no lock, no log line.
 ///
 /// The prefill-round counters live with the round itself
 /// ([`crate::shared::prefill_share::round_stats`]) and are merged into the one snapshot.
-/// The three time counters `prefill_round`, `decode_round` and `idle_wait` never overlap;
-/// `decode_round_with_prefill_waiting` is a part of `decode_round`, and `graph_instantiate`
-/// is spent wherever a capture runs (startup warm-up, or inside a round).
+/// The three time counters `prefill_round`, `decode_call` and `idle_wait` never overlap;
+/// `decode_call_with_prefill_waiting` is a part of `decode_call`.
+///
+/// `graph_instantiate` is not counted here: the graph bank is shared code, so its counter
+/// lives beside the bank ([`crate::shared::decode_graph::stats`]) and is read into this
+/// snapshot. `phases.phase_ns_total.graph_instantiate` and `exchange.expert_prefill_units`
+/// are published by V4.1's `serving_stats` only for now, though the counters behind them
+/// are recorded by every family that uses `run_worker` or the shared bank.
 pub(crate) mod phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// One serve loop's counters. Serving uses [`GLOBAL`]; a test host owns its own.
     pub(crate) struct PhaseStats {
-        /// Wall time of every decode round.
-        decode_round_ns: AtomicU64,
-        /// The wall time of the decode rounds that ran while prompts waited in the prefill
-        /// queue (rounds the decode share pays for). A part of `decode_round_ns`.
-        decode_round_with_prefill_waiting_ns: AtomicU64,
+        /// Wall time of every decode call (one `P::decode_round` call, which may run many
+        /// lane rounds on the two-lane and distributed paths).
+        decode_call_ns: AtomicU64,
+        /// The wall time of the decode calls that ran while prompts waited in the prefill
+        /// queue (calls the decode share pays for). A part of `decode_call_ns`.
+        decode_call_with_prefill_waiting_ns: AtomicU64,
         /// Time blocked waiting for a request with nothing admitted and nothing queued.
         idle_wait_ns: AtomicU64,
-        /// Time inside decode-graph instantiation (instantiate and upload) of the captures
-        /// that reached it, failed ones included.
-        graph_instantiate_ns: AtomicU64,
-        decode_rounds: AtomicU64,
-        /// Member rows of every decode round (one row per request per round it ran in).
-        decode_rows: AtomicU64,
+        decode_calls: AtomicU64,
+        /// Member rows of every decode call (one row per request per call it ran in).
+        decode_call_members: AtomicU64,
         /// From a prompt's entry into the prefill queue to its first chunk, summed over the
         /// prompts that started.
         prefill_queue_wait_ns: AtomicU64,
@@ -1493,21 +1496,19 @@ pub(crate) mod phase_stats {
     impl PhaseStats {
         pub(crate) const fn new() -> Self {
             const ZERO: AtomicU64 = AtomicU64::new(0);
-            Self { decode_round_ns: ZERO, decode_round_with_prefill_waiting_ns: ZERO, idle_wait_ns: ZERO,
-                graph_instantiate_ns: ZERO, decode_rounds: ZERO, decode_rows: ZERO, prefill_queue_wait_ns: ZERO }
+            Self { decode_call_ns: ZERO, decode_call_with_prefill_waiting_ns: ZERO, idle_wait_ns: ZERO,
+                decode_calls: ZERO, decode_call_members: ZERO, prefill_queue_wait_ns: ZERO }
         }
 
-        pub(super) fn record_decode_round(&self, ns: u64, prefill_waiting: bool, rows: u64) {
-            self.decode_round_ns.fetch_add(ns, Ordering::Relaxed);
-            if prefill_waiting { self.decode_round_with_prefill_waiting_ns.fetch_add(ns, Ordering::Relaxed); }
-            self.decode_rounds.fetch_add(1, Ordering::Relaxed);
-            self.decode_rows.fetch_add(rows, Ordering::Relaxed);
+        /// One decode call: its wall time, whether prompts were waiting to prefill behind
+        /// it, and its member rows.
+        pub(super) fn record_decode_call(&self, ns: u64, prefill_waiting: bool, rows: u64) {
+            self.decode_call_ns.fetch_add(ns, Ordering::Relaxed);
+            if prefill_waiting { self.decode_call_with_prefill_waiting_ns.fetch_add(ns, Ordering::Relaxed); }
+            self.decode_calls.fetch_add(1, Ordering::Relaxed);
+            self.decode_call_members.fetch_add(rows, Ordering::Relaxed);
         }
         pub(super) fn record_idle_wait(&self, ns: u64) { self.idle_wait_ns.fetch_add(ns, Ordering::Relaxed); }
-        /// Called from the graph bank (`shared/decode_graph/bank.rs`).
-        pub(crate) fn record_graph_instantiate(&self, ns: u64) {
-            self.graph_instantiate_ns.fetch_add(ns, Ordering::Relaxed);
-        }
         pub(super) fn record_prefill_queue_wait(&self, ns: u64) {
             self.prefill_queue_wait_ns.fetch_add(ns, Ordering::Relaxed);
         }
@@ -1516,19 +1517,20 @@ pub(crate) mod phase_stats {
 
         /// `decoding` is the number of requests decoding at this publish: a value of the
         /// publish, not a stored gauge, so it cannot outlive the requests it counted.
-        pub(super) fn snapshot(&self, rounds: &crate::shared::prefill_share::round_stats::RoundStats, decoding: usize)
+        pub(super) fn snapshot(&self, rounds: &crate::shared::prefill_share::round_stats::RoundStats,
+            graph: &crate::shared::decode_graph::stats::GraphStats, decoding: usize)
             -> serde_json::Value {
             let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
             serde_json::json!({
                 "phase_ns_total": {
                     "prefill_round": rounds.round_ns(),
-                    "decode_round": get(&self.decode_round_ns),
-                    "decode_round_with_prefill_waiting": get(&self.decode_round_with_prefill_waiting_ns),
-                    "graph_instantiate": get(&self.graph_instantiate_ns),
+                    "decode_call": get(&self.decode_call_ns),
+                    "decode_call_with_prefill_waiting": get(&self.decode_call_with_prefill_waiting_ns),
+                    "graph_instantiate": graph.graph_instantiate_ns(),
                     "idle_wait": get(&self.idle_wait_ns),
                 },
-                "rounds_total": {"prefill": rounds.rounds(), "decode": get(&self.decode_rounds)},
-                "decode_rows_total": get(&self.decode_rows),
+                "rounds_total": {"prefill": rounds.rounds(), "decode_calls": get(&self.decode_calls)},
+                "decode_call_members_total": get(&self.decode_call_members),
                 "prefill_prompt_rounds_total": rounds.prompt_rounds(),
                 "prefill_queue_wait_ns_total": get(&self.prefill_queue_wait_ns),
                 "active_decode": decoding,
@@ -3992,27 +3994,31 @@ mod telemetry_tests {
     use super::phase_stats::PhaseStats;
     use crate::shared::prefill_share::round_stats::RoundStats;
 
-    // The serve loop itself needs the native library and both GPUs, so its decode-round,
+    // The serve loop itself needs the native library and both GPUs, so its decode-call,
     // idle-wait and graph-instantiate sites have no CPU seam; these two tests cover the
     // counters' arithmetic and the published shape on their own instance (no shared state).
     // The sites with a seam are driven for real: the prefill round and the queue wait
     // (`shared::prefill_share`, `scheduler::queue`), the exchange and the unit pace
     // (`shared::spark_waves_tests`), and `active_decode` through `serving_stats` below.
+    // The graph-instantiate counter is shared code (`shared::decode_graph::stats`), so its
+    // arithmetic is tested there; this test passes its own instance, so it never reads or
+    // writes the process-global static another test could touch.
 
     #[test]
     fn the_phase_counters_publish_what_was_recorded() {
         let (stats, rounds) = (PhaseStats::new(), RoundStats::new());
-        stats.record_decode_round(1_500_000, true, 7);
-        stats.record_decode_round(1_000_000, false, 2);
+        let graph = crate::shared::decode_graph::stats::GraphStats::new();
+        stats.record_decode_call(1_500_000, true, 7);
+        stats.record_decode_call(1_000_000, false, 2);
         stats.record_idle_wait(250_000);
-        stats.record_graph_instantiate(900_000);
+        graph.record_graph_instantiate(900_000);
         stats.record_prefill_queue_wait(400_000);
-        let published = stats.snapshot(&rounds, 4);
+        let published = stats.snapshot(&rounds, &graph, 4);
         assert_eq!(published, serde_json::json!({
-            "phase_ns_total": {"prefill_round": 0, "decode_round": 2_500_000,
-                "decode_round_with_prefill_waiting": 1_500_000, "graph_instantiate": 900_000, "idle_wait": 250_000},
-            "rounds_total": {"prefill": 0, "decode": 2},
-            "decode_rows_total": 9,
+            "phase_ns_total": {"prefill_round": 0, "decode_call": 2_500_000,
+                "decode_call_with_prefill_waiting": 1_500_000, "graph_instantiate": 900_000, "idle_wait": 250_000},
+            "rounds_total": {"prefill": 0, "decode_calls": 2},
+            "decode_call_members_total": 9,
             "prefill_prompt_rounds_total": 0,
             "prefill_queue_wait_ns_total": 400_000,
             "active_decode": 4,

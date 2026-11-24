@@ -152,10 +152,11 @@ impl CaptureTicket {
         // physical observers must not wait on CUDA while holding this mutex.
         drop(cache);
         // Time inside instantiation (instantiate and upload), counted whether or not it
-        // succeeds: `phases.phase_ns_total.graph_instantiate`.
+        // succeeds: `phases.phase_ns_total.graph_instantiate`. The counter is shared code
+        // beside the bank, because every graph-using family captures through it.
         let instantiate_started = std::time::Instant::now();
         let exec = source.instantiate(stream);
-        crate::families::deepseek_v41::v41_native_serve::scheduler::phase_stats::GLOBAL
+        crate::shared::decode_graph::stats::GLOBAL
             .record_graph_instantiate(instantiate_started.elapsed().as_nanos() as u64);
         let exec = exec?;
         self.cache.lock().unwrap_or_else(|p| p.into_inner())

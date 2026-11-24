@@ -375,7 +375,9 @@ pub(crate) mod exchange_stats {
         /// Per rank: prefill units whose reply carried a pace, and the sums of that pace.
         /// Busy is from the unit's arrival on its owner stream (before its input copies) to
         /// its fence; idle is from the previous unit's fence on that stream to this arrival.
-        /// Decode units report no pace and are not counted here.
+        /// Decode units report no pace and are not counted here. When units merge, each
+        /// merged member's pace runs from its own arrival to a fence after the shared
+        /// launch, so `expert_prefill_units.busy_ns_total` can exceed wall time.
         unit_busy_ns: [AtomicU64; RANKS],
         unit_idle_ns: [AtomicU64; RANKS],
         units: [AtomicU64; RANKS],
