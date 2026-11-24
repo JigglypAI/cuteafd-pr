@@ -1731,7 +1731,7 @@ fn host_figures_subsume_only_ordinary_heap_and_preserve_pinned_device_and_weight
             assert_eq!(nonhost(&after.facts), nonhost(&before.facts),
                 "every PINNED/device owner, view, reservation and byte total is unchanged");
             assert!(before.facts.allowances.iter().any(|a|
-                a.source.contains("serialized target payload heap subset")));
+                a.source.contains("serialized K6 source")));
             assert!(before.facts.allowances.iter().any(|a| a.source.contains("DFlash whole-file")));
             let retained_host = after.facts.allocations.iter().chain(&after.facts.deferred)
                 .filter(|a| a.location == Location::HOST).collect::<Vec<_>>();

@@ -236,17 +236,16 @@ fn checkpoint_owners_match_loader_floors_splits_and_pinned_embedding() {
         assert_eq!(resources[0].weights.0, payload);
     }
 
-    // ModelOpt conversion splits request exact small grids, not landing's floor.
+    // Scalar FP8 projections request exact small grids; native block KV-B stays block FP8.
     let converted: Vec<_> = tensors
         .iter()
         .flat_map(|(name, dtype, shape)| {
-            // The indexer uses rows(), which requires a block grid even when
-            // the projection landing paths convert per-tensor FP8 scales.
-            if name.ends_with("_scale_inv") && !name.contains(".indexer.") {
+            let scalar = !name.contains(".indexer.") && !name.contains(".kv_b_proj.");
+            if name.ends_with("_scale_inv") && scalar {
                 return vec![];
             }
             let mut out = vec![(name.clone(), *dtype, shape.clone())];
-            if *dtype == "F8_E4M3" && !name.contains(".indexer.") {
+            if *dtype == "F8_E4M3" && scalar {
                 out.push(t(format!("{name}_scale"), "F32", &[]));
                 out.push(t(
                     format!("{}input_scale", name.strip_suffix("weight").unwrap()),
