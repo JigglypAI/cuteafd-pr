@@ -161,6 +161,21 @@ and arms for cleanup. Source worktrees are retained for inspection.
   and `CUTEAFD_CLIENT_OUT` exported, and a failing client fails the card.
   `--client-timeout` (default 3600 s, at most 7200 s with any precheck) bounds
   it. It excludes `--exact-state` and `--cold-window`, and `--dry-run` prints the hook.
+- `--sweep-passes N` (default 1) repeats the measurement N times against one
+  server launch, for graph-cache convergence: pass 1 captures shapes for the
+  first time, later passes should show no new captures. The client sweep
+  (`--levels`, `--prefill-lengths`, `--verify-shapes`) runs N full passes,
+  warm-ups included, and `context_load` runs N server-side passes. `--repeats`
+  instead relaunches the server per repeat. `sweep.json` keeps every pass under
+  `passes` (each with its points, prefill, phase thermals and graph bands, the
+  #2649 deltas with #2670 sites and thermals); its top level is the final pass.
+  `summary.json` lists every pass in `passes` (and per row in `rows[].passes`),
+  the Graph Captures table gains a Pass column, and headline speed is the
+  final pass, labelled so in `summary.md`. A measurement window (nsys, cold
+  purge, exact state) opens before pass 1 and closes after the last pass.
+  `run_timeout_s` bounds each pass. A runner that records fewer passes than
+  asked fails the row as `measurement`. This is a bench option, not a serving
+  key.
 - `--prefill-idle-seconds N` waits after each ordinary prefill warm-up before
   the timed request (default 0). Each prefill point records `idle_seconds` in
   `sweep.json`; the wait is outside TTFT and the timed thermal window.

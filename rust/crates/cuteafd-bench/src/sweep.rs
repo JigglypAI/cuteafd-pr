@@ -164,9 +164,63 @@ pub struct Sweep {
     /// it and whether it was capture-free; see [`Sweep::graph_bands`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_bands: Vec<Value>,
+    /// Same-server repeat (smoke `sweep_passes`): this sweep's 1-based pass.
+    /// The top level of a multi-pass `sweep.json` is the final pass (the
+    /// headline), so it carries the final pass number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<u32>,
+    /// Every pass of a multi-pass sweep, in order, the final one included;
+    /// empty for a single pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passes: Vec<Sweep>,
 }
 
 impl Sweep {
+    /// One sweep from same-server passes: a single pass unchanged, otherwise
+    /// the final pass (headline speed) with every pass kept under `passes`.
+    /// Each pass, its graph bands and its fabric phases (`pass<k>/<phase>`)
+    /// are labelled with the pass number.
+    pub fn from_passes(mut passes: Vec<Sweep>) -> Option<Sweep> {
+        if passes.len() <= 1 {
+            return passes.pop();
+        }
+        for (index, sweep) in passes.iter_mut().enumerate() {
+            let pass = index as u32 + 1;
+            sweep.pass = Some(pass);
+            for band in &mut sweep.graph_bands {
+                band["pass"] = serde_json::json!(pass);
+            }
+            let fabric = sweep.points.iter_mut().filter_map(|p| p.fabric.as_mut())
+                .chain(sweep.prefill.iter_mut().filter_map(|p| p.fabric.as_mut()));
+            for phase in fabric {
+                if let Some(name) = phase["name"].as_str().map(|name| format!("pass{pass}/{name}")) {
+                    phase["name"] = Value::String(name);
+                }
+            }
+        }
+        let mut headline = passes.last().cloned().expect("two or more passes");
+        headline.passes = passes;
+        Some(headline)
+    }
+
+    /// The sweeps a reader should walk for per-pass evidence: every pass, or
+    /// this sweep alone.
+    pub fn each_pass(&self) -> Vec<&Sweep> {
+        if self.passes.is_empty() { vec![self] } else { self.passes.iter().collect() }
+    }
+
+    /// Fabric phases of every pass's timed points.
+    pub fn fabric_phases(&self) -> Vec<crate::fabric::Phase> {
+        self.each_pass().into_iter().flat_map(|sweep| sweep.points.iter().filter_map(|p| p.fabric.as_ref())
+            .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref())))
+            .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()).collect()
+    }
+
+    /// Graph bands of every pass (labelled with `pass` when there are several).
+    pub fn pass_graph_bands(&self) -> Vec<Value> {
+        self.each_pass().into_iter().flat_map(|sweep| sweep.graph_bands.iter().cloned()).collect()
+    }
+
     /// One row per timed band that has graph counters: its label, process
     /// captures, device-cache captures, misses and eager runs, and
     /// `zero_captures` (null when the counters were unavailable).
@@ -784,5 +838,38 @@ mod tests {
         let exported = serde_json::to_value(&sweep.points[0]).unwrap();
         assert_eq!(exported["graph"]["zero_captures"], true);
         assert!(serde_json::to_value(&sweep.points[1]).unwrap().get("graph").is_none());
+    }
+
+    #[test]
+    fn same_server_passes_keep_every_pass_and_headline_the_last() {
+        let graph = |captures: u64| serde_json::json!({"available": true, "captures": captures, "zero_captures": captures == 0,
+            "devices": [{"device": 0, "totals": {"captures": captures, "misses": captures, "eager_runs": 0}}]});
+        let pass = |tok_s: f64, captures: u64| {
+            let mut sweep = Sweep { points: vec![Point { c: 1, phase: "levels".into(), aggregate_tok_s: tok_s,
+                graph: Some(graph(captures)), fabric: Some(serde_json::json!({"name": "levels/c1", "timed": true, "ports": [], "assessments": []})),
+                ..Point::default() }], ..Sweep::default() };
+            sweep.graph_bands = sweep.graph_bands();
+            sweep
+        };
+        let single = Sweep::from_passes(vec![pass(50.0, 3)]).unwrap();
+        assert_eq!(single, pass(50.0, 3), "one pass is today's sweep, unlabelled");
+        assert!(single.passes.is_empty() && single.pass.is_none());
+        assert_eq!(single.each_pass().len(), 1);
+        assert!(Sweep::from_passes(vec![]).is_none());
+
+        let sweep = Sweep::from_passes(vec![pass(50.0, 3), pass(55.0, 0)]).unwrap();
+        assert_eq!((sweep.pass, sweep.rate(1, "levels")), (Some(2), Some(55.0)), "the headline is the final pass");
+        assert_eq!(sweep.passes.len(), 2);
+        assert_eq!(sweep.passes[0].pass, Some(1));
+        assert_eq!(sweep.passes[0].rate(1, "levels"), Some(50.0));
+        let bands = sweep.pass_graph_bands();
+        assert_eq!(bands.len(), 2, "one band per pass, not the headline twice");
+        assert_eq!((bands[0]["pass"].as_u64(), bands[0]["captures"].as_u64()), (Some(1), Some(3)));
+        assert_eq!((bands[1]["pass"].as_u64(), bands[1]["zero_captures"].as_bool()), (Some(2), Some(true)));
+        let phases: Vec<String> = sweep.fabric_phases().into_iter().map(|p| p.name).collect();
+        assert_eq!(phases, ["pass1/levels/c1", "pass2/levels/c1"]);
+        let round: Sweep = serde_json::from_value(serde_json::to_value(&sweep).unwrap()).unwrap();
+        assert_eq!(round, sweep);
+        assert!(serde_json::to_value(&single).unwrap().get("passes").is_none(), "single-pass sweep.json is unchanged");
     }
 }
