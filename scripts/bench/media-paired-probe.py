@@ -143,6 +143,12 @@ def check_record(window, response, checkpoint, mode, features_root=None, family=
                         or identity.get("image_processing_sha256") != GLM_IMAGE_PROCESSING_SHA256):
                     raise ValueError("reference feature modeling source differs from pinned GLM export")
             expected_provenance["modeling_source_revision"] = GLM_TRANSFORMERS_REVISION
+        elif family == "hy4_flash":
+            # Still-tower families echo the pinned serving source the features were exported from.
+            from hy4_flash_media import SOURCE_REVISION as HY4_SOURCE
+            if any((feature.get("snapshot_identity") or {}).get("source") != HY4_SOURCE for feature in metadata):
+                raise ValueError("reference feature modeling source differs from pinned Hy4 export")
+            expected_provenance["modeling_source_revision"] = HY4_SOURCE.removeprefix("sglang@")
         if provenance != expected_provenance:
             raise ValueError("reference feature provenance differs from sealed export")
 

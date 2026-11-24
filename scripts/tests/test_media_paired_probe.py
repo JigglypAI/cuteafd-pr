@@ -18,6 +18,8 @@ def feature_metadata(key, family):
         metadata["snapshot_identity"] = {
             "modeling_sha256": module.GLM_MODELING_SHA256,
             "image_processing_sha256": module.GLM_IMAGE_PROCESSING_SHA256}
+    if family == "hy4_flash":
+        metadata["snapshot_identity"] = {"source": "sglang@ccb8d9cc"}
     return metadata
 
 
@@ -26,6 +28,8 @@ def reference_provenance(metadata, family):
                   "encoder_bypassed": True, "features": [metadata]}
     if family == "glm5_flash":
         provenance["modeling_source_revision"] = module.GLM_TRANSFORMERS_REVISION
+    if family == "hy4_flash":
+        provenance["modeling_source_revision"] = "ccb8d9cc"
     return provenance
 
 
