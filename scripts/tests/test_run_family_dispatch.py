@@ -5589,20 +5589,22 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert "prefill reserve does not fit" not in result.stderr
 
 
-@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"),
+@pytest.mark.parametrize("family,command", [("glm5", "serve-glm"), ("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"),
                                            ("glm5_flash", "serve-glmf")])
 @pytest.mark.parametrize("value,expected", [(None, None), ("off", "false"), ("on", "true")])
 def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
     if expected is None:
         expected = "true"
     config = {"model_type": family, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    if family == "glm5":
+        config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
     if family == "kimi_k3":
         config = {"model_type": family, "text_config": {"model_type": "kimi_linear",
                   "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
     if family == "glm5_flash":
         config = GLMF_TWO_LAYER
     keys = "RTX_GPUS=2\nSPECULATOR=dflash2\nVISION=off\nAUDIO=off\n"
-    if family in {"kimi_k3", "glm5_flash"}:
+    if family in {"glm5", "kimi_k3", "glm5_flash"}:
         keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
     if value is not None:
         keys += f"TP2_DFLASH={value}\n"
@@ -5618,6 +5620,45 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
         assert plans and all("--tp2-dflash" not in shlex.split(line) for line in plans)
     else:
         assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
+
+
+def test_glm5_tp2_dflash_and_ml4_dspark_dispatch(tmp_path):
+    glm5_cfg = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    # GLM 5.3 2x RTX + dflash2 forwards snapshot, fp8, slots, sequences and --tp2-dflash to plan and serve.
+    result = _family_launch_result(tmp_path / "glm5-ok", glm5_cfg, "test/glm53",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/glm53\n"
+        "SPECULATOR_FP8=off\nDRAFT_CONTEXT_SLOTS=12\nDRAFT_SEQUENCES=8\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    serve = next(line for line in lines if "cuteafd serve-glm --snapshot" in line)
+    plans = [line for line in lines if "cuteafd plan " in line and "--resolve-settings-only" not in line]
+    assert "--tp2-dflash true" in serve
+    assert "--draft-fp8 false" in serve
+    assert "--draft-context-slots 12" in serve
+    assert "--draft-sequences 8" in serve
+    assert plans and all("--tp2-dflash true" in line and "--drafter-snapshot " in line
+        and "--draft-fp8 false" in line and "--draft-context-slots 12" in line
+        and "--draft-sequences 8" in line for line in plans), plans
+    # TP2_DFLASH=auto is refused for GLM 5.3; explicit on on 1 RTX is refused.
+    for idx, (bad_keys, expected_err) in enumerate([
+        ("RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/glm53\nTP2_DFLASH=auto\n", "TP2_DFLASH must be on or off"),
+        ("RTX_GPUS=1\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/glm53\nTP2_DFLASH=on\n", "TP2_DFLASH requires"),
+    ]):
+        bad = _family_launch_result(tmp_path / f"glm5-bad-{idx}", glm5_cfg, "test/glm53", bad_keys + "VISION=off\nAUDIO=off\n")
+        assert bad.returncode == 2, bad.stderr
+        assert expected_err in bad.stderr
+    # ML4 (mistral_large4) ships bundled dspark, never defaults TP2_DFLASH on, and refuses TP2_DFLASH=on.
+    ml4_cfg = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
+               "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
+    ml4_ok = _family_launch_result(tmp_path / "ml4-ok", ml4_cfg, "test/ml4",
+        "RTX_GPUS=2\nSPECULATOR=dspark\nVISION=off\nAUDIO=off\n")
+    assert ml4_ok.returncode == 0, ml4_ok.stderr
+    ml4_serve = next(line for line in ml4_ok.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line)
+    assert "--tp2-dflash false" in ml4_serve and "--dspark" in ml4_serve
+    ml4_bad = _family_launch_result(tmp_path / "ml4-bad", ml4_cfg, "test/ml4",
+        "RTX_GPUS=2\nSPECULATOR=dspark\nTP2_DFLASH=on\nVISION=off\nAUDIO=off\n")
+    assert ml4_bad.returncode == 2, ml4_bad.stderr
+    assert "TP2_DFLASH requires" in ml4_bad.stderr
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=1\nSPECULATOR=dflash2\n",

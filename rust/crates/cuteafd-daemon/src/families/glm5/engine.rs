@@ -646,7 +646,7 @@ pub(crate) struct GlmEngine<'a> {
     context_units: RefCell<Vec<[context::ContextUnit; 2]>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmPeer<'a>>,
-    exchange: Option<PeerExchange<'a>>,
+    exchange: Option<std::rc::Rc<PeerExchange<'a>>>,
     tp2: Option<Pair<'a>>,
     whole: Option<crate::shared::experts::rtx::pair::Whole<'a>>,
     tp2_exchange: ExchangeDtype,
@@ -904,11 +904,33 @@ impl<'a> GlmEngine<'a> {
         1 + usize::from(self.peer.is_some())
     }
 
+    /// Allocates the target's device-driven peer exchange so a TP2 drafter can
+    /// bind to the exact same exchange before the KV pool is allocated.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_peer_exchange(library: &'a NativeLibrary, cfg: &GlmDsaConfig, device: i32,
+        stream: *mut c_void, peer_device: i32, peer_stream: *mut c_void, prefill_lanes: usize,
+        prefill_rows: usize, tp2_exchange: ExchangeDtype, core_bytes: usize)
+        -> Result<std::rc::Rc<PeerExchange<'a>>> {
+        let rows = prefill_rows.max(DECODE_ROWS);
+        Ok(std::rc::Rc::new(PeerExchange::new_abortable(library,
+            [RankDevice { device, stream }, RankDevice { device: peer_device, stream: peer_stream }],
+            4 * prefill_lanes.max(1),
+            rows * cfg.hidden * (tp2_exchange.element_bytes() + core_bytes),
+            decode_peer_bytes(DECODE_ROWS, cfg.hidden, tp2_exchange))?))
+    }
+
     /// Attaches the head split's second GPU: `device` with `stream`, holding
     /// `layers` (every layer's rank-1 share, see `GlmLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its
     /// caches, RoPE table and the exchange (four slots per prefill lane).
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>, cos_sin: Dev<'a>) -> Result<()> {
+        self.attach_peer_with_exchange(device, stream, layers, cos_sin, None)
+    }
+
+    /// Like [`Self::attach_peer`], reusing a pre-created shared [`PeerExchange`]
+    /// already bound to a TP2 drafter (zero extra exchange allocations).
+    pub(crate) fn attach_peer_with_exchange(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>,
+        cos_sin: Dev<'a>, shared: Option<std::rc::Rc<PeerExchange<'a>>>) -> Result<()> {
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
@@ -917,10 +939,18 @@ impl<'a> GlmEngine<'a> {
                 && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)) { 4 }
         else if layers.iter().chain(&self.weights.layers).any(|layer|
             layer.core.values().any(|weight| weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)) { 2 } else { 0 };
-        let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
-            rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes),
-            decode_peer_bytes(DECODE_ROWS, self.cfg.hidden, self.tp2_exchange))?;
+        let expected_slot_bytes = rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes);
+        let exchange = match shared {
+            Some(exchange) => {
+                ensure!(exchange.device(0) == self.device && exchange.device(1) == device
+                    && exchange.stream(0) == self.stream && exchange.stream(1) == stream
+                    && exchange.slot_bytes() == expected_slot_bytes,
+                    "GLM shared peer exchange geometry differs from target head split");
+                exchange
+            }
+            None => Self::new_peer_exchange(self.library, &self.cfg, self.device, self.stream,
+                device, stream, self.prefill_lanes, self.prefill_rows, self.tp2_exchange, core_bytes)?,
+        };
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
             let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
                 split_family: self.cfg.split_program_family() };
@@ -964,7 +994,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn exchange(&self) -> Result<&PeerExchange<'a>> {
-        self.exchange.as_ref().context("no head-split exchange")
+        self.exchange.as_deref().context("no head-split exchange")
     }
 
     /// The stream of rank `rank`.
@@ -3675,7 +3705,7 @@ impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
         if self.tp2.is_some() || self.layer_execution.is_some() || self.core_admission.is_some()
             || (!self.native_experts.is_empty() && self.peer.is_some())
-            || self.drafter.as_ref().is_some_and(|drafter| drafter.is_remote()) {
+            || self.drafter.as_ref().is_some_and(|drafter| drafter.is_remote() || drafter.is_tp2()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
         if self.graphs.borrow().len() > 0 || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().len() > 0) {

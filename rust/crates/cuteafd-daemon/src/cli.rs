@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
 pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
-    matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark") && split && draft
+    matches!(family, "glm5" | "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark") && split && draft
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
@@ -36,6 +36,8 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         }
     }
     let (enabled, family, split, draft) = match command {
+        Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
@@ -641,7 +643,7 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
-    /// Split MiMo/Kimi/GLM Flash/Muse DFlash over both target GPUs (explicit false wins over config).
+    /// Split GLM 5.3/MiMo/Kimi/GLM Flash/Muse DFlash over both target GPUs (explicit false wins over config).
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
@@ -983,6 +985,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn glm5_tp2_dflash_default_requires_split_and_draft_and_preserves_off() {
+        use clap::{CommandFactory, FromArgMatches};
+        for command in ["serve-glm", "glm-golden"] {
+            for split in [false, true] {
+                for draft in [false, true] {
+                    for explicit in [None, Some("false"), Some("true")] {
+                        let mut argv = vec!["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"];
+                        if command == "glm-golden" { argv.extend(["--golden", "/golden"]); }
+                        if split { argv.extend(["--split-device", "1"]); }
+                        if draft { argv.extend(["--draft", "/draft"]); }
+                        if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
+                        let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+                        let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+                        super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
+                        let actual = match cli.command {
+                            super::Commands::ServeGlm(args) => args.engine.tp2_dflash,
+                            super::Commands::GlmGolden(args) => args.engine.tp2_dflash,
+                            _ => panic!("expected GLM command"),
+                        };
+                        assert_eq!(actual, explicit.map(|v| v == "true").unwrap_or(split && draft),
+                            "{command} split={split} draft={draft} explicit={explicit:?}");
+                    }
+                }
+            }
+        }
+        // Bundled ML4 --dspark without --draft must never default-enable TP2 DFlash.
+        let argv = ["cuteafd", "serve-glm", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--split-device", "1", "--dspark"];
+        let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+        let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+        super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
+        let super::Commands::ServeGlm(args) = cli.command else { panic!("expected ServeGlm"); };
+        assert!(!args.engine.tp2_dflash);
     }
 
     #[test]

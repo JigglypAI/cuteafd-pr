@@ -17,6 +17,8 @@ pub struct ExchangeBuffers {
     pub receive_bytes: Vec<u64>,
     pub terminal_abort: bool,
     pub diagnostics: bool,
+    /// TP2 DFlash shares this exchange from draft load onward, before target KV.
+    pub peer_resident: bool,
     pub context: Option<ContextOwners>,
 }
 
@@ -52,17 +54,18 @@ impl ExchangeBuffers {
             std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>() as u64,
         )?
         .max(FLOOR);
+        let peer_lifetime = if self.peer_resident { Lifetime::RESIDENT } else { Lifetime::TARGET };
         let mut out = Vec::new();
         for &device in &self.physical_devices {
             let rank = devices.logical_rank(device)?;
             let prefix = format!("glm.exchange.rank.{rank}");
-            let mut add = |name: &str, location: Location, bytes: u64, category: Category| {
+            let mut add_at = |name: &str, location: Location, bytes: u64, lifetime: Lifetime, category: Category| {
                 out.push(Component::allocation(
                     Allocation::buffer(
                         format!("{prefix}.{name}"),
                         location,
                         bytes,
-                        Lifetime::TARGET,
+                        lifetime,
                         category,
                         "GLM exchanges",
                     ),
@@ -73,20 +76,24 @@ impl ExchangeBuffers {
             };
             let location = devices.location(device)?;
             for (slot, &bytes) in self.receive_bytes.iter().enumerate() {
-                add(
+                add_at(
                     &format!("peer.recv.{slot}"),
                     location,
                     bytes.max(FLOOR),
+                    peer_lifetime,
                     Category::Transport,
                 );
             }
-            add("peer.control", location, control, Category::Transport);
+            add_at("peer.control", location, control, peer_lifetime, Category::Transport);
             if self.diagnostics {
-                add("peer.progress", location, progress, Category::Transport);
+                add_at("peer.progress", location, progress, peer_lifetime, Category::Transport);
             }
             if self.terminal_abort {
-                add("peer.abort", location, FLOOR, Category::Transport);
+                add_at("peer.abort", location, FLOOR, peer_lifetime, Category::Transport);
             }
+            let mut add = |name: &str, location: Location, bytes: u64, category: Category| {
+                add_at(name, location, bytes, Lifetime::TARGET, category);
+            };
             if let Some(context) = self.context {
                 let shape = context.prefill;
                 if context.extent == 0
@@ -196,6 +203,7 @@ mod tests {
                 receive_bytes: vec![16, 512],
                 terminal_abort: false,
                 diagnostics: false,
+                peer_resident: false,
                 context: None,
             },
         )

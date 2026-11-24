@@ -134,7 +134,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
-                glm5_draft_bf16: args.glm5_draft_bf16,
+                glm5_draft_bf16: args.glm5_draft_bf16 || args.draft_fp8 == Some(false),
                 kimi_drafter_snapshot: None,
                 muse_drafter_snapshot: None,
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
@@ -210,6 +210,15 @@ fn resolve_settings(args: &mut PlanArgs, family: &str, cfg: &std::collections::B
     let budget = defaults::coordinator_weight_budget(args.coordinator_weight_budget_gib, None, coordinator_bytes(args));
     args.coordinator_weight_budget_gib = Some(budget.value);
     resolved.insert("coordinator_weight_budget_gib".into(), setting(budget));
+    if family == "glm5" {
+        if args.draft_fp8.is_none() {
+            args.draft_fp8 = match cfg.get("SPECULATOR_FP8").map(String::as_str) {
+                Some("off") => Some(false), Some("on") => Some(true), None | Some("") | Some("auto") => None,
+                _ => anyhow::bail!("SPECULATOR_FP8 must be auto, on or off"),
+            };
+        }
+        args.glm5_draft_bf16 |= args.draft_fp8 == Some(false);
+    }
     if family == "glm5_flash" {
         let configured = |key: &str| cfg.get(key).map(String::as_str);
         let index = defaults::glmf_index_cache(args.index_cache.map(|v| v.to_possible_value().unwrap().get_name().to_owned()).as_deref(),
@@ -498,10 +507,10 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
     // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
-    let split = args.rtx == 2 || (family == "glm5_flash" && args.spark_range);
+    let split = args.rtx == 2 || (matches!(family, "glm5" | "glm5_flash") && args.spark_range);
     let applicable = crate::cli::tp2_dflash_default(family, args.layout && split,
         args.speculator == "dflash2");
-    let default_on = applicable && (family != "glm5_flash" || args.drafter_gib == 0.0);
+    let default_on = applicable && (!matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
         Some("off") => false,
@@ -516,8 +525,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
         }
     } else { args.tp2_dflash.unwrap_or(configured) };
     anyhow::ensure!(!enabled || applicable,
-        "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
-    anyhow::ensure!(!enabled || family != "glm5_flash" || args.drafter_gib == 0.0,
+        "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
+    anyhow::ensure!(!enabled || !matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0,
         "TP2 DFlash requires checkpoint-derived physical owners; --drafter-gib forces whole placement");
     Ok(enabled)
 }
@@ -528,6 +537,7 @@ fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: 
     let split = tp2_dflash(args, family, cfg)?;
     if let Some(layout) = &mut options.layout {
         layout.tp2_dflash = split;
+        if family == "glm5" { layout.glm5_drafter_snapshot = args.drafter_snapshot.clone(); }
         if family == "glm5_flash" { layout.glmf_drafter_snapshot = args.drafter_snapshot.clone(); }
     }
     Ok(())
@@ -1987,7 +1997,7 @@ mod tests {
     #[test]
     fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
         use clap::{CommandFactory, FromArgMatches, Parser};
-        for (family, command) in [("mimo_v2", "serve-mimo"), ("muse_spark", "serve-muse")] {
+        for (family, command) in [("glm5", "serve-glm"), ("mimo_v2", "serve-mimo"), ("muse_spark", "serve-muse")] {
             for split in [false, true] {
                 for draft in [false, true] {
                     for explicit in [None, Some(false), Some(true)] {
@@ -2007,6 +2017,7 @@ mod tests {
                         let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
                         crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches).unwrap();
                         let served = match parsed.command {
+                            crate::cli::Commands::ServeGlm(args) => args.engine.tp2_dflash,
                             crate::cli::Commands::ServeMimo(args) => args.engine.tp2_dflash,
                             crate::cli::Commands::ServeKimi(args) => args.tp2_dflash,
                             crate::cli::Commands::ServeMuse(args) => args.tp2_dflash,
@@ -2031,20 +2042,24 @@ mod tests {
             let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
                 argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
                 else { panic!("expected plan") };
-            for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+            for family in ["glm5", "mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
                 assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
             }
             assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
         }
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
-        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+        for family in ["glm5", "mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).unwrap());
         }
+        request.drafter_gib = 8.0;
+        assert!(!tp2_dflash(&request, "glm5", &Default::default()).unwrap());
+        assert!(tp2_dflash(&request, "glm5", &cfg).is_err());
+        request.drafter_gib = 0.0;
         request.rtx = 1;
-        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
+        for family in ["glm5", "mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).is_err());
         }

@@ -1767,15 +1767,15 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
   esac
 fi
 tp2_dflash_default=off
-if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
   [[ "$family" != kimi_k3 ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == kimi_k3 && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
-[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
-  release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
-if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
+[[ "$tp2_dflash" != on || ( ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
+if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2438,14 +2438,14 @@ audio_encoder_hash=""
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
   plan_draft_args=(--draft-context-window "$draft_context_window" --concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
+  if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
   [[ -z "$decode_rows" ]] || plan_draft_args+=(--decode-rows "$decode_rows")
   [[ -z "$decode_rows" || "$decode_rows" == auto || -z "${draft_length:-}" ]] || plan_draft_args+=(--draft-length "$draft_length")
   plan_draft_args+=("${attention_precision_args[@]}")
-  if [[ "$family:$speculator" == qwen3_5:dspark ]] || [[ "$family" == glm5_flash && $draft_model_args -gt 0 ]]; then
+  if [[ "$family:$speculator" == qwen3_5:dspark ]] || [[ ( "$family" == glm5 || "$family" == glm5_flash ) && $draft_model_args -gt 0 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
@@ -2460,8 +2460,8 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
-    if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]] ||
-       [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-context-slots || "${family_args[i]}" == --draft-sequences ) ]]; then
+    if [[ ( "$family" == glm5 || "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]] ||
+       [[ ( "$family" == glm5 || "$family" == glm5_flash ) && ( "${family_args[i]}" == --draft-context-slots || "${family_args[i]}" == --draft-sequences ) ]]; then
       plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
     fi
   done
