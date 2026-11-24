@@ -256,3 +256,20 @@ def test_varlen_batch_matches_singles_and_keeps_images_independent(monkeypatch):
         single = vision.encode(weights, value, grid, mode="f32")
         assert got.patch.shape == single.patch.shape and len(got.layers) == 1
         torch.testing.assert_close(got.output, single.output, rtol=1e-5, atol=1e-5)
+
+
+def test_vision_panel_spans_take_the_serving_engines_prepared_identity():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hy4_vision_panel", ROOT / "python/reference/families/hy4_flash/vision_panel.py")
+    panel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(panel)
+    identity = {"encoder": "a" * 64, "processor": "b" * 64}
+    echo = {"start": 18, "len": 272, "kind": "image", "key": "c" * 64, "grid": [1, 32, 32], "identity": identity}
+    seen = []
+    probe = lambda body: seen.append(body) or {"probe": {"media": [echo]}}
+    span = panel.served_span(probe, panel.CHECKPOINT, b"png", [1, 32, 32], 272)
+    assert span["key"] == "c" * 64 and span["identity"] == identity
+    assert seen[0]["model"] == panel.CHECKPOINT and seen[0]["messages"][0]["content"][0]["type"] == "image_url"
+    for bad in ({**echo, "len": 256}, {**echo, "grid": [1, 30, 40]}, {k: v for k, v in echo.items() if k != "identity"}):
+        with pytest.raises(ValueError, match="prepared span differs"):
+            panel.served_span(lambda body, bad=bad: {"probe": {"media": [bad]}}, panel.CHECKPOINT, b"png", [1, 32, 32], 272)

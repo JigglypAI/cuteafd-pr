@@ -5,21 +5,26 @@ Images are first-party synthetic renders from ``scripts/bench/generate-media-fix
 re-rendered at the target canvas sizes with nearest-neighbour upscaling (deterministic,
 no external assets). Prompts render through the checkpoint chat template (reasoning
 effort ``no_think``), then a fixed, about 64-token teacher-forced answer. Only the answer rows
-are scored. Media keys are SHA-256 over (fixture sha, grid); the engine computes its own
-content keys, so spans also record the fixture sha and grid.
+are scored. Media spans take the serving engine's prepared-image key and its sealed
+{encoder, processor} identity from one cold probe per fixture (as fidelity-set.py does),
+so later servers recompute the same key from pixels; the span also records the fixture
+sha. Usage: vision_panel.py --snapshot DIR --out DIR --server URL --bench-token-file FILE
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import io
+import base64
 import json
 from pathlib import Path
 import sys
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
 from fidelity_windows import SET_SCHEMA, bucket, canonical, set_hash, validate_set  # noqa: E402
+from fidelity_media import prepared_span  # noqa: E402
 import hy4_flash_media as media  # noqa: E402
 
 CHECKPOINT, REVISION = "tencent/Hy4-flash", "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
@@ -85,7 +90,29 @@ def template(snapshot):
     return env.from_string((snapshot / "chat_template.jinja").read_text())
 
 
-def build(snapshot, out):
+def probe_client(url, token, timeout=600):
+    """Cold, draft-free media probe against a live server: POST /v1/bench/probe."""
+    def call(body):
+        headers = {"Content-Type": "application/json", "x-cuteafd-bench": token, "Authorization": "Bearer " + token}
+        request = urllib.request.Request(url.rstrip("/") + "/v1/bench/probe",
+                                         canonical({"body": body, "spec": {"cold": True, "no_speculation": True}}), headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    return call
+
+
+def served_span(probe, model, data, grid, length):
+    """The serving engine's prepared span for one fixture; its grid and rows must match the processor."""
+    chat = probe({"model": model, "max_tokens": 1, "temperature": 0, "stream": False, "messages": [{"role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(data).decode()}},
+                    {"type": "text", "text": "media identity probe"}]}]})
+    spans = chat.get("probe", {}).get("media", [])
+    if len(spans) != 1 or spans[0].get("grid") != grid or spans[0].get("len") != length or "identity" not in spans[0]:
+        raise ValueError(f"server prepared span differs from the Hy4 processor: {spans}")
+    return prepared_span(spans[0])
+
+
+def build(snapshot, out, probe):
     from PIL import Image
     from tokenizers import Tokenizer
     snapshot, out = Path(snapshot), Path(out)
@@ -118,8 +145,9 @@ def build(snapshot, out):
             raise ValueError("chat template image placeholder differs from start/pad/end")
         tokens = full_ids[:marker] + [media.IMAGE_ID] * length + full_ids[marker + 1:]
         score_from = len(prompt_ids) + length - 1
-        key = hashlib.sha256(canonical({"fixture": fixtures[wid]["sha256"], "grid": grid})).hexdigest()
-        span = {"kind": "image", "start": marker, "len": length, "grid": grid, "key": key,
+        served = served_span(probe, CHECKPOINT, (out / fixtures[wid]["path"]).read_bytes(), grid, length)
+        span = {"kind": "image", "start": marker, "len": length, "grid": grid, "key": served["key"],
+                "identity": served["identity"],
                 "fixture": {"path": fixtures[wid]["path"], "sha256": fixtures[wid]["sha256"]}}
         windows.append({"id": wid, "block": "V", "bucket": bucket(score_from), "tokens": tokens,
                         "roles": ["ctx"] * score_from + ["gen"] * (len(tokens) - score_from),
@@ -156,8 +184,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--server", required=True, help="live Hy4 server (served as tencent/Hy4-flash) for prepared keys")
+    p.add_argument("--bench-token-file", type=Path, required=True)
     a = p.parse_args()
-    manifest = build(a.snapshot, a.out)
+    manifest = build(a.snapshot, a.out, probe_client(a.server, a.bench_token_file.read_text().strip()))
     for w in manifest["windows"]:
         spans = w.get("media", [])
         print(w["id"], len(w["tokens"]), "score_from", w["score_from"],
