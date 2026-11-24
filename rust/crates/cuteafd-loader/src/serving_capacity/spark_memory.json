@@ -1,43 +1,50 @@
 {
   "schema": 1,
-  "source": "2026-11-24 idle serving-host census after spark-attic installation; build-only hosts retain the 2026-11-16 census (#2082)",
-  "method": "Read idle MemAvailable and validated, unlent spark-attic credit together with scripts/launch/spark-memory-probe.py; no GPU compute processes",
+  "source": "issue #2082; rolling reboot idle census 2026-11-16; SparkNest 0.8.5",
+  "method": "/proc/meminfo MemAvailable in kB multiplied by 1024; zero GPU compute processes on each host; no margin",
   "hosts": {
     "ostrich": {
-      "mem_available_kib": 117916216,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:05Z",
-      "uptime_seconds": 697730
+      "mem_available_kib": 121300648,
+      "measured_at": "2026-11-16T08:31:00Z",
+      "uptime": "about 5 minutes",
+      "fresh_boot": true,
+      "timestamp_approximate": true,
+      "carveout_bytes": 2143289344
     },
     "dodo": {
-      "mem_available_kib": 118149920,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:05Z",
-      "uptime_seconds": 697442
+      "mem_available_kib": 121171588,
+      "measured_at": "2026-11-16T08:31:20Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "emu": {
-      "mem_available_kib": 117904500,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:05Z",
-      "uptime_seconds": 697400
+      "mem_available_kib": 121082712,
+      "measured_at": "2026-11-16T08:32:03Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "kiwi": {
-      "mem_available_kib": 118136832,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:05Z",
-      "uptime_seconds": 697354
+      "mem_available_kib": 121166344,
+      "measured_at": "2026-11-16T08:32:49Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "rhea": {
-      "mem_available_kib": 118942816,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:05Z",
-      "uptime_seconds": 697154
+      "mem_available_kib": 121178876,
+      "measured_at": "2026-11-16T08:36:11Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "moa": {
-      "mem_available_kib": 118759688,
-      "carveout_bytes": 2143289344,
-      "measured_at": "2026-11-24T10:15:10Z",
-      "uptime_seconds": 696956
+      "mem_available_kib": 121171588,
+      "measured_at": "2026-11-16T08:39:36Z",
+      "uptime": "up 0 minutes",
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "kakapo": {
       "mem_available_kib": 120695860,
@@ -54,5 +61,5 @@
       "fresh_boot": false
     }
   },
-  "notes": "The carveout is outside MemAvailable and is usable only by a routed-expert arena. Live samples supersede this census."
+  "notes": "MemAvailable is the Nov 16 idle reference. The separate expert-only carveout allowance was verified on Nov 24 with spark-attic 0.1.6. Live startup samples supersede both values."
 }
