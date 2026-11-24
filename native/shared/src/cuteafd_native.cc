@@ -2036,9 +2036,15 @@ std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
     } else if (kind == cudaGraphNodeTypeMemcpy) {
       cudaMemcpy3DParms params{};
       if (cuteafd::diagnostic_cuda(cudaGraphMemcpyNodeGetParams(nodes[n], &params)) != cudaSuccess) return {};
+      const auto is_linear_1d_ptr = [&](const cudaPitchedPtr& p) {
+        if (!p.ptr) return false;
+        if (p.pitch == 0) return true;
+        return params.extent.height == 1 && params.extent.depth == 1 &&
+               p.pitch == params.extent.width && p.xsize == params.extent.width &&
+               p.ysize == 1;
+      };
       if (params.srcArray || params.dstArray ||
-          !params.srcPtr.ptr || !params.dstPtr.ptr ||
-          params.srcPtr.pitch != 0 || params.dstPtr.pitch != 0 ||
+          !is_linear_1d_ptr(params.srcPtr) || !is_linear_1d_ptr(params.dstPtr) ||
           params.srcPos.x != 0 || params.srcPos.y != 0 || params.srcPos.z != 0 ||
           params.dstPos.x != 0 || params.dstPos.y != 0 || params.dstPos.z != 0 ||
           params.extent.width == 0 || params.extent.height > 1 || params.extent.depth > 1 ||

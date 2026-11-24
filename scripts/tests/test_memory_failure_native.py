@@ -418,10 +418,19 @@ int main() {
   // different batch row counts share donors across cudaGraphExecUpdate.
   assert(sig_donor[3] == cudaGraphNodeTypeMemcpy && sig_donor[4] == cudaMemcpyDeviceToDevice &&
          sig_donor[5] == 0);
-  // Different 1D copy size matches signature; different device produces a distinct transferable signature.
+  // Different 1D copy size matches signature; canonical 1D pitched layout
+  // (pitch == xsize == extent.width, ysize == 1, height == depth == 1) also matches.
   auto smaller_nodes = make_d2d(new_src.data(), new_dst.data(), 2048);
   const auto sig_smaller = run_sig(smaller_nodes);
   assert(sig_smaller == sig_donor);
+  auto pitched_1d = make_d2d(new_src.data(), new_dst.data(), 4096);
+  pitched_1d[1].memcpy.srcPtr.pitch = 4096; pitched_1d[1].memcpy.srcPtr.xsize = 4096; pitched_1d[1].memcpy.srcPtr.ysize = 1;
+  pitched_1d[1].memcpy.dstPtr.pitch = 4096; pitched_1d[1].memcpy.dstPtr.xsize = 4096; pitched_1d[1].memcpy.dstPtr.ysize = 1;
+  assert(run_sig(pitched_1d) == sig_donor);
+  auto pitched_1d_smaller = make_d2d(new_src.data(), new_dst.data(), 2048);
+  pitched_1d_smaller[1].memcpy.srcPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.srcPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.srcPtr.ysize = 1;
+  pitched_1d_smaller[1].memcpy.dstPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.dstPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.dstPtr.ysize = 1;
+  assert(run_sig(pitched_1d_smaller) == sig_donor);
   current_device = 1;
   ptr_attrs[new_src.data()] = {cudaMemoryTypeDevice, 1};
   ptr_attrs[new_dst.data()] = {cudaMemoryTypeDevice, 1};
@@ -430,10 +439,25 @@ int main() {
   current_device = 0;
   ptr_attrs[new_src.data()] = {cudaMemoryTypeDevice, 0};
   ptr_attrs[new_dst.data()] = {cudaMemoryTypeDevice, 0};
-  // Strided/pitched, non-D2D, cross-device peer, 2D/3D, non-zero offset, zero-width, array and memset nodes stay non-transferable.
+  // Strided/pitched, mismatched xsize/ysize/height/depth, non-D2D, cross-device peer, 2D/3D, non-zero offset, zero-width, array and memset nodes stay non-transferable.
   auto pitched = make_d2d(new_src.data(), new_dst.data(), 4096);
-  pitched[1].memcpy.srcPtr.pitch = 8192;
+  pitched[1].memcpy.srcPtr.pitch = 8192; pitched[1].memcpy.srcPtr.xsize = 4096; pitched[1].memcpy.srcPtr.ysize = 1;
   assert(run_sig(pitched).empty());
+  auto bad_xsize = pitched_1d;
+  bad_xsize[1].memcpy.srcPtr.xsize = 2048;
+  assert(run_sig(bad_xsize).empty());
+  auto bad_ysize = pitched_1d;
+  bad_ysize[1].memcpy.dstPtr.ysize = 2;
+  assert(run_sig(bad_ysize).empty());
+  auto zero_ysize = pitched_1d;
+  zero_ysize[1].memcpy.srcPtr.ysize = 0;
+  assert(run_sig(zero_ysize).empty());
+  auto zero_height = pitched_1d;
+  zero_height[1].memcpy.extent.height = 0;
+  assert(run_sig(zero_height).empty());
+  auto zero_depth = pitched_1d;
+  zero_depth[1].memcpy.extent.depth = 0;
+  assert(run_sig(zero_depth).empty());
   auto h2d = make_d2d(host_buf.data(), new_dst.data(), 4096, cudaMemcpyHostToDevice);
   assert(run_sig(h2d).empty());
   auto d2h = make_d2d(new_src.data(), host_buf.data(), 4096, cudaMemcpyDeviceToHost);

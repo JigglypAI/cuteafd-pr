@@ -2933,6 +2933,83 @@ void test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers() {
   for (size_t i = 0; i < count / 2; ++i) assert(staged_after[i] == target_vals[i]);
   for (size_t i = count / 2; i < count; ++i) assert(staged_after[i] == 0x3e00);
   require_status(cuteafd_cuda_graph_exec_destroy(shrunk), "d2d shrunk destroy");
+  // Canonical 1D pitched layout (pitch == xsize == extent.width, ysize == 1, height/depth == 1)
+  // captured via cudaMemcpy3DAsync must match the same transferable signature and donor-update
+  // cleanly across buffer changes and cross-size shrinks with byte-identical output, while a
+  // 2D strided copy stays non-transferable.
+  auto record_pitched = [&](cuteafd_device_buffer_t in, cuteafd_device_buffer_t mid,
+                            cuteafd_device_buffer_t staged, cuteafd_device_buffer_t out,
+                            size_t width_bytes, size_t height, size_t pitch_bytes) {
+    const uint16_t* in_planes[8] = {static_cast<const uint16_t*>(in.ptr)};
+    const uint16_t* staged_planes[8] = {static_cast<const uint16_t*>(staged.ptr)};
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        in_planes, nullptr, static_cast<uint16_t*>(mid.ptr), 1, 1, stream)), "d2d pitched kernel 1");
+    cudaMemcpy3DParms p{};
+    p.srcPtr = cudaPitchedPtr{mid.ptr, pitch_bytes, width_bytes, height};
+    p.dstPtr = cudaPitchedPtr{staged.ptr, pitch_bytes, width_bytes, height};
+    p.extent = cudaExtent{width_bytes, height, 1};
+    p.kind = cudaMemcpyDeviceToDevice;
+    require_cuda(cudaMemcpy3DAsync(&p, stream), "d2d pitched 3d copy");
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        staged_planes, nullptr, static_cast<uint16_t*>(out.ptr), 1, 1, stream)), "d2d pitched kernel 2");
+  };
+  auto p_old_in = device_buffer(bytes), p_old_mid = device_buffer(bytes);
+  auto p_old_staged = device_buffer(bytes), p_old_out = device_buffer(bytes);
+  copy_h2d(p_old_in, donor_vals);
+  record_pitched(p_old_in, p_old_mid, p_old_staged, p_old_out, bytes, 1, bytes);
+  require_cuda(cudaStreamSynchronize(stream), "d2d pitched warmup");
+  void *pitched_first = nullptr, *pitched_second = nullptr, *pitched_smaller = nullptr, *strided_src = nullptr;
+  void *pitched_donor = nullptr, *pitched_receiver = nullptr, *pitched_shrunk = nullptr;
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d pitched first begin");
+  record_pitched(p_old_in, p_old_mid, p_old_staged, p_old_out, bytes, 1, bytes);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &pitched_first, &nodes, &width, &spans, &signature, &words), "d2d pitched first source");
+  assert(nodes == 3 && spans == 0 && expected == std::vector<uint64_t>(signature, signature + words));
+  require_status(cuteafd_cuda_graph_source_instantiate(pitched_first, stream, &pitched_donor), "d2d pitched instantiate");
+  require_cuda(cudaStreamSynchronize(stream), "d2d pitched upload complete");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d pitched second begin");
+  record_pitched(new_in, new_mid, new_staged, new_out, bytes, 1, bytes);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &pitched_second, &nodes, &width, &spans, &signature, &words), "d2d pitched second source");
+  assert(nodes == 3 && spans == 0 && expected == std::vector<uint64_t>(signature, signature + words));
+  status = -1; result = -1;
+  require_status(cuteafd_cuda_graph_source_update(pitched_second, pitched_donor, &status, &result), "d2d pitched update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(pitched_second, pitched_donor, &pitched_receiver), "d2d pitched transfer");
+  require_status(cuteafd_cuda_graph_upload(pitched_receiver, stream), "d2d pitched upload");
+  require_status(cuteafd_cuda_graph_source_destroy(pitched_first), "d2d pitched first destroy");
+  require_status(cuteafd_cuda_graph_source_destroy(pitched_second), "d2d pitched second destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(pitched_donor), "d2d pitched donor destroy");
+  free_buffer(&p_old_in); free_buffer(&p_old_mid); free_buffer(&p_old_staged); free_buffer(&p_old_out);
+  require_cuda(cudaMemset(new_mid.ptr, 0, bytes), "d2d pitched reset mid");
+  require_cuda(cudaMemset(new_staged.ptr, 0, bytes), "d2d pitched reset staged");
+  require_cuda(cudaMemset(new_out.ptr, 0, bytes), "d2d pitched reset out");
+  require_status(cuteafd_cuda_graph_launch(pitched_receiver, stream), "d2d pitched launch");
+  require_cuda(cudaStreamSynchronize(stream), "d2d pitched completion");
+  assert(copy_d2h<uint16_t>(new_staged, count) == target_vals);
+  assert(copy_d2h<uint16_t>(new_out, count) == target_vals);
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d pitched shrink begin");
+  record_pitched(new_in, new_mid, new_staged, new_out, bytes / 2, 1, bytes / 2);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &pitched_smaller, &nodes, &width, &spans, &signature, &words), "d2d pitched shrink source");
+  assert(nodes == 3 && spans == 0 && expected == std::vector<uint64_t>(signature, signature + words));
+  status = -1; result = -1;
+  require_status(cuteafd_cuda_graph_source_update(pitched_smaller, pitched_receiver, &status, &result), "d2d pitched shrink update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(pitched_smaller, pitched_receiver, &pitched_shrunk), "d2d pitched shrink transfer");
+  require_status(cuteafd_cuda_graph_upload(pitched_shrunk, stream), "d2d pitched shrink upload");
+  require_status(cuteafd_cuda_graph_source_destroy(pitched_smaller), "d2d pitched shrink source destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(pitched_receiver), "d2d pitched receiver destroy");
+  copy_h2d(new_staged, sentinel);
+  require_status(cuteafd_cuda_graph_launch(pitched_shrunk, stream), "d2d pitched shrink launch");
+  require_cuda(cudaStreamSynchronize(stream), "d2d pitched shrink completion");
+  auto pitched_after = copy_d2h<uint16_t>(new_staged, count);
+  for (size_t i = 0; i < count / 2; ++i) assert(pitched_after[i] == target_vals[i]);
+  for (size_t i = count / 2; i < count; ++i) assert(pitched_after[i] == 0x3e00);
+  require_status(cuteafd_cuda_graph_exec_destroy(pitched_shrunk), "d2d pitched shrunk destroy");
+  // 2D strided copy (height > 1, pitch > width) must remain non-transferable.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d strided begin");
+  record_pitched(new_in, new_mid, new_staged, new_out, bytes / 4, 2, bytes / 2);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &strided_src, &nodes, &width, &spans, &signature, &words), "d2d strided source");
+  assert(nodes == 3 && words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(strided_src), "d2d strided source destroy");
   // Non-D2D memcpy (H2D) must remain non-transferable.
   void* host_pinned = nullptr;
   require_cuda(cudaMallocHost(&host_pinned, bytes), "d2d test pinned host");
