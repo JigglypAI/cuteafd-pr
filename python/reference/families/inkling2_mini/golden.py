@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "python/reference"))
 import numpy as np
 import torch
 
-from families.inkling2.golden import configure_f32, digest
+from families.inkling2.golden import atomic_json, configure_f32, digest
 from families.inkling2.model import head_forward
 from families.inkling2_mini.model import CHECKPOINT, REVISION, TEXT, Config, Weights, forward
 from fidelity_windows import finish_golden, load_set, verify_snapshot, write_scored_logits
@@ -91,7 +91,9 @@ def execute(a):
         for first in range(start, end, ROWS):
             last = min(first + ROWS, end)
             logits[first-start:last-start] = head_forward(state[first-1:last-1], head, cfg).cpu().numpy()
-        entries.append(write_scored_logits(a.out, window, logits))
+        entry = write_scored_logits(a.out, window, logits)
+        atomic_json(a.out / entry["path"] / "meta.json", entry)
+        entries.append(entry)
     rows = sum(entry["scored_tokens"] for entry in entries)
     platform = ({"capability": list(torch.cuda.get_device_capability(a.device)),
                  "gpu": torch.cuda.get_device_name(a.device), "cuda": torch.version.cuda}
