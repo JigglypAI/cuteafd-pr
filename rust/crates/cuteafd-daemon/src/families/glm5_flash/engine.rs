@@ -2154,11 +2154,16 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn record_exchange(&self, rank: usize, name: &'static str, slot: usize, push: bool) {
+        self.record_exchange_target(rank, name, slot, 0, push);
+    }
+
+    fn record_exchange_target(&self, rank: usize, name: &'static str, slot: usize, target: usize, push: bool) {
         let Some(tp2) = &self.tp2 else { return };
         let mut recorded = tp2.schedule.borrow_mut();
         let Some(schedule) = recorded.as_mut() else { return };
         let label = format!("gpu{rank} {name} slot{slot} {}", if push { "push" } else { "wait" });
-        if push { schedule.push(rank, name, slot, label); } else { schedule.wait(rank, name, slot, label); }
+        if push { schedule.push_to(rank, name, slot, target, label); }
+        else { schedule.wait_for(rank, name, slot, target, label); }
     }
 
     fn exchange_push(&self, exchange: &PeerExchange<'_>, name: &'static str, rank: usize,
@@ -2168,7 +2173,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn exchange_wait(&self, exchange: &PeerExchange<'_>, name: &'static str, rank: usize, slot: usize) -> Result<()> {
-        self.record_exchange(rank, name, slot, false);
+        self.exchange_wait_target(exchange, name, rank, slot, 0)
+    }
+
+    fn exchange_wait_target(&self, exchange: &PeerExchange<'_>, name: &'static str, rank: usize,
+        slot: usize, target: usize) -> Result<()> {
+        self.record_exchange_target(rank, name, slot, target, false);
         exchange.wait(rank, slot)
     }
 
