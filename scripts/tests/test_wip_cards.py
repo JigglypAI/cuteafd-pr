@@ -1628,7 +1628,7 @@ def test_gate_muse_mc_cards_are_separate_from_legacy_support(size, count):
         assert values['MAX_CONTEXT_TOKENS'] == 'auto'
 
 
-@pytest.mark.parametrize('size,gpus,count', [('min', [0], 4), ('max', [0, 1], 6)])
+@pytest.mark.parametrize('size,gpus,count', [('min', [1], 4), ('max', [0, 1], 6)])
 def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, count):
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'glm53-mc-original-{size}'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
