@@ -185,6 +185,11 @@
       "model": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "revision": "cc72179113573d751ed3245e3e58d3640694378d",
       "family": "hy4_flash"
+    },
+    {
+      "model": "thinkingmachines/Inkling-2-Mini",
+      "revision": "7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6",
+      "family": "inkling2_mini"
     }
   ],
   "not_installed": [
