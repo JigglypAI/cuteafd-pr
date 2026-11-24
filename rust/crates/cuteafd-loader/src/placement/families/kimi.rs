@@ -982,13 +982,13 @@ impl Recipe for KimiRecipe {
                     ByteCurve::linear(owner.bytes_at_first, owner.bytes_per_page, self.maximum_pages),
                     false, self.maximum_pages));
             }
-            // The packing peak overlaps the target weights and the drafter's
-            // own resident owners; only the staging above them is transient.
+            // Both mount and push FP8 packing reuse one bounded device staging
+            // owner outside the packed weight arena during DraftLoad only.
             if draft.staging_at_first > 0 || draft.staging_per_page > 0 {
-                let peak = Allocation::buffer("draft.load_peak", Location::coordinator(rank),
+                let staging = Allocation::buffer("draft.load_staging", Location::coordinator(rank),
                     draft.staging_at_first, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
-                    Category::Drafter, "MLA DFlash load staging above its owners");
-                contract.components.push(Component::allocation(peak,
+                    Category::Staging, "MLA DFlash bounded device staging");
+                contract.components.push(Component::allocation(staging,
                     ByteCurve::linear(draft.staging_at_first, draft.staging_per_page, self.maximum_pages),
                     false, self.maximum_pages));
             }
@@ -1749,5 +1749,82 @@ mod tests {
         let recipe = recipe();
         assert!(recipe.admit(single(), Vec::new()).is_err());
         assert!(recipe.prepare(&Request { context: (512).into(), ..single() }).is_err());
+    }
+
+    #[test]
+    fn mla_draft_load_staging_charges_bounded_step_at_draft_load_only() -> anyhow::Result<()> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
+        use crate::formats::block_dspark::DsparkRotaryPlan;
+        use crate::formats::dflash::MlaDflashConfig;
+        use crate::formats::mla::MlaGeometry;
+        use cuteafd_core::{coordinator_programs::MlaDraftKind, MlaCacheFormat};
+        let step = crate::shared::dense_read::STEP_BYTES as u64;
+        let configs = [
+            // lightseek h64 (5 taps -> 490 MiB full FC2 source)
+            MlaDflashConfig { hidden_stream: Default::default(),
+                mla: MlaGeometry { hidden: 7168, heads: 64, q_rank: 1536, kv_rank: 512, nope: 128, rope: 64, value: 128 },
+                intermediate: 14336, eps: 1e-5, block: 8, group: 16, selector_rank: 256, selector_top_k: 16,
+                taps: vec![19, 37, 55, 73, 91], vocab: 163840, mask_token: 163839, max_context: 262144,
+                windows: vec![Some(4096), Some(4096), Some(4096), Some(4096), None],
+                rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+                kind: MlaDraftKind::Dflash2, markov_rank: 0 },
+            // RadixArk h96 (6 taps -> 588 MiB full FC2 source)
+            MlaDflashConfig { hidden_stream: Default::default(),
+                mla: MlaGeometry { hidden: 7168, heads: 96, q_rank: 1536, kv_rank: 512, nope: 128, rope: 64, value: 128 },
+                intermediate: 14336, eps: 1e-5, block: 8, group: 16, selector_rank: 256, selector_top_k: 32,
+                taps: vec![1, 19, 37, 55, 73, 91], vocab: 163840, mask_token: 163839, max_context: 262144,
+                windows: vec![Some(1024); 5],
+                rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+                kind: MlaDraftKind::CausalDflash2, markov_rank: 0 },
+        ];
+        for cfg in configs {
+            let cap = GlmDraftCapacity::new(8, 8, cfg.block)?;
+            let modes = [
+                ("partial-fp8", cfg.runtime_layout(Fp8Only, cap, 8192, 16384, 188, 0, MlaCacheFormat::Fp8)?, step),
+                ("complete-fp8", cfg.complete_fp8_runtime_layout(cap, 8192, 16384, 188, 0, MlaCacheFormat::Fp8)?, step),
+                ("bf16-only", cfg.runtime_layout(Bf16Only, cap, 8192, 16384, 188, 0, MlaCacheFormat::Fp8)?, 0),
+            ];
+            for (label, layout, expected_staging) in modes {
+                let mut r = recipe();
+                r.experts = None;
+                r.arenas = vec![Arena { count: 0, peak: vec![0], resident: vec![0], weights: vec![0] }];
+                r.draft = Some(draft_facts(&layout, PAGE_ROWS, r.maximum_pages, 0)?);
+                let contract = r.prepare(&single())?;
+                let selected = vec![0; contract.variables.len()];
+                let min_pages = r.context / PAGE_ROWS;
+                let facts = contract.facts(&selected, min_pages)?;
+                let staging: Vec<_> = facts.allocations.iter()
+                    .filter(|owner| owner.id == "draft.load_staging").collect();
+                if expected_staging == 0 {
+                    assert!(staging.is_empty(), "{label} should emit no device staging owner");
+                } else {
+                    assert_eq!(staging.len(), 1, "{label} should emit exactly one staging owner");
+                    let owner = staging[0];
+                    assert_eq!(owner.location, Location::coordinator(0));
+                    assert_eq!(owner.bytes, expected_staging);
+                    assert_eq!(owner.category, Category::Staging);
+                    assert_eq!(owner.lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
+                    assert!(owner.view.is_none());
+                    assert!(!facts.resident_weights.iter().any(|w| w.id == "draft.load_staging"));
+                    assert_eq!(expected_staging % SM120_ALLOCATION_GRANULARITY_BYTES, 0);
+                }
+                // Tight budget: fits resident + STEP_BYTES (would fail on dev's 490/588 MiB charge).
+                let probe = evaluate(&facts, &[Budget { id: "gpu0".into(),
+                    locations: vec![Location::coordinator(0)],
+                    physical_bytes: 128 << 30, logical_bytes: 128 << 30, headroom: 0,
+                    baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false } }])?;
+                let at = |phase| probe.iter().find(|row| row.phase == phase).unwrap();
+                let draft_load = at(Phase::DraftLoad);
+                let ready = at(Phase::Ready);
+                assert_eq!(draft_load.owned - ready.owned, expected_staging, "{label}");
+                assert_eq!(draft_load.opaque, ready.opaque, "{label} STEP_BYTES must carry 0 B tail");
+                let tight = draft_load.owned + draft_load.opaque;
+                let req = Request { resident_weight_limit: Some(ResidentWeights(u64::MAX)), ..single() };
+                let admitted = r.admit(req.clone(), budgets(&[(tight, tight)], 0, &[0], &[])?)?;
+                assert_eq!(admitted.placement.pool_tokens, r.context, "{label} should admit at exact bounded DraftLoad peak");
+                assert!(r.admit(req, budgets(&[(tight - 1, tight - 1)], 0, &[0], &[])?).is_err());
+            }
+        }
+        Ok(())
     }
 }

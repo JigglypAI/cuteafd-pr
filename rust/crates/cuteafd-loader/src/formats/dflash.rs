@@ -1133,9 +1133,12 @@ impl MlaDflashConfig {
                 if shape.len() != 2 || shape[0] % 16 != 0 || shape[1] % 128 != 0 {
                     return Err(unsupported("MLA draft FP8 GEMMs require N multiples of 16 and K multiples of 128"));
                 }
+                if shape[1].checked_mul(32).is_none_or(|tile| tile > crate::shared::dense_read::STEP_BYTES) {
+                    return Err(unsupported("MLA draft FP8 row tile exceeds bounded load staging"));
+                }
                 layout.fp8_scales = layout.fp8_scales.checked_add(values / 128 * 4)
                     .ok_or_else(overflow)?;
-                layout.max_load_staging = layout.max_load_staging.max(bytes);
+                layout.max_load_staging = crate::shared::dense_read::STEP_BYTES as u64;
                 &mut layout.fp8_values
             } else if codebook { &mut layout.bf16_codebooks }
             else if shape.len() == 1 || name.ends_with(".base_kernel") { &mut layout.bf16_auxiliary }
@@ -1257,11 +1260,10 @@ impl MlaDflashConfig {
                 GlmDraftLinearShape { k: h as u64, n: (2 * inter) as u64 },
                 GlmDraftLinearShape { k: inter as u64, n: h as u64 },
             ];
-            if shapes.iter().any(|s| s.k % 128 != 0 || s.n % 16 != 0) { return Err(invalid()); }
-            // The executor concatenates gate/up before packing; source headers
-            // alone undercount this transient when the MLP exceeds FC size.
-            weights.max_load_staging = shapes.iter().map(|s| s.k * s.n * 2)
-                .max().unwrap_or(0).max(weights.max_load_staging);
+            if shapes.iter().any(|s| s.k % 128 != 0 || s.n % 16 != 0
+                || s.k.checked_mul(32).is_none_or(|tile| tile > crate::shared::dense_read::STEP_BYTES as u64)) {
+                return Err(invalid());
+            }
             let scratch_rows = tap_rows.max(rows);
             let bytes = shapes.iter().flat_map(|s| (0..=fp8_mode).map(move |m|
                 draft_fp8_scratch_bytes(scratch_rows as u64, s.k, s.n, sm_count as u64, m)))
@@ -2229,7 +2231,7 @@ mod tests {
         }
         cfg.intermediate = 32768;
         let layout = cfg.runtime_layout(Fp8Only, capacity, 262144, 262144, 188, 2, MlaCacheFormat::Bf16).unwrap();
-        assert_eq!(layout.weights.max_load_staging, 2 * 2 * 32768 * 7168);
+        assert_eq!(layout.weights.max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
         assert!(layout.fp8_scratch.as_ref().unwrap().shapes.iter().any(|s| s.n == 65536 && s.k == 7168));
         cfg.mla.hidden = usize::MAX;
         assert!(cfg.runtime_layout(Bf16Only, capacity, 262144, 262144, 188, 0, MlaCacheFormat::Bf16).is_err());
@@ -2291,7 +2293,7 @@ mod tests {
         assert_eq!(fp8.bf16_values, native_mla);
         assert_eq!(bf16.bf16_values - fp8.bf16_values, 2 * fp8.fp8_values);
         assert_eq!(fp8.fp8_scales, fp8.fp8_values / 128 * 4);
-        assert_eq!(fp8.max_load_staging, 2 * 7168 * 5 * 7168);
+        assert_eq!(fp8.max_load_staging, crate::shared::dense_read::STEP_BYTES as u64);
         assert_eq!(fp8.loading_peak_bytes().unwrap(), fp8.resident_bytes().unwrap() + fp8.max_load_staging);
         assert!(fp8.resident_bytes().unwrap() < bf16.resident_bytes().unwrap());
         assert!(fp8.loading_peak_bytes().unwrap() < bf16.resident_bytes().unwrap());
@@ -2704,5 +2706,54 @@ mod tests {
             let mut raw = config(); raw["dflash_config"][field] = value;
             assert!(MlaDflashConfig::from_json(&raw).is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn mla_load_staging_charges_bounded_step_per_mode_and_rejects_oversized_tile() -> anyhow::Result<()> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
+        let step = crate::shared::dense_read::STEP_BYTES as u64;
+        for raw in [config(), causal_config()] {
+            let cfg = MlaDflashConfig::from_json(&raw)?;
+            let capacity = GlmDraftCapacity::new(8, 8, cfg.block)?;
+            // Partial body-FP8 and complete body-FP8 both charge one STEP_BYTES
+            // device staging buffer, never the full BF16 source matrix (490/588 MiB).
+            let partial_weights = cfg.weight_layout(Fp8Only)?;
+            let complete_weights = cfg.complete_fp8_weight_layout()?;
+            let bf16_weights = cfg.weight_layout(Bf16Only)?;
+            assert_eq!(partial_weights.max_load_staging, step);
+            assert_eq!(complete_weights.max_load_staging, step);
+            assert_eq!(bf16_weights.max_load_staging, 0);
+            let fc_bf16_bytes = (cfg.taps.len() * cfg.mla.hidden * cfg.mla.hidden * 2) as u64;
+            assert!(fc_bf16_bytes > step, "fixture must exceed STEP_BYTES to catch full-matrix overcharge");
+            for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let partial = cfg.runtime_layout(Fp8Only, capacity, 8192, 16384, 188, 0, cache)?;
+                let complete = cfg.complete_fp8_runtime_layout(capacity, 8192, 16384, 188, 0, cache)?;
+                let bf16 = cfg.runtime_layout(Bf16Only, capacity, 8192, 16384, 188, 0, cache)?;
+                assert_eq!(partial.weights().max_load_staging, step);
+                assert_eq!(complete.weights().max_load_staging, step);
+                assert_eq!(bf16.weights().max_load_staging, 0);
+                let (demand, peak) = partial.demands(1)?;
+                assert_eq!(peak.bytes - demand.owned.iter().map(|d| d.bytes).sum::<u64>(), step);
+                let (demand, peak) = bf16.demands(1)?;
+                assert_eq!(peak.bytes, demand.owned.iter().map(|d| d.bytes).sum::<u64>());
+            }
+            // Reject an FP8 row tile (16 rows * K * 2 B) that cannot fit in STEP_BYTES.
+            let mut oversized = cfg;
+            oversized.intermediate = (crate::shared::dense_read::STEP_BYTES / 32) + 128;
+            assert!(oversized.weight_layout(Fp8Only).is_err());
+            assert!(oversized.runtime_layout(Fp8Only, capacity, 8192, 16384, 188, 0, MlaCacheFormat::Fp8).is_err());
+            assert!(oversized.weight_layout(Bf16Only).is_ok());
+        }
+        // BF16-only ML4 mtp_dspark stays at 0 B transient device staging.
+        let ml4 = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+            kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
+            block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1, 18, 36, 54, 71],
+            vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+        let ml4_layout = ml4.runtime_layout(Bf16Only, GlmDraftCapacity::new(5, 1, 3)?, 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8)?;
+        assert_eq!(ml4_layout.weights().max_load_staging, 0);
+        assert!(ml4.weight_layout(Fp8Only).is_err());
+        Ok(())
     }
 }
