@@ -729,7 +729,7 @@ mod tests {
         } else { None };
         post(0, 4);
         post(0, 5);
-        let check_landed = |row| {
+        let check_landed = |row: u64| {
             for (table, delta) in tables.iter().zip([0, 10]) {
                 let id = row + delta;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
