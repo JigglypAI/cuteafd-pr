@@ -3,7 +3,7 @@ use crate::shared::decode_graph::sites::{Scope, Table};
 
 #[cfg(test)]
 const SITES: &Table = &[
-    ("glm5_flash.decode_local", Scope::Local, "engine/local_graph.rs:137 decode_graphed_local keeps every PeerExchange and ContextExchange push/wait outside replay_on; both ranks push before either waits"),
+    ("glm5_flash.decode_local", Scope::Local, "engine/local_graph.rs:163 decode_graphed_local keeps every PeerExchange and ContextExchange push/wait outside replay_on with zero unmatched waits during capture"),
 ];
 
 #[cfg(test)]
