@@ -368,9 +368,11 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     }
 
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia, cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
-        // Fidelity-only reference features (golden NLL with the official tower
-        // output); ordinary image requests always encode natively.
-        if prompt.job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) && !media.spans().is_empty() {
+        // Reference features replace the tower only for a scoring probe on a server
+        // launched with MEDIA_FEATURES_DIR (the paired reference arm). The bundled
+        // tower is qualified, so the native arm and ordinary requests encode natively.
+        if prompt.job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) && !media.spans().is_empty()
+            && std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR").is_some() {
             crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::Hy4Flash)?;
         }
         Ok(())
