@@ -293,7 +293,7 @@ impl<'a> Hy4Backend<'a> {
                 },
             )
         };
-        let result = if allow_graphs && !speculative {
+        let result = if allow_graphs {
             run(&mut engine)
         } else {
             engine.without_graphs(run)
@@ -698,17 +698,23 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     ) -> Result<Vec<Vec<u32>>> {
         let start = std::time::Instant::now();
         let engine = self.engine.borrow();
-        let proposals = sequences.iter().map(|request| {
-            match request.seq.anchor.filter(|_| request.depth > 0 && engine.draft_valid(request.placement)) {
-                Some(anchor) => {
-                    timing.steps += 1;
-                    engine.draft_propose(request.placement, anchor, request.depth)
-                }
-                None => Ok(Vec::new()),
-            }
-        }).collect();
+        let selected = sequences.iter().enumerate().filter_map(|(i, request)| {
+            let bonus = request.seq.anchor?;
+            let p = request.placement;
+            (request.depth > 0 && engine.draft_valid(p)).then_some((i, super::draft::Member {
+                slot: p.slot, pos: p.len, bonus, depth: request.depth,
+            }))
+        }).collect::<Vec<_>>();
+        let mut output = vec![Vec::new(); sequences.len()];
+        if !selected.is_empty() {
+            let members = selected.iter().map(|(_, member)| *member).collect::<Vec<_>>();
+            let proposals = engine.draft_batch(&members)?;
+            ensure!(proposals.len() == selected.len(), "DFly2 batch returned the wrong member count");
+            for ((index, _), tokens) in selected.into_iter().zip(proposals) { output[index] = tokens; }
+            timing.steps += 1;
+        }
         timing.seconds += start.elapsed().as_secs_f64();
-        proposals
+        Ok(output)
     }
 
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Hy4Placement, Draft, usize>], speculative: bool) -> Result<()> {

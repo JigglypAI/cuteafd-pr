@@ -1640,12 +1640,28 @@ impl<'a> Hy4Engine<'a> {
     }
 
     pub(super) fn draft_propose(&self, placement: &Hy4Placement, bonus: u32, depth: usize) -> Result<Vec<u32>> {
+        if depth == 0 || !self.draft_valid(placement) { return Ok(Vec::new()); }
+        let batch = [super::draft::Member { slot: placement.slot, pos: placement.len, bonus, depth }];
+        Ok(self.draft_batch(&batch)?.pop().unwrap_or_default())
+    }
+
+    pub(super) fn draft_batch(&self, members: &[super::draft::Member]) -> Result<Vec<Vec<u32>>> {
         let Some(draft) = &self.draft else { return Ok(Vec::new()); };
         let r = &self.ranks[0];
         let embedding = r.weights.embedding.as_ref().context("DFly2 target embedding missing")?;
-        draft.propose(&r.stream, embedding, placement.slot, placement.len, bonus, depth,
-            r.weights.inv_freq_dsa.buffer, |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
-            |hidden| self.project_vocab_tile(0, hidden, 1))
+        let graphs = self.graphs_active().then_some(&r.graphs);
+        if graphs.is_some() {
+            self.set_graph_cycle(ReadPriority::Decode);
+        }
+        let result = draft.propose(&r.stream, embedding, members, graphs, r.weights.inv_freq_dsa.buffer,
+            |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
+            |hidden, rows| self.project_vocab_tile(0, hidden, rows));
+        // Successful proposals settle with their following target round. On an
+        // error there may not be a target round to settle an aborted capture.
+        if graphs.is_some() && result.is_err() {
+            let _ = self.graph_completed();
+        }
+        result
     }
 
     pub(super) fn accept_draft(&self, slot: usize, row: usize, pos: usize) -> Result<()> {
@@ -1699,6 +1715,12 @@ impl<'a> Hy4Engine<'a> {
         self.graphs_enabled.get() && self.ranks.iter().all(|r| r.graphs.attached())
     }
 
+    pub(super) fn retained_draft_graph_rows(&self, members: usize) -> usize {
+        self.draft.as_ref().map_or(0, |draft| {
+            self.ranks[0].graphs.retained_draft_rows(members * draft.cfg.block_rows())
+        })
+    }
+
     pub(crate) fn retained_graph_rows(&self, rows: usize) -> Vec<(i32, usize)> {
         self.ranks
             .iter()
@@ -1734,6 +1756,7 @@ impl<'a> Hy4Engine<'a> {
 
     fn set_graph_cycle(&self, priority: ReadPriority) {
         let cycle = match priority {
+            ReadPriority::Decode | ReadPriority::DecodeFirst if self.verifying => GraphCycle::Verify,
             ReadPriority::Decode | ReadPriority::DecodeFirst => GraphCycle::Decode,
             ReadPriority::Prefill | ReadPriority::PrefillFirst => GraphCycle::Prefill,
         };
@@ -1742,7 +1765,7 @@ impl<'a> Hy4Engine<'a> {
         }
     }
 
-    fn graph_completed(&self) -> Result<()> {
+    pub(super) fn graph_completed(&self) -> Result<()> {
         if !self.graphs_active() {
             return Ok(());
         }
