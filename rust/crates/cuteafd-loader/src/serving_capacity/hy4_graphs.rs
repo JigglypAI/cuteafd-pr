@@ -51,11 +51,20 @@ pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Res
 }
 
 /// Short and 32K C1 physical graph-arena census for split DFly2 on `Exl3Max`
-/// (2x RTX, 0 Sparks). Populated from C1 census; `None` delegates to the base
-/// `Exl3Max` working set until recorded.
+/// (2x RTX, 0 Sparks, shipping `CORE_VIEW=original`, default `TP2_DFLASH=on`):
+/// measured `100 MiB` on GPU0 and `98 MiB` on GPU1 (zero captures/misses/eager
+/// runs on both timed C1 bands).
 pub fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
-    let _ = (layout, rank);
-    None
+    let (w1, step_growth, capture_growth) = match (layout, rank) {
+        (Some(Hy4GraphLayout::Exl3Max), 0) => (100, 20, 4),
+        (Some(Hy4GraphLayout::Exl3Max), 1) => (98, 18, 4),
+        _ => return None,
+    };
+    Some(WorkingSet {
+        w1: w1 << 20,
+        step_growth: step_growth << 20,
+        capture_growth: capture_growth << 20,
+    })
 }
 
 /// Resolve the per-rank graph reserve policy, routing split-DFly2 layouts through
@@ -102,5 +111,22 @@ mod tests {
         assert_eq!(working_set(Hy4GraphLayout::resolve(3, 0), 0), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(1, 1), 0),
                    working_set(Hy4GraphLayout::resolve(1, 4), 0));
+    }
+
+    #[test]
+    fn split_dfly2_delegates_to_shared_working_set_resolver() {
+        let max = Some(Hy4GraphLayout::Exl3Max);
+        for (rank, expected_w1, expected_soft, expected_hard) in [
+            (0, 100, 196, 204),
+            (1, 98, 194, 202),
+        ] {
+            let census = split_dfly2_working_set(max, rank).unwrap();
+            assert_eq!(census.w1, expected_w1 << 20);
+            let policy = graph_reserve::resolve_working_set(None, None, None, rank, census).unwrap();
+            assert_eq!(policy.base_bytes, expected_soft << 20);
+            assert_eq!(policy.bytes, expected_hard << 20);
+        }
+        assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3Min), 0), None);
+        assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3MaxSpark), 0), None);
     }
 }
