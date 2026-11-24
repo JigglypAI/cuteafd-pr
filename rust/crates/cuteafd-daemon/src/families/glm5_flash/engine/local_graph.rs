@@ -30,40 +30,33 @@ impl<'a> GlmfEngine<'a> {
         self.tp2.as_ref().is_some_and(|tp2| tp2.source.get() == RouteSource::Replicated)
     }
 
-    /// Standard BF16/FP32 attention partial push on `rank` (false for K6 core-staged or
-    /// output-shard KDA layers, which use `local_exchange_attention_special`).
-    fn local_push_attention_if_standard(&self, rank: usize, w: &Workspace<'_>, index: usize, t: usize)
+    /// Push `rank`'s attention partial outside capture when this layer uses either
+    /// native-core (`core_publish_attention`) or standard BF16/FP32 `PeerExchange`.
+    /// Returns `false` only for `output_shard_attention` (two-round KDA head/row join).
+    fn local_push_attention(&self, rank: usize, w: &Workspace<'_>, index: usize, t: usize)
         -> Result<bool> {
         let layer = self.local_rank_layer(rank, index)?;
-        if core::stage_attention(layer) || self.output_shard_attention(layer) {
+        let att_slot = slot(index, false, 0);
+        if self.core_publish_attention(rank, w, layer, att_slot, t)? {
+            return Ok(true);
+        }
+        if self.output_shard_attention(layer) {
             return Ok(false);
         }
-        let att_slot = slot(index, false, 0);
         let bytes = t * self.cfg.hidden * if self.precise_attention(layer) { 4 } else { 2 };
         self.exchange_push(self.exchange()?, "main", rank, att_slot, w.delta.buffer.ptr, bytes)?;
         Ok(true)
     }
 
-    /// Complete non-standard attention exchange (`core::stage_attention` or `output_shard_attention`).
-    /// Both ranks push and wait outside capture before returning their merged-attention pointers.
-    fn local_exchange_attention_special(&self, index: usize, w0: &Workspace<'_>, w1: &Workspace<'_>,
-        t: usize, cap: &str) -> Result<Option<[*mut c_void; 2]>> {
+    /// Complete two-round `output_shard_attention` outside capture.
+    fn local_exchange_output_shard(&self, index: usize, w0: &Workspace<'_>, w1: &Workspace<'_>,
+        t: usize, cap: &str) -> Result<[*mut c_void; 2]> {
         let layer0 = self.local_rank_layer(0, index)?;
         let layer1 = self.local_rank_layer(1, index)?;
         let att_slot = slot(index, false, 0);
-        if core::stage_attention(layer0) {
-            let out1 = self.core_attention_meet(1, w1, layer1, att_slot, t)?
-                .context("rank 1 core attention meet")?;
-            let out0 = self.core_attention_meet(0, w0, layer0, att_slot, t)?
-                .context("rank 0 core attention meet")?;
-            return Ok(Some([out0, out1]));
-        }
-        if self.output_shard_attention(layer0) {
-            let out1 = self.complete_output_shard(1, w1, layer1, att_slot, t, cap)?;
-            let out0 = self.complete_output_shard(0, w0, layer0, att_slot, t, cap)?;
-            return Ok(Some([out0, out1]));
-        }
-        Ok(None)
+        let out1 = self.complete_output_shard(1, w1, layer1, att_slot, t, cap)?;
+        let out0 = self.complete_output_shard(0, w0, layer0, att_slot, t, cap)?;
+        Ok([out0, out1])
     }
 
     /// Stage Rank 1's Phase-0 attention and outgoing push for layer `index` one layer ahead
@@ -107,16 +100,20 @@ impl<'a> GlmfEngine<'a> {
                 self.context_local_push_candidates(1, slot1, t)?;
             }
         } else {
-            self.local_push_attention_if_standard(1, w1, index, t)?;
+            self.local_push_attention(1, w1, index, t)?;
         }
         Ok(())
     }
 
     /// Rank-local attention partial reduction in identical operand order (rank 0 then rank 1).
+    /// Handles both native-core (`core_reduce_attention`) and standard BF16/FP32 exchanges.
     fn local_add_attention(&self, rank: usize, w: &Workspace<'_>, index: usize, t: usize) -> Result<*mut c_void> {
-        let exchange = self.exchange()?;
         let layer = self.local_rank_layer(rank, index)?;
         let att_slot = slot(index, false, 0);
+        if core::stage_attention(layer) {
+            return self.core_reduce_attention(rank, w, layer, att_slot, t);
+        }
+        let exchange = self.exchange()?;
         let precise = self.precise_attention(layer);
         let recv = exchange.recv(rank, att_slot)?;
         let (a, b) = if rank == 0 { (w.delta.buffer.ptr, recv) } else { (recv, w.delta.buffer.ptr) };
@@ -144,14 +141,18 @@ impl<'a> GlmfEngine<'a> {
         w.sum_ptr()
     }
 
-    /// Rank-local dense FFN execution on rank `rank` (handles whole-on-rank-0 dense fallback).
+    /// Rank-local dense FFN execution on rank `rank` (no peer exchange; split native-core
+    /// FFNs publish and reduce outside capture via `core_publish_ffn` / `core_finish_ffn`).
     fn local_dense_ffn(&self, rank: usize, w: &Workspace<'_>, index: usize, t: usize, cap: &str) -> Result<()> {
         let layer = self.local_rank_layer(rank, index)?;
         let rows = Scalar::I32(t as i32);
+        let out = if rank == 0 { w.delta.buffer.ptr } else { self.peer_ffn_out(index, w, layer)? };
+        if core::native_ffn(layer) {
+            return self.core_ffn_local(rank, w, layer, cap, out, rows);
+        }
         if rank == 0 {
-            self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
-        } else if layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer) {
-            let out = self.peer_ffn_out(index, w, layer)?;
+            self.ffn(w, layer, self.cfg.dense_intermediate, cap, out, rows)
+        } else if layer.has("w_gate_up_fp8") || native::dense_ffn(layer) {
             self.ffn_on(1, w, layer, self.cfg.dense_intermediate, cap, out, rows)
         } else {
             Ok(())
@@ -260,7 +261,7 @@ impl<'a> GlmfEngine<'a> {
             })?;
 
             // 2. Finish attention exchange (Rank 1 already pushed query/candidates or att[index]).
-            let merged_ptrs = if is_context_mla {
+            let output_shard_ptrs = if is_context_mla {
                 let slot0 = self.context_local_slot(0, index)?;
                 let slot1 = self.context_local_slot(1, index)?;
                 self.context_local_push_query(0, w, slot0, t)?;
@@ -302,121 +303,145 @@ impl<'a> GlmfEngine<'a> {
                 // Both ranks' partials are pushed: wait -> combine_out -> push attention (Rank 1 first).
                 let recv1 = self.context_local_wait_partial(1, slot1)?;
                 self.context_local_combine_out(1, w1, layer1, rows, cap, t, recv1)?;
-                let standard = self.local_push_attention_if_standard(1, w1, index, t)?;
+                let pushed = self.local_push_attention(1, w1, index, t)?;
 
                 let recv0 = self.context_local_wait_partial(0, slot0)?;
                 self.context_local_combine_out(0, w, layer0, rows, cap, t, recv0)?;
-                if standard {
-                    self.local_push_attention_if_standard(0, w, index, t)?;
+                if pushed {
+                    self.local_push_attention(0, w, index, t)?;
                     None
                 } else {
-                    self.local_exchange_attention_special(index, w, w1, t, cap)?
+                    Some(self.local_exchange_output_shard(index, w, w1, t, cap)?)
                 }
-            } else if self.local_push_attention_if_standard(0, w, index, t)? {
+            } else if self.local_push_attention(0, w, index, t)? {
                 None
             } else {
-                self.local_exchange_attention_special(index, w, w1, t, cap)?
+                Some(self.local_exchange_output_shard(index, w, w1, t, cap)?)
             };
 
             // 3. Post-attention + FFN + FFN pushes (Rank 1 first so GPU 1 stays ahead of GPU 0).
             let att_slot = slot(index, false, 0);
             let ffn_slot = slot(index, true, 0);
+            let split_core_ffn = core::native_ffn(layer0) && layer0.split;
             if layer0.dense {
-                // Split K6 core_ffn executes an internal peer publish/wait, so keep it eager
-                // outside capture; standard BF16/FP8 dense FFNs are strictly rank-local.
-                let split_core_ffn = core::native_ffn(layer0) && layer0.split;
-                if merged_ptrs.is_none() {
+                // Rank 1 dense FFN (strictly rank-local capture) -> push!
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 1, att_slot)?;
                 }
-                if split_core_ffn {
-                    let attended = match merged_ptrs {
-                        Some(ptrs) => ptrs[1],
+                let key1 = GraphKey::new_sub(index, 1, t, tables1).normalized(Some(layer1.attention));
+                let pre1 = output_shard_ptrs.map(|p| p[1]);
+                self.replay_on(1, key1, || {
+                    let attended = match pre1 {
+                        Some(ptr) => ptr,
                         None => self.local_add_attention(1, w1, index, t)?,
                     };
                     self.post_pre_on(1, w1, attended, 0, layer1, "ffn", "post_norm", rows, cap)?;
-                    self.local_dense_ffn(1, w1, index, t, cap)?;
-                } else {
-                    let key1 = GraphKey::new_sub(index, 1, t, tables1).normalized(Some(layer1.attention));
-                    let pre1 = merged_ptrs.map(|p| p[1]);
-                    self.replay_on(1, key1, || {
-                        let attended = match pre1 {
-                            Some(ptr) => ptr,
-                            None => self.local_add_attention(1, w1, index, t)?,
-                        };
-                        self.post_pre_on(1, w1, attended, 0, layer1, "ffn", "post_norm", rows, cap)?;
-                        self.local_dense_ffn(1, w1, index, t, cap)
-                    })?;
-                }
+                    self.local_dense_ffn(1, w1, index, t, cap)
+                })?;
                 let out1 = self.peer_ffn_out(index, w1, layer1)?;
-                self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
+                if split_core_ffn {
+                    self.core_publish_ffn(1, w1, index, t)?;
+                } else {
+                    self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
+                }
 
-                if merged_ptrs.is_none() {
+                // Rank 0 dense FFN (strictly rank-local capture) -> push!
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 0, att_slot)?;
                 }
-                if split_core_ffn {
-                    let attended = match merged_ptrs {
-                        Some(ptrs) => ptrs[0],
+                let key0 = GraphKey::new_sub(index, 1, t, tables).normalized(Some(layer0.attention));
+                let pre0 = output_shard_ptrs.map(|p| p[0]);
+                self.replay_on(0, key0, || {
+                    let attended = match pre0 {
+                        Some(ptr) => ptr,
                         None => self.local_add_attention(0, w, index, t)?,
                     };
                     self.post_pre_on(0, w, attended, 0, layer0, "ffn", "post_norm", rows, cap)?;
-                    self.local_dense_ffn(0, w, index, t, cap)?;
-                } else {
-                    let key0 = GraphKey::new_sub(index, 1, t, tables).normalized(Some(layer0.attention));
-                    let pre0 = merged_ptrs.map(|p| p[0]);
-                    self.replay_on(0, key0, || {
-                        let attended = match pre0 {
-                            Some(ptr) => ptr,
-                            None => self.local_add_attention(0, w, index, t)?,
-                        };
-                        self.post_pre_on(0, w, attended, 0, layer0, "ffn", "post_norm", rows, cap)?;
-                        self.local_dense_ffn(0, w, index, t, cap)
-                    })?;
-                }
-                if !last {
+                    self.local_dense_ffn(0, w, index, t, cap)
+                })?;
+                if split_core_ffn {
+                    self.core_publish_ffn(0, w, index, t)?;
+                    // Both core_publish_ffn pushes are queued; reduce/zero then exchange final BF16 FFN.
+                    self.core_finish_ffn(1, w1, layer1, index, out1, t)?;
+                    self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
+                    self.core_finish_ffn(0, w, layer0, index, w.delta.buffer.ptr, t)?;
+                    if !last {
+                        self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
+                    }
+                } else if !last {
                     self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
                 }
-            } else if self.tp2_layer(index) && self.tp2_routes_replicated() && !core::native_ffn(layer0) {
-                // Production TP2 MoE (replicated routers): queue Rank 1's entire MoE + publish
-                // in one contiguous batch before Rank 0 so GPU 1 pushes ffn[index] ahead of GPU 0.
-                if merged_ptrs.is_none() {
+            } else if self.tp2_layer(index) && self.tp2_routes_replicated() {
+                // Production TP2 MoE (replicated routers): pipeline Rank 1 ahead across both
+                // split-core shared-expert FFN and EXL3 routed experts.
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 1, att_slot)?;
                 }
-                let att1 = match merged_ptrs {
+                let att1 = match output_shard_ptrs {
                     Some(ptrs) => ptrs[1],
                     None => self.local_add_attention(1, w1, index, t)?,
                 };
                 self.post_pre_on(1, w1, att1, 0, layer1, "ffn", "post_norm", rows, cap)?;
-                self.ffn_on(1, w1, layer1, self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, rows)?;
-                self.router_on(1, w1, layer1, t, &[Span { first: 0, rows: t }])?;
-                self.tp2_rank(1, index, 0, w1, t, w1.delta.buffer.ptr)?;
-                self.tp2_publish(index, 0, t, Some(w1))?;
+                if split_core_ffn {
+                    self.core_ffn_local(1, w1, layer1, cap, w1.shared.buffer.ptr, rows)?;
+                    self.core_publish_ffn(1, w1, index, t)?;
+                    self.router_on(1, w1, layer1, t, &[Span { first: 0, rows: t }])?;
 
-                if merged_ptrs.is_none() {
-                    self.exchange_wait(exchange, "main", 0, att_slot)?;
-                }
-                let att0 = match merged_ptrs {
-                    Some(ptrs) => ptrs[0],
-                    None => self.local_add_attention(0, w, index, t)?,
-                };
-                self.post_pre_on(0, w, att0, 0, layer0, "ffn", "post_norm", rows, cap)?;
-                self.moe_front(w, index, layer0, t, rows, cap, &[Span { first: 0, rows: t }])?;
-                self.ffn(w, layer0, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
-                self.tp2_rank(0, index, 0, w, t, w.delta.buffer.ptr)?;
-                if !last {
-                    self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
+                    if output_shard_ptrs.is_none() {
+                        self.exchange_wait(exchange, "main", 0, att_slot)?;
+                    }
+                    let att0 = match output_shard_ptrs {
+                        Some(ptrs) => ptrs[0],
+                        None => self.local_add_attention(0, w, index, t)?,
+                    };
+                    self.post_pre_on(0, w, att0, 0, layer0, "ffn", "post_norm", rows, cap)?;
+                    self.moe_front(w, index, layer0, t, rows, cap, &[Span { first: 0, rows: t }])?;
+                    self.core_ffn_local(0, w, layer0, cap, w.shared.buffer.ptr, rows)?;
+                    self.core_publish_ffn(0, w, index, t)?;
+
+                    // Both core_publish_ffn pushes are queued: finish Rank 1 shared + EXL3 + publish first.
+                    self.core_finish_ffn(1, w1, layer1, index, w1.shared.buffer.ptr, t)?;
+                    self.tp2_rank(1, index, 0, w1, t, w1.delta.buffer.ptr)?;
+                    self.tp2_publish(index, 0, t, Some(w1))?;
+
+                    self.core_finish_ffn(0, w, layer0, index, w.shared.buffer.ptr, t)?;
+                    self.tp2_rank(0, index, 0, w, t, w.delta.buffer.ptr)?;
+                    if !last {
+                        self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
+                    }
+                } else {
+                    self.ffn_on(1, w1, layer1, self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, rows)?;
+                    self.router_on(1, w1, layer1, t, &[Span { first: 0, rows: t }])?;
+                    self.tp2_rank(1, index, 0, w1, t, w1.delta.buffer.ptr)?;
+                    self.tp2_publish(index, 0, t, Some(w1))?;
+
+                    if output_shard_ptrs.is_none() {
+                        self.exchange_wait(exchange, "main", 0, att_slot)?;
+                    }
+                    let att0 = match output_shard_ptrs {
+                        Some(ptrs) => ptrs[0],
+                        None => self.local_add_attention(0, w, index, t)?,
+                    };
+                    self.post_pre_on(0, w, att0, 0, layer0, "ffn", "post_norm", rows, cap)?;
+                    self.moe_front(w, index, layer0, t, rows, cap, &[Span { first: 0, rows: t }])?;
+                    self.ffn(w, layer0, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
+                    self.tp2_rank(0, index, 0, w, t, w.delta.buffer.ptr)?;
+                    if !last {
+                        self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
+                    }
                 }
             } else if self.tp2_layer(index) {
-                // Broadcast-route or split-core TP2 MoE: preserve `tp2_pair`'s rank-0-first route/core order.
-                if merged_ptrs.is_none() {
+                // Broadcast-route TP2 fallback: preserve `tp2_pair`'s rank-0-first route broadcast order.
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 0, att_slot)?;
                     self.exchange_wait(exchange, "main", 1, att_slot)?;
                 }
-                let att0 = match merged_ptrs {
+                let att0 = match output_shard_ptrs {
                     Some(ptrs) => ptrs[0],
                     None => self.local_add_attention(0, w, index, t)?,
                 };
                 self.post_pre_on(0, w, att0, 0, layer0, "ffn", "post_norm", rows, cap)?;
-                let att1 = match merged_ptrs {
+                let att1 = match output_shard_ptrs {
                     Some(ptrs) => ptrs[1],
                     None => self.local_add_attention(1, w1, index, t)?,
                 };
@@ -430,10 +455,10 @@ impl<'a> GlmfEngine<'a> {
             } else {
                 // Non-TP2 (Spark or local-on-rank0) MoE: finish Rank 1's shared FFN, push ffn[index]
                 // and issue Rank 1 L2 weight prefetch before Rank 0 enters Spark/local MoE.
-                if merged_ptrs.is_none() {
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 1, att_slot)?;
                 }
-                let att1 = match merged_ptrs {
+                let att1 = match output_shard_ptrs {
                     Some(ptrs) => ptrs[1],
                     None => self.local_add_attention(1, w1, index, t)?,
                 };
@@ -447,10 +472,10 @@ impl<'a> GlmfEngine<'a> {
                     }
                 }
 
-                if merged_ptrs.is_none() {
+                if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 0, att_slot)?;
                 }
-                let att0 = match merged_ptrs {
+                let att0 = match output_shard_ptrs {
                     Some(ptrs) => ptrs[0],
                     None => self.local_add_attention(0, w, index, t)?,
                 };
@@ -526,7 +551,8 @@ mod tests {
             let closure = part.split_once("|| {").unwrap().1.split_once("})?;").unwrap().0;
             for forbidden in ["exchange_push", "exchange_wait", "exchange_direct", "push_query",
                 "wait_query", "push_candidates", "wait_candidates", "push_partial", "wait_partial",
-                "replicate_terminal", "tp2_publish", "core_attention_meet", "complete_output_shard"] {
+                "replicate_terminal", "tp2_publish", "core_attention_meet", "core_publish",
+                "core_finish_ffn", "core_ffn(", "complete_output_shard"] {
                 assert!(!closure.contains(forbidden),
                     "rank-local capture closure unexpectedly contains {forbidden}");
             }
@@ -558,114 +584,134 @@ mod tests {
         ];
 
         for long in [false, true] {
-            let mut s = HostSchedule::default();
-            let capture_point = |s: &mut HostSchedule, label: &str| {
-                // Worst-case `cudaGraphInstantiate` / `cudaGraphExecUpdate` may synchronize
-                // either GPU: every queued wait on both streams must already be matched.
-                s.sync(0, format!("capture {label} sync gpu0"));
-                s.sync(1, format!("capture {label} sync gpu1"));
-            };
-            let stage_r1 = |s: &mut HostSchedule, index: usize, is_ctx: bool| {
-                if index == 0 {
-                    s.wait_for(1, "main", DIRECT, 1, "L0 direct");
-                } else {
-                    s.wait(1, "main", slot(index - 1, true, 0), format!("L{index} r1 wait prev ffn"));
-                }
-                capture_point(s, &format!("L{index} r1 sub0"));
-                if is_ctx {
-                    let cs = index % 2;
-                    s.push(1, "ctx_q", cs, format!("L{index} r1 push q"));
-                    if long { s.push(1, "ctx_c", cs, format!("L{index} r1 push cand")); }
-                } else {
-                    s.push(1, "main", slot(index, false, 0), format!("L{index} r1 push att"));
-                }
-            };
-
-            s.push_to(0, "main", DIRECT, 1, "L0 direct");
-            stage_r1(&mut s, 0, layers[0].1);
-
-            for (index, &(mode, is_ctx)) in layers.iter().enumerate() {
-                let last = index + 1 == layers.len();
-                let att = slot(index, false, 0);
-                let ffn = slot(index, true, 0);
-
-                if index > 0 {
-                    s.wait(0, "main", slot(index - 1, true, 0), format!("L{index} r0 wait prev ffn"));
-                }
-                capture_point(&mut s, &format!("L{index} r0 sub0"));
-
-                if is_ctx {
-                    let cs = index % 2;
-                    s.push(0, "ctx_q", cs, format!("L{index} r0 push q"));
-                    if long { s.push(0, "ctx_c", cs, format!("L{index} r0 push cand")); }
-                    if long {
-                        s.wait(1, "ctx_c", cs, format!("L{index} r1 wait cand"));
-                        s.wait(1, "ctx_q", cs, format!("L{index} r1 wait q"));
-                        capture_point(&mut s, &format!("L{index} r1 ctx sub1"));
-                        s.push(1, "ctx_p", cs, format!("L{index} r1 push partial"));
-
-                        s.wait(0, "ctx_c", cs, format!("L{index} r0 wait cand"));
-                        s.wait(0, "ctx_q", cs, format!("L{index} r0 wait q"));
-                        capture_point(&mut s, &format!("L{index} r0 ctx sub1"));
-                        s.push(0, "ctx_p", cs, format!("L{index} r0 push partial"));
+            for split_core in [false, true] {
+                let mut s = HostSchedule::default();
+                let capture_point = |s: &mut HostSchedule, label: &str| {
+                    // Worst-case `cudaGraphInstantiate` / `cudaGraphExecUpdate` may synchronize
+                    // either GPU: every queued wait on both streams must already be matched.
+                    s.sync(0, format!("capture {label} sync gpu0"));
+                    s.sync(1, format!("capture {label} sync gpu1"));
+                };
+                let stage_r1 = |s: &mut HostSchedule, index: usize, is_ctx: bool| {
+                    if index == 0 {
+                        s.wait_for(1, "main", DIRECT, 1, "L0 direct");
                     } else {
-                        s.wait(1, "ctx_q", cs, format!("L{index} r1 wait q"));
-                        s.push(1, "ctx_p", cs, format!("L{index} r1 push partial"));
-                        s.wait(0, "ctx_q", cs, format!("L{index} r0 wait q"));
-                        s.push(0, "ctx_p", cs, format!("L{index} r0 push partial"));
+                        s.wait(1, "main", slot(index - 1, true, 0), format!("L{index} r1 wait prev ffn"));
                     }
-                    s.wait(1, "ctx_p", cs, format!("L{index} r1 wait partial"));
-                    s.push(1, "main", att, format!("L{index} r1 push att"));
-                    s.wait(0, "ctx_p", cs, format!("L{index} r0 wait partial"));
-                    s.push(0, "main", att, format!("L{index} r0 push att"));
-                } else {
-                    s.push(0, "main", att, format!("L{index} r0 push att"));
+                    capture_point(s, &format!("L{index} r1 sub0"));
+                    if is_ctx {
+                        let cs = index % 2;
+                        s.push(1, "ctx_q", cs, format!("L{index} r1 push q"));
+                        if long { s.push(1, "ctx_c", cs, format!("L{index} r1 push cand")); }
+                    } else {
+                        s.push(1, "main", slot(index, false, 0), format!("L{index} r1 push att"));
+                    }
+                };
+
+                s.push_to(0, "main", DIRECT, 1, "L0 direct");
+                stage_r1(&mut s, 0, layers[0].1);
+
+                for (index, &(mode, is_ctx)) in layers.iter().enumerate() {
+                    let last = index + 1 == layers.len();
+                    let att = slot(index, false, 0);
+                    let ffn = slot(index, true, 0);
+
+                    if index > 0 {
+                        s.wait(0, "main", slot(index - 1, true, 0), format!("L{index} r0 wait prev ffn"));
+                    }
+                    capture_point(&mut s, &format!("L{index} r0 sub0"));
+
+                    if is_ctx {
+                        let cs = index % 2;
+                        s.push(0, "ctx_q", cs, format!("L{index} r0 push q"));
+                        if long { s.push(0, "ctx_c", cs, format!("L{index} r0 push cand")); }
+                        if long {
+                            s.wait(1, "ctx_c", cs, format!("L{index} r1 wait cand"));
+                            s.wait(1, "ctx_q", cs, format!("L{index} r1 wait q"));
+                            capture_point(&mut s, &format!("L{index} r1 ctx sub1"));
+                            s.push(1, "ctx_p", cs, format!("L{index} r1 push partial"));
+
+                            s.wait(0, "ctx_c", cs, format!("L{index} r0 wait cand"));
+                            s.wait(0, "ctx_q", cs, format!("L{index} r0 wait q"));
+                            capture_point(&mut s, &format!("L{index} r0 ctx sub1"));
+                            s.push(0, "ctx_p", cs, format!("L{index} r0 push partial"));
+                        } else {
+                            s.wait(1, "ctx_q", cs, format!("L{index} r1 wait q"));
+                            s.push(1, "ctx_p", cs, format!("L{index} r1 push partial"));
+                            s.wait(0, "ctx_q", cs, format!("L{index} r0 wait q"));
+                            s.push(0, "ctx_p", cs, format!("L{index} r0 push partial"));
+                        }
+                        s.wait(1, "ctx_p", cs, format!("L{index} r1 wait partial"));
+                        s.push(1, "main", att, format!("L{index} r1 push att"));
+                        s.wait(0, "ctx_p", cs, format!("L{index} r0 wait partial"));
+                        s.push(0, "main", att, format!("L{index} r0 push att"));
+                    } else {
+                        s.push(0, "main", att, format!("L{index} r0 push att"));
+                    }
+
+                    match mode {
+                        Mode::Dense => {
+                            s.wait(1, "main", att, format!("L{index} r1 wait att"));
+                            capture_point(&mut s, &format!("L{index} r1 dense sub1"));
+                            s.push(1, "main", ffn, format!("L{index} r1 push ffn/core"));
+                            s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                            capture_point(&mut s, &format!("L{index} r0 dense sub1"));
+                            if split_core {
+                                s.push(0, "main", ffn, format!("L{index} r0 push core_ffn"));
+                                s.wait(1, "main", ffn, format!("L{index} r1 wait core_ffn"));
+                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                                s.wait(0, "main", ffn, format!("L{index} r0 wait core_ffn"));
+                                if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
+                            } else if !last {
+                                s.push(0, "main", ffn, format!("L{index} r0 push ffn"));
+                            }
+                        }
+                        Mode::Tp2Replicated => {
+                            s.wait(1, "main", att, format!("L{index} r1 wait att"));
+                            if split_core {
+                                s.push(1, "main", ffn, format!("L{index} r1 push core_ffn"));
+                                s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                                s.push(0, "main", ffn, format!("L{index} r0 push core_ffn"));
+                                s.wait(1, "main", ffn, format!("L{index} r1 wait core_ffn"));
+                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                                s.wait(0, "main", ffn, format!("L{index} r0 wait core_ffn"));
+                                if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
+                            } else {
+                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                                s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                                if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
+                            }
+                        }
+                        Mode::Tp2Broadcast => {
+                            s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                            s.wait(1, "main", att, format!("L{index} r1 wait att"));
+                            s.push(0, "routes", index % 2, format!("L{index} r0 push routes"));
+                            s.wait(1, "routes", index % 2, format!("L{index} r1 wait routes"));
+                            s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                            if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
+                        }
+                        Mode::Spark => {
+                            s.wait(1, "main", att, format!("L{index} r1 wait att"));
+                            s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                            s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                            s.sync(0, format!("L{index} spark host wait"));
+                            if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
+                        }
+                    }
+
+                    if !last {
+                        stage_r1(&mut s, index + 1, layers[index + 1].1);
+                    }
                 }
 
-                match mode {
-                    Mode::Dense => {
-                        s.wait(1, "main", att, format!("L{index} r1 wait att"));
-                        capture_point(&mut s, &format!("L{index} r1 dense sub1"));
-                        s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                        s.wait(0, "main", att, format!("L{index} r0 wait att"));
-                        capture_point(&mut s, &format!("L{index} r0 dense sub1"));
-                        if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
-                    }
-                    Mode::Tp2Replicated => {
-                        s.wait(1, "main", att, format!("L{index} r1 wait att"));
-                        s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                        s.wait(0, "main", att, format!("L{index} r0 wait att"));
-                        if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
-                    }
-                    Mode::Tp2Broadcast => {
-                        s.wait(0, "main", att, format!("L{index} r0 wait att"));
-                        s.wait(1, "main", att, format!("L{index} r1 wait att"));
-                        s.push(0, "routes", index % 2, format!("L{index} r0 push routes"));
-                        s.wait(1, "routes", index % 2, format!("L{index} r1 wait routes"));
-                        s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                        if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
-                    }
-                    Mode::Spark => {
-                        s.wait(1, "main", att, format!("L{index} r1 wait att"));
-                        s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                        s.wait(0, "main", att, format!("L{index} r0 wait att"));
-                        s.sync(0, format!("L{index} spark host wait"));
-                        if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
-                    }
-                }
+                s.wait(0, "main", slot(layers.len() - 1, true, 0), "tail wait last ffn");
+                capture_point(&mut s, "tail");
+                s.push_to(0, "main", DIRECT, 2, "terminal");
+                s.wait_for(1, "main", DIRECT, 2, "terminal");
 
-                if !last {
-                    stage_r1(&mut s, index + 1, layers[index + 1].1);
-                }
+                check_host(&s).expect("pipelined local decode schedule must never deadlock at any capture or sync");
+                order::check_submission_faults(&s.streams()).expect("submission streams must drain cleanly");
             }
-
-            s.wait(0, "main", slot(layers.len() - 1, true, 0), "tail wait last ffn");
-            capture_point(&mut s, "tail");
-            s.push_to(0, "main", DIRECT, 2, "terminal");
-            s.wait_for(1, "main", DIRECT, 2, "terminal");
-
-            check_host(&s).expect("pipelined local decode schedule must never deadlock at any capture or sync");
-            order::check_submission_faults(&s.streams()).expect("submission streams must drain cleanly");
         }
     }
 }

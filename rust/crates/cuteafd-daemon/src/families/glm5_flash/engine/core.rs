@@ -284,6 +284,18 @@ impl<'a> GlmfEngine<'a> {
         self.on(rank, || core.projections[&key(weights)].reduced(&core.add, rows, first, second,
             slot.retained[2].buffer, weights, output, self.stream_of(rank)))
     }
+    pub(super) fn core_publish_attention(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, at: usize,
+        rows: usize) -> Result<bool> {
+        if !native_attention(layer) { return Ok(false); }
+        self.core_publish(rank, w, at, rows, 0)?;
+        Ok(true)
+    }
+    pub(super) fn core_reduce_attention(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, at: usize,
+        rows: usize) -> Result<*mut c_void> {
+        let output = w.sum.as_ref().context("Flash K6 split sum")?.buffer;
+        self.core_reduce(rank, w, layer, "self_attn.o_proj", at, rows, 0, output)?;
+        Ok(output.ptr)
+    }
     pub(super) fn core_attention_meet(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, at: usize,
         rows: usize) -> Result<Option<*mut c_void>> {
         if !native_attention(layer) { return Ok(None); }
@@ -292,6 +304,44 @@ impl<'a> GlmfEngine<'a> {
         let output = w.sum.as_ref().context("Flash K6 split sum")?.buffer;
         self.core_reduce(rank, w, layer, "self_attn.o_proj", at, rows, 0, output)?;
         Ok(Some(output.ptr))
+    }
+    /// Rank-local portion of [`Self::core_ffn`] (`gate`, `up`, `swiglu`, `down`) with no peer exchange.
+    pub(super) fn core_ffn_local(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str,
+        output: *mut c_void, count: Scalar) -> Result<()> {
+        let rows = rows(count)?;
+        let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
+        let s = &slot.scratch;
+        let (gate, up, hidden, scratch) = (s.stage("gate")?, s.stage("up")?, s.stage("hidden")?, s.stage("scratch")?);
+        self.core_linear(rank, w, layer, &ffn_key(layer, "gate"), w.x.buffer, gate, rows, 1, cap)?;
+        self.core_linear(rank, w, layer, &ffn_key(layer, "up"), w.x.buffer, up, rows, 1, cap)?;
+        let gate_key = ffn_key(layer, "gate");
+        let inter = layer.core.get(&gate_key).map(|w| w.shape[0])
+            .or_else(|| layer.attention_native.get(&gate_key).map(|w| w.layout.shape[0]))
+            .context("Flash FFN gate extent")?;
+        self.core_stage(rank, layer.split, &format!("swiglu_i{inter}_{cap}"), &[("gate", gate.ptr), ("up", up.ptr),
+            ("hidden", hidden.ptr), ("scratch", scratch.ptr)], &[count])?;
+        let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
+        let key = ffn_key(layer, "down");
+        self.core_linear(rank, w, layer, &key, hidden, output, rows, 1, cap)
+    }
+    pub(super) fn core_publish_ffn(&self, rank: usize, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
+        let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
+        let at = super::slot(index, true, slot.lane);
+        self.core_publish(rank, w, at, rows, 1)
+    }
+    pub(super) fn core_finish_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, index: usize,
+        output: *mut c_void, rows: usize) -> Result<()> {
+        let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
+        let at = super::slot(index, true, slot.lane);
+        self.exchange_wait(self.exchange()?, "main", rank, at)?;
+        let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
+        let key = ffn_key(layer, "down");
+        if rank == 0 {
+            self.core_reduce(rank, w, layer, &key, at, rows, 1, output)
+        } else {
+            // SAFETY: only rank 0 contributes the fully transformed shared/dense result.
+            self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(output, output.bytes, self.stream_of(rank)) })
+        }
     }
     pub(super) fn core_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str,
         output: *mut c_void, count: Scalar) -> Result<()> {
