@@ -4736,3 +4736,18 @@ def test_sweep_passes_refuse_nothing_to_repeat_or_out_of_range(entry, tmp_path, 
         '--arm', 'a=b:s', '--state', str(tmp_path / 'state'), *extra, '--dry-run'])
     with pytest.raises(SystemExit):
         cards.main()
+
+
+def test_summary_flags_only_differing_resolved_drafters(tmp_path):
+    whole = dict(kind='dflash2', placement='whole', ranks=[{'cuda_rank': 1}], lead={'cuda_rank': 1}, arena_bytes=[10])
+    split = dict(kind='dflash2', placement='split', ranks=[{'cuda_rank': 1}, {'cuda_rank': 0}], lead={'cuda_rank': 1}, arena_bytes=[6, 4])
+    rows = [dict(card='c', arm=arm, repeat=repeat, simulated=False, status='pass', C1=10, drafter=layout)
+            for repeat, layouts in enumerate([(whole, split), (split, split), (None, whole)], 1)
+            for arm, layout in zip(['base', 'candidate'], layouts)]
+    cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
+    summary = json.loads((tmp_path / 'summary.json').read_text())
+    assert summary['ab_verdict'] == 'eligible'
+    assert [diff['repeat'] for diff in summary['drafter_differences']] == [1, 3]
+    assert summary['drafter_differences'][0]['arms'] == dict(base=whole, candidate=split)
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'Resolved Drafter Differences' in text and 'base: not reported' in text

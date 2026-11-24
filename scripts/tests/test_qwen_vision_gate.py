@@ -334,7 +334,9 @@ def test_qwen_graph_stats_are_collected_on_request_not_every_update():
     publish = serve[serve.index("fn publish<E:"):serve.index("pub(crate) const MESSAGE_STARTS")]
     assert "graph_capture_stats" not in publish
     api = (ROOT / "rust/crates/cuteafd-daemon/src/shared/api.rs").read_text()
-    assert "profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)" in api
+    assert "profile.stats_diagnostics = Some(collect_stats)" in api
+    diagnostics = api[api.index("fn collect_stats("):].split("\n}", 1)[0]
+    assert "crate::shared::probe::graph_capture_stats(stats)" in diagnostics
     http = (ROOT / "rust/crates/cuteafd-api/src/openai.rs").read_text()
     assert "spawn_blocking(move || collect_stats(&state))" in http
     assert "state.profile.stats_diagnostics" in http

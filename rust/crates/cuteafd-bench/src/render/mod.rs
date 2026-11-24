@@ -103,6 +103,32 @@ mod tests {
     }
 
     #[test]
+    fn drafter_round_trips_in_server_info_and_is_optional_in_old_reports() {
+        use crate::report::{DrafterKind, DrafterLayout, DrafterPlacement, DrafterRank, Report};
+        let mut report = crate::sample::full_report();
+        let legacy = serde_json::to_value(&report).unwrap();
+        assert!(legacy["server"].get("drafter").is_none());
+        let old: Report = serde_json::from_value(legacy).unwrap();
+        assert!(!super::card::card_svg(&old).contains("Drafter:"));
+        assert!(!super::report::panel_svg(&old, "configuration").contains("DRAFTER"));
+        report.server.drafter = Some(DrafterLayout { kind: DrafterKind::Dflash2,
+            placement: Some(DrafterPlacement::Split), ranks: vec![DrafterRank::CudaRank(1), DrafterRank::CudaRank(0)],
+            lead: Some(DrafterRank::CudaRank(1)), arena_bytes: vec![1_200_000_000, 1_100_000_000], gpu_uuids: Default::default() });
+        report.server.drafter.as_mut().unwrap().bind_visible_gpus("GPU-00000000-0000-0000-0000-000000000001,GPU-00000000-0000-0000-0000-000000000002");
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["server"]["drafter"], serde_json::json!({"kind":"dflash2", "placement":"split",
+            "ranks":[{"cuda_rank":1},{"cuda_rank":0}], "lead":{"cuda_rank":1}, "arena_bytes":[1_200_000_000,1_100_000_000],
+            "gpu_uuids":{"0":"GPU-00000000-0000-0000-0000-000000000001", "1":"GPU-00000000-0000-0000-0000-000000000002"}}));
+        let restored: Report = serde_json::from_value(wire).unwrap();
+        let line = "DFlash2 split over GPU rank 1 + GPU rank 0 (lead GPU rank 1), 1.20 / 1.10 GB";
+        let card = super::card::card_svg(&restored);
+        assert!(card.contains(&format!("Drafter: {line}")));
+        let config = super::report::panel_svg(&restored, "configuration");
+        assert!(config.contains(line), "{config}");
+        assert!(super::png::png(&card, 1.0).is_ok());
+    }
+
+    #[test]
     fn card_marks_adaptive_and_fixed_drafts() {
         let mut report = crate::sample::full_report();
         for (mode, label) in [("adaptive", "adaptive draft"), ("fixed 4", "fixed draft 4")] {

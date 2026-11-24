@@ -7,6 +7,74 @@ use serde_json::Value;
 pub const SCHEMA: &str = "cuteafd.bench.report/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrafterKind { None, Dflash2, Dspark, Mtp, Dfly2 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrafterPlacement { Whole, Split, PairedBlock, Remote }
+
+/// Physical owners in launch order. Arena bytes (including drafter KV) align with ranks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrafterLayout {
+    pub kind: DrafterKind,
+    pub placement: Option<DrafterPlacement>,
+    pub ranks: Vec<DrafterRank>,
+    pub lead: Option<DrafterRank>,
+    pub arena_bytes: Vec<u64>,
+    /// Physical GPU UUID keyed by process CUDA rank, when known at launch.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gpu_uuids: std::collections::BTreeMap<i32, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DrafterRank { #[serde(rename = "cuda_rank")] CudaRank(i32), Spark(u8) }
+
+impl std::fmt::Display for DrafterRank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::CudaRank(id) => write!(f, "GPU rank {id}"), Self::Spark(id) => write!(f, "Spark{id}") }
+    }
+}
+
+impl DrafterLayout {
+    pub const NONE: Self = Self { kind: DrafterKind::None, placement: None, ranks: Vec::new(), lead: None, arena_bytes: Vec::new(), gpu_uuids: std::collections::BTreeMap::new() };
+
+    /// The launcher lists full GPU UUIDs in CUDA ordinal order. Don't infer
+    /// UUIDs for bare ordinals or abbreviated UUIDs that cannot be verified.
+    pub fn bind_visible_gpus(&mut self, visible: &str) {
+        self.gpu_uuids = self.ranks.iter().filter_map(|rank| {
+            let DrafterRank::CudaRank(rank) = *rank else { return None; };
+            let uuid = visible.split(',').nth(usize::try_from(rank).ok()?)?.trim();
+            let groups = uuid.strip_prefix("GPU-")?.split('-').collect::<Vec<_>>();
+            (groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+                && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit())))
+                .then(|| (rank, uuid.to_owned()))
+        }).collect();
+    }
+
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            DrafterKind::None => return "none".into(),
+            DrafterKind::Dflash2 => "DFlash2", DrafterKind::Dspark => "dSpark",
+            DrafterKind::Mtp => "MTP", DrafterKind::Dfly2 => "DFly2",
+        };
+        let placement = match self.placement {
+            Some(DrafterPlacement::Whole) => "whole on",
+            Some(DrafterPlacement::Split) => "split over",
+            Some(DrafterPlacement::PairedBlock) => "paired-block over",
+            Some(DrafterPlacement::Remote) => "remote on",
+            None => return kind.into(),
+        };
+        let ranks = self.ranks.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ");
+        let lead = self.lead.map_or_else(String::new, |rank| format!(" (lead {rank})"));
+        let bytes = self.arena_bytes.iter().map(|&bytes| format!("{:.2}", bytes as f64 / 1e9)).collect::<Vec<_>>().join(" / ");
+        format!("{kind} {placement} {ranks}{lead}, {bytes} GB")
+    }
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Queued,
@@ -114,6 +182,9 @@ pub struct ServerInfo {
     pub build: BuildInfo,
     pub hardware: Hardware,
     pub configuration: Configuration,
+    /// Absent when the serving binary predates this runtime report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drafter: Option<DrafterLayout>,
     /// Seconds from process start to the API accepting requests.
     #[serde(default)]
     pub readiness_s: Option<f64>,

@@ -148,6 +148,7 @@ pub(crate) struct Admission {
     pub host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub graphs: GraphCache,
+    pub solved: cuteafd_loader::placement::planner::ResolvedPlan,
     pub decisions: cuteafd_loader::placement::planner::Decisions,
 }
 
@@ -166,7 +167,7 @@ pub(crate) fn admit(inputs: &v4::V4Inputs) -> Result<Admission> {
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     Ok(Admission { placement: admitted.placement, host_prefix: prefix, expert_usage,
         graphs: GraphCache { reserves: admitted.graph_reserves, bootstraps: admitted.graph_bootstraps },
-        decisions: admitted.solved.decisions })
+        decisions: admitted.solved.decisions.clone(), solved: admitted.solved })
 }
 
 /// The admitted layout identity `/v1/stats` Ready and first_request memory

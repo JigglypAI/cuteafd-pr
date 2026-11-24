@@ -1049,6 +1049,8 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 }
 
 impl<'a> DflashDrafter<'a> {
+    pub(crate) fn is_head_split(&self) -> bool { self.head_split.is_some() }
+
     fn load_projections(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &DflashConfig,
         representation: GlmDraftRepresentation, mla: bool, ml4: bool, sequences: usize)
         -> Result<cuteafd_ffi::draft_projection::DraftProjections<'a>> {

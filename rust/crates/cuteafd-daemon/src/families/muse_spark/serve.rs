@@ -242,6 +242,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
+    if let Some(layout) = drafter_report(&built, &device_ids)? {
+        crate::shared::draft::report::publish(layout);
+    }
     let placement = &built.placement;
     {
         use sha2::{Digest, Sha256};
@@ -897,4 +900,14 @@ mod tests {
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());
         Ok(())
     }
+}
+
+pub(super) fn drafter_report(admitted: &cuteafd_loader::placement::families::muse_spark::AdmittedMuse, devices: &[i32])
+    -> Result<Option<crate::shared::draft::report::DrafterLayout>> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let Some(draft) = &admitted.drafter else { return Ok(None); };
+    let lead = admitted.draft_home.context("Muse admitted draft head absent")?;
+    let placement = if draft.tp2.is_empty() { Placement::Whole } else { Placement::Split };
+    Ok(Some(report::from_plan(Kind::Dflash2, placement, lead, devices, &admitted.solved,
+        |owner| owner.id.starts_with("muse.drafter."))?))
 }

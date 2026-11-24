@@ -3017,6 +3017,21 @@ impl Opened {
             }
             probe("expert-prime")
         })?;
+        if args.serving_graph_policy.is_some() {
+            use crate::shared::draft::report::{self, Kind, Placement};
+            let resolved = match &engine.drafter {
+                None => None,
+                Some(dspark::Drafter::Dflash2(draft)) => Some((Kind::Dflash2,
+                    dflash_placement(draft.is_head_split()), 0)),
+                Some(dspark::Drafter::RemoteDflash(draft)) => Some((Kind::Dflash2, Placement::Remote,
+                    receipt_devices.logical_rank(draft.draft.device.id)?)),
+                Some(dspark::Drafter::Dspark(_)) => Some((Kind::Dspark, Placement::Whole, 0)),
+            };
+            if let Some((kind, placement, lead)) = resolved {
+                report::publish(report::from_plan(kind, placement, lead, &physical, &admitted_plan,
+                    |owner| owner.id.starts_with("glmf.draft."))?);
+            }
+        }
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         probe("packing")?;
         if let Some(dump) = crate::shared::selection_dump::shared("glm5_flash")? {
@@ -3630,4 +3645,24 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'
     });
     allocator.release(placement);
     result
+}
+
+fn dflash_placement(head_split: bool) -> crate::shared::draft::report::Placement {
+    use crate::shared::draft::report::Placement;
+    if head_split { Placement::Split } else { Placement::Whole }
+}
+
+#[cfg(test)]
+#[test]
+fn drafter_report_matches_the_selected_head_split() -> anyhow::Result<()> {
+    use crate::shared::draft::report::{self, Kind, Placement, Rank, tests::{owner, plan}};
+    for split in [false, true] {
+        let mut owners = vec![owner(0, 200)];
+        if split { owners.push(owner(1, 130)); }
+        let layout = report::admitted(Kind::Dflash2, dflash_placement(split), 0, &[4, 7], &plan(owners))?;
+        assert_eq!(layout.placement, Some(if split { Placement::Split } else { Placement::Whole }));
+        assert_eq!(layout.ranks, if split { vec![Rank::CudaRank(4), Rank::CudaRank(7)] } else { vec![Rank::CudaRank(4)] });
+        assert_eq!(layout.lead, Some(Rank::CudaRank(4)));
+    }
+    Ok(())
 }

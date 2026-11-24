@@ -1510,6 +1510,7 @@ def precheck(job):
         if job.get('planned_speculator') is not None:
             status = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status', timeout=10)
             result['speculator'] = attest_served_speculator(job, status.get('settings'))
+            result['drafter'] = status.get('drafter')
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
         text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & IMAGE_PROBES else ''
@@ -2372,7 +2373,9 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
-        settings = report.get('server', {}).get('configuration', {}).get('settings', [])
+        server = report.get('server', {})
+        row['drafter'] = server.get('drafter')
+        settings = server.get('configuration', {}).get('settings', [])
         try:
             row['served_speculator'] = attest_served_speculator(job, settings)
         except ValueError as error:
@@ -2541,6 +2544,8 @@ def summarize_job(job, exit_code):
         path = dest / (key + '.json')
         if path.exists():
             row[key] = json.loads(path.read_text())
+    if row.get('drafter') is None and (row.get('precheck') or {}).get('drafter') is not None:
+        row['drafter'] = row['precheck']['drafter']
     if job.get('planned_speculator') is not None and not row.get('served_speculator'):
         evidence = row.get('precheck', {})
         if evidence.get('speculator') != job['planned_speculator']:
@@ -2765,9 +2770,25 @@ def spec_cell(row):
     return text
 
 
+def drafter_differences(rows, arms):
+    """Compare resolved records, not the launch options that requested them."""
+    pairs = {}
+    for row in rows:
+        if row['status'] == 'pass':
+            pairs.setdefault((row['card'], row['repeat']), {})[row['arm']] = row.get('drafter')
+    differences = []
+    for (card, repeat), layouts in sorted(pairs.items()):
+        if len(layouts) < 2 or any(arm not in layouts for arm in arms):
+            continue
+        if any(layout != layouts[arms[0]] for layout in layouts.values()):
+            differences.append(dict(card=card, repeat=repeat, arms=layouts))
+    return differences
+
+
 def write_summary(state, rows, arms):
     validate_matched_pairs(rows, list(arms))
     names = list(arms)
+    drafter_changes = drafter_differences(rows, names)
     extra = sorted({k for r in rows for k in r if k.startswith('prefill ') and isinstance(r.get(k), (int, float))},
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
@@ -2785,7 +2806,7 @@ def write_summary(state, rows, arms):
                    graph_bands=[b for part in ('sweep', 'context_load') for b in (p.get(part) or {}).get('graph_bands', [])])
               for r in rows for p in r.get('passes', [])]
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
-                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats,
+                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats, drafter_differences=drafter_changes,
                                     **({'passes': passes} if passes else {})))
     def cell(value):
         if isinstance(value, float):
@@ -2825,6 +2846,13 @@ def write_summary(state, rows, arms):
         text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'
         for m in medians:
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
+        text += '\n'
+    if drafter_changes:
+        text += '## Resolved Drafter Differences\n\n'
+        for change in drafter_changes:
+            layouts = '; '.join(f"{arm}: {cell(layout) if layout is not None else 'not reported'}"
+                                for arm, layout in change['arms'].items())
+            text += f"- {change['card']} / r{change['repeat']}: {layouts}\n"
         text += '\n'
     if caveats:
         text += ('## A/B Verdict: Rerun\n\nTimed foreign traffic, a used port down, or a mapped-table backend change: compare in a quiet window.\n\n' if rerun

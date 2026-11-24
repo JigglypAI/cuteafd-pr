@@ -621,6 +621,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     vision.connect()?;
     // Same Ready-boundary verification as the single-rank worker: both GPUs'
     // predicted runtime bases against what their devices hold.
+    if let Some(draft) = &draft {
+        let physical = devices.map(|device| device.id);
+        let lead = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?.logical_rank(draft.device.id)?;
+        crate::shared::draft::report::publish(super::drafter_report(lead, &physical, &pool.solved)?);
+    }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     memory_checkpoint("ready")?;

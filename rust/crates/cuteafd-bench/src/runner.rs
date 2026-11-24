@@ -438,6 +438,7 @@ impl Bench {
             "draft": crate::context::get().draft_mode(),
             "snapshot": crate::context::get().snapshot,
             "settings": crate::context::get().settings,
+            "drafter": crate::context::drafter(),
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
             "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))
