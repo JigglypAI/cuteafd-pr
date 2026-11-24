@@ -94,6 +94,13 @@ pub(crate) struct ServeArgs {
     pub token_io: TokenIoArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
+    #[command(flatten)]
+    pub console: crate::shared::console::ConsoleArgs,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
 }
 
 impl ServeArgs {
@@ -282,6 +289,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.wave.")
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
+            || id.starts_with("expert-usage.gpu")
     };
     let planned: BTreeMap<&str, &cuteafd_loader::placement::planner::Allocation> = plan
         .facts
@@ -391,7 +399,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         .clone()
         .or_else(|| cuteafd_api::openai::snapshot_model_id(&args.snapshot))
         .context("Hy4-flash snapshot without HF identity requires --model-id")?;
-    let profile = ModelProfile::new(model, encoding);
+    let expert_usage = args.expert_usage_reader.configure(args.expert_usage, false).map_err(anyhow::Error::msg)?;
+    let mut profile = ModelProfile::new(model, encoding);
+    profile.expert_usage = args.expert_usage_reader.clone();
     let api = args.api.load()?;
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(
         cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize,
@@ -522,6 +532,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 prefix_mark_budget: worker_args.prefix.prefix_cache_mark_mib as u64 * (1 << 20),
                 prefix_slots: None,
                 replies,
+                expert_usage,
                 resident_weight_limit,
             };
             let inputs = admission::gather(&facts_req)
@@ -697,6 +708,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             if let Some(link) = spark_link {
                 engine.attach_spark(link, onboarded_layers.clone());
             }
+            engine.configure_expert_usage(inputs.expert_usage.as_ref(), worker_args.expert_usage_reader.clone())?;
             let graph_layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(
                 gpus,
                 worker_args.peers.len(),
@@ -734,6 +746,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .transpose()?;
 
             cuteafd_bench::context::ResolvedSettings::default()
+                .value("expert-usage", expert_usage)
                 .value("max-context-tokens", served_context)
                 .value("pool-tokens", pool_tokens)
                 .value("rtx-expert-layers", onboarded_layers.len())
@@ -743,6 +756,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 
             let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
             backend.warm_decode_graphs(graph_layout)?;
+            backend.enable_expert_usage();
             let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
                 cuteafd_engine::media::EmbeddingCache::new(0),
                 crate::shared::qwen::Encoder::Off,
@@ -798,7 +812,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         .context("Hy4-flash worker exited before readiness")??;
     let limits = args.prefix.reserve.limits(context)?;
     let snapshot = args.snapshot.clone();
-    let hub = crate::shared::console::hub(false, || {
+    let hub = crate::shared::console::hub(args.console.console_text, || {
         Ok(crate::shared::console::Layout::new(
             "hy4_flash",
             profile.id.clone(),
@@ -1080,6 +1094,7 @@ mod tests {
             placement: AttentionPlacement::Heads,
             modes,
             routed: routed.clone(),
+            expert_usage: None,
             local: LocalPackage::Missing("synthetic".into()),
             spark: vec![vec![SparkCharge { experts: 1 << 30, owners: 1 << 28, runtime: 1 << 28 }]; routed.len() + 1],
             links: hy4_place::spark_link(0, 1, prefill, replies)?,

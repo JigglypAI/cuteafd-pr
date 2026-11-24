@@ -334,6 +334,10 @@ Spark expert peers (#2478). `DECODE_ROWS=auto` resolves to 64; plan and serve
 refuse larger budgets because the Hy4-flash split-K decode exports cover at
 most 64 rows on either topology. Scratch is charged for the resolved budget.
 Routed LatentMoE layers use MUL1 EXL3 (`hy4f:exl3-k45-mul1`).
+`EXPERT_USAGE=on` (default) counts the canonical rank-0 routes, including Spark
+routes but excluding graph startup and TP2 replicas; `off` omits its owners.
+`CONSOLE_TEXT=off` disables console token text even for unlocked viewers.
+Hy4-flash refuses `L2_PREFETCH` by name; leave it unset.
 Engram tables are FP8-only (`engram-fp8-layer-*-part-*.safetensors`, 100-byte strided
 E4M3 + F32 scale rows declared in `cuteafd-mc.json`, with no BF16 fallback): checkpoints
 lacking FP8 Engram shards are refused by name in plan, serve and golden. All four Engram
@@ -999,7 +1003,7 @@ Keys here that are optional and off by default are also listed under
 | `ENABLE_BENCH` | `off` | `on`, `off` | Enable the in-server bench endpoints. |
 | `GATEWAY` | binary default `on` | `on`, `off` | Messages/Responses/Realtime routes. |
 | `USAGE` | `on` | `on`, `off` | Usage history tier. |
-| `EXPERT_USAGE` | `on` | `on`, `off` | Device-side executed expert routes, separate prefill/decode tallies and 5 s / 60 s / total windows at `/v1/stats`. Active for V4.1, V4, MiMo, Kimi K3, GLM 5.3 and ML4 by default; `off` disables counting and telemetry owners. Families without an adapter remain effectively off and show the `/experts` placeholder. V4/GLM 5.3/ML4 `--skip-routed-experts` and MiMo `--skip-experts` disable telemetry before admission, even with `on`. Direct engine/plan CLI uses `--expert-usage=false` to opt out. Shared adapters extend coverage. Each canonical producer GPU owns counters; one worker merges their aggregate snapshots into one bounded engine history. `/experts` uses the console's admin cookie. Rejected speculative verification rows count; GLM 5.3/ML4 startup warm-up and graph-capture replays are excluded; graph padding and TP2 replicas do not. Window and benchmark phase boundaries are approximate asynchronous samples; short phases can share a sample. A 5 s snapshot-completion timeout logs an error and leaves history stale without stopping serving. Totals saturate at u64 limits; merged-counter overflow stops sampling with an error. No disk persistence. |
+| `EXPERT_USAGE` | `on` | `on`, `off` | Device-side executed expert routes, separate prefill/decode tallies and 5 s / 60 s / total windows at `/v1/stats`. Active for V4.1, V4, MiMo, Kimi K3, GLM 5.3 / ML4, Hy4-flash and MiniMax by default; `off` disables counting and telemetry owners. Families without an adapter remain effectively off and show the `/experts` placeholder. V4/GLM 5.3/ML4 `--skip-routed-experts` and MiMo `--skip-experts` disable telemetry before admission, even with `on`. Direct engine/plan CLI uses `--expert-usage=false` to opt out. Shared adapters extend coverage. Each canonical producer GPU owns counters; one worker merges their aggregate snapshots into one bounded engine history. `/experts` uses the console's admin cookie. Rejected speculative verification rows count; GLM 5.3/ML4 startup warm-up and graph-capture replays are excluded; graph padding and TP2 replicas do not. Window and benchmark phase boundaries are approximate asynchronous samples; short phases can share a sample. A 5 s snapshot-completion timeout logs an error and leaves history stale without stopping serving. Totals saturate at u64 limits; merged-counter overflow stops sampling with an error. No disk persistence. |
 | `CONSOLE_ASSETS` | `off` | `on`, `off` | Serve console pages from a checkout; `on` needs `--wip`. The `/memory` dashboard uses the same admin console cookie as `/experts`; its read-only `/console/memory` snapshot combines all accepted Growth owner forms (including deferred owners), reconciled worker workspace and future-ring owners, background allocation inventory and published KV/prefix/graph counters. Named-owner bars use exact capacity scales; the domain selector expands non-weight/non-KV owners on a subtotal scale. It polls each second and retains five minutes only while open. Allocation inventory refreshes every 10 s; reconciliation remains stage-sampled, with Spark launch-relative figures diagnostic only. Missing fields are unavailable, never zero. |
 | `CONSOLE_TEXT` | `on` | `on`, `off` | Live console token text for unlocked viewers. |
 | `HOST_WAIT` | `block` | `spin`, `block` | Serving host-thread wait mode. |
@@ -1149,7 +1153,7 @@ requires its embedding on the GPU entry owner. The launch-key table records
 whether a key is accepted at all, not whether all its values are supported.
 
 `EXPERT_USAGE` has a live adapter only for V4.1, V4, GLM 5.3 / ML4, MiMo,
-Kimi and MiniMax. Other families reject an explicit key instead of accepting a no-op;
+Kimi, Hy4-flash and MiniMax. Other families reject an explicit key instead of accepting a no-op;
 the `/experts` placeholder remains available without telemetry.
 
 Speculator (`SPECULATOR`):
@@ -1372,7 +1376,7 @@ original core is already FP8, not an MC publication.
 | `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| `EXPERT_USAGE` | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✓ | ✓ |
 | `CONSOLE_ASSETS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONSOLE_TEXT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `HOST_WAIT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

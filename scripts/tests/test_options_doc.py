@@ -485,7 +485,7 @@ def test_embedding_value_support_and_expert_usage_adapters():
     host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
     assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 6
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
-        "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3", "MiniMax"}
+        "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3", "Hy4-flash", "MiniMax"}
 
 
 def test_qwen_pool_first_onboarding_documents_whole_and_hybrid_tp2():
