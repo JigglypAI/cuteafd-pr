@@ -1067,6 +1067,49 @@ impl<'a> LocalLane<'a> {
         Ok(captured)
     }
 
+    /// Capture one explicit speculative row width (FFN, resident KDA/MLA Attention,
+    /// and Context) sequentially without launching, for golden wide-batch verification.
+    pub(crate) fn warm_explicit_verify_graphs(&mut self, rows: usize) -> Result<usize> {
+        ensure!(rows >= 2 && rows <= self.decode_rows(),
+            "Kimi explicit verify graph rows {rows} outside decode capacity {}", self.decode_rows());
+        let mut graphs = self.graphs.take().context("Kimi graphs must be attached before explicit prewarm")?;
+        let stream = self.stream().clone();
+        let metadata = super::state::startup_metadata_with_limit(rows, 1, self.kda.slots(), self.decode_rows())?;
+        let upload = stream.device.run(|| {
+            for (name, words) in ["KDA slots", "KDA first"].into_iter().zip(&metadata) {
+                let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+                // SAFETY: ordered upload retains its source through the copy;
+                // fixed metadata destinations outlive work.
+                unsafe { stream.device.library.copy_h2d_ordered(self.lane.buffer(name)?, &bytes, stream.raw)?; }
+            }
+            Ok(())
+        });
+        let mut keys = Vec::new();
+        for layer in 0..self.cfg.layers {
+            keys.push(super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op: super::graphs::Op::Ffn(layer) });
+            match self.cfg.attention[layer] {
+                KimiAttention::Kda => keys.push(super::graphs::Key {
+                    lane: self.lane_index, rank: self.rank, rows,
+                    op: super::graphs::Op::Attention { layer, speculative: true },
+                }),
+                KimiAttention::Mla if self.context.is_some() => keys.push(super::graphs::Key {
+                    lane: self.lane_index, rank: self.rank, rows,
+                    op: super::graphs::Op::Context { layer, speculative: true },
+                }),
+                KimiAttention::Mla if self.mla.layer(layer).is_ok() => keys.push(super::graphs::Key {
+                    lane: self.lane_index, rank: self.rank, rows,
+                    op: super::graphs::Op::Attention { layer, speculative: true },
+                }),
+                KimiAttention::Mla => {}
+            }
+        }
+        let staged = self.attention.take();
+        let result = upload.and_then(|()| graphs.prewarm_explicit(&stream, &keys, |key| self.submit_startup_graph(key)));
+        self.attention = staged;
+        self.graphs = Some(graphs);
+        result
+    }
+
     pub(crate) fn graph_cycle(&mut self, cycle: crate::shared::decode_graph::device::Cycle) {
         if let Some(graphs) = self.graphs.as_mut() { graphs.cycle(cycle); }
     }

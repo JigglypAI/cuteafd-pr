@@ -369,6 +369,20 @@ impl<'a> Graphs<'a> {
         Ok(captured)
     }
 
+    /// Capture an explicit set of keys without consulting the checked-in prewarm list.
+    /// Used by golden wide-batch verification so cross-device Context graphs capture
+    /// sequentially per rank without launching (#1878).
+    pub(crate) fn prewarm_explicit(&mut self, stream: &Stream<'a>, keys: &[Key],
+        mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
+        let mut captured = 0;
+        for &key in keys {
+            if self.cached(&key) { continue }
+            let Some(ticket) = self.bank_mut(key.op).cache_ticket(&key, false, None) else { continue };
+            if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
+        }
+        Ok(captured)
+    }
+
     /// Run one step body through the cache: replay a resident executable, else
     /// capture it, else run the body eagerly.
     pub(crate) fn graph(&mut self, stream: &Stream<'a>, key: Key, allow_capture: bool,

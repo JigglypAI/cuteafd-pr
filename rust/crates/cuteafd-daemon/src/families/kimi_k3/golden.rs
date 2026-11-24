@@ -962,6 +962,14 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
         (bit_eq, top1_eq, max_abs)
     };
 
+    // 0. Explicitly capture 128-row verify graphs per rank sequentially without launching (#1878),
+    // then seal cross-device capture for live 2-GPU steps (matching serve-kimi startup).
+    let warmed_128 = {
+        let _startup = crate::shared::decode_graph::sites::startup(true);
+        engine.warm_explicit_verify_graphs(TOTAL_ROWS)?
+    };
+    crate::shared::decode_graph::device::seal_cross_device_capture();
+
     // 1. Solo reference: each sequence individually (8-row verify + partial commit + 1-row follow-up).
     let mut solo_verify: Vec<Vec<f32>> = Vec::with_capacity(TOTAL_ROWS);
     let mut solo_followup: Vec<Vec<f32>> = Vec::with_capacity(SEQS);
@@ -978,7 +986,7 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
         ensure!(values.len() == VERIFY * vocab, "Kimi solo verify logits shape");
         for row in values.chunks_exact(vocab) { solo_verify.push(row.to_vec()); }
         let mut seq = super::backend::DraftState::default();
-        placement.len = start + VERIFY;
+        placement.len = start + sample.kept;
         engine.accept_provisional::<_, ()>(&mut [crate::shared::qwen::scheduler::Verified {
             placement: &mut placement, seq: &mut seq, start, history: (), rows: &sample.verify,
             first_row: 0, kept: Some((sample.kept, 0)), finished: false, neural: false }])?;
@@ -1020,7 +1028,7 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
         ensure!(values.len() == TOTAL_ROWS * vocab, "Kimi wide-batch verify logits shape");
         let verify_rows: Vec<Vec<f32>> = values.chunks_exact(vocab).map(|r| r.to_vec()).collect();
         let mut states: Vec<super::backend::DraftState> = (0..SEQS).map(|_| Default::default()).collect();
-        for (p, &start) in placements.iter_mut().zip(&starts) { p.len = start + VERIFY; }
+        for ((p, &start), s) in placements.iter_mut().zip(&starts).zip(&samples) { p.len = start + s.kept; }
         {
             let mut verified: Vec<crate::shared::qwen::scheduler::Verified<'_, super::prefix::Placement, super::backend::DraftState, ()>> =
                 placements.iter_mut().zip(states.iter_mut()).zip(&starts).zip(&samples).enumerate()
@@ -1046,17 +1054,18 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
         Ok((verify_rows, follow_rows, captures_delta, replays_delta))
     };
 
-    // 2. Batched 128-row eager (Note: Context-split MLA always replays/captures its Context graph; optional KDA/FFN run eager).
+    // 2. Batched 128-row eager (KDA + FFN run eagerly; Context replays its prewarmed 128-row graph).
     let (eager_verify, eager_follow, eager_caps, eager_replays) = run_batched(false)?;
-    // 3. Batched 128-row graphed capture pass, followed by graphed replay pass (must see 0 new captures).
-    let (cap_verify, cap_follow, cap_caps, cap_replays) = run_batched(true)?;
-    let (rep_verify, rep_follow, rep_caps, rep_replays) = run_batched(true)?;
+    // 3. Two batched 128-row graphed replay passes (KDA + FFN + Context all replay; 0 new captures).
+    let (rep1_verify, rep1_follow, rep1_caps, rep1_replays) = run_batched(true)?;
+    let (rep2_verify, rep2_follow, rep2_caps, rep2_replays) = run_batched(true)?;
 
     let (solo_vs_eager_bit, solo_vs_eager_top1, solo_vs_eager_max) = compare_rows(&solo_verify, &eager_verify);
-    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max) = compare_rows(&eager_verify, &rep_verify);
-    let (cap_vs_rep_bit, cap_vs_rep_top1, cap_vs_rep_max) = compare_rows(&cap_verify, &rep_verify);
+    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max) = compare_rows(&eager_verify, &rep1_verify);
+    let (rep1_vs_rep2_bit, rep1_vs_rep2_top1, rep1_vs_rep2_max) = compare_rows(&rep1_verify, &rep2_verify);
     let (follow_solo_vs_eager_bit, follow_solo_vs_eager_top1, follow_solo_vs_eager_max) = compare_rows(&solo_followup, &eager_follow);
-    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max) = compare_rows(&solo_followup, &rep_follow);
+    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max) = compare_rows(&solo_followup, &rep1_follow);
+    let (follow_rep1_vs_rep2_bit, follow_rep1_vs_rep2_top1, follow_rep1_vs_rep2_max) = compare_rows(&rep1_follow, &rep2_follow);
 
     let receipt = serde_json::json!({
         "schema": "cuteafd.kimi.wide-batch-128/1",
@@ -1065,29 +1074,32 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
         "verify_per_sequence": VERIFY,
         "total_verify_rows": TOTAL_ROWS,
         "provenance": provenance,
+        "warmed_128_executables": warmed_128,
         "passes": {
             "eager": { "captures": eager_caps, "replays": eager_replays },
-            "graphed_capture": { "captures": cap_caps, "replays": cap_replays },
-            "graphed_replay": { "captures": rep_caps, "replays": rep_replays },
+            "graphed_replay_1": { "captures": rep1_caps, "replays": rep1_replays },
+            "graphed_replay_2": { "captures": rep2_caps, "replays": rep2_replays },
         },
         "verify_parity": {
             "solo_vs_eager": { "bit_identical_rows": solo_vs_eager_bit, "top1_exact_rows": solo_vs_eager_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": solo_vs_eager_max },
             "eager_vs_graphed_replay": { "bit_identical_rows": eager_vs_rep_bit, "top1_exact_rows": eager_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": eager_vs_rep_max },
-            "graphed_capture_vs_replay": { "bit_identical_rows": cap_vs_rep_bit, "top1_exact_rows": cap_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": cap_vs_rep_max },
+            "graphed_replay_1_vs_2": { "bit_identical_rows": rep1_vs_rep2_bit, "top1_exact_rows": rep1_vs_rep2_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": rep1_vs_rep2_max },
         },
         "kda_commit_m128_followup_parity": {
             "solo_vs_eager": { "bit_identical_rows": follow_solo_vs_eager_bit, "top1_exact_rows": follow_solo_vs_eager_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_eager_max },
             "solo_vs_graphed_replay": { "bit_identical_rows": follow_solo_vs_rep_bit, "top1_exact_rows": follow_solo_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_rep_max },
+            "graphed_replay_1_vs_2": { "bit_identical_rows": follow_rep1_vs_rep2_bit, "top1_exact_rows": follow_rep1_vs_rep2_top1, "total_rows": SEQS, "max_abs_diff": follow_rep1_vs_rep2_max },
         },
     });
     println!("Kimi wide-batch 128-row oracle: {}", serde_json::to_string_pretty(&receipt)?);
     let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("wide-batch-128.json"))?;
     serde_json::to_writer_pretty(out, &receipt)?;
 
-    ensure!(rep_caps == 0 && rep_replays > 0, "Kimi 128-row graphed replay recaptured ({rep_caps}) or had zero replays ({rep_replays})");
+    ensure!(warmed_128 > 0 && rep1_caps == 0 && rep2_caps == 0 && rep1_replays > eager_replays && rep2_replays == rep1_replays,
+        "Kimi 128-row graphed replay failed (warmed={warmed_128}, eager_replays={eager_replays}, rep1=({rep1_caps},{rep1_replays}), rep2=({rep2_caps},{rep2_replays}))");
     ensure!(solo_vs_eager_top1 == TOTAL_ROWS, "Kimi 128-row solo vs batched verify top-1 mismatch ({solo_vs_eager_top1}/{TOTAL_ROWS}, max_abs={solo_vs_eager_max})");
-    ensure!(eager_vs_rep_top1 == TOTAL_ROWS && cap_vs_rep_bit == TOTAL_ROWS,
-        "Kimi 128-row graphed replay diverged (eager_vs_rep top1={eager_vs_rep_top1}/{TOTAL_ROWS} max={eager_vs_rep_max}, cap_vs_rep bit={cap_vs_rep_bit}/{TOTAL_ROWS})");
+    ensure!(eager_vs_rep_top1 == TOTAL_ROWS && rep1_vs_rep2_bit == TOTAL_ROWS,
+        "Kimi 128-row graphed replay diverged (eager_vs_rep top1={eager_vs_rep_top1}/{TOTAL_ROWS} max={eager_vs_rep_max}, rep1_vs_rep2 bit={rep1_vs_rep2_bit}/{TOTAL_ROWS})");
     ensure!(follow_solo_vs_eager_top1 == SEQS && follow_solo_vs_rep_top1 == SEQS,
         "Kimi 16-slot kda_commit_m128 follow-up mismatch (eager={follow_solo_vs_eager_top1}/{SEQS}, rep={follow_solo_vs_rep_top1}/{SEQS})");
     Ok(())
@@ -1136,9 +1148,9 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         "Kimi golden devices must name distinct physical owners");
     let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership, .. } = match args.split_device {
         Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
-            [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
+            [args.device, peer], prefill, graphs, verify.unwrap_or(if args.wide_batch { 8 } else { 0 }))?,
         None => load_target(args, &library, &programs, checkpoint, full, cfg,
-            [args.device], prefill, graphs, verify.unwrap_or(0))?,
+            [args.device], prefill, graphs, verify.unwrap_or(if args.wide_batch { 8 } else { 0 }))?,
     };
     let devices = std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>();
     // Diagnostic A/B: the four standalone launches; refused once graphs are captured.

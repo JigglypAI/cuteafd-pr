@@ -630,6 +630,21 @@ impl<'a> Engine<'a> {
         Ok(GraphWarmup { captured, before_capture })
     }
 
+    /// Capture one explicit speculative width across every physical rank without
+    /// launching, then settle device graph accounting (golden wide-batch oracle).
+    pub(crate) fn warm_explicit_verify_graphs(&self, rows: usize) -> Result<usize> {
+        let mut captured = 0;
+        {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            for local in &mut lanes.local[0] {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
+                captured += local.warm_explicit_verify_graphs(rows)?;
+            }
+        }
+        self.graph_settle()?;
+        Ok(captured)
+    }
+
     /// Completed-step graph boundary. Every rank's step is queued and no lane is
     /// mid-segment, so each physical device is sampled once and growth charged.
     fn graph_settle(&self) -> Result<()> {
