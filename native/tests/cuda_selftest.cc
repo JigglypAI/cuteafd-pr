@@ -2948,6 +2948,41 @@ void test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers() {
   free_buffer(&new_in); free_buffer(&new_mid); free_buffer(&new_staged); free_buffer(&new_out);
 }
 
+void dump_d2d_memcpy_node_params() {
+  constexpr size_t bytes = 4 * 40960;
+  auto src = device_buffer(bytes), dst = device_buffer(bytes);
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "dump d2d stream");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "dump d2d begin");
+  require_status(cuteafd_copy_d2d_async(dst, src, bytes, stream), "dump d2d copy");
+  cudaGraph_t graph = nullptr;
+  require_cuda(cudaStreamEndCapture(stream, &graph), "dump d2d end");
+  size_t count = 0;
+  require_cuda(cudaGraphGetNodes(graph, nullptr, &count), "dump d2d count");
+  std::vector<cudaGraphNode_t> nodes(count);
+  require_cuda(cudaGraphGetNodes(graph, nodes.data(), &count), "dump d2d nodes");
+  for (size_t i = 0; i < count; ++i) {
+    cudaGraphNodeType type{};
+    require_cuda(cudaGraphNodeGetType(nodes[i], &type), "dump d2d node type");
+    if (type != cudaGraphNodeTypeMemcpy) continue;
+    cudaMemcpy3DParms p{};
+    require_cuda(cudaGraphMemcpyNodeGetParams(nodes[i], &p), "dump d2d params");
+    std::cout << "d2d_memcpy_node[" << i << "]:"
+              << " nodeType=" << static_cast<int>(type)
+              << " kind=" << static_cast<int>(p.kind)
+              << " extent=(" << p.extent.width << "," << p.extent.height << "," << p.extent.depth << ")"
+              << " srcPtr=(pitch=" << p.srcPtr.pitch << ",xsize=" << p.srcPtr.xsize << ",ysize=" << p.srcPtr.ysize << ")"
+              << " dstPtr=(pitch=" << p.dstPtr.pitch << ",xsize=" << p.dstPtr.xsize << ",ysize=" << p.dstPtr.ysize << ")"
+              << " srcPos=(" << p.srcPos.x << "," << p.srcPos.y << "," << p.srcPos.z << ")"
+              << " dstPos=(" << p.dstPos.x << "," << p.dstPos.y << "," << p.dstPos.z << ")"
+              << " srcArray=" << (p.srcArray != nullptr)
+              << " dstArray=" << (p.dstArray != nullptr) << "\n";
+  }
+  require_cuda(cudaGraphDestroy(graph), "dump d2d destroy graph");
+  require_cuda(cudaStreamDestroy(stream), "dump d2d destroy stream");
+  free_buffer(&src); free_buffer(&dst);
+}
+
 void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
   constexpr size_t bytes = 5120 * sizeof(uint16_t);
   auto input = device_buffer(bytes);
@@ -3413,7 +3448,14 @@ int main(int argc, char** argv) {
     test_cuda_graph_peer_attribution();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dump-d2d-params") == 0) {
+    dump_d2d_memcpy_node_params();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--graph-transfer-only") == 0) {
+    if (const char* dump = std::getenv("CUTEAFD_DUMP_D2D_PARAMS"); dump && std::strcmp(dump, "1") == 0) {
+      dump_d2d_memcpy_node_params();
+    }
     test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
     test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
     std::cout << "test result: ok. 2 passed; 0 failed\n";
