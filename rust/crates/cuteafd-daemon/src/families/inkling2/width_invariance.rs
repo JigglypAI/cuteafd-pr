@@ -1,5 +1,5 @@
 //! Teacher-forced width oracle on the admitted serving executor and real Spark experts.
-use super::{cache::Placement, engine::Execution, golden::GoldenArgs, owners::{UnitBuffers,UnitOwner}};
+use super::{cache::{InklingPrefix, Placement}, engine::Execution, golden::GoldenArgs, owners::{UnitBuffers,UnitOwner}};
 use crate::shared::{prefill_pipeline::{Unit,UnitSegment}, speculation::target::{BlockVerifyTarget,VerifyRequest,VerifyRow}};
 use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
