@@ -45,71 +45,61 @@ impl QwenGraphShapeKey {
     fn is_dual(self) -> bool { matches!(self, Self::Dual0Spark | Self::DualSparks) }
 }
 
-/// Exact-row working-set soft cap and hard margin per rank (bytes), following
-/// the shared W1 soft-cap rule (pending `work/graph-soft-cap-rule` landing in
-/// `graph_reserve.rs`):
-/// - `soft = ceil_2MiB(max(1.2 * W1, W1 + 100 MB, W1 + 2 * step))`
-/// - `margin = ceil_2MiB(max(2 * largest_single_capture_growth, 2 MiB))`
-/// - `hard = soft + margin`, `spanning = 0` (`qwen4.segment` is `Scope::Local`).
+/// Exact-row C1 working-set census inputs per rank (bytes), fed directly into
+/// `graph_reserve::resolve_working_set`:
+/// - `soft = ceil_2MiB(W1 + max(20% * W1, 100 MB, 2 * step_growth))`
+/// - `growth_headroom = ceil_2MiB(max(2 * capture_growth, 2 MiB))`
+/// - `hard = soft + growth_headroom`, `spanning = 0` (`qwen4.segment` is `Scope::Local`).
 ///
-/// Calibrated from the donor-off census (`GPU_GRAPH_RESERVE=4GiB`, shared
-/// default donor rule, `baseline + spec_lossless_set + 32K context_load + C1..C16`):
+/// Calibrated from the donor-off census (`GPU_GRAPH_RESERVE=4GiB`, pressure-only
+/// donors, `baseline + spec_lossless_set + 32K context_load + C1..C16`):
 /// - `qwen38-exl3-min` (1 RTX, 49 segments):
 ///   * Full live shape set high-water: 392.00 MiB (411,041,792 B; 2,756 execs, 46,128 nodes).
-///   * W1 (`rows <= 4`, short + long): 29.72 MiB (208 execs, 3,540 nodes);
-///     step growth `G = 6.97 MiB`; `W1 + 100 MB = 125.09 MiB` -> `soft = 126 MiB`.
-///   * `largest_bytes = 4.00 MiB` (`2x = 8.00 MiB`) -> `margin = 8 MiB`, `hard = 134 MiB`.
+///   * W1 (`rows <= 4`, short + long): 30.08 MiB (31,544,571 B; 208 execs, 3,540 nodes);
+///     max single-step growth: 6.96 MiB (7,298,024 B; 819 nodes / 49 segs);
+///     largest single capture: 4.00 MiB (4,194,304 B).
+///   * Resolved: `soft = 126 MiB`, `growth_headroom = 8 MiB`, `hard = 134 MiB`.
 /// - `qwen38-exl3-2rtx` (2 RTX; rank 0 = 25 segments, rank 1 = 24 segments):
 ///   * Full live shape set high-water: 206.00 / 198.00 MiB (216,006,656 / 207,618,048 B;
 ///     1,456 / 1,398 execs, 24,260 / 23,448 nodes).
-///   * W1 (`rows <= 4`, short + long): 15.07 / 14.52 MiB (106 / 102 execs, 1,796 / 1,740 nodes);
-///     step growth `G = 3.54 / 3.44 MiB`; `W1 + 100 MB = 110.44 / 109.88 MiB` -> `soft = 112 / 112 MiB`.
-///   * `largest_bytes = 2.00 / 4.00 MiB` (`2x = 4.00 / 8.00 MiB`) ->
-///     `margin = 4 / 8 MiB`, `hard = 116 / 120 MiB`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QwenGraphBudget {
-    pub soft_cap: u64,
-    pub margin: u64,
-}
-
-const SINGLE_BUDGET: QwenGraphBudget = QwenGraphBudget { soft_cap: 126 << 20, margin: 8 << 20 };
-const DUAL_BUDGET: [QwenGraphBudget; 2] = [
-    QwenGraphBudget { soft_cap: 112 << 20, margin: 4 << 20 },
-    QwenGraphBudget { soft_cap: 112 << 20, margin: 8 << 20 },
+///   * W1 (`rows <= 4`, short + long): 15.25 / 14.69 MiB (15,991,260 / 15,406,662 B;
+///     106 / 102 execs, 1,796 / 1,740 nodes);
+///     max single-step growth: 3.53 / 3.39 MiB (3,703,989 / 3,559,471 B; 416 / 402 nodes);
+///     largest single capture: 2.00 / 4.00 MiB (2,097,152 / 4,194,304 B).
+///   * Resolved: `soft = 112 / 112 MiB`, `growth_headroom = 4 / 8 MiB`, `hard = 116 / 120 MiB`.
+const SINGLE_WORKING_SET: crate::placement::graph_reserve::WorkingSet =
+    crate::placement::graph_reserve::WorkingSet {
+        w1: 31_544_571,
+        step_growth: 7_298_024,
+        capture_growth: 4 << 20,
+    };
+const DUAL_WORKING_SET: [crate::placement::graph_reserve::WorkingSet; 2] = [
+    crate::placement::graph_reserve::WorkingSet {
+        w1: 15_991_260,
+        step_growth: 3_703_989,
+        capture_growth: 2 << 20,
+    },
+    crate::placement::graph_reserve::WorkingSet {
+        w1: 15_406_662,
+        step_growth: 3_559_471,
+        capture_growth: 4 << 20,
+    },
 ];
 
-/// The exact-row W1 soft cap and 2x-capture hard margin of `rank` on `key` (bytes).
-pub fn qwen_graph_budget(key: QwenGraphShapeKey, rank: usize) -> Option<QwenGraphBudget> {
+/// Measured exact-row C1 working-set census inputs of `rank` on `key`.
+pub fn qwen_working_set(key: QwenGraphShapeKey, rank: usize)
+    -> Option<crate::placement::graph_reserve::WorkingSet> {
     if rank >= key.owners() { return None; }
-    if key.is_dual() { Some(DUAL_BUDGET[rank]) } else { Some(SINGLE_BUDGET) }
+    if key.is_dual() { Some(DUAL_WORKING_SET[rank]) } else { Some(SINGLE_WORKING_SET) }
 }
 
-/// Resolve Qwen4's per-rank reserve through `graph_reserve::current_working_set`,
-/// applying the W1 soft cap and `2x` largest-capture hard margin until the shared
-/// `work/graph-soft-cap-rule` resolver lands.
+/// Resolve Qwen4's per-rank reserve through the shared `graph_reserve::current_working_set`.
 pub fn qwen_resolve_reserve(key: QwenGraphShapeKey, rank: usize)
     -> Result<crate::placement::graph_reserve::Resolved, String> {
-    const CHUNK: u64 = 2 << 20;
-    let budget = qwen_graph_budget(key, rank)
+    let measured = qwen_working_set(key, rank)
         .ok_or_else(|| format!("Qwen {key:?} graph reserve has no rank {rank}"))?;
-    let mut resolved = crate::placement::graph_reserve::current_working_set(rank, budget.soft_cap)
-        .map_err(|error| error.to_string())?;
-    if resolved.source == "user total" {
-        let margin = if resolved.bytes <= CHUNK {
-            resolved.bytes / 2
-        } else {
-            budget.margin.min(resolved.bytes.saturating_sub(CHUNK))
-        };
-        resolved.soft_margin_floor = margin;
-        resolved.base_bytes = resolved.bytes.saturating_sub(margin);
-    } else {
-        resolved.base_bytes = budget.soft_cap;
-        resolved.extra_bytes = budget.margin;
-        resolved.effective_extra_bytes = budget.margin;
-        resolved.soft_margin_floor = budget.margin;
-        resolved.bytes = budget.soft_cap + budget.margin;
-    }
-    Ok(resolved)
+    crate::placement::graph_reserve::current_working_set(rank, measured)
+        .map_err(|error| error.to_string())
 }
 
 /// Preserve the established short-context allocation buckets, but do not key a
@@ -153,18 +143,30 @@ mod owner_graph_tests {
 
     #[test]
     fn qwen_exact_row_soft_caps_cover_every_resolved_shape() {
+        use crate::placement::graph_reserve::resolve_working_set;
         assert_eq!(QwenGraphShapeKey::resolve(1, false), QwenGraphShapeKey::Single0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(1, true), QwenGraphShapeKey::SingleSparks);
         assert_eq!(QwenGraphShapeKey::resolve(2, false), QwenGraphShapeKey::Dual0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(2, true), QwenGraphShapeKey::DualSparks);
         for key in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks] {
-            assert_eq!(qwen_graph_budget(key, 0), Some(SINGLE_BUDGET), "{key:?}");
-            assert_eq!(qwen_graph_budget(key, 1), None, "{key:?}");
+            let ws = qwen_working_set(key, 0).expect("single rank 0");
+            assert_eq!(ws, SINGLE_WORKING_SET, "{key:?}");
+            let r = resolve_working_set(None, None, None, 0, ws).unwrap();
+            assert_eq!((r.base_bytes, r.growth_headroom, r.bytes, r.source),
+                (126 << 20, Some(8 << 20), 134 << 20, "working-set reserve"), "{key:?}");
+            assert_eq!(qwen_working_set(key, 1), None, "{key:?}");
         }
         for key in [QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
-            assert_eq!(qwen_graph_budget(key, 0), Some(DUAL_BUDGET[0]), "{key:?}");
-            assert_eq!(qwen_graph_budget(key, 1), Some(DUAL_BUDGET[1]), "{key:?}");
-            assert_eq!(qwen_graph_budget(key, 2), None, "{key:?}");
+            let ws0 = qwen_working_set(key, 0).expect("dual rank 0");
+            let ws1 = qwen_working_set(key, 1).expect("dual rank 1");
+            assert_eq!((ws0, ws1), (DUAL_WORKING_SET[0], DUAL_WORKING_SET[1]), "{key:?}");
+            let r0 = resolve_working_set(None, None, None, 0, ws0).unwrap();
+            let r1 = resolve_working_set(None, None, None, 1, ws1).unwrap();
+            assert_eq!((r0.base_bytes, r0.growth_headroom, r0.bytes, r0.source),
+                (112 << 20, Some(4 << 20), 116 << 20, "working-set reserve"), "{key:?} rank 0");
+            assert_eq!((r1.base_bytes, r1.growth_headroom, r1.bytes, r1.source),
+                (112 << 20, Some(8 << 20), 120 << 20, "working-set reserve"), "{key:?} rank 1");
+            assert_eq!(qwen_working_set(key, 2), None, "{key:?}");
         }
     }
 

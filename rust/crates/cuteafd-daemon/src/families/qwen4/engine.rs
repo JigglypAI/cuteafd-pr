@@ -1026,7 +1026,7 @@ impl<'a> Qwen4Engine<'a> {
             })?;
             crate::shared::decode_graph::device::set_reserve_policy(self.gdn_banks[owner].device.id, resolved)?;
             tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
-                soft_cap = resolved.base_bytes, margin = resolved.soft_margin_floor,
+                soft_cap = resolved.base_bytes, growth_headroom = ?resolved.growth_headroom,
                 bootstrap = cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
                 shape = ?shape, "Qwen exact-row graph reserve");
             reserves.push(resolved.bytes);
