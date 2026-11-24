@@ -74,17 +74,21 @@ pub struct TowerExtension {
     pub rotated_dims: u32,
     pub passthrough_dims: u32,
     pub inv_freq: [u64; 3],
-    /// 0 none, 1 divided-fixed spatial. Single-frame inputs skip time positions.
+    /// 0 none, 1 divided-fixed spatial, 2 Hy4 scale-factor `(size + 0.1) / edge`
+    /// over a table whose row 0 is an unused class token. Stills skip time.
     pub absolute_kind: u32,
     pub position_height: u32,
     pub position_width: u32,
-    /// 0 none, 1 compiled FP32 half-pixel bilinear, BF16 load/store.
+    /// 0 none, 1 compiled FP32 half-pixel bilinear, BF16 load/store, 2 ATen
+    /// `upsample_bilinear2d` with a scale factor (pairs with absolute_kind 2).
     pub interpolation: u32,
     pub absolute_position: u64,
     pub pre_norm: TowerNorm,
     pub final_norm: TowerNorm,
     pub spatial_merge: u32,
-    /// 0 none, 1 group then project, 2 project then group then project.
+    /// 0 none, 1 group then project, 2 project then group then project, 3 Hy4
+    /// channel-major conv grouping then project, then one checkpoint marker row
+    /// (`VisionSpec::merger_extra[0]`) after every merged row.
     pub projection_order: u32,
     pub projectors: [TowerProjector; 2],
     pub post_norm: TowerNorm,
@@ -164,6 +168,21 @@ impl TowerExtension {
                 && (p.fc1_bias == NONE || extent(p.fc1_bias, p.hidden_width as u64, 2))
                 && (p.fc2_bias == NONE || extent(p.fc2_bias, p.output_width as u64, 2))
         };
+        let hy4 = self.absolute_kind == 2;
+        if hy4 != (self.projection_order == 3)
+            || (hy4
+                && (base.head_dim != 72
+                    || base.patch_size != 16
+                    || self.rotary_kind != 0
+                    || self.pixel_layout != 1
+                    || self.temporal_patch != 1
+                    || self.pre_norm != TowerNorm::default()
+                    || self.post_norm != TowerNorm::default()
+                    || self.final_norm.kind != 2
+                    || !extent(base.merger_extra[0], u64::from(base.output_width), 2)))
+        {
+            return Err(fail());
+        }
         if self.version != 1
             || self.size != std::mem::size_of::<Self>() as u32
             || base.perception.is_some()
@@ -219,13 +238,15 @@ impl TowerExtension {
                 && self.position_width == 0
                 && self.interpolation == 0
                 && self.absolute_position == NONE => {}
-            1 if self.position_height > 0
-                && self.position_width > 0
-                && self.interpolation == 1
-                && u64::from(self.position_height)
-                    .checked_mul(u64::from(self.position_width))
-                    .and_then(|n| n.checked_mul(u64::from(base.hidden)))
-                    .is_some_and(|n| extent(self.absolute_position, n, 2)) => {}
+            kind @ (1 | 2)
+                if self.position_height > 0
+                    && self.position_width > 0
+                    && self.interpolation == kind
+                    && u64::from(self.position_height)
+                        .checked_mul(u64::from(self.position_width))
+                        .and_then(|n| n.checked_add(u64::from(kind == 2)))
+                        .and_then(|n| n.checked_mul(u64::from(base.hidden)))
+                        .is_some_and(|n| extent(self.absolute_position, n, 2)) => {}
             _ => return Err(fail()),
         }
         let [first, second] = self.projectors;
@@ -234,7 +255,7 @@ impl TowerExtension {
             return Err(fail());
         }
         match self.projection_order {
-            1 if base.hidden.checked_mul(grouped) == Some(first.input_width)
+            1 | 3 if base.hidden.checked_mul(grouped) == Some(first.input_width)
                 && first.output_width == base.output_width
                 && second.kind == 0 => {}
             2 if first.input_width == base.hidden

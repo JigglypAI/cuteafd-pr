@@ -6,6 +6,7 @@ pub mod config;
 pub mod draft;
 pub mod engram;
 pub mod execution;
+pub mod vision;
 pub mod weight_layout;
 
 pub use config::{Hy4DflyConfig, Hy4FlashConfig, Hy4VisionConfig};

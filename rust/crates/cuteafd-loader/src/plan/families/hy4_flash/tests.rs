@@ -686,6 +686,9 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
     let measured_inputs = admission::gather(&FactsRequest {
         checkpoint: &checkpoint,
@@ -717,6 +720,9 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
 
     let req = hy4_place::request(
@@ -779,6 +785,9 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
 
     // 41 onboarded layers on a 1x 96 GiB RTX with original view cannot fit and must refuse, never clamp.

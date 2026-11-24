@@ -13,6 +13,7 @@ pub(crate) mod execution;
 pub(crate) mod golden;
 mod graph_sites;
 pub(crate) mod graphs;
+pub(crate) mod media;
 pub(crate) mod native;
 pub(crate) mod programs;
 pub(crate) mod serve;

@@ -22,12 +22,20 @@ bool generic_projector_extent(const cuteafd_vision_spec& s,const cuteafd_vision_
 
 bool valid_generic_tower(const cuteafd_vision_spec& s) {
   if(!s.tower || s.perception || s.abi_version!=4 || s.geometry_reserved || !s.weight_bytes || s.weight_bytes>(5ULL<<30) ||
-     !s.max_tokens || s.max_tokens>16698 || s.patch_size!=14 || !s.blocks || !s.norm1_bias || !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
+     !s.max_tokens || s.max_tokens>16698 || !s.blocks || !s.norm1_bias || !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
   const auto& t=*s.tower;
+  // Hy4-flash: patch-16 raster, separate biased Q/K/V, scale-factor positions,
+  // channel-major conv grouping and checkpoint newline rows. Others stay patch 14.
+  const bool hy4=t.absolute_kind==2;
+  if(hy4!=(t.projection_order==3) || s.patch_size!=(hy4?16u:14u))return false;
+  if(hy4 && (s.head_dim!=72 || t.rotary_kind || t.pixel_layout!=1 || t.temporal_patch!=1 || t.pre_norm.kind ||
+     t.block_norm_kind!=1 || t.activation!=1 || t.final_norm.kind!=2 || t.projectors[0].activation!=1 ||
+     t.post_norm.kind || s.max_tokens>4096 || !generic_extent(s,s.merger_extra[0],size_t(s.output_width)*2)))return false;
+  if(!hy4 && s.merger_extra[0]!=UINT64_MAX && s.merger_extra[0]!=0)return false;
   if(t.version!=1 || t.size!=sizeof(t) || (t.block_norm_kind!=1 && t.block_norm_kind!=2) ||
      (t.activation!=1 && t.activation!=2) || !isfinite(t.block_norm_epsilon) || t.block_norm_epsilon<=0.f ||
      !s.hidden || s.hidden>8192 || !s.intermediate || s.intermediate>32768 || !s.depth || s.depth>128 ||
-     !s.heads || s.heads>32 || s.kv_heads!=s.heads || (s.head_dim!=80 && s.head_dim!=128) ||
+     !s.heads || s.heads>32 || s.kv_heads!=s.heads || (s.head_dim!=72 && s.head_dim!=80 && s.head_dim!=128) ||
      uint64_t(s.heads)*s.head_dim!=t.attention_width || t.spatial_merge!=2 ||
      (t.pixel_layout!=1 && t.pixel_layout!=2) ||
      !((t.temporal_patch==1 && t.temporal_input==0) || (t.temporal_patch==2 && t.temporal_input==1)))return false;
@@ -43,12 +51,14 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
      (t.rotary_kind==2 && (t.rotary_axis_dims[0] || !t.rotary_axis_dims[1] || t.rotary_axis_dims[1]!=t.rotary_axis_dims[2] || t.passthrough_dims)))return false;
   if(!t.absolute_kind) {
     if(t.position_height || t.position_width || t.interpolation || t.absolute_position!=UINT64_MAX)return false;
-  } else if(t.absolute_kind!=1 || !t.position_height || t.position_height>512 || !t.position_width || t.position_width>512 ||
-     t.interpolation!=1 || !generic_extent(s,t.absolute_position,size_t(t.position_height)*t.position_width*s.hidden*2))return false;
+  } else if(t.absolute_kind>2 || !t.position_height || t.position_height>512 || !t.position_width || t.position_width>512 ||
+     t.interpolation!=t.absolute_kind ||
+     // Hy4's learned table keeps the unused class-token row 0 ahead of the grid.
+     !generic_extent(s,t.absolute_position,(size_t(t.position_height)*t.position_width+(hy4?1:0))*s.hidden*2))return false;
   for(const auto& p:t.projectors)if(!generic_projector_extent(s,p))return false;
   const auto& first=t.projectors[0];const auto& second=t.projectors[1];
   if(first.kind!=1)return false;
-  if(t.projection_order==1) {
+  if(t.projection_order==1 || t.projection_order==3) {
     if(uint64_t(s.hidden)*4!=first.input_width || first.output_width!=s.output_width || second.kind)return false;
   } else if(t.projection_order==2) {
     if(first.input_width!=s.hidden || second.kind!=1 || uint64_t(first.output_width)*4!=second.input_width || second.output_width!=s.output_width)return false;
@@ -57,6 +67,8 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
      (s.patch_bias!=UINT64_MAX && !generic_extent(s,s.patch_bias,size_t(s.hidden)*2)))return false;
   for(uint32_t layer=0;layer<s.depth;++layer) {
     const auto& b=s.blocks[layer];
+    // Hy4 Q/K/V are adjacent checkpoint tensors: the same 3x extent, read as three projections.
+    if(hy4 && (b.qkv_bias==UINT64_MAX || s.norm1_bias[layer]==UINT64_MAX || s.norm2_bias[layer]==UINT64_MAX))return false;
     const uint64_t offsets[]={b.qkv,b.proj,b.gate_up,b.down,b.norm1,b.norm2};
     const size_t sizes[]={size_t(3)*t.attention_width*s.hidden*2,size_t(t.attention_width)*s.hidden*2,
       size_t(s.intermediate)*s.hidden*2,size_t(s.hidden)*s.intermediate*2,size_t(s.hidden)*2,size_t(s.hidden)*2};

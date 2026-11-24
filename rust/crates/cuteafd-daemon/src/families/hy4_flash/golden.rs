@@ -403,6 +403,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             args.skip_routed_experts,
             onboarded,
             if draft_tp == 2 { 2 * 6 } else { 0 },
+            Default::default(),
         )?
     } else {
         Hy4Engine::new(
@@ -1062,7 +1063,8 @@ fn run_resume_check(
                     // schedules, with distinct anchors and a different depth per member.
                     let members = [&p_a, &p_b].into_iter().enumerate().map(|(i, p)| {
                         super::draft::Member { slot: p.slot, pos: p.len,
-                            bonus: if i == 0 { tok } else { (tok + 1) % vocab as u32 }, depth: 5 - i * 2 }
+                            bonus: if i == 0 { tok } else { (tok + 1) % vocab as u32 }, depth: 5 - i * 2,
+                            rope_delta: p.rope.delta() }
                     }).collect::<Vec<_>>();
                     let separate = members.iter().map(|m| engine.draft_batch(std::slice::from_ref(m))
                         .map(|mut batch| batch.pop().expect("singleton DFly2 output")))

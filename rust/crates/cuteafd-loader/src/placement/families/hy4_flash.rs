@@ -168,6 +168,8 @@ pub struct Hy4Inputs {
     /// Measured pinned host staging bytes for prefill & decode Engram gathers (`Hy4EngramShape::staging_bytes()`).
     pub engram_staging_bytes: u64,
     pub resident_weight_limit: Option<ResidentWeights>,
+    /// Bundled ViT owner candidates; None when VISION=off.
+    pub vision: Option<crate::placement::still_encoder::StillEncoder>,
 }
 
 #[derive(Debug, Clone)]
@@ -1050,6 +1052,11 @@ impl Recipe for Hy4Inputs {
             }
         }
 
+        // Independent bundled tower shares the target/KV/expert joint solve.
+        if let Some(vision) = &self.vision {
+            vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
+        }
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract {
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,

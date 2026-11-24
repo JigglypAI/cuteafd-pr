@@ -201,6 +201,7 @@ int mha_attention(Owner* o,int n) {
 #include "vision_perception.cuh"
 #include "vision_tower.cuh"
 #include "vision_tower_encode.cuh"
+#include "vision_hy4.cuh"
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
 #include "vision_mistral.cuh"
 #endif
@@ -231,6 +232,7 @@ bool valid_tower(const cuteafd_vision_spec& s) {
 size_t scratch_tower(Owner* o) {
   const auto& s=o->spec;
   if(s.perception)return scratch_perception(o);
+  if(s.tower && s.tower->absolute_kind==2)return scratch_hy4_tower(s,o->arena,o->generic_storage);
   if(s.tower)return scratch_generic_tower(s,o->arena,o->generic_storage);
   if(s.abi_version==2 && s.reserved==2)return scratch_qwen(o,s.max_tokens,s.output_width);
   if(s.abi_version==2 && s.reserved==5)return scratch_muse(o,s.max_tokens,s.output_width);
@@ -316,7 +318,7 @@ static int32_t vision_create_impl(const cuteafd_vision_spec* s, int32_t device, 
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->tower) {
-    const char* group=s->tower->temporal_patch==1 ? "tower_kimi" : "tower_minimax";
+    const char* group=s->tower->absolute_kind==2 ? "tower_hy4f" : s->tower->temporal_patch==1 ? "tower_kimi" : "tower_minimax";
     e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
   } else if(s->abi_version==2 || s->perception) {
     const char* group=s->perception ? (s->reserved==6?"pe_inkling2":"pe_step5") :
@@ -397,6 +399,8 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   int32_t gh, int32_t gw, uint16_t* output, uint64_t output_bytes, cuteafd_vision_observer cb, void* ctx) {
   if(!owner || !rgb || !lut || !output)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner); const auto& s=o->spec;
+  if(s.tower && s.tower->absolute_kind==2) { const int32_t grid[2]={gh,gw};
+    return encode_hy4_batch(o,rgb,rgb_bytes,lut,grid,1,output,output_bytes,cb,ctx); }
   if(s.tower)return encode_generic_tower(o,rgb,rgb_bytes,lut,gh,gw,gh*s.patch_size,gw*s.patch_size,
       0,0,gw*s.patch_size,gh*s.patch_size,output,output_bytes,cb,ctx);
   if(s.perception)return encode_perception(o,rgb,rgb_bytes,lut,gh,gw,gh*s.patch_size,gw*s.patch_size,
@@ -480,10 +484,24 @@ extern "C" int32_t cuteafd_vision_encode_pixels(void* owner,const uint8_t* rgb,u
     uint16_t* output,uint64_t output_bytes,cuteafd_vision_observer cb,void* ctx) {
   if(!owner)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner);
+  if(o->spec.tower && o->spec.tower->absolute_kind==2)return cudaErrorNotSupported;
   if(o->spec.tower)return encode_generic_tower(o,rgb,rgb_bytes,parameters,gh,gw,sh,sw,cx,cy,cw,ch,
       output,output_bytes,cb,ctx);
   if(!o->spec.perception)return cudaErrorNotSupported;
   return encode_perception(o,rgb,rgb_bytes,parameters,gh,gw,sh,sw,cx,cy,cw,ch,output,output_bytes,cb,ctx);
+}
+
+// Several still images in one owner turn: one upload, one varlen attention per
+// block, one download and one stream sync. grids holds images x {h,w} patches;
+// rgb packs each image's row-major RGB8 canvas back to back; output packs each
+// image's LM span rows in order. Only towers declaring batch support accept it.
+extern "C" int32_t cuteafd_vision_encode_batch(void* owner,const uint8_t* rgb,uint64_t rgb_bytes,
+    const float* lut,const int32_t* grids,int32_t images,uint16_t* output,uint64_t output_bytes,
+    cuteafd_vision_observer cb,void* ctx) {
+  if(!owner)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(owner);
+  if(!o->spec.tower || o->spec.tower->absolute_kind!=2)return cudaErrorNotSupported;
+  return encode_hy4_batch(o,rgb,rgb_bytes,lut,grids,images,output,output_bytes,cb,ctx);
 }
 
 extern "C" int32_t cuteafd_vision_rmsnorm_bf16(const float* x,const float* w,uint16_t* y,int32_t rows,int32_t dim,float eps,void* stream) {

@@ -317,7 +317,8 @@ pub fn workspace_rank(
     let record = kv.record_bytes();
     let recall = cfg.layers * k * 4;
     let mut planes: Vec<(&str, usize)> = vec![
-        ("positions", r * 8),
+        // [rows,3] M-RoPE positions (text rows repeat one position on every axis).
+        ("positions", r * 24),
         ("write_slots", r * 8),
         ("page_table", r * (k + block) * 4),
         ("lengths", r * 4),

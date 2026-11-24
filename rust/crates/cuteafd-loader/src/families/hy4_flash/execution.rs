@@ -236,7 +236,7 @@ impl WaveScratchLayout {
         let engram_concat = cfg.engram_concat_width();
 
         let mut views: Vec<(String, usize)> = vec![
-            ("positions_i64".into(), (max_rows * 8).max(256)),
+            ("positions_i64".into(), (max_rows * 24).max(256)),
             ("positions_i32".into(), (max_rows * 4).max(256)),
             ("dsa_slots_i64".into(), (max_rows * 8).max(256)),
             ("swa_slots_i64".into(), (max_rows * 8).max(256)),
@@ -252,7 +252,7 @@ impl WaveScratchLayout {
             ("dsa_cu_seqlens".into(), ((max_rows + 1) * 4).max(256)),
             ("swa_cu_seqlens".into(), ((max_sequences + 1) * 4).max(256)),
             ("idx_limits".into(), (max_rows * 4).max(256)),
-            ("idx_group_pos".into(), (max_batch_groups * 8).max(256)),
+            ("idx_group_pos".into(), (max_batch_groups * 24).max(256)),
             ("idx_group_slots".into(), (max_batch_groups * 8).max(256)),
         ];
         for i in 0..cfg.engram_layers.len() {

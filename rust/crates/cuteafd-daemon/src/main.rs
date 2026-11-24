@@ -62,6 +62,8 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
             vision: &mut args.media.vision, audio: None }),
         Commands::ServeMinimax(args) => Some(ServeMedia { snapshot: &args.snapshot,
             vision: &mut args.media.vision, audio: None }),
+        Commands::ServeHy4f(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.media.vision, audio: None }),
         Commands::ServeMuse(args) => Some(ServeMedia { snapshot: &args.snapshot,
             vision: &mut args.vision, audio: Some(&mut args.audio) }),
         Commands::ServeQwen4(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,

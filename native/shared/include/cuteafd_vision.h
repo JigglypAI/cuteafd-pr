@@ -51,13 +51,15 @@ typedef struct {
   uint32_t rotary_kind; /* 0 none, 1 split-half THW, 2 adjacent-pair WH. */
   uint32_t rotary_axis_dims[3], rotated_dims, passthrough_dims;
   uint64_t inv_freq[3]; /* T,H,W; axis_dims/2 FP32 elements per active axis. */
-  uint32_t absolute_kind; /* 0 none, 1 divided-fixed spatial; stills skip time. */
+  uint32_t absolute_kind; /* 0 none, 1 divided-fixed spatial, 2 Hy4 scale-factor (size+0.1)/edge; stills skip time. */
   uint32_t position_height, position_width;
-  uint32_t interpolation; /* 0 none, 1 compiled FP32 half-pixel bilinear. */
+  uint32_t interpolation; /* 0 none, 1 compiled FP32 half-pixel bilinear, 2 ATen upsample_bilinear2d scale_factor. */
   uint64_t absolute_position;
   cuteafd_vision_tower_norm pre_norm, final_norm;
   uint32_t spatial_merge;
-  uint32_t projection_order; /* 0 none, 1 group-project, 2 project-group-project. */
+  uint32_t projection_order; /* 0 none, 1 group-project, 2 project-group-project,
+   * 3 channel-major 2x2 conv group-project then one marker row per merged row
+   * (spec.merger_extra[0] holds the BF16 marker vector, output_width wide). */
   cuteafd_vision_tower_projector projectors[2];
   cuteafd_vision_tower_norm post_norm;
 } cuteafd_vision_tower;
@@ -113,6 +115,12 @@ int32_t cuteafd_vision_encode_pixels(void* owner, const uint8_t* rgb, uint64_t r
                              const float* parameters, int32_t grid_h, int32_t grid_w,
                              int32_t source_h, int32_t source_w, int32_t content_x, int32_t content_y,
                              int32_t content_w, int32_t content_h,
+                             uint16_t* output, uint64_t output_bytes,
+                             cuteafd_vision_observer observer, void* observer_context);
+/* Batched stills (towers that declare it): grids is images x {h,w} patches,
+ * rgb and output pack every image in order; one upload, sync and download. */
+int32_t cuteafd_vision_encode_batch(void* owner, const uint8_t* rgb, uint64_t rgb_bytes,
+                             const float* lut, const int32_t* grids, int32_t images,
                              uint16_t* output, uint64_t output_bytes,
                              cuteafd_vision_observer observer, void* observer_context);
 int32_t cuteafd_vision_get_ledger(void* owner, cuteafd_vision_ledger*);

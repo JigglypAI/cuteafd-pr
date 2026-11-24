@@ -355,8 +355,17 @@ on one RTX GPU and `context` (ContextSplit, parity-owned DSA KV/index pages with
 no DSA KV replication and head-split SWA-512) on two RTX GPUs; explicit
 `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
 refuses in `serve-hy4f`). `EMBEDDING=gpu` is required
-(`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
-`off`). `SPECULATOR=auto` (default) uses the checkpoint's bundled five-stage
+(`host` refuses). `VISION=auto` (default) serves the checkpoint's bundled
+27-layer ViT (`vit.*`, 0.87 GiB packed BF16 arena plus admitted scratch) from
+the jointly admitted owner: an RTX GPU, or `spark[:rank]` replicas when every
+expert layer is onboarded; `VISION=rtx[:gpu]|spark[:rank]|off`,
+`VISION_REPLICAS` and `MEDIA_CACHE_BYTES` use the shared media options.
+Images follow Tencent's serving processor (SGLang `smart_resize`, 32-pixel
+cells, 64x64 to 2048x2048 pixels, bicubic, mean/std 0.5): a `h x w` patch grid
+becomes `h/2 * (w/2 + 1)` image rows, the checkpoint's `image_newline` closing
+each merged row, with interleaved 3D M-RoPE positions. Up to eight images
+encode in one batched tower pass. `AUDIO` accepts `auto` or `off` and starts
+none. `SPECULATOR=auto` (default) uses the checkpoint's bundled five-stage
 DFly2 on Spark-free layouts, including two-RTX `context` (default) and explicit
 `heads`; Spark layouts retain their drafter-off default. `SPECULATOR=dfly2`
 explicitly enables it. It reuses committed target MLA KV
@@ -1237,7 +1246,7 @@ Media:
 
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | ✓ (`auto`/`off`; auto starts none) |
+| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | ✓ | ✓ (`auto`/`off`; auto starts none) |
 | `AUDIO` | `off` (default; no tower) | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
 
 Native EXLR8 (`EXLR8_MANIFEST`): GLM 5.3/ML4 and GLM Flash, the only
@@ -1369,8 +1378,8 @@ original core is already FP8, not an MC publication.
 | **Media** | | | | | | | | | | |  | |  |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO` | ✓ (`off` only) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
-| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CHAT_TEMPLATE_FROM` | ✗ | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

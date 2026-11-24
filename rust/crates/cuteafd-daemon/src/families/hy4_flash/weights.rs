@@ -575,6 +575,7 @@ impl<'a> Hy4RankWeights<'a> {
         cfg: &Hy4FlashConfig,
         max_rows: usize,
         max_head_rows: usize,
+        media: crate::shared::vision::push::Contribution,
     ) -> Result<Vec<Self>> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4-flash supports 1 or 2 coordinator GPUs, not {gpus}");
@@ -593,7 +594,7 @@ impl<'a> Hy4RankWeights<'a> {
             ("hy4_flash/dense-mount-tables", 2 * mount.pinned_tables)];
         admit_host_memory(0, &mount_owners, 0, 0)?;
         dense.admit_mount(mount)?;
-        let ranks = crate::shared::experts::rtx::push::load_alone(&checkpoint.snapshot, devices, || {
+        let ranks = crate::shared::experts::rtx::push::load_alone_with_media(&checkpoint.snapshot, devices, media, || {
             let mut ranks = Vec::with_capacity(gpus);
             for (rank, layout) in layouts.into_iter().enumerate() {
                 let device = devices[rank];

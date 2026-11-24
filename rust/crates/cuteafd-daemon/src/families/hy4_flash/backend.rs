@@ -127,6 +127,9 @@ pub(crate) struct Hy4Backend<'a> {
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
     request_id: Cell<u64>,
+    /// Bundled ViT contract when vision is enabled (None: VISION=off).
+    vision: Option<cuteafd_loader::families::hy4_flash::vision::VisionContract>,
+    config: serde_json::Value,
 }
 
 impl<'a> Hy4Backend<'a> {
@@ -135,7 +138,12 @@ impl<'a> Hy4Backend<'a> {
         context: usize,
         unit_rows: usize,
         host: Option<cuteafd_hostcache::config::Config>,
+        snapshot: &Path,
+        vision: bool,
     ) -> Result<Self> {
+        let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+        let vision = vision.then(|| cuteafd_loader::families::hy4_flash::vision::VisionContract::from_config(&config))
+            .transpose()?;
         let library = engine.library();
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
@@ -163,6 +171,8 @@ impl<'a> Hy4Backend<'a> {
             profile: RefCell::new([0.0; 2]),
             pending: RefCell::new(None),
             request_id: Cell::new(0),
+            vision,
+            config,
         })
     }
 
@@ -280,7 +290,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     type Placement = Hy4Placement;
     type Draft = Draft;
     type History = usize;
-    type Coordinates = ();
+    type Coordinates = std::sync::Arc<cuteafd_loader::families::hy4_flash::vision::RopePositions>;
     type Encoder = crate::shared::qwen::Encoder;
     type Meta = ();
     type Prefix = Hy4Prefix<'a>;
@@ -353,30 +363,35 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     }
 
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty() && job.image_groups.is_empty(), "Hy4 vision tower is not enabled");
-        ensure!(job.audio.is_empty(), "Hy4 has no bundled audio tower");
-        let keys = cuteafd_engine::media::MediaKeys::new(&tokens, u32::try_from(self.vocab)?, &[])?;
-        let media = RequestMedia::new(vec![], self.engine.borrow().cfg.hidden, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, vec![]))
+        let hidden = self.engine.borrow().cfg.hidden;
+        super::media::prepare(job, tokens, &self.config, self.vision.as_ref(), self.vocab, hidden, self.context)
     }
 
-    fn probe_features(&self, _: &scheduler::Prompt, _: &mut RequestMedia, _: &mut EmbeddingCache, _: &Path) -> Result<()> {
+    fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia, cache: &mut EmbeddingCache, snapshot: &Path) -> Result<()> {
+        // Fidelity-only reference features (golden NLL with the official tower
+        // output); ordinary image requests always encode natively.
+        if prompt.job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()) && !media.spans().is_empty() {
+            crate::shared::probe::still::features(prompt, media, cache, snapshot, cuteafd_loader::media::ImageFamily::Hy4Flash)?;
+        }
         Ok(())
     }
 
-    fn coordinates(&self, _: &[u32], _: &NativeRequest, _: &RequestMedia) -> Result<()> {
-        Ok(())
+    fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<Self::Coordinates> {
+        super::media::rope_positions(tokens, job, media, self.vision.as_ref())
     }
 
     fn placement(&self, units: Vec<u32>, slot: i32) -> Hy4Placement {
         Hy4Placement::new(units, slot as usize, self.pad_id)
     }
 
-    fn bind_request(&self, placement: &mut Hy4Placement, _: (), _: RequestMedia, tokens: &[u32], resume: usize) -> Result<()> {
+    fn bind_request(&self, placement: &mut Hy4Placement, rope: Self::Coordinates, media: RequestMedia,
+        tokens: &[u32], resume: usize) -> Result<()> {
         ensure!(
             placement.len == resume && placement.state_len == resume && resume <= tokens.len(),
             "Hy4 restored request frontier differs"
         );
+        placement.rope = rope;
+        placement.media = (!media.spans().is_empty()).then(|| std::sync::Arc::new(media));
         placement.set_engram_tail_from_prefix(&tokens[..resume], self.pad_id);
         Ok(())
     }
@@ -670,7 +685,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             let bonus = request.seq.anchor?;
             let p = request.placement;
             (request.depth > 0 && engine.draft_valid(p)).then_some((i, super::draft::Member {
-                slot: p.slot, pos: p.len, bonus, depth: request.depth,
+                slot: p.slot, pos: p.len, bonus, depth: request.depth, rope_delta: p.rope.delta(),
             }))
         }).collect::<Vec<_>>();
         let mut output = vec![Vec::new(); sequences.len()];

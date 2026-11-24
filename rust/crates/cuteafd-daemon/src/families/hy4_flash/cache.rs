@@ -501,6 +501,10 @@ pub(crate) struct Hy4Placement {
     /// Last 2 committed token IDs (`[t_{len-2}, t_{len-1}]`, left-padded with `engram_pad_id`)
     /// so Engram 3-gram hashing resumes byte-identically from any prefix mark or decode step.
     pub engram_tail: [u32; 2],
+    /// Interleaved M-RoPE coordinates; text-only requests keep equal axes.
+    pub rope: std::sync::Arc<cuteafd_loader::families::hy4_flash::vision::RopePositions>,
+    /// Image spans and their cached features, injected into prompt rows.
+    pub media: Option<std::sync::Arc<cuteafd_engine::media::RequestMedia>>,
 }
 
 impl Hy4Placement {
@@ -511,7 +515,14 @@ impl Hy4Placement {
             len: 0,
             state_len: 0,
             engram_tail: [pad_id, pad_id],
+            rope: Default::default(),
+            media: None,
         }
+    }
+
+    /// Rope coordinates of a sequence row (prompt, decode, verify or draft).
+    pub(crate) fn rope_at(&self, row: usize) -> anyhow::Result<[i64; 3]> {
+        self.rope.at(row)
     }
 
     pub(crate) fn set_engram_tail_from_prefix(&mut self, prefix: &[u32], pad_id: u32) {
@@ -537,7 +548,7 @@ impl crate::shared::qwen::scheduler::Placement for Hy4Placement {
         self.slot as i32
     }
     fn spans(&self) -> &[cuteafd_core::MediaSpan] {
-        &[]
+        self.media.as_ref().map_or(&[], |media| media.spans())
     }
 }
 

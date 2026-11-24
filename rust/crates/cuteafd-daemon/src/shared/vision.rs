@@ -5,6 +5,7 @@ mod glm_flash;
 mod muse;
 pub(crate) mod perception;
 mod minimax;
+mod hy4;
 mod constants;
 pub(crate) use constants::ConstantRegion;
 mod read_transform;
@@ -276,13 +277,19 @@ impl TowerSpec {
                 .map_err(|error| VisionError::Unsupported(error.to_string())),
             Some("minimax_m3_vl") => Self::minimax(snapshot,max_tokens)
                 .map_err(|error| VisionError::Unsupported(error.to_string())),
+            // `max_tokens` is the tower's merged capacity; newline rows are added per image.
+            Some("hy_v4_flash") => Self::hy4_flash(snapshot,max_tokens.min(cuteafd_loader::families::hy4_flash::vision::MAX_MERGED_ROWS))
+                .map_err(|error| VisionError::Unsupported(error.to_string())),
             // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
             Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
     /// Marker rows this tower writes after each merged row (Mistral's span: 1).
-    pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
+    pub fn row_markers(&self) -> u32 {
+        u32::from(self.native.reserved == mistral::RESERVED
+            || self.native.tower.is_some_and(|tower| tower.projection_order == 3))
+    }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
         if let Some(family)=self.family {return family;}
@@ -419,6 +426,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Step5 => "step5",
             cuteafd_loader::media::ImageFamily::Kimi => "kimi_k3",
             cuteafd_loader::media::ImageFamily::MiniMax => "minimax_m3",
+            cuteafd_loader::media::ImageFamily::Hy4Flash => "hy4_flash",
         };
         let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
@@ -516,6 +524,20 @@ impl VitRuntime {
     pub fn ledger(&self) -> Result<VisionLedger> {
         Ok(self.native.ledger()?)
     }
+    pub fn supports_batch(&self) -> bool { self.native.supports_batch() }
+    /// One batched owner turn: pack every image's RGB and output contiguously.
+    fn encode_batch(&mut self, jobs: Vec<EncodeJob>) -> Result<Vec<u16>> {
+        let lut = jobs.first().map(|job| job.lut.clone())
+            .ok_or_else(|| VisionError::Unsupported("empty vision batch".into()))?;
+        if jobs.iter().any(|job| *job.lut != *lut) {
+            return Err(VisionError::Unsupported("vision batch mixes normalization tables".into()));
+        }
+        let rgb: Vec<u8> = jobs.iter().flat_map(|job| job.rgb.iter().copied()).collect();
+        let grids: Vec<[usize; 2]> = jobs.iter().map(|job| job.grid).collect();
+        let mut output: Vec<u16> = vec![0; jobs.iter().map(|job| job.output.len()).sum()];
+        self.native.encode_batch_into(&rgb, &grids, &lut, &mut output)?;
+        Ok(output)
+    }
 }
 
 pub struct EncodeJob {
@@ -551,6 +573,9 @@ impl Drop for EncoderTicket {
 }
 enum EncoderJob {
     Vision(EncodeJob),
+    /// Several stills in one owner turn (towers with `NativeVision::supports_batch`):
+    /// the reply packs each image's rows in order.
+    VisionBatch(Vec<EncodeJob>),
     Audio(audio::AudioEncodeJob),
 }
 struct Work {
@@ -608,6 +633,8 @@ pub struct EncoderService {
     audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
     healthy: Arc<AtomicBool>,
     turn: Option<Arc<crate::shared::gpu_turn::GpuTurn>>,
+    /// The resident tower accepts batched stills (`submit_batch`).
+    batch: bool,
 }
 impl EncoderService {
     pub fn start(
@@ -669,6 +696,7 @@ impl EncoderService {
             }
         }
         let vision_plan = vision.as_ref().map(|(spec, _)| spec.clone());
+        let batch = vision.as_ref().is_some_and(|(spec, _)| spec.native.tower.is_some_and(|tower| tower.projection_order == 3));
         let pcm_plan = audio.as_ref().and_then(|config| match config {
             audio::AudioOwnerConfig::Pcm { spec, .. } => Some(spec.clone()), _ => None,
         });
@@ -770,6 +798,10 @@ impl EncoderService {
                                 }.map(|()| job.output),
                                 None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
+                            EncoderJob::VisionBatch(jobs) => match vision.as_mut() {
+                                Some(runtime) => runtime.encode_batch(jobs),
+                                None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
+                            },
                             EncoderJob::Audio(job) => match audio.as_mut() {
                                 Some(runtime) => runtime.encode(job),
                                 None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
@@ -801,6 +833,7 @@ impl EncoderService {
                 audio_geometry,
                 healthy,
                 turn,
+                batch,
             }, contribution))
             },
             Ok(Err(error)) => {
@@ -823,6 +856,14 @@ impl EncoderService {
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
     }
+    /// Several stills as one owner job; the result packs their rows in order.
+    pub fn submit_batch(&self, jobs: Vec<EncodeJob>) -> Result<EncoderTicket> {
+        if !(1..=cuteafd_ffi::vision::NativeVision::MAX_BATCH).contains(&jobs.len()) {
+            return Err(VisionError::Unsupported("vision batch size outside 1..=8".into()));
+        }
+        self.submit_job(EncoderJob::VisionBatch(jobs))
+    }
+    pub fn supports_batch(&self) -> bool { self.batch }
     pub fn audio_geometry(&self) -> Option<cuteafd_core::media::AudioTokenGeometry> { self.audio_geometry }
     pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
         if self.audio_ledger.is_none() {
@@ -988,7 +1029,7 @@ mod tests {
         let (queue, jobs) = mpsc::sync_channel(2);
         let mut service = EncoderService { queue: Some(queue), owner: None,
             ledger: Default::default(), audio_ledger: None, audio_geometry: None,
-            healthy: Arc::new(AtomicBool::new(true)), turn: None };
+            healthy: Arc::new(AtomicBool::new(true)), turn: None, batch: false };
         let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
             output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));
@@ -1002,6 +1043,7 @@ mod tests {
             while let Ok(work) = jobs.recv() {
                 let (kind, output) = match work.job {
                     EncoderJob::Vision(job) => ("vision", job.output),
+                    EncoderJob::VisionBatch(jobs) => ("vision", jobs.into_iter().flat_map(|job| job.output).collect()),
                     EncoderJob::Audio(job) => ("audio", job.output),
                 };
                 seen.lock().unwrap().push(kind);
