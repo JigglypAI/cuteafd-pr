@@ -287,81 +287,104 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             );
         }
 
+        let mut per_width = Vec::with_capacity(widths.len());
         let mut graph_exact = false;
         if args.graph_parity {
-            // Replay same 1-token step eagerly vs through graph capture + replay (3 steps).
-            let mut eager_bits = Vec::new();
-            let mut graphed_bits = Vec::new();
-            for (graphed, out) in [(false, &mut eager_bits), (true, &mut graphed_bits)] {
-                for rep in 0..3 {
-                    let mut p = super::cache::Placement {
-                        units: (pages_needed..2 * pages_needed).collect(),
-                        slot: 1,
-                        len: 0,
-                        state_len: 0,
-                        media: None,
-                    };
-                    prefix.bind_slot(&mut p, Some(prefix_len + 1))?;
-                    let pre_u = Unit {
-                        index: 0,
-                        sequence: 0,
-                        rows: 0..prefix_len,
-                        layers: 0..cfg.total_visits(),
-                        slot: 0,
-                        barrier: false,
-                        segments: vec![UnitSegment {
+            // Replay every checked width eagerly vs through graph capture + replay (3 steps).
+            for &w in &widths {
+                let mut eager_bits = Vec::new();
+                let mut graphed_bits = Vec::new();
+                for (graphed, out) in [(false, &mut eager_bits), (true, &mut graphed_bits)] {
+                    for rep in 0..3 {
+                        let mut p = super::cache::Placement {
+                            units: (pages_needed..2 * pages_needed).collect(),
+                            slot: 1,
+                            len: 0,
+                            state_len: 0,
+                            media: None,
+                        };
+                        prefix.bind_slot(&mut p, Some(prefix_len + w))?;
+                        let pre_u = Unit {
+                            index: 0,
                             sequence: 0,
                             rows: 0..prefix_len,
-                            tokens: 0..prefix_len,
-                            prompt_end: true,
-                            snapshot: false,
-                            head: false,
-                        }],
-                    };
-                    let mut ps = [p];
-                    execution.prefill(
-                &mut ps,
-                &[&tokens[..prefix_len]],
-                &[pre_u],
-                super::prefill::HeadProjection::AllHeadRows,
-                &mut |_, _, _| Ok(()),
-            )?;
-                    p = ps[0].clone();
-                    let dec_u = Unit {
-                        index: 0,
-                        sequence: 0,
-                        rows: 0..1,
-                        layers: 0..cfg.total_visits(),
-                        slot: 0,
-                        barrier: false,
-                        segments: vec![UnitSegment {
+                            layers: 0..cfg.total_visits(),
+                            slot: 0,
+                            barrier: false,
+                            segments: vec![UnitSegment {
+                                sequence: 0,
+                                rows: 0..prefix_len,
+                                tokens: 0..prefix_len,
+                                prompt_end: true,
+                                snapshot: false,
+                                head: false,
+                            }],
+                        };
+                        let mut ps = [p];
+                        execution.prefill(
+                            &mut ps,
+                            &[&tokens[..prefix_len]],
+                            &[pre_u],
+                            super::prefill::HeadProjection::AllHeadRows,
+                            &mut |_, _, _| Ok(()),
+                        )?;
+                        p = ps[0].clone();
+                        let dec_u = Unit {
+                            index: 0,
                             sequence: 0,
-                            rows: 0..1,
-                            tokens: prefix_len..prefix_len + 1,
-                            prompt_end: false,
-                            snapshot: false,
-                            head: true,
-                        }],
-                    };
-                    p.len = prefix_len;
-                    let mut ps = [p];
-                    let logits = if graphed {
-                        execution.decode(&mut ps, &[&tokens[prefix_len..prefix_len + 1]], &dec_u)?
-                    } else {
-                        execution.decode_eager(&mut ps, &[&tokens[prefix_len..prefix_len + 1]], &dec_u)?
-                    };
-                    if rep == 2 {
-                        *out = read_logits(&library, device_id, &logits)?.into_iter().map(f32::to_bits).collect();
+                            rows: 0..w,
+                            layers: 0..cfg.total_visits(),
+                            slot: 0,
+                            barrier: false,
+                            segments: vec![UnitSegment {
+                                sequence: 0,
+                                rows: 0..w,
+                                tokens: prefix_len..prefix_len + w,
+                                prompt_end: false,
+                                snapshot: false,
+                                head: true,
+                            }],
+                        };
+                        p.len = prefix_len;
+                        let mut ps = [p];
+                        let logits = if graphed {
+                            execution.decode(&mut ps, &[&tokens[prefix_len..prefix_len + w]], &dec_u)?
+                        } else {
+                            execution.decode_eager(&mut ps, &[&tokens[prefix_len..prefix_len + w]], &dec_u)?
+                        };
+                        if rep == 2 {
+                            *out = read_logits(&library, device_id, &logits)?
+                                .into_iter()
+                                .map(f32::to_bits)
+                                .collect();
+                        }
                     }
                 }
+                ensure!(
+                    eager_bits == graphed_bits,
+                    "Inkling 2 Mini graph vs eager replay at width {w} is NOT byte-exact!"
+                );
+                per_width.push(serde_json::json!({
+                    "width": w,
+                    "byte_exact": true,
+                    "graph_vs_eager_byte_exact": true,
+                }));
             }
-            ensure!(eager_bits == graphed_bits, "Inkling 2 Mini graph vs eager replay is NOT byte-exact!");
             graph_exact = true;
+        } else {
+            for &w in &widths {
+                per_width.push(serde_json::json!({
+                    "width": w,
+                    "byte_exact": true,
+                    "graph_vs_eager_byte_exact": serde_json::Value::Null,
+                }));
+            }
         }
         width_report = serde_json::json!({
             "widths_checked": widths,
             "byte_exact": true,
             "graph_vs_eager_byte_exact": graph_exact,
+            "per_width": per_width,
         });
     }
 

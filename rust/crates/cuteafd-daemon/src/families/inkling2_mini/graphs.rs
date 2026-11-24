@@ -109,11 +109,30 @@ impl<'a> DecodeGraphs<'a> {
         self.bank.cache_clear_drained();
     }
 
-    fn run(&mut self, key: Key, stream: &Stream<'a>, mut work: impl FnMut() -> Result<()>) -> Result<()> {
+    fn run(
+        &mut self,
+        key: Key,
+        slots: usize,
+        stream: &Stream<'a>,
+        mut work: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let verify_rows = if key.mode == Mode::Verify { key.rows } else { 0 };
         if self.unsupported.contains(&key) {
             return work();
         }
         if self.first_touched.insert(key) {
+            if decode_graph::census::enabled() {
+                tracing::info!(
+                    target: "cuteafd::graph_capture",
+                    site = "inkling2_mini.step",
+                    outcome = "first_touch",
+                    rows = key.rows,
+                    verify_rows,
+                    slots,
+                    ?key,
+                    "graph census miss"
+                );
+            }
             self.first_touch_pending = true;
             return work();
         }
@@ -125,8 +144,32 @@ impl<'a> DecodeGraphs<'a> {
                 .run(|| unsafe { decode_graph::launch(library, raw, stream.raw) });
         }
         let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else {
+            if decode_graph::census::enabled() {
+                tracing::info!(
+                    target: "cuteafd::graph_capture",
+                    site = "inkling2_mini.step",
+                    outcome = "eager_miss",
+                    rows = key.rows,
+                    verify_rows,
+                    slots,
+                    ?key,
+                    "graph census miss"
+                );
+            }
             return work();
         };
+        if decode_graph::census::enabled() {
+            tracing::info!(
+                target: "cuteafd::graph_capture",
+                site = "inkling2_mini.step",
+                outcome = "capture_miss",
+                rows = key.rows,
+                verify_rows,
+                slots,
+                ?key,
+                "graph census miss"
+            );
+        }
         stream.device.run(|| {
             // SAFETY: rank-local stream operations on persistent admitted owners.
             if let Err(error) = unsafe { decode_graph::begin_capture(library, stream.raw, &ticket) } {
@@ -173,6 +216,7 @@ pub(super) fn step<'a>(
     graphs: Option<&mut DecodeGraphs<'a>>,
     stream: &Stream<'a>,
     rows: usize,
+    slots: usize,
     mode: Mode,
     taps: bool,
     mut work: impl FnMut() -> Result<()>,
@@ -180,7 +224,7 @@ pub(super) fn step<'a>(
     let Some(graphs) = graphs else {
         return work();
     };
-    graphs.run(Key { rows, mode, taps }, stream, work)
+    graphs.run(Key { rows, mode, taps }, slots, stream, work)
 }
 
 #[cfg(test)]

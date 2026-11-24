@@ -382,12 +382,13 @@ fn run_monolithic_step<'a, O: VisitOps<'a>>(
     let packed = build_packed_members(cfg, cache, placements, unit)?;
     owner.packed_metadata(cache, &packed, uploads)?;
     let rows = unit.rows.len();
+    let slots = packed.len();
     let mode = if owner.replaying() {
         Mode::Verify
     } else {
         Mode::Decode
     };
-    graphs::step(graphs, &owner.stream, rows, mode, has_taps, || {
+    graphs::step(graphs, &owner.stream, rows, slots, mode, has_taps, || {
         for (visit_idx, &visit) in visits.iter().enumerate() {
             let state = PackedVisitUnit {
                 unit: owner,
