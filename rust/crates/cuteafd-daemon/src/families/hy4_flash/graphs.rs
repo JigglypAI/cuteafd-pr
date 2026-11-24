@@ -22,9 +22,6 @@ use std::{
 pub(crate) enum Section {
     DraftFusion,
     DraftLayer,
-    DraftAttn,
-    DraftFfn,
-    DraftTail,
     DraftCorrection,
     /// TP1 local SWA layer: optional Engram compute + MLA SWA + post-attn + Dense/MoE+EXL3+post-FFN.
     SwaLocal,
@@ -125,12 +122,7 @@ impl<'a> Hy4Graphs<'a> {
             key.rows == rows
                 && matches!(
                     key.section,
-                    Section::DraftFusion
-                        | Section::DraftLayer
-                        | Section::DraftAttn
-                        | Section::DraftFfn
-                        | Section::DraftTail
-                        | Section::DraftCorrection
+                    Section::DraftFusion | Section::DraftLayer | Section::DraftCorrection
                 )
         })
     }

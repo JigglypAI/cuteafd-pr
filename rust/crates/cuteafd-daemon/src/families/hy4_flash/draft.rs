@@ -1085,7 +1085,39 @@ impl<'a> Drafter<'a> {
             })
         };
 
-        // 1. Lead rank embedding + MTP fusion -> `r0.state`.
+        // 1. Stage metadata to every participating drafter rank first so GPU1
+        //    overlaps its H2D copies (and stage-0 KV gather on TP2) with GPU0's
+        //    embedding + MTP fusion before the DIRECT state broadcast.
+        let pos_bytes = words(&meta.positions);
+        let write_bytes = words(&meta.write_slots);
+        let table_bytes = words(&meta.table);
+        let len_bytes = words(&meta.lengths);
+        let cu_bytes = words(&(0..=rows as i32).collect::<Vec<_>>());
+        let anchor_bytes = words(&meta.anchors);
+        for (rank_idx, local) in self.ranks.iter().enumerate() {
+            let stream = streams[rank_idx];
+            local.device.run(|| {
+                for (name, data) in [
+                    ("positions", &pos_bytes),
+                    ("write_slots", &write_bytes),
+                    ("page_table", &table_bytes),
+                    ("lengths", &len_bytes),
+                    ("cu", &cu_bytes),
+                ] {
+                    local.upload(local.b(name), data, stream)?;
+                }
+                if rank_idx == 0 {
+                    local.upload(local.b("anchor_ids"), &anchor_bytes, stream)?;
+                }
+                ensure!(
+                    local.b("kv").bytes >= count * pt_width * record,
+                    "DFly2 rank {rank_idx} KV staging is short"
+                );
+                Ok(())
+            })?;
+        }
+
+        // 2. Lead rank embedding + MTP fusion -> `r0.state`.
         r0.device.run(|| {
             let state = r0.b("state");
             let anchor = r0.b("anchor");
@@ -1123,49 +1155,61 @@ impl<'a> Drafter<'a> {
             Ok(())
         })?;
 
-        // 2. On TP2, broadcast fused `state` from rank 0 -> rank 1 via PeerExchange DIRECT
-        //    strictly outside capture.
+        // 3. On TP2, overlap GPU1's stage-0 target KV gather with GPU0's fusion,
+        //    then broadcast fused `state` from rank 0 -> rank 1 via PeerExchange DIRECT.
         if tp == 2 {
+            let r1 = &self.ranks[1];
+            let s1 = streams[1];
+            let target0 = self.cfg.target_kv_layers[0];
+            let layer_cache = cache(1, target0)?;
+            let peer_cache = context_split.then(|| cache(0, target0)).transpose()?;
+            let kv1 = r1.b("kv");
+            r1.device.run(|| {
+                for (i, member) in members.iter().enumerate() {
+                    let staging = slice_buf(kv1, i * pt_width * record, pt_width * record)?;
+                    r1.launch(
+                        "gather",
+                        &[
+                            layer_cache,
+                            r1.recall(self.cfg.layers, false, member.slot, 0)?,
+                            staging,
+                        ],
+                        &[
+                            Scalar::I32(meta.recall[i] as i32),
+                            Scalar::I32(1),
+                            Scalar::I32(0),
+                        ],
+                        s1,
+                    )?;
+                    if let Some(peer_pool) = peer_cache {
+                        r1.launch(
+                            "gather",
+                            &[
+                                peer_pool,
+                                r1.recall_peer(self.cfg.layers, false, member.slot, 0)?,
+                                staging,
+                            ],
+                            &[
+                                Scalar::I32(meta.recall[i] as i32),
+                                Scalar::I32(1),
+                                Scalar::I32(0),
+                            ],
+                            s1,
+                        )?;
+                    }
+                }
+                Ok(())
+            })?;
             let ex = exchange.context("DFly2 TP2 requires target PeerExchange")?;
             let state_bytes = rows * H * 2;
             ex.push_to(
                 0,
                 DIRECT,
                 r0.b("state").ptr,
-                self.ranks[1].b("state").ptr,
+                r1.b("state").ptr,
                 state_bytes,
             )?;
             ex.wait(1, DIRECT)?;
-        }
-
-        // 3. Stage metadata to every participating drafter rank.
-        let pos_bytes = words(&meta.positions);
-        let write_bytes = words(&meta.write_slots);
-        let table_bytes = words(&meta.table);
-        let len_bytes = words(&meta.lengths);
-        let cu_bytes = words(&(0..=rows as i32).collect::<Vec<_>>());
-        let anchor_bytes = words(&meta.anchors);
-        for (rank_idx, local) in self.ranks.iter().enumerate() {
-            let stream = streams[rank_idx];
-            local.device.run(|| {
-                for (name, data) in [
-                    ("positions", &pos_bytes),
-                    ("write_slots", &write_bytes),
-                    ("page_table", &table_bytes),
-                    ("lengths", &len_bytes),
-                    ("cu", &cu_bytes),
-                ] {
-                    local.upload(local.b(name), data, stream)?;
-                }
-                if rank_idx == 0 {
-                    local.upload(local.b("anchor_ids"), &anchor_bytes, stream)?;
-                }
-                ensure!(
-                    local.b("kv").bytes >= count * pt_width * record,
-                    "DFly2 rank {rank_idx} KV staging is short"
-                );
-                Ok(())
-            })?;
         }
 
         // 4. Five absorbed-MLA + SwiGLU DFly2 layers.
@@ -1257,8 +1301,12 @@ impl<'a> Drafter<'a> {
                 let prev_down = (stage > 0).then(|| format!("{PREFIX}{}.mlp.down_proj", stage - 1));
                 let o_stem = format!("{a}.o_proj");
 
-                // (a) Per-rank target KV gather outside capture (local half + P2P peer half under ContextSplit).
+                // (a) Per-rank target KV gather outside capture (local half + P2P peer half under
+                //     ContextSplit; rank 1 stage 0 already ran overlapped with GPU0's DraftFusion).
                 for (rank_idx, local) in self.ranks.iter().enumerate() {
+                    if stage == 0 && rank_idx == 1 {
+                        continue;
+                    }
                     let stream = streams[rank_idx];
                     let layer_cache = cache(rank_idx, target)?;
                     let peer_cache = context_split.then(|| cache(1 - rank_idx, target)).transpose()?;
@@ -1301,13 +1349,15 @@ impl<'a> Drafter<'a> {
                     })?;
                 }
 
-                // (b) Rank-local graphed attention (fuses prior layer's deferred FFN reduce/add).
+                // (b) Rank-local attention (fuses prior layer's deferred FFN reduce/add).
+                //     Keep the 5-layer TP2 body eager so 21 extra per-width draft graphs
+                //     do not evict the 42-layer target's bounded 204/202 MiB graph cache.
                 for rank_idx in 0..2 {
                     let local = &self.ranks[rank_idx];
                     let stream = streams[rank_idx];
                     let rope = ropes[rank_idx];
                     let recv_ffn = ffn_recv[rank_idx];
-                    run_rank(rank_idx, Section::DraftAttn, stage, &mut || {
+                    local.device.run(|| {
                         if let Some(prev) = prev_down.as_deref() {
                             let delta = local.b("delta");
                             local.reduce_f32_to_bf16(prev, rows, recv_ffn, delta, stream)?;
@@ -1325,18 +1375,19 @@ impl<'a> Drafter<'a> {
                     })?;
                 }
 
-                // (c) Device-driven PeerExchange on PEER_SLOT_ATTN outside capture.
+                // (c) Device-driven PeerExchange on PEER_SLOT_ATTN.
                 ex.push(0, PEER_SLOT_ATTN, self.ranks[0].b("delta_f32").ptr, partial_bytes)?;
                 ex.push(1, PEER_SLOT_ATTN, self.ranks[1].b("delta_f32").ptr, partial_bytes)?;
                 ex.wait(0, PEER_SLOT_ATTN)?;
                 ex.wait(1, PEER_SLOT_ATTN)?;
 
-                // (d) Rank-local graphed attention reduce + norms + split MLP partial.
+                // (d) Rank-local attention reduce + norms + split MLP partial (eager to
+                //     avoid polluting GPU0/GPU1 target graph reserves).
                 for rank_idx in 0..2 {
                     let local = &self.ranks[rank_idx];
                     let stream = streams[rank_idx];
                     let recv_attn = attn_recv[rank_idx];
-                    run_rank(rank_idx, Section::DraftFfn, stage, &mut || {
+                    local.device.run(|| {
                         let state = local.b("state");
                         let residual = local.b("residual");
                         let norm = local.b("norm");
@@ -1361,7 +1412,7 @@ impl<'a> Drafter<'a> {
                     })?;
                 }
 
-                // (e) Device-driven PeerExchange on PEER_SLOT_FFN outside capture.
+                // (e) Device-driven PeerExchange on PEER_SLOT_FFN.
                 //     On the final layer, only rank 0 consumes the result (rank0-only tail).
                 let last_layer = stage + 1 == self.cfg.layers;
                 if !last_layer {
@@ -1374,10 +1425,10 @@ impl<'a> Drafter<'a> {
                 }
             }
 
-            // (f) Rank-0-only final layer FFN reduce + residual + final_norm.
+            // (f) Rank-0-only final layer FFN reduce + residual + final_norm (3 tiny kernels, eager).
             let last_stage = self.cfg.layers - 1;
             let last_down = format!("{PREFIX}{last_stage}.mlp.down_proj");
-            run_rank(0, Section::DraftTail, last_stage, &mut || {
+            r0.device.run(|| {
                 let state = r0.b("state");
                 let residual = r0.b("residual");
                 let norm = r0.b("norm");

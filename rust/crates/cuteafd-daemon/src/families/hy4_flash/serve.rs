@@ -956,6 +956,7 @@ mod tests {
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("decode-rows", decode_rows)
                 .value("dfly2", args.dfly2 == Some(true))
+                .value("tp2-dflash", if args.tp2_dflash { "on" } else { "off" })
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)
