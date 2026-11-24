@@ -70,13 +70,17 @@ function(cuteafd_vision_owner_entry name)
         if(NOT stem IN_LIST borrowed_programs)
           message(FATAL_ERROR "Vision group ${E_BORROW_POINTWISE_GROUP} does not export ${stem}")
         endif()
-        set(borrowed_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${E_BORROW_POINTWISE_GROUP}")
+        get_property(borrowed_directory GLOBAL PROPERTY "CUTEAFD_VISION_PROGRAM_DIR_${stem}")
+        if(NOT borrowed_directory)
+          set(borrowed_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${E_BORROW_POINTWISE_GROUP}")
+        endif()
         string(JSON size LENGTH "${programs}")
         string(JSON programs SET "${programs}" ${size}
           "{\"directory\":\"${borrowed_directory}\",\"name\":\"${stem}\"}")
         list(APPEND pointwise_export_args --omit-program ${stem})
         continue()
       endif()
+      set_property(GLOBAL PROPERTY "CUTEAFD_VISION_PROGRAM_DIR_${stem}" "${pointwise_directory}")
       foreach(ext h o)
         list(APPEND pointwise_outputs "${pointwise_directory}/${stem}.${ext}")
       endforeach()
@@ -178,7 +182,7 @@ foreach(kind inkling2 inkling2_mini step5)
       vision_biased_projection_h1024_o3072 vision_biased_projection_h1024_o1024
       vision_biased_projection_h1024_o4096 vision_biased_projection_h4096_o1024
       vision_projection_h1200_o1024 vision_pe_rgb_p20 vision_pe_merge_h1024
-      vision_pe_patch_projection_h4096_o4096)
+      vision_pe_patch_projection_h4096_o4096 vision_gelu_h4096)
   elseif(kind STREQUAL "step5")
     set(shared_attention DIRECTORY "${CUTEAFD_VISION_ATTENTION_DIR}/d96_full")
     set(borrowed_programs

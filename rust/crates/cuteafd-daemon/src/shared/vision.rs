@@ -272,7 +272,7 @@ impl TowerSpec {
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
             Some("muse_spark") => Self::muse(snapshot, max_tokens),
-            Some("inkling2"|"step5_vl") => Self::perception(snapshot,max_tokens),
+            Some("inkling2"|"inkling2_loop"|"step5_vl") => Self::perception(snapshot,max_tokens),
             Some("kimi_k3"|"kimi_k31") => crate::families::kimi_k3::vision::tower(snapshot,max_tokens)
                 .map_err(|error| VisionError::Unsupported(error.to_string())),
             Some("minimax_m3_vl") => Self::minimax(snapshot,max_tokens)
