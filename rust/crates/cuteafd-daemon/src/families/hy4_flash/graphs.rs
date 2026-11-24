@@ -43,6 +43,8 @@ pub(crate) enum Section {
     FfnFrontend,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
+    /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
+    Tail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,8 +60,6 @@ pub(crate) struct Hy4Graphs<'a> {
     eager: RefCell<HashSet<Key>>,
     touched: RefCell<HashSet<Key>>,
     device: i32,
-    pins: HashSet<usize>,
-    warming: Cell<bool>,
     first_touch_pending: Cell<bool>,
 }
 
@@ -70,8 +70,6 @@ impl<'a> Hy4Graphs<'a> {
             eager: RefCell::new(HashSet::new()),
             touched: RefCell::new(HashSet::new()),
             device: -1,
-            pins: HashSet::new(),
-            warming: Cell::new(false),
             first_touch_pending: Cell::new(false),
         }
     }
@@ -82,15 +80,8 @@ impl<'a> Hy4Graphs<'a> {
         device: i32,
         rank: usize,
         layout: Option<Hy4GraphLayout>,
-        max_rows: usize,
-        dfly2: bool,
     ) -> Result<()> {
-        let policy = hy4_graphs::reserve_policy(layout, rank, dfly2)?;
-        let warm_layout = if dfly2 && hy4_graphs::draft_working_set(layout, rank).is_some() { None } else { layout };
-        self.pins = hy4_graphs::selected_rows(warm_layout, max_rows)?
-            .into_iter()
-            .filter_map(|(rows, pin)| pin.then_some(rows))
-            .collect();
+        let policy = hy4_graphs::reserve_policy(layout, rank)?;
         self.bank.get_mut().attach_device(
             library,
             device,
@@ -106,14 +97,6 @@ impl<'a> Hy4Graphs<'a> {
         )?;
         device::set_reserve_policy(device, policy)?;
         self.device = device;
-        if policy.base_bytes == 0 && hy4_graphs::prewarm(layout).is_none() {
-            tracing::warn!(
-                ?layout,
-                rank,
-                reserve = policy.bytes,
-                "Hy4-flash untraced graph layout: no pins or measured base; using byte bootstrap estimate"
-            );
-        }
         Ok(())
     }
 
@@ -121,14 +104,10 @@ impl<'a> Hy4Graphs<'a> {
         self.bank.borrow().cache_attached()
     }
 
-    pub(crate) fn warming(&self, enabled: bool) {
-        self.warming.set(enabled);
-    }
-
     pub(crate) fn cycle(&self, cycle: Cycle) {
         self.bank
             .borrow_mut()
-            .cache_cycle(if self.warming.get() { Cycle::Other } else { cycle });
+            .cache_cycle(cycle);
     }
 
     pub(crate) fn clear_drained(&self) {
@@ -164,20 +143,13 @@ impl<'a> Hy4Graphs<'a> {
         &self, rows: usize, stage: usize, section: Section, stream: &Stream<'a>,
         work: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        self.run_with_pin(Key { layer: stage, rows, section }, stream, false, work)
+        self.run(Key { layer: stage, rows, section }, stream, work)
     }
 
     pub(crate) fn run(
-        &self, key: Key, stream: &Stream<'a>, work: impl FnMut() -> Result<()>,
-    ) -> Result<()> {
-        self.run_with_pin(key, stream, self.pins.contains(&key.rows), work)
-    }
-
-    fn run_with_pin(
         &self,
         key: Key,
         stream: &Stream<'a>,
-        pinned: bool,
         mut work: impl FnMut() -> Result<()>,
     ) -> Result<()> {
         if !self.attached() || self.eager.borrow().contains(&key) {
@@ -199,7 +171,7 @@ impl<'a> Hy4Graphs<'a> {
         let Some(mut ticket) = self
             .bank
             .borrow_mut()
-            .cache_ticket(&key, pinned, None)
+            .cache_ticket(&key, false, None)
         else {
             return work();
         };
@@ -237,7 +209,7 @@ impl<'a> Hy4Graphs<'a> {
                 }
             };
             // SAFETY: exclusive executable ownership; all captured allocations belong to Hy4Engine,
-            // never to this pin, and terminate() drains + clears banks before dropping storage.
+            // not the cache entry, and terminate() drains + clears banks before dropping storage.
             let graph = unsafe { GraphOwner::new(library, stream.device.id, raw, ())? };
             if !retain(nodes, inspection_error.is_none()) {
                 self.eager.borrow_mut().insert(key);
