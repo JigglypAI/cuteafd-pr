@@ -345,7 +345,7 @@ mod tests {
             sequential: vec![], reservations: vec![], allowances: vec![],
             resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] };
         let mut contract = Contract::fixed(64, 1, 1, empty);
-        contract.variables = vec![Variable::Encoder(vec![0, 1]),
+        contract.variables = vec![Variable::Encoder(vec![true, true]),
             Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
         contract.components = blas_components("sm_120", &owners, 1, order).unwrap();
         for selected in [0, 1] {
@@ -514,7 +514,7 @@ mod tests {
             capacity: 64, vocab: 33, device_sampling: true}, prefix};
         let exact = serving.allocations().unwrap();
         assert_eq!(exact.len(), 26);
-        let contract = Contract { floor_fallback: None,resident_weight_limit: None, spark_reply_formats: None, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,page_rows: 64, pool_page_multiple: 1, maximum_pages: 16, gpus: 1,
+        let contract = Contract { resident_weight_limit: None, spark_reply_formats: None, phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,page_rows: 64, pool_page_multiple: 1, maximum_pages: 16, gpus: 1,
             variables: vec![Variable::Prefill(vec![PrefillShape {rows: 64, waves: 1}]), Variable::Lanes(vec![1])],
             requires: vec![], components: serving.components(16).unwrap()};
         for pages in [1, 8, 16] {

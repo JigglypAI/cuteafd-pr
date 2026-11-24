@@ -60,7 +60,7 @@ impl StillEncoder {
     pub fn extend(&self,variables:&mut Vec<Variable>,components:&mut Vec<Component>,maximum:u64)
         -> Result<(),Refusal> {
         let variable=variables.len();
-        variables.push(Variable::Encoder((0..self.candidates.len()).collect()));
+        variables.push(Variable::Encoder(self.candidates.iter().map(EncoderPlacement::vision_on).collect()));
         for (option,placement) in self.candidates.iter().enumerate() {
             let locations=match placement.kind {
                 EncoderKind::Off=>Vec::new(),

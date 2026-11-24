@@ -33,7 +33,6 @@ pub struct ProcessOwners {
     pub native_load: Option<NativeLoad>,
     pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
-    pub auto_vision: bool,
     pub media_cache_bytes: u64,
     pub alternate_resident: Option<Vec<GlmfResidentRank>>,
     /// Exact target layouts by embedding-home option, then coordinator rank.
@@ -189,7 +188,7 @@ impl NativeLoad {
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, spark_candidates: vec![], spark_rank_caps: Vec::new(), physical_sparks: 0, native_load: None, mount_load: None,
-            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
+            encoders: vec![], media_cache_bytes: 0, alternate_resident: None,
             target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_required: false, retained_expert_metadata: vec![],
             draft_push: None, draft_tp2: vec![] }
     }
@@ -661,12 +660,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     if !process.encoders.is_empty() {
         use crate::plan::encoder::EncoderKind;
         let variable = contract.variables.len();
-        contract.variables.push(p::Variable::Encoder((0..process.encoders.len()).collect()));
-        if process.auto_vision {
-            if let Some(option) = process.encoders.iter().position(|encoder| encoder.kind == EncoderKind::Off) {
-                contract.floor_fallback = Some(p::Choice { variable, option });
-            }
-        }
+        contract.variables.push(p::Variable::Encoder(process.encoders.iter().map(crate::plan::encoder::EncoderPlacement::vision_on).collect()));
         for (option, encoder) in process.encoders.iter().enumerate() {
             let locations = match &encoder.kind {
                 EncoderKind::Off => vec![],

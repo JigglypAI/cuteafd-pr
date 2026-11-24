@@ -81,7 +81,7 @@ names.
   there is no separate drafter checkpoint; `DRAFT_LENGTH` can fix the draft count for policy experiments.
 - **Prefix cache:** snapshots carry each layer's records at their own size,
   and none for latent readers, whose pages belong to their source layer.
-- **Vision:** the officially bundled Pixtral tower and projector run resident on an RTX or remotely on a planner-selected Spark, with checkpoint-native image preprocessing and row markers.
+- **Vision:** the officially bundled Pixtral tower and projector run resident on an RTX or remotely on a planner-selected Spark, with checkpoint-native image preprocessing and row markers. `VISION=auto` admits the tower when the KV pool still meets `KV_MIN_TOKENS`.
 
 ## References
 

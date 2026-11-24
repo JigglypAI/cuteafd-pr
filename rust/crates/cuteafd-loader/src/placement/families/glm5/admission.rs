@@ -2028,7 +2028,7 @@ impl Recipe for GlmRecipe<'_> {
         {
             return Err(invalid("attention ownership or context page quantum"));
         }
-        let mut contract = Contract { floor_fallback: None,
+        let mut contract = Contract {
             resident_weight_limit: request.resident_weight_limit,
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: self.spark_links.then(|| SparkReplyFormats {
@@ -2135,7 +2135,7 @@ impl Recipe for GlmRecipe<'_> {
         if !self.encoders.is_empty() {
             use crate::plan::encoder::EncoderKind;
             let variable = contract.variables.len();
-            contract.variables.push(Variable::Encoder((0..self.encoders.len()).collect()));
+            contract.variables.push(Variable::Encoder(self.encoders.iter().map(crate::plan::encoder::EncoderPlacement::vision_on).collect()));
             for (option, encoder) in self.encoders.iter().enumerate() {
                 let when = Choice { variable, option };
                 let locations = match &encoder.kind {

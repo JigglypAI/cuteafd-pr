@@ -78,8 +78,9 @@ pub enum Variable {
     HeadHome(Vec<u8>),
     /// Ordered coordinator homes for the single Spark intake owner.
     IntakeHome(Vec<u8>),
-    /// Ordered optional bundled-encoder candidates; lower index is preferred.
-    Encoder(Vec<usize>),
+    /// Ordered bundled-media candidates, by whether the vision tower is on.
+    /// The option index is the family recipe's placement index.
+    Encoder(Vec<bool>),
     /// Fallback rank set for this routed group, after the selected ordered
     /// onboarding prefixes have claimed their local layers. No per-layer
     /// optional local home is introduced.
@@ -394,9 +395,6 @@ pub struct Contract {
     pub maximum_pages: u64,
     pub gpus: usize,
     pub variables: Vec<Variable>,
-    /// Permit this option only when the alternatives cannot meet the pool floor.
-    /// This preference precedes pool maximization within the same search.
-    pub floor_fallback: Option<Choice>,
     pub requires: Vec<Requires>,
     pub components: Vec<Component>,
 }
@@ -462,7 +460,6 @@ impl Contract {
             maximum_pages,
             gpus,
             variables: vec![],
-            floor_fallback: None,
             requires: vec![],
             components,
         }
@@ -647,8 +644,8 @@ impl Contract {
                         return Err(Refusal::InvalidFact("duplicate intake home domain".into()));
                     }
                 }
-                Variable::Encoder(values) => {
-                    if encoder.replace(values[option]).is_some() {
+                Variable::Encoder(_) => {
+                    if encoder.replace(option).is_some() {
                         return Err(Refusal::InvalidFact("duplicate encoder domain".into()));
                     }
                 }
@@ -834,8 +831,8 @@ impl Contract {
                     }
                     draft_home=true;
                 }
-                Variable::Encoder(values) => {
-                    if encoder || values.iter().copied().ne(0..values.len()) {
+                Variable::Encoder(_) => {
+                    if encoder {
                         return Err(Refusal::InvalidFact("invalid encoder domain".into()));
                     }
                     encoder = true;

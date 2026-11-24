@@ -34,7 +34,7 @@ impl QwenEncoders {
         }
         let variable = variables.len();
         if !self.candidates.is_empty() {
-            variables.push(Variable::Encoder((0..self.candidates.len()).collect()));
+            variables.push(Variable::Encoder(self.candidates.iter().map(EncoderPlacement::vision_on).collect()));
         }
         for (option, encoder) in self.candidates.iter().enumerate() {
             let mut owners = Vec::new();
@@ -105,7 +105,7 @@ impl QwenEncoders {
         if encoder.kind == EncoderKind::Off && declined {
             let reasons = solved.encoder_diagnostics.iter().map(|(reason, _)| reason.as_str())
                 .collect::<Vec<_>>().join("; ");
-            encoder.reason = format!("Auto disabled image input at the pool-first solution: {reasons}; free memory or choose a smaller layout");
+            encoder.reason = format!("Auto disabled image input to preserve the KV pool floor: {reasons}; free memory or choose a smaller layout");
             encoder.shortfall = solved.encoder_diagnostics.iter().map(|(_, bytes)| *bytes)
                 .filter(|bytes| *bytes > 0).min().unwrap_or(0);
         }

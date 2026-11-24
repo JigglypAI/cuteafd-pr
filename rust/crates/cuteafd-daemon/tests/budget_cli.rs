@@ -1500,7 +1500,7 @@ fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
         let snapshot = require_installed_snapshot("PE min/max tower admission",
             &format!("wrldsuksgo2mars/{model}"), Some(revision), &hf_home);
         for (gpus, ranks) in layouts {
-            for vision in ["spark", "off"] {
+            for vision in ["auto", "spark", "off"] {
                 let output = test_command(env!("CARGO_BIN_EXE_cuteafd"))
                     .arg("plan").arg(&snapshot).args(["--core-view", "original", "--layout", "--rtx", gpus,
                         "--spark-ranks", ranks, "--concurrency", "16", "--max-context-tokens", "auto",
@@ -1513,7 +1513,7 @@ fn installed_pe_min_max_plans_charge_one_native_tower_arena() {
                     .flat_map(|device| device["items"].as_array().unwrap()).collect::<Vec<_>>();
                 let weights = items.iter().filter(|item| item["group"] == "vision packed weight arena").collect::<Vec<_>>();
                 let scratch = items.iter().filter(|item| item["group"] == "vision scratch").collect::<Vec<_>>();
-                if vision == "spark" {
+                if vision != "off" {
                     assert_eq!(report["encoder"]["kind"]["kind"], "spark", "{model}/{gpus}RTX: {}", report["encoder"]);
                     assert_eq!(report["encoder"]["weights"], expected_weights);
                     assert_eq!(weights.len(), 1, "{model}/{gpus}RTX: packed arena charged more than once");

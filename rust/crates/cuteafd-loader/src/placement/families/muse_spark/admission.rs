@@ -832,7 +832,6 @@ impl Recipe for MuseRecipe<'_> {
             return Err(invalid("layer mode outside the Muse executor"));
         }
         let mut contract = Contract {
-            floor_fallback: None,
             resident_weight_limit: request.resident_weight_limit,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: Some(SparkReplyFormats {
@@ -864,7 +863,7 @@ impl Recipe for MuseRecipe<'_> {
             }
         }
         let encoder = contract.variables.len();
-        contract.variables.push(Variable::Encoder((0..self.encoders.len()).collect()));
+        contract.variables.push(Variable::Encoder(self.encoders.iter().map(|(vision, _)| vision.vision_on()).collect()));
         // The DFlash2 drafter reads the target head, its embedding and its
         // taps, so the head GPU is its only home; declaring the domain keeps
         // the owner charged and named by the shared solve.

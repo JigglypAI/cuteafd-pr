@@ -916,7 +916,6 @@ impl Recipe for Hy4Inputs {
 
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract {
-            floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
                 prefill: Some(request.spark_reply_formats.prefill(false)),

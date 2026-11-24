@@ -651,7 +651,7 @@ impl Recipe for KimiRecipe {
         {
             return Err(invalid("attention ownership or fixed owner rank"));
         }
-        let mut contract = Contract { floor_fallback: None,
+        let mut contract = Contract {
             resident_weight_limit: request.resident_weight_limit,
             phase_order: PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: self.spark_links.then(|| SparkReplyFormats {

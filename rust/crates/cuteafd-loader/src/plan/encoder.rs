@@ -29,6 +29,10 @@ pub struct EncoderPlacement {
     pub shortfall: u64,
 }
 impl EncoderPlacement {
+    pub(crate) fn vision_on(&self) -> bool {
+        self.kind != EncoderKind::Off
+    }
+
     pub fn admitted_bytes(&self) -> u64 {
         if self.kind == EncoderKind::Off { 0 } else { self.weights.saturating_add(self.scratch) }
     }
@@ -184,7 +188,7 @@ pub(crate) fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -
             if request.mode != MediaMode::Auto
                 || hardware.gpus[gpu].free_bytes >= required.saturating_add(hardware.gpus[gpu].kv_target_bytes) {
                 result.push(make(EncoderKind::Rtx { gpu }, Vec::new(),
-                    "RTX: KV target preserved after tower + scratch admission"));
+                    "RTX candidate: tower + scratch reserved by admission"));
             }
         }
     }

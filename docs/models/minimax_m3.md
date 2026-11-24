@@ -27,8 +27,9 @@ as its explicit disable. Drafts are verified on the shared `history` policy
 fixed-width measurement override.
 The example's explicit `SPECULATOR=off` stays in force until its separate line
 change joins the next placement-input publication batch; remove that line or set
-`dspark` to use the family default now. Keep `VISION=off` and `AUDIO=off`;
-remaining gates are tracked in [#1856](https://github.com/tpurtell/cuteafd/issues/1856).
+`dspark` to use the family default now. `VISION=auto` starts bundled vision
+when the KV pool still meets `KV_MIN_TOKENS`; `VISION=off` keeps the
+text-only examples reproducible. Keep `AUDIO=off`; remaining gates are tracked in [#1856](https://github.com/tpurtell/cuteafd/issues/1856).
 
 `ATTENTION_PLACEMENT=auto|heads` retains whole-layer ownership on one RTX
 (the API calls its single-rank mode `heads`). On two RTX, `auto|heads` selects

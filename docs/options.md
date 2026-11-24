@@ -898,7 +898,7 @@ when the server has no drafter or its effective draft policy is `off`.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
+| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower unless it would drop the KV pool below `KV_MIN_TOKENS`. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
 | `AUDIO` | `auto` (V4.1: `off`) | `auto`, `off` (V4.1: `off` only) | Bundled audio tower. V4.1 has no audio encoder. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
 | `MEDIA_CACHE_BYTES` | engine | byte size | Host embedding-cache quota for an enabled media tower. On the GLM engine this applies to ML4 vision only (default min(8 GiB, 5% of host RAM)); the same quota goes to plan and serve. |
@@ -966,9 +966,9 @@ startup graph inventories use the full verification width. Noncausal DFlash2
 block-8 drafters are unchanged.
 
 MiniMax and Kimi default to their bundled still-image towers (`VISION=auto`), placed
-Spark-first with RTX fallback by joint admission. `VISION=off` keeps text-only
-serving and rejects image chat. Step-5 production serving remains text-only; dense Qwen
-has media off. Kimi and MiniMax `plan --layout` reserve their bundled
+Spark-first with RTX fallback by joint admission. The tower can reduce the KV
+pool below its target, but not below `KV_MIN_TOKENS`. `VISION=off` keeps text-only
+serving and rejects image chat. Dense Qwen has automatic media off. Kimi and MiniMax `plan --layout` reserve their bundled
 still-image tower as an independent packed arena plus phase-peak scratch,
 Spark-first with RTX fallback in the joint admission solve. Native still-image serving uses the admitted owner through the shared vision
 runtime; the numerical drift diagnostics remain on #1984 and #1779. GLM 5.3 / ML4,

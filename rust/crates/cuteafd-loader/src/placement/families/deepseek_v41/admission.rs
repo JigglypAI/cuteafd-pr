@@ -1557,7 +1557,6 @@ impl Recipe for V41Recipe<'_> {
             .checked_mul(self.maximum_pages)
             .ok_or(Refusal::Overflow("V4.1 pool extent"))?;
         let mut contract = Contract {
-            floor_fallback: None,
             resident_weight_limit: request.resident_weight_limit,
             phase_order: PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {
@@ -1668,7 +1667,7 @@ impl Recipe for V41Recipe<'_> {
             let variable = contract.variables.len();
             contract
                 .variables
-                .push(Variable::Encoder((0..self.encoders.len()).collect()));
+                .push(Variable::Encoder(self.encoders.iter().map(crate::plan::encoder::EncoderPlacement::vision_on).collect()));
             for (option, encoder) in self.encoders.iter().enumerate() {
                 let when = Choice { variable, option };
                 let locations = match &encoder.kind {

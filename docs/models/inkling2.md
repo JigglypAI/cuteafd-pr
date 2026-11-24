@@ -41,6 +41,8 @@ The bundled MTP drafter (`mtp.safetensors`) is a five-layer dSpark with block
 size 8 over DFlare-mixed target features from layers 5, 11, 17, 23, 29, 35, 41
 and the final norm, and an `rnn_hidden` Markov head. The bundled vision tower
 is a 23-layer ViT with a 2x2 merge projector into the text hidden size.
+`VISION=auto` admits the tower when the KV pool still meets `KV_MIN_TOKENS`;
+explicit `VISION=off` leaves it unloaded.
 
 ## Checkpoints
 

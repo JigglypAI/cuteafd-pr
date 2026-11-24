@@ -207,7 +207,8 @@ preserve target KV/CSA, predictor histories and cursors exactly.
 Start with `examples/configs/step5-fp8-max.config` or
 `examples/configs/step5-nvfp4-min.config`. Replace the sample fabric endpoints
 and select a sealed WIP slot containing `serve-step5`. Bundled PE vision defaults
-to automatic joint admission (Spark-first with RTX fallback); `VISION=off`
+to automatic joint admission (Spark-first with RTX fallback) whenever the KV
+pool still meets `KV_MIN_TOKENS`; `VISION=off`
 explicitly selects text-only operation. One or two coordinator GPUs execute
 every supported expert format; actual memory admission determines fit, not
 card name or a 32 GiB policy floor. NVFP4 remains supported wherever native

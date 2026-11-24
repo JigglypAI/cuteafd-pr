@@ -151,7 +151,7 @@ fn allocation_granularity_preserves_activation_lifetimes_serde_search_and_fixed_
     let owner = granular_owner("weights", "payload", vec![3 << 20, 24 << 10], lifetime);
     let payload = owner.requests().iter().sum();
     let option = contract.variables.len();
-    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    contract.variables.push(Variable::Encoder(vec![true, true]));
     let mut allocation = Component::allocation(Allocation::buffer("payload", owner.location,
         payload, lifetime, Category::Weights, "weights"), ByteCurve::fixed(payload, maximum), false, maximum);
     allocation.activation = Activation::choice(option, 0);
@@ -249,7 +249,7 @@ fn driver_page_tables_preserve_backings_aliases_activation_and_lifetimes() {
     let mut component = Component::allocation(backing.clone(), ByteCurve::linear(1, 513, maximum), true, maximum);
     component.byte_extent(ByteCurve::linear(1, 513, maximum)).unwrap();
     let option = contract.variables.len();
-    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    contract.variables.push(Variable::Encoder(vec![true, true]));
     component.activation = Activation::choice(option, 0);
     contract.components.push(component);
     backing.id = "prefix.alias".into();
@@ -347,7 +347,7 @@ fn driver_models_preserve_physical_backings_opaque_costs_and_fixed_replay() {
     let spark = Location { device: Device::Spark(0), domain: Domain::Managed };
     let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
     let option = contract.variables.len();
-    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    contract.variables.push(Variable::Encoder(vec![true, true]));
     let curve = ByteCurve::linear(1, 4097, maximum);
     let arena = Allocation::buffer("arena", spark, 1, Lifetime::RESIDENT, Category::Experts, "experts");
     let mut owner = Component::allocation(arena.clone(), curve.clone(), false, maximum);
@@ -3437,7 +3437,7 @@ fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
 }
 
 #[test]
-fn floor_fallback_preserves_optional_owner_before_maximizing_pool() {
+fn automatic_vision_checks_minimum_before_maximizing_pool() {
     struct Optional;
     impl Recipe for Optional {
         fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
@@ -3445,22 +3445,33 @@ fn floor_fallback_preserves_optional_owner_before_maximizing_pool() {
             base.maximum = 256;
             let mut contract = base.prepare(request)?;
             let variable = contract.variables.len();
-            contract.variables.push(Variable::Encoder(vec![0, 1]));
-            contract.floor_fallback = Some(Choice { variable, option: 1 });
+            contract.variables.push(Variable::Encoder(vec![true, true, false, false]));
             let mut tower = Component::allocation(allocation("tower", 64),
                 ByteCurve::fixed(64, 4), false, 4);
-            tower.activation = Activation::choice(variable, 0);
+            tower.activation = Activation { clauses: (0..2).map(|option| vec![Choice { variable, option }]).collect() };
             contract.components.push(tower);
             Ok(contract)
         }
     }
     let on = solve(request(), vec![budget(256)], &Optional).unwrap();
     assert_eq!((on.pool_tokens, on.decisions.encoder), (192, Some(0)));
-    let off = solve(request(), vec![budget(64)], &Optional).unwrap();
-    assert_eq!((off.pool_tokens, off.decisions.encoder), (64, Some(1)));
+    let at_floor = solve(request(), vec![budget(128)], &Optional).unwrap();
+    assert_eq!((at_floor.pool_tokens, at_floor.decisions.encoder), (64, Some(0)));
+    let off = solve(request(), vec![budget(127)], &Optional).unwrap();
+    assert_eq!((off.pool_tokens, off.decisions.encoder), (64, Some(2)));
+    assert_eq!(off.encoder_diagnostics[0].1, 1);
+    let configured = cuteafd_core::memory_policy::MemoryPolicy {
+        kv_min: Some(128), kv_target: Some(256), ..Default::default()
+    };
+    configured.scoped(|| {
+        let on = solve(request(), vec![budget(192)], &Optional).unwrap();
+        assert_eq!((on.pool_tokens, on.decisions.encoder), (128, Some(0)));
+        let off = solve(request(), vec![budget(191)], &Optional).unwrap();
+        assert_eq!((off.pool_tokens, off.decisions.encoder), (128, Some(2)));
+    });
     let exact = solve(Request { pool: Pin::Exact(256), ..request() },
         vec![budget(256)], &Optional).unwrap();
-    assert_eq!((exact.pool_tokens, exact.decisions.encoder), (256, Some(1)));
+    assert_eq!((exact.pool_tokens, exact.decisions.encoder), (256, Some(2)));
     assert!(matches!(solve(request(), vec![budget(32)], &Optional),
         Err(Refusal::FullContextShortfall { .. })));
 }
@@ -3475,7 +3486,7 @@ fn encoder_priority_follows_pool_and_onboarding_before_slack() {
             base.onboard = 1;
             let mut contract = base.prepare(request)?;
             let variable = contract.variables.len();
-            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            contract.variables.push(Variable::Encoder(vec![true, true]));
             let mut tower = Component::allocation(allocation("tower", 64),
                 ByteCurve::fixed(64, 2), false, 2);
             tower.activation = Activation::choice(variable, 0);
