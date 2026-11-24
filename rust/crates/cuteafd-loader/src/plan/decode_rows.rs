@@ -250,4 +250,16 @@ mod tests {
         assert!(matches!(err, PlanError::UnsupportedDecodeRows { value: 256, capacity: 128, .. }), "{err}");
         assert!(err.to_string().contains("glmf_"), "{err}");
     }
+
+    #[test]
+    fn inkling2_supports_128_on_one_or_two_gpus_and_refuses_above_128() {
+        let inkling = &crate::plan::families::inkling2::INKLING2;
+        for gpus in [1, 2] {
+            assert_eq!(resolve(inkling, req(None, 16, 1, gpus, None)).unwrap(), 64);
+            assert_eq!(resolve(inkling, req(Some(128), 16, 1, gpus, None)).unwrap(), 128);
+            let err = resolve(inkling, req(Some(256), 32, 1, gpus, None)).unwrap_err();
+            assert!(matches!(err, PlanError::UnsupportedDecodeRows { value: 256, capacity: 128, .. }), "{err}");
+            assert!(err.to_string().contains("inkling2_*_m256"), "{err}");
+        }
+    }
 }

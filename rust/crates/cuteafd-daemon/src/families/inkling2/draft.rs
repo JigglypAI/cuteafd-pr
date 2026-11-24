@@ -42,10 +42,11 @@ impl<'a> Binding<'a>{
     pub fn ranks(&self) -> impl Iterator<Item=&Rank<'a>> {
         std::iter::once(&self.drafter.lead).chain(self.drafter.split.as_ref().map(|split| &**split.peer))
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn new(programs:&'a Programs<'a>,streams:Vec<Rc<Stream<'a>>>,weights:Vec<Weights<'a>>,layout:DraftLayout,
         admitted:&ResolvedPlan,target_head:ProjectionWeight<'_, 'a>,head:&Head<'a>,target_kernels:&Kernels<'a>,
         peer:Option<super::head::PeerHead<'_, 'a>>,
-        prefill_rows:usize,waves:usize,mark_slots:usize)->Result<Self>{
+        prefill_rows:usize,waves:usize,decode_rows:usize,mark_slots:usize)->Result<Self>{
         let count=streams.len();
         ensure!(matches!(count,1|2) && weights.len()==count && layout.weights.len()==count && layout.runtime.len()==count,
             "Inkling target and draft rank counts differ");
@@ -97,11 +98,11 @@ impl<'a> Binding<'a>{
             local.map(|rank|rank.stream.device.run(||Marks::new(rank,mark_slots))).collect::<Result<_>>()?
         };
         let width=9216+2048/count;
-        let verify=streams.iter().map(|stream|stream.device.run(||Verify::new(programs,Rc::clone(stream),runtime.slots,width)))
+        let verify=streams.iter().map(|stream|stream.device.run(||Verify::new(programs,Rc::clone(stream),runtime.slots,width,decode_rows)))
             .collect::<Result<Vec<_>>>()?;
         let stream=&streams[0];
         let prefill=(0..waves).map(|_|TapBuffer::new(Rc::clone(stream),&layout.config,prefill_rows)).collect::<Result<Vec<_>>>()?;
-        let decode=TapBuffer::new(Rc::clone(stream),&layout.config,64)?;
+        let decode=TapBuffer::new(Rc::clone(stream),&layout.config,decode_rows)?;
         stream.drain()?;
         Ok(Self{drafter,marks,verify,prefill,decode,layout})
     }

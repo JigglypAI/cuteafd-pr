@@ -320,6 +320,13 @@ def inkling_fir_programs():
                                           ("strided", 4096, compile_inkling2_convolution_strided_aot)):
             out.append((f"conv_{kind}_h{width}_f32_{suffix}", f"convolution_{suffix}", {"max_rows": capacity},
                         partial(compile_, **params)))
+    out.append(("fir_history_commit_m128", "fir_history_commit", {"max_rows": 128},
+                partial(compile_fir_history_commit_aot, max_rows=128)))
+    for width, dynamic in ((4608, False), (1024, False), (1024, True), (512, False), (512, True)):
+        kind = "dynamic" if dynamic else "static"
+        params = dict(width=width, heads=width // 128 if dynamic else 1, dynamic=dynamic)
+        out.append((f"conv_{kind}_h{width}_f32_replay_m128", "convolution_replay", {"max_rows": 128},
+                    partial(compile_inkling2_convolution_replay_aot, max_rows=128, **params)))
     return out
 
 
@@ -504,6 +511,18 @@ def inkling2_attention_programs(decode_rows: int, prefill_rows: int):
                     if parts == 2:
                         compiler = partial(compiler, g=g)
                     result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}{suffix}",
+                                   "attention", params, compiler))
+    if decode_rows < 128:
+        for parts in (1, 2):
+            g = dataclasses.replace(INKLING2_SMALL, heads=24, kv_heads=4) if parts == 2 else INKLING2_SMALL
+            suffix = "_tp2" if parts == 2 else ""
+            for kind in ("local", "global"):
+                for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
+                    params = dict(kind=kind, route="decode", max_rows=128, kv_format=kv_format)
+                    compiler = partial(compile_inkling2_attention_aot, **params)
+                    if parts == 2:
+                        compiler = partial(compiler, g=g)
+                    result.append((f"{kind}_attention_decode_{kv_format}_v2_m128{suffix}",
                                    "attention", params, compiler))
     return result
 
@@ -2188,8 +2207,8 @@ def main() -> None:
                                  functools.partial(compile_native_attention_projection, n, k, rows, precision)))
         work += [("inkling_draft", *item) for item in inkling_draft_programs()]
         for suffix, op, params, compile_ in inkling_fir_programs():
-            family = "fir" if suffix == "fir_history_commit" else "inkling2"
-            name = "history_commit" if family == "fir" else suffix
+            family = "fir" if suffix.startswith("fir_history_commit") else "inkling2"
+            name = suffix.removeprefix("fir_") if family == "fir" else suffix
             work.append((family, name, op, params, compile_))
         for k, n in sorted(inkling_draft_projection_shapes(1) | inkling_draft_projection_shapes(2) | {(4608, 100608), (4608, 100416)}):
             work.append(("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 4096},

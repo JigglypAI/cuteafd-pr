@@ -69,6 +69,8 @@ pub struct FactsRequest<'a> {
     pub spark_ranks: usize,
     pub spark_bytes: u64,
     pub prefill: PrefillShape,
+    /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: u32,
     /// Explicit context, or 0 for the checkpoint's maximum.
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
@@ -159,10 +161,15 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: Option<&Path
 /// inputs remain explicit errors; no checkpoint-byte fraction sizes scratch.
 pub fn spark_charges(catalog: &crate::OfficialV41Catalog, experts: &[LayerExperts], routed: &[usize], ranks: usize,
     prefill: PrefillShape, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
+    spark_charges_for_rows(catalog, experts, routed, ranks, prefill, shared::DECODE_ROWS, ingress)
+}
+
+pub fn spark_charges_for_rows(catalog: &crate::OfficialV41Catalog, experts: &[LayerExperts], routed: &[usize], ranks: usize,
+    prefill: PrefillShape, decode_rows: u32, ingress: cuteafd_core::SparkIngress) -> anyhow::Result<Vec<Vec<SparkCharge>>> {
     if ranks == 0 { return Ok(vec![Vec::new(); routed.len() + 1]); }
     anyhow::ensure!((2..=8).contains(&ranks), "Inkling 2 Spark worlds are 2..=8 ranks, not {ranks}");
     let exl3 = experts.iter().any(|layer| matches!(layer.storage, Some(ExpertStorage::Exl3 { .. })));
-    let executions = shared::spark_executions(prefill, exl3)?;
+    let executions = shared::spark_executions_for_rows(prefill, exl3, decode_rows)?;
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(prefill.rows)?,
         ingress, partial_reply_bytes: None };
     let rings = crate::plan::layout::spark_ring_geometry(shared::LANES as usize);
@@ -291,11 +298,17 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             "Lower --max-context-tokens."));
     }
     let shape = request.prefill;
+    let decode_rows = request.decode_rows;
+    if !(1..=shared::MAX_DECODE_ROWS).contains(&decode_rows) {
+        return Err(refused(format!("Inkling 2 decode_rows {decode_rows} exceeds supported 1..={}", shared::MAX_DECODE_ROWS),
+            "Set DECODE_ROWS to auto or 1..=128."));
+    }
     let routed = (0..cfg.layers).collect::<Vec<_>>();
     let placement = if gpus == 1 { crate::placement::AttentionPlacement::Heads } else { request.attention };
+    let body_rows = shape.rows.max(u64::from(decode_rows)) as usize;
     let program_sets = match (&request.coordinator, request.manifest.as_deref()) {
         (Coordinator::Planned { .. }, Some(manifest)) => (0..gpus).map(|rank| {
-            let selected = weights.compact_programs(manifest, rank, shape.rows.max(u64::from(shared::DECODE_ROWS)) as usize)?;
+            let selected = weights.compact_programs(manifest, rank, body_rows)?;
             let mut set = crate::placement::ProgramSet::from_manifest(manifest,
                 &["inkling2", "exlr8", "dense_trellis_k6", "native_attention"]);
             let keep = |name: &str| !(name.starts_with("dense_trellis_k6_") || name.starts_with("native_attention_"))
@@ -314,9 +327,8 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let target_fp8_scratch = targets.iter().map(|target| {
         if target.core.is_empty() && target.fp8.is_empty() { return Ok(0); }
         let manifest = request.manifest.as_deref().context("Inkling compact core requires PROGRAMS.json")?;
-        target.trellis_programs(manifest, shape.rows as usize, shared::DECODE_ROWS as usize)?;
-        target.fp8_scratch(manifest,
-            shape.rows as usize, shared::DECODE_ROWS as usize)
+        target.trellis_programs(manifest, body_rows, decode_rows.min(64) as usize)?;
+        target.fp8_scratch(manifest, body_rows, decode_rows.min(64) as usize)
     }).collect::<anyhow::Result<Vec<_>>>().map_err(|error| refused(format!("Inkling compact program inventory refused: {error:#}"),
         "Install the Inkling native trellis and block-FP8 projection exports."))?;
     let mut mount = targets.iter().map(|target| target.mount_load(request.checkpoint)).collect::<anyhow::Result<Vec<_>>>()
@@ -326,13 +338,13 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         "Provide every routed layer's fused MXFP8/NVFP4 headers or per-expert EXL3 modules."))?;
     let storage = experts.iter().map(|layer| layer.storage.expect("inventory names every layer's storage")).collect::<Vec<_>>();
     let catalog = request.catalog;
-    let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(shared::DECODE_ROWS)));
+    let local = local_package(&catalog, request.manifest_path, gpus, shape.rows.max(u64::from(decode_rows)));
     // Mixed native checkpoints (NVFP4 then MXFP8) keep the per-layer native
     // ingress; the link is sized for its widest request row (BF16).
     let first_wire = shared::ingress(storage.first().copied());
     let ingress = if storage.iter().all(|&storage| shared::ingress(Some(storage)) == first_wire) { first_wire }
         else { cuteafd_core::SparkIngress::Native };
-    let spark = spark_charges(&catalog, &experts, &routed, ranks, shape, ingress)
+    let spark = spark_charges_for_rows(&catalog, &experts, &routed, ranks, shape, decode_rows, ingress)
         .map_err(|error| refused(format!("Inkling 2 Spark inventory refused: {error:#}"),
             "Use a Spark world of 2..=8 ranks."))?;
     let head = InklingInputs::head_rank(gpus, &modes);
@@ -406,14 +418,14 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         mark_bytes,draft_mark,request.prefix_mark_budget,host_prefix.quota_bytes>0)
         .map_err(|error|refused(format!("Inkling prefix slots refused: {error:#}"),"Check combined mark extent."))?;
     let drafter=request.drafter.zip(drafter).map(|(selection, (config, weights, _))| {
-        super::draft::DraftLayout::from_weights(config,weights,usize::try_from(request.sequences)?,
+        super::draft::DraftLayout::from_weights_for_decode_rows(config,weights,usize::try_from(request.sequences)?,
             usize::try_from(request.sequences)?.min(8),usize::try_from(context)?,usize::try_from(pool.maximum_tokens())?,
-            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,selection.sms,selection.kv_cache,request.manifest.as_deref())
+            usize::try_from(shape.rows)?,usize::try_from(shape.waves)?,decode_rows as usize,selection.sms,selection.kv_cache,request.manifest.as_deref())
             .map(|layout|shared::Drafter{layout})
     }).transpose().map_err(|error|refused(format!("bundled drafter inventory refused: {error:#}"),"Check MTP tensor headers and exports."))?;
     Ok(InklingInputs { cfg: cfg.clone(), kv_format: request.kv_format, gpus, spark_ranks: ranks,
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
-        pool, prefill: shape, sequences: request.sequences, prefix_entries: request.prefix_entries,
+        pool, prefill: shape, decode_rows, sequences: request.sequences, prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget, prefix_mark_slots, targets, target_fp8_scratch, placement, modes,
         routed: routed.clone(), experts, local, spark, links,
         spark_reply_formats: request.replies, drafter, vision, budgets, code, graph_reserve,

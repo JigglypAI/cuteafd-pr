@@ -43,7 +43,7 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     arithmetic = layer.split('    pub fn project_target(')[1].split('#[cfg(test)]')[0]
     assert 'Allocation::new' not in arithmetic
     head = (FAMILY/'head.rs').read_text()
-    assert 'self.rows <= 64' in head
+    assert 'self.rows <= 128' in head
     assert 'probe::head_spans(rows, self.rows)' in head
     assert 'scoring.record(' in head
     assert 'ScoreLogits::Recorded' in head

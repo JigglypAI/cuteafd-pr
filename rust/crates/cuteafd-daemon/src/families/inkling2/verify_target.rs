@@ -31,7 +31,7 @@ impl<'a> BlockVerifyTarget for Target<'_,'a>{
     fn verify<'e>(&'e mut self,mark:&Self::Mark,request:VerifyRequest<'_>)->Result<VerifyOutput<'e>>{
         request.validate(self.execution.cfg.layers,self.execution.cfg.unpadded_vocab_size,&mark.conv.first().context("Inkling verify lead mark missing")?.slots)?;
         let draft=self.execution.draft.as_ref().context("Inkling drafter missing")?.clone();
-        ensure!(request.tap_sites==draft.layout.config.taps && request.rows.len()<=64
+        ensure!(request.tap_sites==draft.layout.config.taps && request.rows.len()<=self.execution.requests.decode.layout.rows
             && request.rows.iter().all(|row|row.token.is_some()),"Inkling verify requires admitted native sites and active packed rows");
         let mut tokens=Vec::<Vec<u32>>::new();let mut submitted=Vec::new();let mut segments=Vec::new();
         let mut first=0;

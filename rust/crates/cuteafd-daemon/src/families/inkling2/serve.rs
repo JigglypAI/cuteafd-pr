@@ -22,6 +22,8 @@ pub(crate) struct ServeArgs {
     pub max_context: Option<usize>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     #[arg(long, default_value_t=16)] pub max_sequences: usize,
+    #[arg(long, default_value_t = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::AUTO)]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[arg(long, default_value="0.0.0.0:8000")] pub listen: String,
     #[arg(long)] pub model_id: Option<String>,
     #[arg(long)] pub prefill_rows: Option<usize>,
@@ -49,6 +51,17 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use crate::shared::{qwen::scheduler::{self, Backend}, inventory::{InventoryPhase, RuntimeInventory}};
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeRequest, chat::inkling2::InklingEncoding};
     cuteafd_core::concurrency::validate("inkling2", args.max_sequences as u64)?;
+    let gpus = if args.split_device.is_some() { 2 } else { 1 };
+    let decode_rows = cuteafd_loader::plan::decode_rows::resolve(
+        &cuteafd_loader::plan::families::inkling2::INKLING2,
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(),
+            concurrency: args.max_sequences as u64,
+            decode_lanes: 1,
+            rtx_gpus: gpus,
+            draft_length: args.draft_length.draft_length.map(|n| n as u32),
+        },
+    )?;
     args.prefill_packing.require_unrestricted("Inkling")?;
     ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
@@ -90,6 +103,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 super::startup::Options { device: worker_args.device, split_device: worker_args.split_device, peers: &worker_args.peers,
                     native_lib: &worker_args.native_lib, manifest: &worker_args.manifest,
                     prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
+                    decode_rows,
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                     pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, drafter:worker_args.dspark.then_some(worker_args.draft_kv_cache), onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
@@ -175,9 +189,14 @@ mod tests {
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("max-context-tokens", 262144).value("pool-tokens", 2097152)
                 .value("rtx-expert-layers", 0).value("prefill-rows", prefill.unit_rows)
-                .value("prefill-waves", prefill.waves).publish();
+                .value("prefill-waves", prefill.waves).value("decode-rows", 64).publish();
             Ok(())
         })?;
+        let mut wide = argv.to_vec();
+        wide.extend(["--decode-rows", "128"]);
+        let crate::cli::Commands::ServeInkling2(wide) = crate::cli::Cli::try_parse_from(wide)?.command
+            else { anyhow::bail!("Inkling command not parsed") };
+        assert_eq!(wide.decode_rows.as_option(), Some(128));
         for invalid in ["0", "01", "1048577"] {
             let mut bad = argv.to_vec();
             let at = bad.iter().position(|value| *value == "--max-context-tokens").unwrap();

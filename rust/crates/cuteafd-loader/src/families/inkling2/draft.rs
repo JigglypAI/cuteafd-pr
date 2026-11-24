@@ -51,8 +51,16 @@ impl DraftLayout {
     pub fn from_weights(config: RecurrentBlockConfig, weights: Vec<RecurrentWeightLayout>, slots: usize,
         sequences: usize, context: usize, pool: usize, prefill: usize, waves: usize, sms: usize,
         format: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
+        Self::from_weights_for_decode_rows(config, weights, slots, sequences, context, pool, prefill, waves, 64, sms, format, manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_weights_for_decode_rows(config: RecurrentBlockConfig, weights: Vec<RecurrentWeightLayout>, slots: usize,
+        sequences: usize, context: usize, pool: usize, prefill: usize, waves: usize, decode_rows: usize, sms: usize,
+        format: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
         let ranks = weights.len();
-        ensure!(matches!(ranks, 1 | 2) && slots > 0 && sequences > 0 && prefill > 0 && waves > 0,
+        ensure!(matches!(ranks, 1 | 2) && slots > 0 && sequences > 0 && prefill > 0 && waves > 0
+            && (1..=128).contains(&decode_rows),
             "recurrent draft fact geometry");
         let lead = weights[0].lead;
         ensure!(lead < ranks && weights.iter().enumerate().all(|(rank, layout)|
@@ -88,11 +96,12 @@ impl DraftLayout {
             target.push((format!("unit.{wave}.taps"),extent(&[prefill,taps,h,2])?));
             target.push((format!("unit.{wave}.narrow"),extent(&[prefill,h,2])?));
         }
-        target.push(("decode.taps".into(),extent(&[64,taps,h,2])?));
-        target.push(("decode.narrow".into(),extent(&[64,h,2])?));
+        let replay_rows = super::execution::replay_capacity(decode_rows);
+        target.push(("decode.taps".into(),extent(&[decode_rows,taps,h,2])?));
+        target.push(("decode.narrow".into(),extent(&[decode_rows,h,2])?));
         let conv=super::conv::ConvLayout::new(slots,48,h,1024/ranks)?;
         let verify = vec![("verify.checkpoint".into(),conv.bytes()?),
-            ("verify.replay".into(),extent(&[48,64,conv.width,4])?), ("verify.table".into(),64*12)];
+            ("verify.replay".into(),extent(&[48,replay_rows,conv.width,4])?), ("verify.table".into(),replay_rows*12)];
         target.extend(verify.iter().cloned());
         let (peer,exchange)=if ranks==2 {
             let bytes=runtime[0].buffers.iter().find(|(name,_)|name=="step.partial").context("draft partial owner missing")?.1;

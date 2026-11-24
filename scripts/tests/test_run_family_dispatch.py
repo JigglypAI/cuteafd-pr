@@ -1195,7 +1195,9 @@ if family == "glm5_flash" and decode_rows > 128:
     sys.exit("glm5_flash on 1 RTX GPU supports DECODE_ROWS up to 128 (missing glmf_*_m256)")
 if family == "minimax_m3" and decode_rows > 128:
     sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash", "minimax_m3") and decode_rows > 64:
+if family == "inkling2" and decode_rows > 128:
+    sys.exit("inkling2 supports DECODE_ROWS up to 128 (missing inkling2_*_m256)")
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes, decode_rows=decode_rows)
@@ -3459,6 +3461,27 @@ def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, key
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) and "--resolve-settings-only" not in line
                    and "cuteafd plan" not in line and "python3 -I -" not in line
                    for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("keys,expected_flag", [
+    ("", None),
+    ("DECODE_ROWS=auto\n", None),
+    ("DECODE_ROWS=64\n", "--decode-rows 64"),
+    ("DECODE_ROWS=128\n", "--decode-rows 128"),
+])
+def test_inkling_decode_rows_are_forwarded_from_global_key(tmp_path, keys, expected_flag):
+    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+    result = _family_launch_result(tmp_path, config, "test/inkling",
+                                   "RTX_GPUS=2\nSPARK_COUNT=6\n" + keys,
+                                   extra_args=("--wip", "inkling-test"))
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "serve-inkling2" in line and "--snapshot" in line)
+    if expected_flag is None:
+        assert "--decode-rows" not in launch, launch
+    else:
+        assert expected_flag in launch and launch.count("--decode-rows") == 1, launch
+    assert not any("--decode-rows" in line for line in lines if "cuteafd expertd-native" in line)
 
 
 @pytest.mark.parametrize("family", ["glm5_flash", "qwen3_5"])
