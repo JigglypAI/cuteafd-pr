@@ -845,11 +845,16 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let probe_preparer = probe.as_ref().filter(|p| p.spec.feature_scoring())
         .and(profile.probe_media_preparer.as_ref());
     if let Some(p) = &probe {
-        let geometry = profile.media_preparer.as_ref().or(probe_preparer).map(|p| p.config().token_geometry())
-            .unwrap_or(cuteafd_core::media::ImageTokenGeometry::MERGED);
+        // Spans are checked against the loaded processor's geometry (what serving
+        // expands); without a processor there is no geometry and media is refused below.
+        let geometry = profile.media_preparer.as_ref().or(probe_preparer).map(|p| p.config().token_geometry());
         let audio = profile.audio_preparer.as_ref().map(|p| p.geometry())
             .unwrap_or(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
-        if let Err(message) = p.spec.validate_media_geometries(geometry, audio) {
+        let checked = match geometry {
+            Some(geometry) => p.spec.validate_media_geometries(geometry, audio),
+            None => p.spec.validate_audio_geometry(audio),
+        };
+        if let Err(message) = checked {
             p.fail(format!("{message:#}"));
             return Err(Rejection::bad(message));
         }
@@ -2995,7 +3000,7 @@ mod tests {
         let request: Value = serde_json::from_slice(&std::fs::read(
             std::env::var_os("CUTEAFD_TEST_MEDIA_REQUEST").unwrap()).unwrap()).unwrap();
         let spec: probe::ProbeSpec = serde_json::from_value(request["spec"].clone()).unwrap();
-        spec.validate_media().unwrap();
+        spec.validate_media_geometry(ImageFamily::Mimo.token_geometry()).unwrap();
         let expected = spec.clone();
         let (id, _probe) = probe::registry().register(spec);
         let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::from_snapshot(&snapshot,

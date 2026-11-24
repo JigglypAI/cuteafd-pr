@@ -262,10 +262,6 @@ impl ProbeSpec {
         Ok(())
     }
 
-    pub fn validate_media(&self) -> anyhow::Result<()> {
-        self.validate_media_geometry(cuteafd_core::media::ImageTokenGeometry::MERGED)
-    }
-
     pub fn validate_media_geometry(&self, geometry: cuteafd_core::media::ImageTokenGeometry) -> anyhow::Result<()> {
         self.validate_media_geometries(geometry, cuteafd_core::media::AudioTokenGeometry::MimoRvq)
     }

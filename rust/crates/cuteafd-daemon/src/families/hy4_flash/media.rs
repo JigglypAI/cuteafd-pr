@@ -20,7 +20,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         }
         Some(contract) if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !p.spec.media.is_empty()) => {
             let probe = job.probe.as_ref().expect("checked probe");
-            probe.spec.validate_media_geometry(PROBE_GEOMETRY)?;
+            probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::Hy4Flash.token_geometry())?;
             ensure!(probe.spec.media.len() == job.media.len() && tokens.len() <= context
                 && tokens.iter().all(|&id| id < vocabulary), "Hy4 expanded probe media/context differs");
             let mut spans = Vec::with_capacity(job.media.len());
@@ -67,9 +67,6 @@ pub(super) fn rope_positions(tokens: &[u32], job: &NativeRequest, media: &Reques
     }).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(RopePositions::new(tokens, &images, contract)?))
 }
-
-/// Hy4 image spans carry one newline row per merged row: h/2 * (w/2 + 1).
-const PROBE_GEOMETRY: cuteafd_core::media::ImageTokenGeometry = cuteafd_core::media::ImageTokenGeometry::ROW_MARKERS;
 
 #[cfg(test)]
 mod tests {
@@ -127,18 +124,19 @@ mod tests {
     #[test]
     fn probe_spans_admit_newline_rows() {
         // A 512x512 image is a 32x32 patch grid: 16 rows of 16 merged tokens plus a newline each.
-        assert_eq!(PROBE_GEOMETRY.extent([1, 32, 32]).map(|(_, _, rows)| rows), Some(272));
-        assert_eq!(PROBE_GEOMETRY.extent([1, 30, 40]).map(|(_, _, rows)| rows), Some(315));
+        let geometry = cuteafd_loader::media::ImageFamily::Hy4Flash.token_geometry();
+        assert_eq!(geometry.extent([1, 32, 32]).map(|(_, _, rows)| rows), Some(272));
+        assert_eq!(geometry.extent([1, 30, 40]).map(|(_, _, rows)| rows), Some(315));
         let (_, c) = contract();
         let probe = |grid: [u32; 3], len: usize| cuteafd_api::openai::probe::ProbeSpec {
             prompt_ids: Some(vec![c.image_start; len + 2]),
             media: vec![serde_json::from_value(serde_json::json!({"kind": "image", "start": 1, "len": len,
                 "grid": grid, "key": "0".repeat(64), "image_url": {"url": "data:image/png;base64,AA=="}})).unwrap()],
             ..Default::default() };
-        assert!(probe([1, 32, 32], 272).validate_media_geometry(PROBE_GEOMETRY).is_ok());
-        // The merged-only geometry other still towers use would refuse every Hy4 span.
-        assert!(probe([1, 32, 32], 272).validate_media().is_err());
-        assert!(probe([1, 32, 32], 256).validate_media_geometry(PROBE_GEOMETRY).is_err());
+        assert!(probe([1, 32, 32], 272).validate_media_geometry(geometry).is_ok());
+        // The merged-only geometry would refuse every Hy4 span.
+        assert!(probe([1, 32, 32], 272).validate_media_geometry(cuteafd_core::media::ImageTokenGeometry::MERGED).is_err());
+        assert!(probe([1, 32, 32], 256).validate_media_geometry(geometry).is_err());
     }
 
     #[test]

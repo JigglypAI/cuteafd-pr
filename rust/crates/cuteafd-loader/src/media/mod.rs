@@ -170,6 +170,18 @@ pub enum ImageFamily {
     Hy4Flash,
 }
 
+impl ImageFamily {
+    /// Span geometry serving and probe admission share: merge and whether each
+    /// merged row ends in a marker row. Mistral's merge is checkpoint-declared
+    /// (`ProcessorConfig::token_geometry` keeps the loaded value).
+    pub fn token_geometry(self) -> cuteafd_core::media::ImageTokenGeometry {
+        cuteafd_core::media::ImageTokenGeometry {
+            merge: ProcessorConfig::for_family(self).merge,
+            row_markers: u32::from(matches!(self, ImageFamily::Mistral | ImageFamily::Hy4Flash)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FamilyProcessor {
@@ -235,9 +247,9 @@ impl ProcessorConfig {
         if requested==0 {return Err(invalid("image span policy must be positive"));}
         Ok(self.architectural_span_ceiling().map_or(requested,|ceiling| requested.min(ceiling)))
     }
+    /// The loaded processor's span geometry: the checkpoint's merge with the family's row-marker rule.
     pub fn token_geometry(&self) -> cuteafd_core::media::ImageTokenGeometry {
-        cuteafd_core::media::ImageTokenGeometry { merge: self.merge,
-            row_markers: u32::from(matches!(self.family, ImageFamily::Mistral | ImageFamily::Hy4Flash)) }
+        cuteafd_core::media::ImageTokenGeometry { merge: self.merge, ..self.family.token_geometry() }
     }
 
     pub fn for_family(family: ImageFamily) -> Self {

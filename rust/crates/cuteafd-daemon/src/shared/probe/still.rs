@@ -42,7 +42,7 @@ pub(crate) fn spans(job: &NativeRequest, tokens: &[u32], vocabulary: u32, contex
         "still probe token/context/audio extent");
     ensure!(probe.spec.prompt_ids.as_deref() == Some(tokens) && probe.spec.media.len() == job.media.len(),
         "still probe expanded ids/image count differs");
-    probe.spec.validate_media()?;
+    probe.spec.validate_media_geometry(family.token_geometry())?;
     let placeholder = marker(snapshot, if family == ImageFamily::Kimi { "<|media_pad|>" } else { "]<]image[>[" }, vocabulary)?;
     let tokenizer = cuteafd_loader::cached_tokenizer(snapshot)?;
     let mut covered = std::collections::BTreeSet::new();
