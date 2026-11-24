@@ -135,6 +135,9 @@ pub(crate) struct EngineArgs {
     /// its experts local) and verifies up to this many drafts per sequence.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
+    /// Maximum decode/verify batch rows (`auto`, `64`, or `128`).
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Numerical attention recipe rows; automatic uses the actually loaded MTP width.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
@@ -239,6 +242,9 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences per case (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Multi-sequence 128-row verify + GDN/PLE commit + graphed replay parity oracle (32 x 4 = 128 rows).
+    #[arg(long, requires_all = ["nll", "save_logits"])]
+    pub wide_batch: bool,
 }
 
 impl EngineArgs {
@@ -267,8 +273,24 @@ impl EngineArgs {
 
     /// Per-wave tables, PLE gathers and Spark workers never hold the whole span.
     fn prefill_wave_rows(&self) -> usize {
+        let decode = self.resolved_decode_rows(self.slots.max(1) as u64).unwrap_or(engine::DECODE_ROWS);
         self.prefill_units.unwrap_or(if self.prefill_rows > 0 { self.prefill_rows } else { 4096 })
-            .max(engine::DECODE_ROWS)
+            .max(decode)
+    }
+
+    pub(super) fn resolved_decode_rows(&self, concurrency: u64) -> Result<usize> {
+        let gpus = 1 + usize::from(self.split_device.is_some());
+        let rows = cuteafd_loader::plan::resolve_decode_rows(
+            "qwen4",
+            cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+                requested: self.decode_rows.as_option(),
+                concurrency: concurrency.max(1),
+                decode_lanes: 1,
+                rtx_gpus: gpus,
+                draft_length: (self.mtp > 0).then_some(self.mtp as u32),
+            },
+        )?;
+        Ok(cuteafd_loader::families::qwen4::decode_capacity(usize::try_from(rows)?))
     }
 
 }
@@ -289,11 +311,12 @@ impl Opened {
     }
 }
 
-fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
+fn required_fp8_programs(args: &EngineArgs, decode_rows: usize) -> Vec<String> {
     let mut required = Vec::new();
+    let decode_cap = if decode_rows <= engine::DECODE_ROWS { "m64" } else { "m128" };
     if args.fp8_decode {
         let suffix = if args.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
-        for cap in ["m64", "m4096"] {
+        for cap in [decode_cap, "m4096"] {
             required.extend([format!("qwen4_gdn_w8_{cap}"),
                 format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}")]);
         }
@@ -306,8 +329,9 @@ fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
     -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
         cuteafd_core::coordinator_programs::AttentionPlanError>
 {
+    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64).unwrap_or(engine::DECODE_ROWS);
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
+        decode_rows, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
     cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
     Ok(plan)
 }
@@ -362,7 +386,7 @@ mod weight_representation_tests {
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
             let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
-                &["max-context-tokens", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
+                &["max-context-tokens", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows", "decode-rows"], || {
                     crate::commands::bench::fixture_prefix().resolve_entries(16);
                     let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
                     let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
@@ -400,13 +424,13 @@ mod weight_representation_tests {
         assert_eq!(parsed.prefill_shape()?, Some(shape));
         assert_eq!(parsed.prefill_wave_rows(), 4096);
         let worker = admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::Fp8,
-            parsed.prefill_wave_rows(), shape.waves, false)?;
+            parsed.prefill_wave_rows(), shape.waves, engine::DECODE_ROWS, false)?;
         assert_eq!((worker.capacity(), worker.compiled_capacity()), (4096, 4096));
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let admission = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
         assert_eq!(admission.prefill_rows, 8192);
         assert_eq!(admission.prefill_shape, Some(shape));
-        assert!(required_fp8_programs(&EngineArgs { fp8_decode: true, ..parsed })
+        assert!(required_fp8_programs(&EngineArgs { fp8_decode: true, ..parsed }, engine::DECODE_ROWS)
             .iter().all(|name| !name.contains("m8192")));
         Ok(())
     }
@@ -508,14 +532,16 @@ mod weight_representation_tests {
     fn required_fp8_producer_uses_selected_kv_format() {
         for format in ["bf16", "fp8"] {
             let parsed = args(&["--fp8-decode", "true", "--kv-cache", format]).unwrap();
-            let required = required_fp8_programs(&parsed);
             let suffix = if format == "fp8" { "_kv_fp8" } else { "" };
-            for cap in ["m64".to_string(), "m4096".to_string()] {
-                assert!(required.contains(&format!("qwen4_attn_producer_w8{suffix}_{cap}")));
-                let other = if format == "fp8" { "" } else { "_kv_fp8" };
-                assert!(!required.contains(&format!("qwen4_attn_producer_w8{other}_{cap}")));
-                assert!(required.contains(&format!("qwen4_gdn_w8_{cap}")));
-                assert!(required.contains(&format!("qwen4_attn_o_w8_{cap}")));
+            for (decode_rows, decode_cap) in [(64usize, "m64"), (128, "m128")] {
+                let required = required_fp8_programs(&parsed, decode_rows);
+                for cap in [decode_cap.to_string(), "m4096".to_string()] {
+                    assert!(required.contains(&format!("qwen4_attn_producer_w8{suffix}_{cap}")));
+                    let other = if format == "fp8" { "" } else { "_kv_fp8" };
+                    assert!(!required.contains(&format!("qwen4_attn_producer_w8{other}_{cap}")));
+                    assert!(required.contains(&format!("qwen4_gdn_w8_{cap}")));
+                    assert!(required.contains(&format!("qwen4_attn_o_w8_{cap}")));
+                }
             }
         }
     }
@@ -597,10 +623,12 @@ impl Opened {
         if let Some(peer) = args.split_device {
             return self.with_dual_engine(args, peer, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), media, body);
         }
+        let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64)?;
+        cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
         self::programs::validate_all(&self.cfg, &programs, args.max_context)?;
-        let required = required_fp8_programs(args);
+        let required = required_fp8_programs(args, decode_rows);
         for name in &required {
             programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \
                 {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
@@ -706,7 +734,7 @@ impl Opened {
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
                 layer, args.prefill_wave_rows(), prefill_shape.map_or(1, |shape| shape.waves as usize),
-                engine::DECODE_ROWS)?),
+                decode_rows)?),
             _ => None,
         };
         weights::arena::probe(&self.library, &[device.id], &model, &embedding)?;
@@ -724,8 +752,8 @@ impl Opened {
         loaded_weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let max_context = crate::shared::context::pool_context("qwen4", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
-        let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
-            max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
+        let mut engine = engine::Qwen4Engine::new_with_decode_rows(&self.library, &programs, self.cfg.clone(), model, ple, stream,
+            max_context, args.prefill_rows, pages, args.slots, decode_rows, args.kv_format, embedding)?;
         engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
@@ -836,6 +864,10 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
         ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
         None
     };
+    let mut args = args;
+    if args.wide_batch {
+        args.engine.slots = args.engine.slots.max(32);
+    }
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
         if args.replay_check {
@@ -882,7 +914,10 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
             }
             return Ok(());
         }
-        if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
+        if let Some(windows) = &windows {
+            if args.wide_batch { return score_wide_batch(&args, &opened, engine, windows); }
+            return score_fidelity(&args, &opened, engine, windows);
+        }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
         }
@@ -1099,6 +1134,195 @@ fn score_fidelity(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engi
         "reference_config":fidelity_dataset::QWEN_CONFIG,"reference_revision":fidelity_dataset::QWEN_REVISION,
         "reference_manifest_sha256":fidelity_dataset::QWEN_MANIFEST_SHA256,
         "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
+}
+
+/// Multi-sequence 128-row verify + GDN/PLE commit + graphed replay oracle.
+/// Runs 32 independent sequences (4 verify tokens each = 128 rows) solo (1x4),
+/// batched 32x4 eager, and batched 32x4 graphed (capture + replay), committing
+/// varied kept counts (1..=4) via `qwen4_gdn_commit_m128` + `qwen4_ple_commit_m128`
+/// and verifying post-commit follow-up decode parity against solo.
+fn score_wide_batch(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>,
+    windows: &[cuteafd_bench::reference::Window]) -> Result<()> {
+    use crate::shared::decode_graph::device::{snapshots, Cycle};
+    ensure!(engine.decode_rows == 128, "Qwen4 --wide-batch requires --decode-rows 128 (got {})", engine.decode_rows);
+    ensure!(engine.slots >= 32, "Qwen4 --wide-batch requires at least 32 slots (got {})", engine.slots);
+    ensure!(!windows.is_empty(), "Qwen4 --wide-batch needs at least one fidelity window");
+    let root = args.save_logits.as_deref().context("--wide-batch requires --save-logits")?;
+    std::fs::create_dir(root).context("Qwen4 wide-batch output must be a new directory")?;
+    let vocab = opened.cfg.vocab_size;
+
+    const SEQS: usize = 32;
+    const VERIFY: usize = 4;
+    const TOTAL_ROWS: usize = SEQS * VERIFY;
+    struct Sample { prefix: Vec<u32>, verify: Vec<u32>, kept: usize, followup: u32 }
+    let mut samples = Vec::with_capacity(SEQS);
+    for idx in 0..SEQS {
+        let win = &windows[idx % windows.len()];
+        let prefix_len = 24 + (idx * 5) % 40;
+        let offset = (idx / windows.len()) * 80;
+        ensure!(offset + prefix_len + VERIFY + 1 <= win.tokens.len(), "Qwen4 --wide-batch window too short");
+        let prefix = win.tokens[offset..offset + prefix_len].to_vec();
+        let verify = win.tokens[offset + prefix_len..offset + prefix_len + VERIFY].to_vec();
+        let kept = (idx % VERIFY) + 1;
+        let followup = win.tokens[offset + prefix_len + kept];
+        samples.push(Sample { prefix, verify, kept, followup });
+    }
+
+    let argmax = |row: &[f32]| -> usize {
+        row.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0)
+    };
+    let cosine = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let (xd, yd) = (x as f64, y as f64);
+            dot += xd * yd; na += xd * xd; nb += yd * yd;
+        }
+        dot / (na.sqrt() * nb.sqrt()).max(1e-12)
+    };
+    let compare_rows = |a: &[Vec<f32>], b: &[Vec<f32>]| -> (usize, usize, f32, f64) {
+        let (mut bit_eq, mut top1_eq, mut max_abs, mut min_cos) = (0usize, 0usize, 0.0f32, 1.0f64);
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            let mut exact = true;
+            for (&x, &y) in ra.iter().zip(rb.iter()) {
+                if x.to_bits() != y.to_bits() { exact = false; }
+                let diff = (x - y).abs();
+                if diff > max_abs { max_abs = diff; }
+            }
+            if exact { bit_eq += 1; }
+            if argmax(ra) == argmax(rb) { top1_eq += 1; }
+            let c = cosine(ra, rb);
+            if c < min_cos { min_cos = c; }
+        }
+        (bit_eq, top1_eq, max_abs, min_cos)
+    };
+
+    engine.prepare_serving_workspaces()?;
+    let reserve = engine.configure_graph_cache()?;
+    ensure!(reserve.iter().any(|&bytes| bytes > 0), "Qwen4 --wide-batch needs a nonzero graph reserve");
+    let graph_counters = || -> (u64, u64) {
+        let snaps = snapshots();
+        let sum = |f: fn(&crate::shared::decode_graph::device::Counters) -> u64| -> u64 {
+            snaps.iter().flat_map(|s| [Cycle::Verify, Cycle::Decode].into_iter().filter_map(|c| s.cycles.get(&c))).map(f).sum()
+        };
+        (sum(|c| c.captures), sum(|c| c.hits))
+    };
+
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &opened.cfg);
+
+    // 1. Solo reference: each sequence individually (4-row verify + partial commit + 1-row follow-up).
+    let mut solo_verify: Vec<Vec<f32>> = Vec::with_capacity(TOTAL_ROWS);
+    let mut solo_followup: Vec<Vec<f32>> = Vec::with_capacity(SEQS);
+    for sample in &samples {
+        let mut p = allocator.admit(sample.prefix.len() + VERIFY + 1)?;
+        engine.prefill_device(&mut p, &sample.prefix, None, None, 1)?;
+        let start = p.len;
+        let history = p.history.clone();
+        let logits = engine.verify_device_ungraphed(&mut [(&mut p, &sample.verify)], true)?
+            .context("Qwen4 solo verify logits")?;
+        let values = logits.to_host(engine.library)?;
+        ensure!(values.len() == VERIFY * vocab, "Qwen4 solo verify logits shape");
+        for row in values.chunks_exact(vocab) { solo_verify.push(row.to_vec()); }
+        engine.commit(&[(p.slot, 0, sample.kept)])?;
+        engine.rewind(&mut p, start, history, &sample.verify[..sample.kept]);
+        let follow = engine.verify_device_ungraphed(&mut [(&mut p, &[sample.followup])], false)?
+            .context("Qwen4 solo follow-up logits")?;
+        let follow_vals = follow.to_host(engine.library)?;
+        ensure!(follow_vals.len() == vocab, "Qwen4 solo follow-up logits shape");
+        solo_followup.push(follow_vals);
+        engine.drain_state()?;
+        allocator.release(p);
+    }
+
+    // Helper: run all 32 sequences together as one 128-row verify + 32-slot commit + per-slot 1-row follow-up.
+    let mut run_batched = |graphed: bool| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, u64, u64)> {
+        let mut placements = Vec::with_capacity(SEQS);
+        for sample in &samples {
+            let mut p = allocator.admit(sample.prefix.len() + VERIFY + 1)?;
+            engine.prefill_device(&mut p, &sample.prefix, None, None, 1)?;
+            placements.push(p);
+        }
+        let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
+        let histories: Vec<_> = placements.iter().map(|p| p.history.clone()).collect();
+        let (caps_before, hits_before) = graph_counters();
+        let logits = {
+            let mut batch: Vec<(&mut engine::Qwen4Placement, &[u32])> = placements.iter_mut()
+                .zip(&samples).map(|(p, s)| (p, s.verify.as_slice())).collect();
+            if graphed {
+                engine.verify_device(&mut batch, true)?.context("Qwen4 wide-batch graphed verify logits")?
+            } else {
+                engine.verify_device_ungraphed(&mut batch, true)?.context("Qwen4 wide-batch eager verify logits")?
+            }
+        };
+        let values = logits.to_host(engine.library)?;
+        let (caps_after, hits_after) = graph_counters();
+        ensure!(values.len() == TOTAL_ROWS * vocab, "Qwen4 wide-batch verify logits shape");
+        let verify_rows: Vec<Vec<f32>> = values.chunks_exact(vocab).map(|r| r.to_vec()).collect();
+        let accepted: Vec<(i32, usize, usize)> = placements.iter().zip(&samples).enumerate()
+            .map(|(i, (p, s))| (p.slot, i * VERIFY, s.kept)).collect();
+        engine.commit(&accepted)?;
+        for (((p, &start), history), s) in placements.iter_mut().zip(&starts).zip(histories).zip(&samples) {
+            engine.rewind(p, start, history, &s.verify[..s.kept]);
+        }
+        let mut follow_rows = Vec::with_capacity(SEQS);
+        for (p, s) in placements.iter_mut().zip(&samples) {
+            let follow = engine.verify_device_ungraphed(&mut [(p, &[s.followup])], false)?
+                .context("Qwen4 wide-batch follow-up logits")?;
+            let follow_vals = follow.to_host(engine.library)?;
+            ensure!(follow_vals.len() == vocab, "Qwen4 wide-batch follow-up logits shape");
+            follow_rows.push(follow_vals);
+        }
+        engine.drain_state()?;
+        for p in placements { allocator.release(p); }
+        Ok((verify_rows, follow_rows, caps_after - caps_before, hits_after - hits_before))
+    };
+
+    let (eager_verify, eager_follow, eager_caps, eager_hits) = run_batched(false)?;
+    let (cap_verify, cap_follow, cap_caps, cap_hits) = run_batched(true)?;
+    let (rep_verify, rep_follow, rep_caps, rep_hits) = run_batched(true)?;
+
+    let (solo_vs_eager_bit, solo_vs_eager_top1, solo_vs_eager_max, solo_vs_eager_cos) = compare_rows(&solo_verify, &eager_verify);
+    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max, eager_vs_rep_cos) = compare_rows(&eager_verify, &rep_verify);
+    let (cap_vs_rep_bit, cap_vs_rep_top1, cap_vs_rep_max, cap_vs_rep_cos) = compare_rows(&cap_verify, &rep_verify);
+    let (follow_solo_vs_eager_bit, follow_solo_vs_eager_top1, follow_solo_vs_eager_max, follow_solo_vs_eager_cos) = compare_rows(&solo_followup, &eager_follow);
+    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max, follow_solo_vs_rep_cos) = compare_rows(&solo_followup, &rep_follow);
+    let (follow_cap_vs_rep_bit, follow_cap_vs_rep_top1, follow_cap_vs_rep_max, follow_cap_vs_rep_cos) = compare_rows(&cap_follow, &rep_follow);
+
+    let receipt = serde_json::json!({
+        "schema": "cuteafd.qwen4.wide-batch-128/1",
+        "decode_rows": engine.decode_rows,
+        "sequences": SEQS,
+        "verify_per_sequence": VERIFY,
+        "total_verify_rows": TOTAL_ROWS,
+        "kv_cache": args.engine.kv_format.to_string(),
+        "passes": {
+            "eager": { "captures": eager_caps, "hits": eager_hits },
+            "graphed_capture": { "captures": cap_caps, "hits": cap_hits },
+            "graphed_replay": { "captures": rep_caps, "hits": rep_hits },
+        },
+        "verify_parity": {
+            "solo_vs_eager": { "bit_identical_rows": solo_vs_eager_bit, "top1_exact_rows": solo_vs_eager_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": solo_vs_eager_max, "min_cosine": solo_vs_eager_cos },
+            "eager_vs_graphed_replay": { "bit_identical_rows": eager_vs_rep_bit, "top1_exact_rows": eager_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": eager_vs_rep_max, "min_cosine": eager_vs_rep_cos },
+            "graphed_capture_vs_replay": { "bit_identical_rows": cap_vs_rep_bit, "top1_exact_rows": cap_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": cap_vs_rep_max, "min_cosine": cap_vs_rep_cos },
+        },
+        "gdn_ple_commit_m128_followup_parity": {
+            "solo_vs_eager": { "bit_identical_rows": follow_solo_vs_eager_bit, "top1_exact_rows": follow_solo_vs_eager_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_eager_max, "min_cosine": follow_solo_vs_eager_cos },
+            "solo_vs_graphed_replay": { "bit_identical_rows": follow_solo_vs_rep_bit, "top1_exact_rows": follow_solo_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_rep_max, "min_cosine": follow_solo_vs_rep_cos },
+            "graphed_capture_vs_replay": { "bit_identical_rows": follow_cap_vs_rep_bit, "top1_exact_rows": follow_cap_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_cap_vs_rep_max, "min_cosine": follow_cap_vs_rep_cos },
+        },
+    });
+    println!("Qwen4 wide-batch 128-row oracle: {}", serde_json::to_string_pretty(&receipt)?);
+    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("wide-batch-128.json"))?;
+    serde_json::to_writer_pretty(out, &receipt)?;
+
+    ensure!(cap_caps > 0 && rep_caps == 0 && rep_hits > 0,
+        "Qwen4 128-row graphed replay failed (cap=({cap_caps},{cap_hits}), rep=({rep_caps},{rep_hits}))");
+    ensure!(solo_vs_eager_cos >= 0.999 && solo_vs_eager_top1 >= TOTAL_ROWS - 2,
+        "Qwen4 128-row solo vs batched verify mismatch ({solo_vs_eager_top1}/{TOTAL_ROWS}, min_cos={solo_vs_eager_cos}, max_abs={solo_vs_eager_max})");
+    ensure!(eager_vs_rep_bit == TOTAL_ROWS && cap_vs_rep_bit == TOTAL_ROWS && follow_cap_vs_rep_bit == SEQS,
+        "Qwen4 128-row graphed replay diverged (eager_vs_rep bit={eager_vs_rep_bit}/{TOTAL_ROWS} max={eager_vs_rep_max}, cap_vs_rep bit={cap_vs_rep_bit}/{TOTAL_ROWS})");
+    ensure!(follow_solo_vs_eager_cos >= 0.999 && follow_solo_vs_rep_cos >= 0.999 && follow_solo_vs_eager_top1 >= SEQS - 1 && follow_solo_vs_rep_top1 >= SEQS - 1,
+        "Qwen4 32-slot gdn/ple commit_m128 follow-up mismatch (eager={follow_solo_vs_eager_top1}/{SEQS} cos={follow_solo_vs_eager_cos}, rep={follow_solo_vs_rep_top1}/{SEQS} cos={follow_solo_vs_rep_cos})");
     Ok(())
 }
 

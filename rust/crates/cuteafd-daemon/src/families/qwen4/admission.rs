@@ -35,12 +35,12 @@ pub(super) fn loaded_media_weights(devices: &[i32], media: Option<(i32, Resident
 }
 
 pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
-    rows: usize, waves: u64, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    rows: usize, waves: u64, decode_rows: usize, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let capacity = u32::try_from(rows)?;
     let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
         else { cuteafd_core::SparkIngress::Fp8K32 };
-    let executions = cuteafd_loader::plan::spark_executions::admit_family("qwen4", &backend.exports(), None,
-        rows as u64, waves)?;
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("qwen4", &backend.exports(),
+        Some(u32::try_from(decode_rows)?), rows as u64, waves)?;
     cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
         crate::shared::placement::spark_rings(64 << 20)?, executions)
@@ -50,12 +50,13 @@ pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
 #[allow(clippy::too_many_arguments)]
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
     manifest: Option<&'a serde_json::Value>, ple: Option<(u64, bool)>, future_expert_bytes: u64) -> Result<QwenAdmissionInputs<'a>> {
-    let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
+    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64)?;
+    let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry_rows(cfg, layers, mtp, args.kv_format, decode_rows)?;
     let shape = args.resolved_prefill()?;
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: shape.span_rows,
         slots: args.slots as u64, mark_bytes: marks, ple, future_expert_bytes,
-        headroom: cuteafd_loader::placement::reserve::gpu("qwen4") })
+        headroom: cuteafd_loader::placement::reserve::gpu("qwen4"), decode_rows })
 }
 
 pub(super) use cuteafd_loader::families::qwen4::StepTableBytes;
@@ -112,7 +113,8 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
     use cuteafd_core::memory_layout::{Basis, Category};
     use cuteafd_loader::families::qwen4::{resident::Qwen4Representation, weight_layout};
     use cuteafd_loader::placement::Demand;
-    let rows = args.prefill_wave_rows().max(super::engine::DECODE_ROWS);
+    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64)?;
+    let rows = args.prefill_wave_rows().max(decode_rows);
     ensure!(args.shared_only || args.expert_window.is_none(),
         "Qwen placement requires resident experts; diagnostic expert paging is not admitted");
     let sparks = args.peers.as_ref().map_or(0, |peers| peers.split(',').count());
@@ -271,20 +273,21 @@ pub(super) fn host_owners(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, m
 fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, mtp: bool, owners: usize,
     spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64, memory: (u64, u64))
     -> Result<qwen4::QwenHost> {
-    use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, mtp_pinned_logits_bytes, pinned_logits_bytes, scoring_logits_bytes};
+    use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, mtp_pinned_logits_bytes, pinned_logits_bytes_rows, scoring_logits_bytes_rows};
+    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64)?;
     let (total, available) = memory;
     let shape = args.resolved_prefill()?;
-    let unit_rows = shape.unit_rows.max(super::engine::DECODE_ROWS as u64);
+    let unit_rows = shape.unit_rows.max(decode_rows as u64);
     let waves = shape.waves.max(1);
     let mapped = cfg.ple_layers.first().is_some_and(|&layer| layer < layers);
     let ple = match (mapped, ple_row_bytes) {
-        (true, Some(row_bytes)) => Some(PleHost::new(cfg, unit_rows, waves, row_bytes)?),
+        (true, Some(row_bytes)) => Some(PleHost::new_with_decode_rows(cfg, unit_rows, waves, row_bytes, decode_rows)?),
         (true, None) => anyhow::bail!("Qwen mapped PLE layer without table headers"),
         (false, _) => None,
     };
     let (bounds, mtp_upload) = UploadInputs { prefill_rows: usize::try_from(unit_rows)?,
         waves: usize::try_from(waves)?, spark: spark_ranks > 0, mtp: mtp && cfg.mtp_layers > 0, ple_ids: !mapped, packed_decode_tables: owners == 1 }
-        .bounds(cfg)?;
+        .bounds_with_decode_rows(cfg, decode_rows)?;
     let (prefix_quota, prefix_chunk) = match &args.planner_host_prefix {
         Some((prefix, concurrency)) if prefix.prefix_cache_entries != 0 && prefix.host_cache_bytes.enabled() =>
             qwen4::host::prefix_quota(qwen4::host::prefix_geometry(cfg, layers, mtp, args.kv_format)?,
@@ -306,9 +309,9 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
     Ok(QwenHost {
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
-        pinned_logits: pinned_logits_bytes(owners, cfg.vocab_size as u64)?,
+        pinned_logits: pinned_logits_bytes_rows(owners, cfg.vocab_size as u64, decode_rows)?,
         mtp_pinned_logits: mtp_pinned_logits_bytes(args.prefill_shape()?.is_some(), mtp && cfg.mtp_layers > 0, cfg.vocab_size as u64)?,
-        scoring_logits: scoring_logits_bytes(shape.span_rows, cfg.vocab_size as u64)?,
+        scoring_logits: scoring_logits_bytes_rows(shape.span_rows, cfg.vocab_size as u64, decode_rows)?,
         prefix_quota, prefix_chunk,
         loaded_media_cache: args.planner_media_cache_bytes,
         host_embedding,
@@ -332,7 +335,8 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
     use anyhow::{ensure, Context};
     use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2};
     use cuteafd_loader::formats::fp8_experts::Slicing;
-    let rows = args.prefill_wave_rows().max(super::engine::DECODE_ROWS);
+    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64)?;
+    let rows = args.prefill_wave_rows().max(decode_rows);
     let costs = qwen4::dual_expert_costs(catalog, layers)?;
     let wire = catalog.exl3().is_some();
     let (packages, backend_workspace) = if let Some(exl3) = catalog.exl3() {
@@ -625,7 +629,7 @@ mod tests {
                     kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::default(),
                     manifest: None, prefill_rows: rows * waves, prefill_shape: shape,
                     slots: 8, mark_bytes: 0,
-                    ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0,
+                    ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0, decode_rows: 64,
                 })?;
                 for (_, name, bytes) in runtime.items.iter().filter(|item| item.1.ends_with("step")) {
                     let planned = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
@@ -676,8 +680,10 @@ mod tests {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for backend in [SparkBackend::Fp8, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
             for (waves, unit) in [(1u64, 4096usize), (2, 2048), (2, 4096)] {
-                assert_eq!(super::spark_model(backend, unit, waves, false)?.executions,
-                    planned("qwen4", backend, None, unit as u64, waves));
+                for decode in [64usize, 128] {
+                    assert_eq!(super::spark_model(backend, unit, waves, decode, false)?.executions,
+                        planned("qwen4", backend, (decode != 64).then_some(decode as u32), unit as u64, waves));
+                }
             }
         }
         Ok(())
@@ -688,7 +694,7 @@ mod tests {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for (rows, waves) in [(64, 1), (2048, 2), (4096, 2)] {
             for bf16 in [false, true] {
-                let model = super::spark_model(SparkBackend::Fp8, rows, waves, bf16)?;
+                let model = super::spark_model(SparkBackend::Fp8, rows, waves, 64, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
                 let compiled = cuteafd_core::covering_export(&SparkBackend::Fp8.exports(), rows as u32).unwrap();
                 assert_eq!((model.capacity(), model.compiled_capacity()), (rows.max(64) as u32, compiled));
@@ -793,7 +799,7 @@ mod tests {
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
                         slots: 16, mark_bytes: 0,
-                        ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
+                        ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30, decode_rows: 64 },
                     gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 3 << 30,
                         baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],
                     arenas: &arenas, layer_experts: &experts, layer_extra: &extra,

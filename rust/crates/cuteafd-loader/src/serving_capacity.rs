@@ -739,7 +739,24 @@ pub fn qwen_cache_geometry(
     mtp: bool,
     kv_format: Qwen4KvCache,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    qwen_cache_geometry_rows(cfg, layers, mtp, kv_format, crate::families::qwen4::VERIFY_ROWS)
+}
+
+pub fn qwen_cache_geometry_rows(
+    cfg: &Qwen4Config,
+    layers: usize,
+    mtp: bool,
+    kv_format: Qwen4KvCache,
+    decode_rows: usize,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("qwen4", cfg.layers, layers)?;
+    if !(1..=crate::families::qwen4::MAX_DECODE_ROWS).contains(&decode_rows) {
+        return Err(CacheGeometryError::Unsupported {
+            family: "qwen4",
+            what: "decode rows outside Qwen4 compiled capacity (1..=128)",
+        });
+    }
+    let cap = crate::families::qwen4::decode_capacity(decode_rows) as u64;
     if cfg.kv_heads != 2
         || cfg.head_dim != 256
         || cfg.index_head_dim != 128
@@ -822,12 +839,12 @@ pub fn qwen_cache_geometry(
             product("GDN conv input", &[conv_channels, 2])?,
         ],
     )?;
-    let replay_layer = product("GDN replay", &[64, replay_row])?
+    let replay_layer = product("GDN replay", &[cap, replay_row])?
         .div_ceil(1024)
         .checked_mul(1024)
         .ok_or(CacheGeometryError::Overflow("GDN replay padding"))?;
     let ple_replay = if ple > 0 {
-        product("PLE replay", &[64, hc_width, 2])?
+        product("PLE replay", &[cap, hc_width, 2])?
     } else {
         0
     };
@@ -850,7 +867,7 @@ pub fn qwen_cache_geometry(
                 ],
             )?,
             // Commit tables plus the deferred MTP id buffer allocated even with MTP off.
-            fixed_state_bytes: 3 * 64 * 4 + 64 * 64 * 4,
+            fixed_state_bytes: 3 * cap * 4 + 64 * cap * 4,
             context_table_bytes_per_token: 0,
         }],
     })

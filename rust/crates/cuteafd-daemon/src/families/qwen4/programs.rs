@@ -21,7 +21,8 @@ pub(super) fn packed_inventory<'a>(required: impl IntoIterator<Item = &'a str>)
         let role = match op {
             "hc_pre" | "hc_post_pre" | "hc_post" | "router_scores" | "shared" | "add"
                 | "ple_bf16" | "ple_fp8" | "expert_input_quant" => PackedRows,
-            "head" | "head_fp8" | "mtp_feedback" | "gdn_commit" | "ple_commit" | "index_expand" => SequenceLocal,
+            "head" | "head_fp8" | "mtp_feedback" | "gdn_commit" | "gdn_commit_m128"
+                | "ple_commit" | "ple_commit_m128" | "index_expand" => SequenceLocal,
             _ if ["gdn_", "attn_producer_", "sparse_gqa_", "index_topk_", "attn_o_"]
                 .iter().any(|stem| op.starts_with(stem)) => SequenceLocal,
             _ => bail!("Qwen program {name} lacks an explicit packed row role"),
@@ -47,7 +48,24 @@ fn expected(cfg: &Qwen4Config, name: &str) -> Result<Value> {
     let (stem, weights) = if let Some(stem) = stem.strip_suffix("_w8") { (stem, json!("only")) }
         else if let Some(stem) = stem.strip_suffix("_fp8").filter(|_| rows.is_some()) { (stem, json!(true)) }
         else { (stem, json!(false)) };
-    let replay = crate::shared::qwen::GdnLayout::new(cfg.gdn_geometry())?.replay_layer_bytes;
+    let commit_rows = match stem {
+        "ple_commit" | "gdn_commit" => {
+            let r = rows.unwrap_or(64);
+            ensure!([64, 128].contains(&r), "{name}: unsupported Qwen commit replay_rows {r}");
+            r
+        }
+        _ => 64,
+    };
+    let replay_rows = match stem {
+        "gdn" => rows.unwrap_or(64),
+        "gdn_commit" => commit_rows,
+        _ => 64,
+    };
+    let replay = if [64, 128].contains(&replay_rows) {
+        crate::shared::qwen::GdnLayout::with_replay_rows(cfg.gdn_geometry(), replay_rows)?.replay_layer_bytes
+    } else {
+        crate::shared::qwen::GdnLayout::new(cfg.gdn_geometry())?.replay_layer_bytes
+    };
     let state_rows = (cfg.ple_conv - 1) * cfg.ngram_size;
     let width = cfg.dense_context().next_multiple_of(64);
     let mut geometry = match stem {
@@ -63,9 +81,9 @@ fn expected(cfg: &Qwen4Config, name: &str) -> Result<Value> {
         "ple_bf16" | "ple_fp8" => json!({"hidden":cfg.hidden,"streams":cfg.hc_count,
             "rows_per_token":cfg.ple_rows(),"row_dim":cfg.ple_dim / cfg.ple_rows(),"taps":cfg.ple_conv,
             "dilation":cfg.ngram_size,"state_rows":state_rows,"fp8":stem == "ple_fp8"}),
-        "ple_commit" => json!({"channels":cfg.hidden * cfg.hc_count,"state_rows":state_rows,"replay_rows":64}),
+        "ple_commit" => json!({"channels":cfg.hidden * cfg.hc_count,"state_rows":state_rows,"replay_rows":commit_rows}),
         "gdn_commit" => json!({"value_heads":cfg.gdn_value_heads,"key_heads":cfg.gdn_key_heads,
-            "channels":cfg.gdn_conv_width(),"replay_rows":64,"replay_bytes":replay}),
+            "channels":cfg.gdn_conv_width(),"replay_rows":commit_rows,"replay_bytes":replay}),
         "gdn" => json!({"hidden":cfg.hidden,"key_heads":cfg.gdn_key_heads,"value_heads":cfg.gdn_value_heads,
             "head_dim":cfg.gdn_head_dim,"in_width":cfg.gdn_conv_width() + cfg.gdn_value_width() + 2 * cfg.gdn_value_heads,
             "eps":cfg.rms_norm_eps,"fp8_weights":weights}),
@@ -82,14 +100,17 @@ fn expected(cfg: &Qwen4Config, name: &str) -> Result<Value> {
         _ => bail!("{name}: no Qwen geometry contract"),
     };
     if let Some(rows) = rows {
-        ensure!([64, 4096].contains(&rows), "{name}: unsupported Qwen row capacity {rows}");
-        geometry["max_rows"] = json!(rows);
-        if weights == "only" || stem == "sparse_gqa" {
-            geometry[if stem == "sparse_gqa" { "route" } else { "mode" }] = json!(if rows == 64 { "decode" } else { "prefill" });
-        }
-        if stem == "gdn" {
-            geometry["replay_rows"] = if rows == 64 { json!(64) } else { Value::Null };
-            geometry["replay_bytes"] = if rows == 64 { json!(replay) } else { Value::Null };
+        if !matches!(stem, "ple_commit" | "gdn_commit") {
+            ensure!([64, 128, 4096].contains(&rows), "{name}: unsupported Qwen row capacity {rows}");
+            geometry["max_rows"] = json!(rows);
+            let is_decode = rows <= 128;
+            if weights == "only" || stem == "sparse_gqa" {
+                geometry[if stem == "sparse_gqa" { "route" } else { "mode" }] = json!(if is_decode { "decode" } else { "prefill" });
+            }
+            if stem == "gdn" {
+                geometry["replay_rows"] = if is_decode { json!(rows) } else { Value::Null };
+                geometry["replay_bytes"] = if is_decode { json!(replay) } else { Value::Null };
+            }
         }
     }
     if matches!(stem, "attn_producer" | "sparse_gqa") {
@@ -108,9 +129,10 @@ fn validate(cfg: &Qwen4Config, context: usize, spec: &ProgramSpec) -> Result<()>
             actual.as_f64().zip(value.as_f64()).is_some_and(|(a, b)| a == b));
         ensure!(equal, "{}: geometry.{key} must be {value}, got {actual:?}", spec.name);
     }
-    if spec.name.rsplit_once("_m").is_some_and(|(_, rows)| rows.parse::<usize>().is_ok()) {
-        let rows = expected["max_rows"].as_u64().unwrap();
-        ensure!(u64::from(spec.capacity_rows) == rows, "{}: manifest row capacity disagrees with geometry", spec.name);
+    if let Some(rows) = expected.get("max_rows").and_then(Value::as_u64) {
+        if spec.name.rsplit_once("_m").is_some_and(|(_, r)| r.parse::<usize>().is_ok()) {
+            ensure!(u64::from(spec.capacity_rows) == rows, "{}: manifest row capacity disagrees with geometry", spec.name);
+        }
     }
     if spec.name.starts_with("qwen4_index_topk_") {
         ensure!(context > 0 && spec.geometry["max_context"].as_u64().is_some_and(|n| n >= context as u64),

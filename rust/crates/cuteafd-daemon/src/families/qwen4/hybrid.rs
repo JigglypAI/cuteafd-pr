@@ -40,7 +40,8 @@ impl Opened {
         let candidate = admitted.candidate.as_ref().context("Qwen expert prefix was not admitted")?;
         let layers = candidate.layers.clone();
         admitted.validate_layers(&layers)?;
-        let rows = args.prefill_wave_rows().max(engine::DECODE_ROWS);
+        let decode_rows = args.resolved_decode_rows(args.slots as u64)?;
+        let rows = args.prefill_wave_rows().max(decode_rows);
         let gpus = devices.len();
         ensure!((1..=2).contains(&gpus) && streams.len() == gpus, "Qwen hybrid device/stream owners differ");
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
@@ -128,7 +129,7 @@ impl Opened {
             let ranks = [0, 1].map(|rank| crate::shared::peer_split::RankDevice {
                 device: devices[rank].id, stream: streams[rank] });
             Some(engine::LocalRouted::Tp2(RefCell::new(rtx::owner_tp2::OwnerTp2::new(&self.library,
-                ranks, pair, self.cfg.hidden, self.cfg.topk, rows, engine::DECODE_ROWS,
+                ranks, pair, self.cfg.hidden, self.cfg.topk, rows, decode_rows,
                 catalog.exl3().is_some(), "qwen4")?)))
         };
         let mtp = if let Some(serial) = serial {
@@ -162,7 +163,7 @@ impl Opened {
                 Some(catalog), &working, peers.len(), super::admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?,
                     args.prefill_wave_rows(), args.resolved_prefill()?.waves,
-                    self.checkpoint.spark_input_is_bf16())?, None)?.select(&peers)?;
+                    decode_rows, self.checkpoint.spark_input_is_bf16())?, None)?.select(&peers)?;
             let link = devices[0].run(|| self.spark_link(args, &peers))?;
             transport.push(RefCell::new(link));
         }

@@ -19,6 +19,13 @@ pub fn prefill_limits(local: bool) -> crate::serving_capacity::prefill_waves::Pr
 
 /// Native verify capacity shared by scheduler geometry and retained-source admission.
 pub const VERIFY_ROWS: usize = 64;
+/// Maximum compiled decode/verify row capacity exported for Qwen4 (`_m64` / `_m128`).
+pub const MAX_DECODE_ROWS: usize = 128;
+
+/// Compiled decode program capacity covering `decode_rows` live rows (`64` or `128`).
+pub const fn decode_capacity(decode_rows: usize) -> usize {
+    if decode_rows <= VERIFY_ROWS { VERIFY_ROWS } else { MAX_DECODE_ROWS }
+}
 
 /// Worst-case source ownership with no assumed GPU progress. Unit hooks still
 /// restage metadata (Q4); every such group needs its own source until read.
@@ -41,14 +48,13 @@ pub fn upload_shape(rows: usize, decode: bool, pages: usize, pools: usize, ple_r
     if mtp && units == 0 {
         if decode {
             // shared/qwen/scheduler.rs (resource::trim_budget) trims sum(depth + 1) to geometry.decode_rows;
-            // qwen4/serve.rs supplies VERIFY_ROWS through engine::DECODE_ROWS.
-            // Pending catch-up and the subsequent draft chain each have at most
-            // VERIFY_ROWS rows. Per-call alignment is bounded by one-row calls.
+            // pending catch-up and the subsequent draft chain each have at most `rows` decode rows.
+            // Per-call alignment is bounded by one-row calls.
             let row = StepTableBytes::new(1, true, pages, pools, ple_rows)?;
             let mtp_planes = [row.positions, row.rope_positions, row.block_rope_positions,
                 row.kv_slots, row.slots, row.seq_first, row.pool_slots, row.cache_lengths,
                 row.page_table, row.pool_table, 4, 4];
-            shape.append(&mtp_planes, 2 * VERIFY_ROWS)?;
+            shape.append(&mtp_planes, 2 * rows)?;
         } else {
             shape.append(&planes, units.max(1))?;
             shape.append(&[rows.checked_mul(4).context("Qwen MTP upload rows overflow")?, tables.ids], units.max(1))?;

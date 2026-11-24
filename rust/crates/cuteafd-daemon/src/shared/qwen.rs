@@ -147,10 +147,14 @@ pub(crate) struct GdnLayout {
 
 impl GdnLayout {
     pub(crate) fn new(g: GdnGeometry) -> Result<Self> {
+        Self::with_replay_rows(g, REPLAY_ROWS)
+    }
+
+    pub(crate) fn with_replay_rows(g: GdnGeometry, replay_rows: usize) -> Result<Self> {
         let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen GDN layout size overflow");
         let add = |a: usize, b: usize| a.checked_add(b).context("Qwen GDN layout size overflow");
         ensure!(g.key_heads > 0 && g.value_heads > 0 && g.key_dim > 0 && g.value_dim > 0
-            && g.conv_kernel > 0 && g.value_heads % g.key_heads == 0, "invalid Qwen GDN geometry");
+            && g.conv_kernel > 0 && g.value_heads % g.key_heads == 0 && replay_rows > 0, "invalid Qwen GDN geometry");
         let key = mul(g.key_heads, g.key_dim)?;
         let value = mul(g.value_heads, g.value_dim)?;
         let conv = add(mul(2, key)?, value)?;
@@ -159,7 +163,7 @@ impl GdnLayout {
         // Normalized K, V, decay/beta and native BF16 convolution inputs.
         let replay_row = add(add(mul(key, 4)?, mul(value, 4)?)?,
             add(mul(g.value_heads, 8)?, mul(conv, 2)?)?)?;
-        let replay_layer_bytes = mul(add(mul(REPLAY_ROWS, replay_row)?, 1023)? / 1024, 1024)?;
+        let replay_layer_bytes = mul(add(mul(replay_rows, replay_row)?, 1023)? / 1024, 1024)?;
         Ok(Self { conv_slot_bytes, state_slot_bytes, replay_layer_bytes })
     }
 
@@ -205,6 +209,7 @@ pub(crate) struct GdnBank<'a> {
     pub(crate) stream: *mut c_void,
     layers: usize,
     slots: usize,
+    replay_rows: usize,
     layout: GdnLayout,
     commit_program: &'static str,
     pub(crate) conv: Option<Dev<'a>>,
@@ -217,7 +222,13 @@ impl<'a> GdnBank<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, stream: *mut c_void,
         geometry: GdnGeometry, layers: usize, slots: usize, commit_program: &'static str) -> Result<Self> {
-        let layout = GdnLayout::new(geometry)?;
+        Self::new_with_replay_rows(library, programs, stream, geometry, layers, slots, commit_program, REPLAY_ROWS)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_replay_rows(library: &'a NativeLibrary, programs: &'a Programs<'a>, stream: *mut c_void,
+        geometry: GdnGeometry, layers: usize, slots: usize, commit_program: &'static str, replay_rows: usize) -> Result<Self> {
+        let layout = GdnLayout::with_replay_rows(geometry, replay_rows)?;
         let [conv_bytes, state_bytes, replay_bytes] = layout.pool_bytes(layers, slots)?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256), Tag::kv("shared/gdn-bank"))?);
@@ -227,11 +238,11 @@ impl<'a> GdnBank<'a> {
         let (conv, state, replay) = if layers > 0 {
             (Some(zeroed(conv_bytes)?), Some(zeroed(state_bytes)?), Some(zeroed(replay_bytes)?))
         } else { (None, None, None) };
-        let commit_tables = zeroed(3 * REPLAY_ROWS * 4)?;
+        let commit_tables = zeroed(3 * replay_rows * 4)?;
         // SAFETY: the bank's live table and stream; reserving before readiness keeps
         // every later ordered commit upload free of pinned allocation.
         unsafe { library.reserve_h2d_ordered(commit_tables.buffer, stream)? };
-        Ok(Self { library, programs, stream, layers, slots, layout, commit_program, conv, state, replay,
+        Ok(Self { library, programs, stream, layers, slots, replay_rows, layout, commit_program, conv, state, replay,
             commit_tables })
     }
 
@@ -264,12 +275,12 @@ impl<'a> GdnBank<'a> {
     }
 
     pub(crate) fn commit(&self, table: &[i32], sequences: usize) -> Result<()> {
-        ensure!(sequences <= REPLAY_ROWS && table.len() == 3 * sequences, "invalid Qwen GDN commit table");
+        ensure!(sequences <= self.replay_rows && table.len() == 3 * sequences, "invalid Qwen GDN commit table");
         for i in 0..sequences {
             let slot = usize::try_from(table[i])?;
             let first = usize::try_from(table[sequences + i])?;
             let keep = usize::try_from(table[2 * sequences + i])?;
-            ensure!(slot < self.slots && first.checked_add(keep).is_some_and(|end| end <= REPLAY_ROWS),
+            ensure!(slot < self.slots && first.checked_add(keep).is_some_and(|end| end <= self.replay_rows),
                 "Qwen GDN commit outside replay or state pool");
         }
         let bytes: Vec<u8> = table.iter().flat_map(|value| value.to_ne_bytes()).collect();

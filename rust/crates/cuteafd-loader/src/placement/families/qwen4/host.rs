@@ -50,17 +50,23 @@ impl PleHost {
     /// `unit_rows` and `waves` are the executor's prefill unit and depth; the
     /// decode stage stages `VERIFY_ROWS` tokens.
     pub fn new(cfg: &Qwen4Config, unit_rows: u64, waves: u64, row_bytes: u64) -> Result<Self, Refusal> {
+        Self::new_with_decode_rows(cfg, unit_rows, waves, row_bytes, VERIFY_ROWS)
+    }
+
+    pub fn new_with_decode_rows(cfg: &Qwen4Config, unit_rows: u64, waves: u64, row_bytes: u64, decode_rows: usize)
+        -> Result<Self, Refusal> {
         let invalid = |what: &str| Refusal::InvalidFact(format!("Qwen PLE host: {what}"));
-        let rows = usize::try_from(unit_rows.max(64)).map_err(|_| invalid("unit rows"))?;
+        let decode_rows = crate::families::qwen4::decode_capacity(decode_rows);
+        let rows = usize::try_from(unit_rows.max(decode_rows as u64)).map_err(|_| invalid("unit rows"))?;
         let waves = usize::try_from(waves.max(1)).map_err(|_| invalid("waves"))?;
         let row_bytes = usize::try_from(row_bytes).map_err(|_| invalid("row bytes"))?;
         let per_token = cfg.ple_rows();
         let prefill = rows.checked_mul(per_token).ok_or(Refusal::Overflow("Qwen PLE prefill rows"))?;
-        let decode = VERIFY_ROWS.checked_mul(per_token).ok_or(Refusal::Overflow("Qwen PLE decode rows"))?;
+        let decode = decode_rows.checked_mul(per_token).ok_or(Refusal::Overflow("Qwen PLE decode rows"))?;
         let staging = crate::formats::mapped_table::MappedStaging::new(prefill, waves, decode, row_bytes)
             .map_err(|error| invalid(&error.to_string()))?;
         let shares = crate::formats::mapped_table::token_table::TokenTable::shares(rows, waves,
-            VERIFY_ROWS, per_token);
+            decode_rows, per_token);
         let row_cache = crate::formats::mapped_table::token_table::TokenTable::cache_bytes(row_bytes, shares);
         Ok(Self { staging: (staging.total_bytes - staging.workspace_bytes) as u64,
             worker: staging.workspace_bytes as u64, row_cache: row_cache as u64 })
@@ -161,10 +167,16 @@ pub struct UploadInputs {
 impl UploadInputs {
     /// Prefill and decode arenas of one owner, and the separate MTP prefill.
     pub fn bounds(self, cfg: &Qwen4Config) -> Result<([UploadBound; 2], Option<UploadBound>), Refusal> {
+        self.bounds_with_decode_rows(cfg, VERIFY_ROWS)
+    }
+
+    pub fn bounds_with_decode_rows(self, cfg: &Qwen4Config, decode_rows: usize)
+        -> Result<([UploadBound; 2], Option<UploadBound>), Refusal> {
+        let decode_rows = crate::families::qwen4::decode_capacity(decode_rows);
         let units = if self.spark && self.waves > 1 { self.waves } else { 0 };
         let prefill = UploadBound::of(|pages, pools| upload_shape(self.prefill_rows, false, pages, pools,
             cfg.ple_rows(), cfg.layers, units, self.spark, self.mtp, self.ple_ids, false))?;
-        let decode = UploadBound::of(|pages, pools| upload_shape(VERIFY_ROWS, true, pages, pools,
+        let decode = UploadBound::of(|pages, pools| upload_shape(decode_rows, true, pages, pools,
             cfg.ple_rows(), cfg.layers, 0, self.spark, self.mtp, self.ple_ids, self.packed_decode_tables))?;
         let mtp = (units > 0 && self.mtp).then(|| UploadBound::of(|pages, pools|
             mtp_upload_shape(self.prefill_rows, pages, pools, units))).transpose()?;
@@ -175,7 +187,13 @@ impl UploadInputs {
 /// Pinned logits landing on each owner: decode and prefill arenas coexist.
 pub fn pinned_logits_bytes(owners: usize, vocab: u64)
     -> Result<u64, Refusal> {
-    let rows = 64u64.checked_add(1)
+    pinned_logits_bytes_rows(owners, vocab, VERIFY_ROWS)
+}
+
+pub fn pinned_logits_bytes_rows(owners: usize, vocab: u64, decode_rows: usize)
+    -> Result<u64, Refusal> {
+    let cap = crate::families::qwen4::decode_capacity(decode_rows) as u64;
+    let rows = cap.checked_add(1)
         .and_then(|n| n.checked_mul(owners as u64)).ok_or(Refusal::Overflow("Qwen pinned logits rows"))?;
     host_logits_bytes(rows, rows, vocab).ok_or(Refusal::Overflow("Qwen pinned logits"))
 }
@@ -188,7 +206,11 @@ pub fn mtp_pinned_logits_bytes(prefill_shape: bool, mtp: bool, vocab: u64) -> Re
 
 /// Host FP32 scoring logits: one bounded decode/head wave.
 pub fn scoring_logits_bytes(span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
-    let rows = 64;
+    scoring_logits_bytes_rows(span_rows, vocab, VERIFY_ROWS)
+}
+
+pub fn scoring_logits_bytes_rows(span_rows: u64, vocab: u64, decode_rows: usize) -> Result<u64, Refusal> {
+    let rows = crate::families::qwen4::decode_capacity(decode_rows) as u64;
     host_logits_bytes(rows, span_rows, vocab).ok_or(Refusal::Overflow("Qwen scoring logits"))
 }
 

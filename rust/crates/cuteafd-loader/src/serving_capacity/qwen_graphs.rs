@@ -210,10 +210,17 @@ mod owner_graph_tests {
 pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool,
     kv_format: crate::families::qwen4::Qwen4KvCache)
     -> anyhow::Result<super::FamilyCacheGeometry> {
+    qwen_cache_geometry_placed_rows(cfg, owners, mtp, kv_format, QWEN_DECODE_ROWS)
+}
+
+pub fn qwen_cache_geometry_placed_rows(cfg: &crate::families::qwen4::Qwen4Config, owners: &[usize], mtp: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache, decode_rows: usize)
+    -> anyhow::Result<super::FamilyCacheGeometry> {
     use super::{KvPlacement, RankCacheGeometry};
     let segments = qwen_graph_segments(owners).ok_or_else(|| anyhow::anyhow!("invalid Qwen cache owners"))?;
     anyhow::ensure!(owners.len() <= cfg.layers, "Qwen cache owner count exceeds the backbone");
-    let mut geometry = super::qwen_cache_geometry(cfg, owners.len(), mtp, kv_format)?;
+    let cap = crate::families::qwen4::decode_capacity(decode_rows) as u64;
+    let mut geometry = super::qwen_cache_geometry_rows(cfg, owners.len(), mtp, kv_format, decode_rows)?;
     if segments.len() == 1 { return Ok(geometry); }
     let mut ranks = vec![RankCacheGeometry::default(); 2];
     let mut previous = RankCacheGeometry::default();
@@ -222,7 +229,7 @@ pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, own
         Ok(())
     };
     for (layer, &owner) in owners.iter().enumerate() {
-        let current = super::qwen_cache_geometry(cfg, layer + 1, false, kv_format)?.ranks[0];
+        let current = super::qwen_cache_geometry_rows(cfg, layer + 1, false, kv_format, decode_rows)?.ranks[0];
         let rank = &mut ranks[owner];
         add(&mut rank.persistent_unit_bytes, current.persistent_unit_bytes - previous.persistent_unit_bytes)?;
         add(&mut rank.active_state_per_sequence_bytes,
@@ -238,7 +245,7 @@ pub fn qwen_cache_geometry_placed(cfg: &crate::families::qwen4::Qwen4Config, own
     add(&mut ranks[0].retained_mark_bytes, all.retained_mark_bytes - previous.retained_mark_bytes)?;
     ranks[0].pool_metadata_unit_bytes = all.pool_metadata_unit_bytes;
     ranks[0].fixed_state_bytes = all.fixed_state_bytes;
-    ranks[1].fixed_state_bytes = 3 * QWEN_DECODE_ROWS as u64 * 4;
+    ranks[1].fixed_state_bytes = 3 * cap * 4;
     geometry.placement = KvPlacement::PartitionedLayers;
     geometry.ranks = ranks;
     Ok(geometry)
@@ -287,10 +294,15 @@ pub fn qwen_unit_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, shap
 }
 
 /// The largest scratch among the programs one Qwen step launches at `cap`
-/// (`m64` / `m4096`), and the index top-k scratch, from the program manifest.
+/// (`m64` / `m128` / `m4096`), and the index top-k scratch, from the program manifest.
 pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool,
     kv_format: crate::families::qwen4::Qwen4KvCache) -> (u64, u64) {
-    let cap = if decode { "m64" } else { "m4096" };
+    qwen_step_scratch_rows(manifest, decode, QWEN_DECODE_ROWS, ple_fp8, kv_format)
+}
+
+pub fn qwen_step_scratch_rows(manifest: &serde_json::Value, decode: bool, decode_rows: usize, ple_fp8: bool,
+    kv_format: crate::families::qwen4::Qwen4KvCache) -> (u64, u64) {
+    let cap = if !decode { "m4096" } else if decode_rows <= QWEN_DECODE_ROWS { "m64" } else { "m128" };
     let suffix = if kv_format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
     let scratch = |name: &str| manifest["programs"].as_array().into_iter().flatten()
         .find(|p| p["name"] == name).and_then(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64()).unwrap_or(0);
@@ -334,23 +346,32 @@ pub struct QwenAdmissionInputs<'a> {
     /// Lazily loaded EXL3 expert window (peak), 0 when experts are resident.
     pub future_expert_bytes: u64,
     pub headroom: u64,
+    /// Admitted decode/verify row budget (`64` or `128`).
+    pub decode_rows: usize,
+}
+
+impl QwenAdmissionInputs<'_> {
+    pub fn decode_capacity(&self) -> usize {
+        crate::families::qwen4::decode_capacity(if self.decode_rows == 0 { QWEN_DECODE_ROWS } else { self.decode_rows })
+    }
 }
 
 pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission, super::CacheGeometryError> {
     use cuteafd_core::memory_layout::Category;
-    let geometry = super::qwen_cache_geometry(inputs.cfg, inputs.layers, inputs.mtp, inputs.kv_format)?;
+    let decode_rows = inputs.decode_capacity();
+    let geometry = super::qwen_cache_geometry_rows(inputs.cfg, inputs.layers, inputs.mtp, inputs.kv_format, decode_rows)?;
     let rank = &geometry.ranks[0];
     let unit = geometry.logical_unit_rows;
     // Prefill owns one page table and decode one per row, each with four
     // record page ids plus one pool page id per allocation unit.
     let separate_mtp = inputs.prefill_shape.is_some() && inputs.mtp;
-    let tables_per_unit = (1 + QWEN_DECODE_ROWS as u64 + u64::from(separate_mtp)) * 5 * 4;
+    let tables_per_unit = (1 + decode_rows as u64 + u64::from(separate_mtp)) * 5 * 4;
     let per_token = (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes + tables_per_unit).div_ceil(unit);
     let ple_fp8 = inputs.ple.is_some_and(|p| p.1);
     let mapped = inputs.ple.map(|p| p.0);
     let workspace = |decode: bool| {
-        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8, inputs.kv_format));
-        let (t, logits) = if decode { (QWEN_DECODE_ROWS as u64, QWEN_DECODE_ROWS as u64) } else { (inputs.prefill_rows.max(1), 1) };
+        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch_rows(m, decode, decode_rows, ple_fp8, inputs.kv_format));
+        let (t, logits) = if decode { (decode_rows as u64, decode_rows as u64) } else { (inputs.prefill_rows.max(1), 1) };
         // Page tables follow the pool (per_token above).
         if !decode {
             if let Some(shape) = inputs.prefill_shape {
@@ -361,7 +382,7 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
         qwen_workspace_bytes(inputs.cfg, t, decode, logits, 0, mapped, scratch, topk)
     };
     let mtp_workspace = if separate_mtp {
-        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, false, ple_fp8, inputs.kv_format));
+        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch_rows(m, false, decode_rows, ple_fp8, inputs.kv_format));
         qwen_workspace_bytes(inputs.cfg, inputs.prefill_shape.unwrap().unit_rows, false, 1, 0, mapped, scratch, topk)
     } else { 0 };
     let items = vec![
@@ -389,7 +410,7 @@ mod tests {
             let admission = qwen_admission(&QwenAdmissionInputs {
                 cfg: &cfg, layers: 48, mtp: false, kv_format: Qwen4KvCache::Fp8,
                 manifest: None, prefill_rows: rows, prefill_shape: None, slots: 8,
-                mark_bytes: 0, ple: None, future_expert_bytes: 0, headroom: 0,
+                mark_bytes: 0, ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64,
             }).unwrap();
             for (name, capacity, decode, head_rows) in [
                 ("prefill step", rows, false, 1), ("decode step", 64, true, 64),
@@ -432,7 +453,7 @@ mod tests {
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
         let mut inputs = QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: true, kv_format: Qwen4KvCache::Fp8,
             manifest: None, prefill_rows: 4096, prefill_shape: None, slots: 8, mark_bytes: 0,
-             ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
+             ple: Some((160, true)), future_expert_bytes: 0, headroom: 0, decode_rows: 64 };
         let legacy = qwen_admission(&inputs).unwrap();
         inputs.prefill_shape = Some(PrefillShape { unit_rows: 2048, waves: 2 });
         let units = qwen_admission(&inputs).unwrap();

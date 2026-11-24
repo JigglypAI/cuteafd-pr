@@ -331,8 +331,8 @@ impl Recipe for QwenSingle<'_> {
         {
             return Err(Refusal::InvalidFact("invalid Qwen single-owner extent".into()));
         }
-        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(cfg, layers, mtp,
-            a.kv_format).map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
+        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry_rows(cfg, layers, mtp,
+            a.kv_format, a.decode_capacity()).map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
         let mut components = Vec::new();
         let mut previous = 0u64;
         for layer in 0..a.layers {
@@ -911,8 +911,9 @@ impl<'a> QwenDual<'a> {
         let requested = inputs.requested_pool;
         let cards = inputs.gpus.map(|gpu| gpu.capacity_bytes);
         let mut facts = PoolFacts::new(inputs.context, requested, page);
-        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(
-            a.cfg, layers, mtp, a.kv_format)
+        let decode_cap = a.decode_capacity() as u64;
+        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry_rows(
+            a.cfg, layers, mtp, a.kv_format, a.decode_capacity())
             .map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
         // Records are owned by the layer's rank; the probe accumulates each
         // owner's full-attention layers exactly as the contract prices them.
@@ -935,7 +936,7 @@ impl<'a> QwenDual<'a> {
         // pool, so a model with no full-attention records still pays a
         // nonzero slope and keeps a finite domain. Mirrors `prepare`.
         let complete = compute(a.layers, a.mtp)?.ranks[0];
-        let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+        let tables = (1 + decode_cap) * 5 * 4;
         let mut slopes = [0u64; 2];
         for (gpu, slope) in slopes.iter_mut().enumerate() {
             let overhead = tables.checked_add(if gpu == 0 { complete.pool_metadata_unit_bytes } else { 0 })
@@ -1055,8 +1056,9 @@ impl Recipe for QwenDual<'_> {
         if request.context.maximum != self.context || self.maximum_pages == 0 {
             return Err(Refusal::InvalidFact("invalid Qwen dual extent".into()));
         }
-        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(cfg, layers, mtp,
-            a.kv_format).map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
+        let decode_cap = a.decode_capacity() as u64;
+        let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry_rows(cfg, layers, mtp,
+            a.kv_format, a.decode_capacity()).map_err(|error| Refusal::InvalidFact(format!("Qwen cache geometry: {error}")));
         let mut components = Vec::new();
         let mut previous = crate::serving_capacity::RankCacheGeometry::default();
         for (layer, &gpu) in self.owners.iter().enumerate() {
@@ -1101,7 +1103,7 @@ impl Recipe for QwenDual<'_> {
         // Both ranks allocate full-width page tables; owner0 alone owns pool
         // metadata, the MTP record arena and pending rows, and the deferred MTP
         // id buffer. The MTP arena is priced as its own physical backing.
-        let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+        let tables = (1 + decode_cap) * 5 * 4;
         let hops = plan_hops(&self.owners.iter().map(|&gpu|
             LayerMode::Whole { gpu: gpu as u8, ffn: FfnMode::Owner }).collect::<Vec<_>>(), &self.hop_spec)
             .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
@@ -1132,7 +1134,7 @@ impl Recipe for QwenDual<'_> {
             components.push(pooled(format!("qwen.owner{gpu}.records.metadata"), location,
                 overhead[gpu], Category::Kv, "records", self.maximum_pages)?);
             components.push(owner(format!("qwen.owner{gpu}.commit"), location,
-                3 * QWEN_DECODE_ROWS as u64 * 4, Category::Kv, "owner commit tables",
+                3 * decode_cap * 4, Category::Kv, "owner commit tables",
                 PlanLifetime::RESIDENT, self.maximum_pages));
             components.push(owner(format!("qwen.owner{gpu}.code"), location,
                 inputs.pending_code_bytes[gpu], Category::Runtime, "loaded code",
@@ -1143,7 +1145,7 @@ impl Recipe for QwenDual<'_> {
                 layers: a.layers, mtp: gpu == 0 && a.mtp, kv_format: a.kv_format,
                 manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
                 slots: a.slots, mark_bytes: a.mark_bytes,
-                ple: a.ple, future_expert_bytes: 0, headroom: a.headroom })
+                ple: a.ple, future_expert_bytes: 0, headroom: a.headroom, decode_rows: a.decode_rows })
                 .map_err(|error| Refusal::InvalidFact(format!("Qwen owner admission: {error}")))?;
             for (index, &(category, group, bytes)) in admitted.items.iter().enumerate() {
                 if !matches!(group, "decode step" | "prefill step" | "prefill MTP step") { continue; }
@@ -1366,7 +1368,7 @@ mod tests {
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                     kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 8,
-                    mark_bytes: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                    mark_bytes: 0, ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64 },
                 owner_manifests: [None; 2],
                 gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 0,
                     baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
@@ -1490,7 +1492,7 @@ mod tests {
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64 },
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
@@ -1721,7 +1723,7 @@ mod tests {
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64 },
             capacity_bytes: 96 * gib, baseline, pending_code_bytes: 0, max_context: 131072,
             requested_pool, spark_ranks,
             host: QwenHost::ample(cfg, 1, 4096).unwrap(), encoders: Default::default() }
@@ -1795,7 +1797,7 @@ mod tests {
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
                     kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                    mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
+                    mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64 },
                 owner_manifests: [None; 2], gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 0,
                     baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
                 arenas: &arenas, layer_experts: &experts, layer_extra: &extra, fixed: vec![],
@@ -2185,7 +2187,7 @@ mod tests {
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
-                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
+                mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0, decode_rows: 64 },
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],

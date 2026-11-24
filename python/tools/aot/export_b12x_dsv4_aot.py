@@ -1770,6 +1770,47 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out.append((f"attn_producer_w8_kv_fp8_m{cap}", "attn_producer",
                     {"max_rows": cap, "fp8_only": mode, "kv_format": "fp8"},
                     lambda r=cap, m=mode: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8_only=m, kv_format="fp8")))
+    # Wide decode/verify (DECODE_ROWS=128) additive exports: preserve every m64/m4096 export byte-identically.
+    wide = 128
+    if wide != decode_rows and wide != prefill_rows:
+        out += [
+            (f"ple_commit_m{wide}", "ple_commit", {"replay_rows": wide},
+             lambda r=wide: qwen4.compile_qwen4_ple_commit_aot(g, replay_rows=r)),
+            (f"gdn_commit_m{wide}", "gdn_commit", {"replay_rows": wide},
+             lambda r=wide: qwen4_gdn.compile_qwen4_gdn_commit_aot(g, replay_rows=r)),
+            (f"gdn_m{wide}", "gdn", {"max_rows": wide, "decode": True},
+             lambda r=wide: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r, decode=True)),
+            (f"attn_producer_m{wide}", "attn_producer", {"max_rows": wide},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r)),
+            (f"index_topk_m{wide}", "index_topk", {"max_rows": wide, "max_context": max_context},
+             lambda r=wide: attn.compile_qwen4_index_topk_aot(g, max_rows=r, max_context=max_context)),
+            (f"sparse_gqa_m{wide}", "sparse_gqa", {"max_rows": wide, "route": "decode"},
+             lambda r=wide: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, route="decode")),
+            (f"attn_o_m{wide}", "attn_o", {"max_rows": wide},
+             lambda r=wide: attn.compile_qwen4_attn_o_aot(g, max_rows=r)),
+            (f"gdn_fp8_m{wide}", "gdn", {"max_rows": wide, "fp8": True},
+             lambda r=wide: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r, fp8=True)),
+            (f"attn_producer_fp8_m{wide}", "attn_producer", {"max_rows": wide, "fp8": True},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8=True)),
+            (f"attn_o_fp8_m{wide}", "attn_o", {"max_rows": wide, "fp8": True},
+             lambda r=wide: attn.compile_qwen4_attn_o_aot(g, max_rows=r, fp8=True)),
+            (f"gdn_w8_m{wide}", "gdn", {"max_rows": wide, "fp8_only": "decode"},
+             lambda r=wide: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r, fp8_only="decode")),
+            (f"attn_producer_w8_m{wide}", "attn_producer", {"max_rows": wide, "fp8_only": "decode"},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8_only="decode")),
+            (f"attn_o_w8_m{wide}", "attn_o", {"max_rows": wide, "fp8_only": "decode"},
+             lambda r=wide: attn.compile_qwen4_attn_o_aot(g, max_rows=r, fp8_only="decode")),
+            (f"attn_producer_kv_fp8_m{wide}", "attn_producer", {"max_rows": wide, "kv_format": "fp8"},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, kv_format="fp8")),
+            (f"sparse_gqa_kv_fp8_m{wide}", "sparse_gqa", {"max_rows": wide, "kv_format": "fp8", "route": "decode"},
+             lambda r=wide: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r, kv_format="fp8", route="decode")),
+            (f"attn_producer_fp8_kv_fp8_m{wide}", "attn_producer",
+             {"max_rows": wide, "fp8": True, "kv_format": "fp8"},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8=True, kv_format="fp8")),
+            (f"attn_producer_w8_kv_fp8_m{wide}", "attn_producer",
+             {"max_rows": wide, "fp8_only": "decode", "kv_format": "fp8"},
+             lambda r=wide: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8_only="decode", kv_format="fp8")),
+        ]
     return out
 
 
