@@ -15,6 +15,7 @@ use crate::shared::experts::staging::RouteStaging;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use crate::shared::memory::receipts::Inventory;
+use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::memory::weight_arena::DeviceArena;
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
 use crate::shared::spark_intake::SparkLink;
@@ -25,16 +26,18 @@ use crate::shared::token_table::{enqueue as enqueue_table_h2d, CopyPlane};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{arena_class, ArenaTag};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
-use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
+use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::{
-    mla_split_scratch_bytes, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+    mla_split_scratch_bytes, wave_metadata_layout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+    WAVE_METADATA,
 };
 use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
+use cuteafd_loader::serving_capacity::WeightArenaLayout;
 use cuteafd_transport::{
     expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
     ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
@@ -218,6 +221,77 @@ impl<'a> WaveScratch<'a> {
         }
         for (i, alloc) in self.engram_masked.iter().enumerate() {
             alloc.inventory(inventory, &format!("{prefix}.engram_masked.{i}"))?;
+        }
+        Ok(())
+    }
+}
+
+struct MetadataUpload<'a> {
+    backing: HostAllocation<'a>,
+    layout: WeightArenaLayout,
+    completion: Vec<Event<'a>>,
+    pending: bool,
+}
+
+impl<'a> MetadataUpload<'a> {
+    fn new(devices: &[Device<'a>], layout: WeightArenaLayout) -> Result<Self> {
+        let completion = devices.iter().copied().map(Event::new).collect::<Result<_>>()?;
+        let backing = HostAllocation::new(devices[0].library, layout.bytes(), Tag::staging("hy4_flash/wave-metadata"))?;
+        Ok(Self { backing, layout, completion, pending: false })
+    }
+
+    fn upload(&mut self, ranks: &[RankRuntime<'a>], slot: usize, planes: [&[u8]; WAVE_METADATA.len()]) -> Result<()> {
+        ensure!(!self.pending, "Hy4 wave metadata still in flight");
+        ensure!(ranks.len() == self.completion.len(), "Hy4 metadata rank count changed");
+        let mut sources = [CuteafdHostBuffer::default(); WAVE_METADATA.len()];
+        let mut lengths = [0; WAVE_METADATA.len()];
+        let source = self.backing.buffer;
+        let bytes = self.backing.bytes_mut();
+        let mut count = 0;
+        for (name, contents) in WAVE_METADATA.into_iter().zip(planes) {
+            if contents.is_empty() {
+                continue;
+            }
+            let view = self.layout.view(name).with_context(|| format!("Hy4 missing metadata view {name}"))?;
+            ensure!(contents.len() <= view.bytes(), "Hy4 metadata {name} exceeds its admitted view");
+            let at = view.offset();
+            bytes[at..at + contents.len()].copy_from_slice(contents);
+            sources[count] = CuteafdHostBuffer { ptr: source.ptr.wrapping_byte_add(at), bytes: contents.len(), ..source };
+            lengths[count] = contents.len();
+            count += 1;
+        }
+        self.pending = true;
+        for (r, event) in ranks.iter().zip(&mut self.completion) {
+            let wave = &r.waves[slot];
+            let mut dst = [CuteafdDeviceBuffer::default(); WAVE_METADATA.len()];
+            let bufs = [wave.positions_i64.buffer, wave.positions_i32.buffer, wave.dsa_slots_i64.buffer,
+                wave.swa_slots_i64.buffer, wave.dsa_page_table.buffer, wave.swa_page_table.buffer,
+                wave.dsa_cu_seqlens.buffer, wave.swa_cu_seqlens.buffer, wave.swa_seqlens.buffer,
+                wave.idx_limits.buffer, wave.idx_group_pos.buffer, wave.idx_group_slots.buffer];
+            for (target, buffer) in dst.iter_mut().zip(bufs.into_iter().zip(planes).filter_map(|(buffer, plane)| {
+                (!plane.is_empty()).then_some(buffer)
+            })) {
+                *target = buffer;
+            }
+            r.device.run(|| {
+                // SAFETY: the pinned source is private to this slot and stays immutable
+                // until both events complete (or terminal retirement drains the streams).
+                unsafe { r.device.library.copy_host_buffers_h2d_batch_async(
+                    &dst[..count], &sources[..count], &lengths[..count], r.stream.raw,
+                ) }
+            })?;
+            event.record(&r.stream)?;
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self) -> Result<()> {
+        if self.pending {
+            for event in &self.completion {
+                // SAFETY: these are this slot's recorded source-completion events.
+                event.device.run(|| unsafe { event.device.library.cuda_event_synchronize(event.raw) })?;
+            }
+            self.pending = false;
         }
         Ok(())
     }
@@ -1172,6 +1246,7 @@ pub(crate) struct Hy4Engine<'a> {
     max_seq_pages: usize,
     graphs_enabled: Cell<bool>,
     swa_pt_host: Vec<i32>,
+    metadata_uploads: Vec<MetadataUpload<'a>>,
     ranks: Vec<RankRuntime<'a>>,
     head_handoff: Option<Handoff<'a>>,
     spark: Option<SparkLink<'a>>,
@@ -1278,6 +1353,10 @@ impl<'a> Hy4Engine<'a> {
         let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
         let max_seq_pages = admitted_context.div_ceil(PAGE_ROWS).max(16);
 
+        let metadata_uploads = (0..prefill_waves).map(|slot| {
+            let wave = WaveScratchLayout::new(&cfg, 0, slot, gpus, max_rows, max_seq_pages, max_sequences)?;
+            MetadataUpload::new(devices, wave_metadata_layout(slot, &wave.arena)?)
+        }).collect::<Result<Vec<_>>>()?;
         let mut ranks = Vec::with_capacity(gpus);
         for (rank, weights) in weights_all.into_iter().enumerate() {
             let device = devices[rank];
@@ -1393,6 +1472,7 @@ impl<'a> Hy4Engine<'a> {
             max_seq_pages: max_seq_pages.max(16),
             graphs_enabled: Cell::new(false),
             swa_pt_host,
+            metadata_uploads,
             ranks,
             head_handoff,
             spark: None,
@@ -1700,6 +1780,9 @@ impl<'a> Hy4Engine<'a> {
     }
 
     pub(crate) fn inventory(&self, weights_inv: &mut Inventory<'_>, retained_inv: &mut Inventory<'_>) -> Result<()> {
+        for upload in &self.metadata_uploads {
+            retained_inv.pinned(upload.layout.id(), upload.backing.buffer)?;
+        }
         for (rank, r) in self.ranks.iter().enumerate() {
             r.weights.inventory(weights_inv, retained_inv)?;
             r.cache.inventory(retained_inv)?;
@@ -2021,6 +2104,12 @@ impl<'a> Hy4Engine<'a> {
         // BEFORE launching embed/layer 0 so host I/O overlaps with GPU execution.
         let engram_wave = self.engram.begin_wave(&unit.layers, &engram_members, priority)?;
 
+        self.metadata_uploads[wave_slot].upload(&self.ranks, wave_slot, [
+            &pos_i64, &pos_i32, &dsa_slots_i64, &swa_slots_i64,
+            &dsa_pt_bytes, &swa_pt_slice_bytes, &cu_singleton, &swa_cu_bytes,
+            &swa_seqlens_bytes, &limits_bytes, &g_pos_bytes, &g_slots_bytes,
+        ])?;
+
         // Embed tokens on rank 0 into waves[wave_slot].r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
             let r0 = &mut self.ranks[0];
@@ -2042,30 +2131,6 @@ impl<'a> Hy4Engine<'a> {
                     bytes,
                     self.ranks[1].stream.raw,
                 )
-            })?;
-        }
-
-        // Upload unit metadata ONCE into this wave slot on each rank's non-blocking stream;
-        // Engram layers land from pinned staging right before each Engram layer runs.
-        for r in &self.ranks {
-            let w = &r.waves[wave_slot];
-            r.device.run(|| unsafe {
-                let s = r.stream.raw;
-                r.device.library.copy_h2d_ordered(w.positions_i64.buffer, &pos_i64, s)?;
-                r.device.library.copy_h2d_ordered(w.positions_i32.buffer, &pos_i32, s)?;
-                r.device.library.copy_h2d_ordered(w.dsa_slots_i64.buffer, &dsa_slots_i64, s)?;
-                r.device.library.copy_h2d_ordered(w.swa_slots_i64.buffer, &swa_slots_i64, s)?;
-                r.device.library.copy_h2d_ordered(w.dsa_page_table.buffer, &dsa_pt_bytes, s)?;
-                r.device.library.copy_h2d_ordered(w.swa_page_table.buffer, &swa_pt_slice_bytes, s)?;
-                r.device.library.copy_h2d_ordered(w.dsa_cu_seqlens.buffer, &cu_singleton, s)?;
-                r.device.library.copy_h2d_ordered(w.swa_cu_seqlens.buffer, &swa_cu_bytes, s)?;
-                r.device.library.copy_h2d_ordered(w.swa_seqlens.buffer, &swa_seqlens_bytes, s)?;
-                r.device.library.copy_h2d_ordered(w.idx_limits.buffer, &limits_bytes, s)?;
-                if !g_pos_bytes.is_empty() {
-                    r.device.library.copy_h2d_ordered(w.idx_group_pos.buffer, &g_pos_bytes, s)?;
-                    r.device.library.copy_h2d_ordered(w.idx_group_slots.buffer, &g_slots_bytes, s)?;
-                }
-                Ok(())
             })?;
         }
 
@@ -3146,6 +3211,8 @@ impl<'a> Hy4Engine<'a> {
                         .get_mut(unit.slot)
                         .and_then(Option::take)
                         .context("Hy4 commit_unit without active unit")?;
+                    // End-of-unit boundary: only wait for the source DMA, not the layers.
+                    self.engine.metadata_uploads[unit.slot].retire()?;
                     for m in &batch.members {
                         let p = &mut self.placements[m.sequence];
                         p.len = m.pos_start + m.row_len;
