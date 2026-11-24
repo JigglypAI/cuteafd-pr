@@ -171,11 +171,12 @@ def test_deployment_preserves_release_container_commands(
                 assert after["command"].count("--fp8-head") == 1
                 assert after["command"][head + 1] == "auto"
                 before["command"][before["command"].index("--fp8-head") + 1] = "auto"
-                # Preserve historical whole-drafter commands with the now-explicit choice.
-                # On max pairs this is the mock planner's selection, not a fit assertion.
+                # The new default splits on active two-RTX DFlash2 layouts.
                 position = after["command"].index("--tp2-dflash")
                 assert after["command"].count("--tp2-dflash") == 1
-                assert after["command"][position + 1] == "false"
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
+                assert after["command"][position + 1] == tp2_dflash
                 del after["command"][position:position + 2]
                 if "--vision-peers" in before["command"]:
                     endpoints = before["command"][before["command"].index("--vision-peers") + 1].split(",")
