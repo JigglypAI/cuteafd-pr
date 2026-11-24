@@ -146,6 +146,7 @@ pub struct Hy4Inputs {
     pub sequences: u64,
     pub prefix_mark_slots: usize,
     pub targets: Vec<CoordinatorWeights>,
+    pub target_mount_load: crate::shared::dense_read::MountLoad,
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
     pub routed: Vec<usize>,
@@ -659,6 +660,13 @@ impl Recipe for Hy4Inputs {
         let mut components = Vec::new();
         for gpu in 0..self.gpus {
             components.extend(self.rank_owners(gpu, maximum)?);
+        }
+        for reader in ["dense", "native"] {
+            components.extend(self.target_mount_load.allocations(&format!("hy4_flash.{reader}.mount"))
+                .into_iter().map(|owner| {
+                    let bytes = owner.bytes;
+                    Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum)
+                }));
         }
         components.extend(
             serving::ServingOwners {

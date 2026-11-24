@@ -1076,6 +1076,7 @@ mod tests {
             sequences: 16,
             prefix_mark_slots: 16,
             targets: vec![target],
+            target_mount_load: Default::default(),
             placement: AttentionPlacement::Heads,
             modes,
             routed: routed.clone(),

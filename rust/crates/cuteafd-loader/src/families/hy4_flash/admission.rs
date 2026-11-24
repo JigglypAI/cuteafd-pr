@@ -568,6 +568,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         headroom: host_headroom,
     });
 
+    let target_mount_load = super::weight_layout::target_mount_load(request.checkpoint, gpus)
+        .map_err(|error| refused(
+            format!("Hy4-flash dense load staging refused: {error:#}"),
+            "Check dense tensor header extents.",
+        ))?;
+
     Ok(Hy4Inputs {
         cfg: cfg.clone(),
         kv_format: request.kv_format,
@@ -580,6 +586,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         sequences: request.sequences,
         prefix_mark_slots,
         targets,
+        target_mount_load,
         placement: request.attention,
         modes,
         routed,
