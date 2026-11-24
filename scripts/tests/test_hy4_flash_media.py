@@ -227,3 +227,15 @@ def test_inject_replaces_rows_before_stream_expansion():
     assert torch.equal(out[:span["start"]], original[:span["start"], None].expand(-1, 4, -1))
     with pytest.raises(ValueError):
         media.inject_embeddings(torch.randn(len(w["tokens"]), media.WIDTH), w, {span["key"]: feature[:-1]})
+
+
+def test_engine_identity_matches_probe_contract(tmp_path):
+    import hashlib
+    snapshot = tmp_path / "cc72179113573d751ed3245e3e58d3640694378d"
+    snapshot.mkdir()
+    for name in ("config.json", "tokenizer.json", "model.safetensors.index.json"):
+        (snapshot / name).write_text(name)
+    identity = media.engine_identity(snapshot)
+    assert identity == {"snapshot_revision": snapshot.name, "family": "Hy4Flash", "source": "sglang@ccb8d9cc",
+                        **{f"{n}_sha256": hashlib.sha256(n.encode()).hexdigest()
+                           for n in ("config.json", "tokenizer.json", "model.safetensors.index.json")}}

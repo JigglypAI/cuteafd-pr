@@ -388,6 +388,8 @@ def main():
     parser.add_argument("--media", action="store_true", help="inject the bundled vit.* tower for media windows")
     parser.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
     parser.add_argument("--media-features-out", type=Path, help="write immutable BF16 feature files")
+    parser.add_argument("--engine-snapshot", type=Path,
+                        help="snapshot the engine serves; feature files bind its identity (default --snapshot)")
     parser.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--geometry", choices=("tiled", "official-full"), default="tiled",
                         help="official-full runs the pinned HF decoder layers at full length (short media panels "

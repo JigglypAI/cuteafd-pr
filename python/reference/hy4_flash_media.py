@@ -179,6 +179,19 @@ def _source_hashes():
             "sglang_revision": sources.SGLANG_REVISION, "sglang_files": sources.SGLANG_VISION_FILES}
 
 
+SOURCE_REVISION = "sglang@ccb8d9cc"
+
+
+def engine_identity(snapshot):
+    """Exactly the identity the engine's feature-override probe verifies (shared/probe/still.rs)."""
+    snapshot = Path(snapshot)
+    identity = {"snapshot_revision": snapshot.name, "family": "Hy4Flash", "source": SOURCE_REVISION}
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json", "tiktoken.model", "model.safetensors.index.json"):
+        if (snapshot / name).is_file():
+            identity[name + "_sha256"] = hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
+    return identity
+
+
 def provenance(args, manifest):
     import PIL
     snapshot = Path(args.snapshot)
@@ -212,6 +225,8 @@ def window_features(args, manifest):
     root = getattr(args, "media_root", None) or args.windows.parent
     mode = "serving" if getattr(args, "tower_dtype", "bf16") == "bf16" else "f32"
     weights = vision.load_weights(args.snapshot)
+    # Feature files bind the snapshot the engine serves (its probe checks this identity exactly).
+    feature_identity = engine_identity(getattr(args, "engine_snapshot", None) or args.snapshot)
     features, bindings, entries = {}, {}, []
     try:
         for window in manifest["windows"]:
@@ -226,7 +241,7 @@ def window_features(args, manifest):
                 out = getattr(args, "media_features_out", None)
                 if out and not getattr(args, "_prefix_probe", False):
                     entries.append(write_features(out, span, output.bfloat16().contiguous().cpu().view(torch.uint16).numpy(),
-                                                  tower_dtype="bf16" if mode == "serving" else "fp32", identity=identity))
+                                                  tower_dtype="bf16" if mode == "serving" else "fp32", identity=feature_identity))
     finally:
         del weights
         torch.cuda.synchronize()
@@ -235,6 +250,30 @@ def window_features(args, manifest):
     if out and not getattr(args, "_prefix_probe", False):
         index = {"schema": "cuteafd.media.features.index/1", "family": "hy4_flash",
                  "checkpoint": manifest["checkpoint"], "tokenizer_sha256": identity["tokenizer_sha256"],
+                 "snapshot_identity": feature_identity,
                  "set_sha256": manifest["set_sha256"], "features": [entry["key"] for entry in entries]}
         publish_immutable(Path(out) / "features.json", canonical(index) + b"\n")
     return features, identity
+
+
+def export_main():
+    """Write engine-probe feature files for a panel without the LM:
+    ``python3 hy4_flash_media.py --snapshot BF16 --engine-snapshot SERVED --windows W --out DIR``."""
+    import argparse
+    from fidelity_windows import load_set
+    p = argparse.ArgumentParser(description=export_main.__doc__)
+    p.add_argument("--snapshot", type=Path, required=True)
+    p.add_argument("--engine-snapshot", type=Path)
+    p.add_argument("--windows", type=Path, required=True)
+    p.add_argument("--media-root", type=Path)
+    p.add_argument("--out", dest="media_features_out", type=Path, required=True)
+    p.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
+    a = p.parse_args()
+    features, _ = window_features(a, load_set(a.windows, "hy4_flash"))
+    print(f"{a.media_features_out}: {len(features)} feature sets")
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    export_main()
