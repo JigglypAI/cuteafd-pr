@@ -720,6 +720,47 @@ impl NativeVision {
                 None, std::ptr::null_mut()))
         }
     }
+    /// Qualification only: the batched encode with a per-stage observer that
+    /// receives each drained device stage (BF16 rows x width). Stage 0 is the
+    /// patch embedding, -1 after positions, 1..=depth block outputs, depth+1
+    /// the merger RMSNorm and depth+2 the final LM rows.
+    pub fn encode_batch_observed(
+        &mut self,
+        rgb: &[u8],
+        grids: &[[usize; 2]],
+        lut: &[f32; 768],
+        output: &mut [u16],
+        observe: &mut dyn FnMut(i32, *const c_void, usize, usize) -> Result<(), VisionError>,
+    ) -> Result<(), VisionError> {
+        struct Context<'a> {
+            observe: &'a mut dyn FnMut(i32, *const c_void, usize, usize) -> Result<(), VisionError>,
+            failed: Option<VisionError>,
+        }
+        unsafe extern "C" fn trampoline(context: *mut c_void, stage: i32, data: *const c_void,
+            rows: i32, width: i32, _column: i32) -> i32 {
+            // SAFETY: `context` is the live `Context` below for the synchronous encode.
+            let context = unsafe { &mut *context.cast::<Context>() };
+            match (context.observe)(stage, data, rows.max(0) as usize, width.max(0) as usize) {
+                Ok(()) => 0,
+                Err(error) => { context.failed = Some(error); 1 }
+            }
+        }
+        if !self.batch || grids.is_empty() || grids.len() > Self::MAX_BATCH {
+            return Err(VisionError::InvalidInput("observed batch requires a batch-capable tower"));
+        }
+        let packed: Vec<i32> = grids.iter().flat_map(|&[h, w]| [h as i32, w as i32]).collect();
+        let mut context = Context { observe, failed: None };
+        // SAFETY: host buffers and the observer context outlive the synchronous call;
+        // native validates every extent and drains before each observer callback.
+        let status = unsafe {
+            let encode = self._library.get::<EncodeBatch>(b"cuteafd_vision_encode_batch")?;
+            encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(), packed.as_ptr(), grids.len() as i32,
+                output.as_mut_ptr(), std::mem::size_of_val(output) as u64, Some(trampoline),
+                (&mut context as *mut Context).cast())
+        };
+        if let Some(error) = context.failed { return Err(error); }
+        check(status)
+    }
     pub fn ledger(&self) -> Result<VisionLedger, VisionError> {
         let mut ledger = VisionLedger::default();
         // SAFETY: exclusive owner is live on this thread; native writes one ledger.

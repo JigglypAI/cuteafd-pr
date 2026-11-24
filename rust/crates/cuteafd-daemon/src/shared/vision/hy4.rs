@@ -31,6 +31,7 @@ impl TowerSpec {
             pixel_layout: 1,
             temporal_input: 0,
             rotary_kind: 0,
+            passthrough_dims: (contract.hidden / contract.heads) as u32,
             absolute_kind: 2,
             position_height: POSITION_EDGE as u32,
             position_width: POSITION_EDGE as u32,
@@ -155,5 +156,95 @@ pub(crate) mod tests {
         missing.merger_extra[0] = NO_VISION_OFFSET;
         assert!(missing.tower.unwrap().validate(&missing).is_err());
         assert_ne!(spec.encoder_id("r", 120), spec.encoder_id("r", 121));
+    }
+
+    fn read_f32(path: &Path) -> Vec<f32> {
+        std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+    }
+    fn bf16(bits: u16) -> f32 { f32::from_bits(u32::from(bits) << 16) }
+    /// (cosine, max-abs, relative L2) of engine rows against the oracle stage.
+    fn compare(actual: &[f32], expected: &[f32]) -> (f64, f64, f64) {
+        assert_eq!(actual.len(), expected.len(), "stage extent differs");
+        let (mut dot, mut aa, mut ee, mut diff, mut worst) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for (&a, &e) in actual.iter().zip(expected) {
+            let (a, e) = (f64::from(a), f64::from(e));
+            dot += a * e; aa += a * a; ee += e * e; diff += (a - e) * (a - e);
+            worst = worst.max((a - e).abs());
+        }
+        (dot / (aa.sqrt() * ee.sqrt()).max(f64::MIN_POSITIVE), worst, (diff / ee.max(f64::MIN_POSITIVE)).sqrt())
+    }
+
+    /// Hardware (coordinator dev container): the real `vit.*` tower against the
+    /// independent serving-mode oracle, per stage, per fixture, single and batched.
+    /// `HY4_VISION_GOLDEN` holds `vision/<fixture>/{rgb.u8,meta.json,stage_*.f32}`;
+    /// writes `HY4_VISION_REPORT` (JSON) when set.
+    #[test]
+    #[ignore = "requires VISION_SNAPSHOT, VISION_LIBRARY, HY4_VISION_GOLDEN and a SM120/SM121 GPU"]
+    fn hy4_tower_matches_the_serving_oracle_per_stage() {
+        let snapshot = std::path::PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
+        let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let golden = std::path::PathBuf::from(std::env::var("HY4_VISION_GOLDEN").unwrap()).join("vision");
+        let processor = cuteafd_loader::media::ProcessorConfig::from_snapshot(&snapshot,
+            cuteafd_loader::media::ImageFamily::Hy4Flash).unwrap();
+        let lut = normalization_lut(&processor);
+        let spec = TowerSpec::hy4_flash(&snapshot, MAX_MERGED_ROWS).unwrap();
+        let depth = spec.native.depth as i32;
+        let required = NativeVision::required(&library, &spec.native).unwrap();
+        let mut runtime = VitRuntime::load(spec, &library, 0, required.total_bytes()).unwrap();
+        // SAFETY: the same trusted native library the tower owner loaded.
+        let native = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }.unwrap();
+        let mut fixtures: Vec<_> = std::fs::read_dir(&golden).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.join("meta.json").is_file()).collect();
+        fixtures.sort();
+        assert!(!fixtures.is_empty(), "no Hy4 vision fixtures under {}", golden.display());
+        let mut report = serde_json::Map::new();
+        let mut batch_rgb = Vec::new();
+        let mut batch_grids = Vec::new();
+        let mut singles = Vec::new();
+        let (mut worst_cos, mut worst_out) = (1f64, 0f64);
+        for fixture in &fixtures {
+            let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture.join("meta.json")).unwrap()).unwrap();
+            let grid: [usize; 2] = serde_json::from_value(meta["grid"].clone()).unwrap();
+            let rgb = std::fs::read(fixture.join("rgb.u8")).unwrap();
+            let rows = cuteafd_ffi::vision::output_rows(grid, true);
+            let mut output = vec![0u16; rows * 3072];
+            let mut stages: Vec<(String, Vec<f32>)> = Vec::new();
+            runtime.native.encode_batch_observed(&rgb, &[grid], &lut, &mut output, &mut |stage, data, rows, width| {
+                let extent = rows * width * 2;
+                let mut bytes = vec![0u8; extent];
+                native.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
+                    device_id: 0, flags: 0 }).map_err(|e| cuteafd_ffi::vision::VisionError::Runtime(e.to_string()))?;
+                let name = match stage { 0 => "0".to_string(), -1 => "pos".into(), s if s == depth + 1 => "28".into(),
+                    s if s == depth + 2 => "out".into(), s => s.to_string() };
+                stages.push((name, bytes.chunks_exact(2).map(|b| bf16(u16::from_le_bytes([b[0], b[1]]))).collect()));
+                Ok(())
+            }).unwrap();
+            let mut entry = serde_json::Map::new();
+            for (name, actual) in &stages {
+                let path = fixture.join(format!("stage_{name}.f32"));
+                if !path.is_file() { continue; }
+                let (cos, max_abs, rel) = compare(actual, &read_f32(&path));
+                if name == "out" { worst_out = worst_out.max(rel); }
+                worst_cos = worst_cos.min(cos);
+                entry.insert(name.clone(), serde_json::json!({"cosine": cos, "max_abs": max_abs, "rel_l2": rel}));
+            }
+            report.insert(fixture.file_name().unwrap().to_string_lossy().into(), entry.into());
+            batch_rgb.extend_from_slice(&rgb);
+            batch_grids.push(grid);
+            singles.extend(output);
+        }
+        // Batched owner turn must equal the single-image encodes exactly.
+        let mut batched = vec![0u16; singles.len()];
+        runtime.native.encode_batch_into(&batch_rgb, &batch_grids, &lut, &mut batched).unwrap();
+        let identical = batched == singles;
+        report.insert("batch_equals_singles".into(), identical.into());
+        report.insert("worst_cosine".into(), worst_cos.into());
+        report.insert("worst_output_rel_l2".into(), worst_out.into());
+        let text = serde_json::to_string_pretty(&report).unwrap();
+        println!("{text}");
+        if let Some(path) = std::env::var_os("HY4_VISION_REPORT") { std::fs::write(path, &text).unwrap(); }
+        assert!(identical, "batched Hy4 tower output differs from single-image encodes");
+        assert!(worst_cos > 0.999, "Hy4 tower stage cosine {worst_cos} below 0.999");
     }
 }

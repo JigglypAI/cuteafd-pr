@@ -41,16 +41,14 @@ impl LocalEncoder {
         let limits = cuteafd_core::media::ImageEncodeLimits {
             max_patches: u32::try_from(max_tokens.saturating_mul(config.merge.pow(2) as usize))
                 .unwrap_or(u32::MAX),
-            max_output_rows: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+            // Row-marker towers (Mistral, Hy4 newline rows) emit their whole LM span.
+            max_output_rows: u32::try_from(if config.token_geometry().row_markers > 0 {
+                config.max_image_tokens.max(max_tokens)
+            } else { max_tokens }).unwrap_or(u32::MAX),
             max_canvas_pixels: (max_tokens as u64)
                 .saturating_mul(u64::from(config.merge.pow(2)))
                 .saturating_mul(u64::from(config.patch.pow(2))),
-            geometry: cuteafd_core::media::ImageTokenGeometry {
-                merge: config.merge,
-                row_markers: u32::from(
-                    config.family == cuteafd_loader::media::ImageFamily::Mistral,
-                ),
-            },
+            geometry: config.token_geometry(),
         };
         Self::with_limits(service, config, width, limits)
     }
