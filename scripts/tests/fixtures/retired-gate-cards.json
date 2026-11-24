@@ -1,0 +1,168 @@
+{
+  "entries": [
+    {
+      "name": "v41-flash-max",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi",
+        "rhea",
+        "moa"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8701",
+        "EXPERT_PORT": "19801",
+        "SPARK_COUNT": "6",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_3_HOST": "kiwi",
+        "SPARK_4_HOST": "rhea",
+        "SPARK_5_HOST": "moa"
+      }
+    },
+    {
+      "name": "v41-flash-ref-tp4",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8745",
+        "EXPERT_PORT": "19845",
+        "SPARK_COUNT": "4",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_3_HOST": "kiwi"
+      }
+    },
+    {
+      "name": "v41-flash-sim5090",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8748",
+        "EXPERT_PORT": "19848",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "0",
+        "GPU_MEMORY_CAP": "31.8GiB",
+        "SPARK_INTAKE": "pinned",
+        "MAX_CONTEXT_TOKENS": "1048576",
+        "SPECULATOR": "dspark",
+        "SPARK_COUNT": "4",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_3_HOST": "kiwi"
+      }
+    },
+    {
+      "name": "v41-flash-min",
+      "family": "deepseek_v41",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8702",
+        "EXPERT_PORT": "19802",
+        "SPARK_COUNT": "3",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu"
+      }
+    },
+    {
+      "name": "v4-flash-max",
+      "family": "deepseek_v4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8704",
+        "EXPERT_PORT": "19804",
+        "SPARK_COUNT": "0"
+      }
+    },
+    {
+      "name": "glm53-exlr8-min",
+      "family": "glm5",
+      "config": "examples/configs/glm53-exlr8-min.config",
+      "gpus": [
+        0
+      ],
+      "sparks": [
+        "ostrich",
+        "dodo",
+        "emu",
+        "kiwi"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8760",
+        "EXPERT_PORT": "19860",
+        "SPARK_COUNT": "4",
+        "SPARK_0_HOST": "ostrich",
+        "SPARK_1_HOST": "dodo",
+        "SPARK_2_HOST": "emu",
+        "SPARK_3_HOST": "kiwi",
+        "SPARK_0_LANE_A": "10.55.0.1",
+        "SPARK_1_LANE_A": "10.55.0.2",
+        "SPARK_2_LANE_A": "10.55.0.3",
+        "SPARK_3_LANE_A": "10.55.0.4"
+      }
+    },
+    {
+      "name": "glmf-exlr8-k4-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exlr8-k4-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8751",
+        "EXPERT_PORT": "19851",
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0"
+      },
+      "prefill_lengths": [
+        65536
+      ]
+    }
+  ]
+}

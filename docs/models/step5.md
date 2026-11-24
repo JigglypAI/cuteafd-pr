@@ -7,8 +7,9 @@ limits. `KV_MAX_TOKENS` is unset by default and can explicitly cap growth.
 See [memory policy](../options.md#memory-and-pools).
 
 Step-5-Preview serves text from its standard Hugging Face checkpoint headers.
-The MC release cards target one RTX PRO 6000 plus three Sparks and two RTX
-plus six Sparks. Official FP8 and NVFP4 remain supported; NVFP4 experts
+The v7 MC cards use K8 compact on one RTX PRO 6000 plus three Sparks and
+two RTX plus six Sparks. Original, K6 compact and FP8 compact are compared
+on the same two-RTX layout. Official FP8 and NVFP4 remain supported; NVFP4 experts
 use the checkpoint's calibrated W4A4 math, including decode.
 
 ## EXL3 K4 MC

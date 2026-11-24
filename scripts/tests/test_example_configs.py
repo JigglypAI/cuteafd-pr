@@ -32,7 +32,7 @@ QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "hy4-flash-exl3-k4-mc-min.config", "hy4-flash-exl3-k4-mc-max.config",
                  "hy4-flash-exl3-k4-mc-k8-max.config", "hy4-flash-exl3-k4-mc-k6-max.config",
                  "hy4-flash-exl3-k4-mc-fp8-max.config", "hy4-flash-exl3-k4-mc-1rtx-1spark.config",
-                 "hy4-flash-exl3-k4-mc-1rtx-4spark-k6.config",
+                 "hy4-flash-exl3-k4-mc-1rtx-4spark.config",
                  "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
@@ -274,7 +274,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 28
+    assert len(entries) == 22
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -310,7 +310,8 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 13
+    assert len(models) == 11
+    assert models["wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1"] == {1, 2}
     assert all(columns == {1, 2} for columns in models.values())
 
 
@@ -338,7 +339,8 @@ def test_v4_flash_max_keeps_all_experts_on_the_rtx_pair() -> None:
     assert config["RTX_GPUS"] == "2" and config["SPARK_COUNT"] == "0"
     assert config["EXPERT_BACKEND"] == "auto"
     assert not any(re.fullmatch(r"SPARK_\d+_(HOST|LANE_A|LANE_B)", key) for key in config)
-    for path in ("scripts/bench/release-smoke.example.json", "scripts/bench/kits/gate/matrix-gate.json"):
+    for path in ("scripts/tests/fixtures/retired-release-example-cards.json",
+                 "scripts/tests/fixtures/retired-gate-cards.json"):
         matrix = json.loads((ROOT / path).read_text())
         entry = next(entry for entry in matrix["entries"] if entry["name"] == "v4-flash-max")
         assert entry["gpus"] == [0, 1] and entry["sparks"] == []
@@ -354,8 +356,8 @@ def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:
     for rank in range(6):
         assert config[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert config[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
-    for path in ("scripts/bench/kits/gate/matrix-gate.json",
-                 "scripts/bench/release-smoke.example.json"):
+    for path in ("scripts/tests/fixtures/retired-gate-cards.json",
+                 "scripts/tests/fixtures/retired-release-example-cards.json"):
         matrix = json.loads((ROOT / path).read_text())
         entries = {entry["name"]: entry for entry in matrix["entries"]}
         maximum = entries["v41-flash-max"]
@@ -606,6 +608,8 @@ def test_v5_smoke_card_inventory() -> None:
 
 V6 = "scripts/bench/release-smoke-v6.json"
 V6_COMPACT = "scripts/bench/release-smoke-v6-mc-compact.json"
+V7 = "scripts/bench/release-smoke-v7.json"
+V7_COMPACT = "scripts/bench/release-smoke-v7-mc-compact.json"
 
 MC_CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
@@ -622,8 +626,8 @@ def _effective(entry: dict, matrix: dict) -> dict[str, str]:
     return {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
 
 
-@pytest.mark.parametrize("matrix_path", [V6, V6_COMPACT])
-def test_v6_smoke_entries_use_a_matched_image_pair(matrix_path: str) -> None:
+@pytest.mark.parametrize("matrix_path", [V6, V6_COMPACT, V7, V7_COMPACT])
+def test_versioned_smoke_entries_use_a_matched_image_pair(matrix_path: str) -> None:
     matrix = json.loads((ROOT / matrix_path).read_text())
     tag = matrix["build"]
     for entry in matrix["entries"]:
@@ -774,6 +778,100 @@ def test_v6_compact_mode_matrix_covers_every_mc_family() -> None:
                _effective(entry, compact)["CORE_VIEW"]) for entry in compact["entries"]}
     placeholders = {(entry["family"], entry["checkpoint"], entry["core_view"]) for entry in blocked}
     assert not active & placeholders
+
+
+V7_RETIREMENTS = {
+    "v41-flash-min", "v41-flash-max", "v4-flash-min", "glm53-exlr8-min",
+    "glmf-exlr8-k4-max", "inkling2-nvfp4-min", "inkling2-mxfp8-max",
+    "qwen35-9b-bf16-min", "qwen38-27b-bf16-min", "qwen38-27b-fp8-min",
+}
+HY4_MC = "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC"
+
+
+def test_v7_release_cards_match_live_and_retired_inventory():
+    v6 = json.loads((ROOT / V6).read_text())
+    v7 = json.loads((ROOT / V7).read_text())
+    published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    assert v7["retired"] == published["retired"]
+    assert [(e["name"], e["report"]) for e in v7["retired"][:len(v6["retired"])]] == [
+        (e["name"], e["report"]) for e in v6["retired"]]
+    removed = v7["retired"][len(v6["retired"]):]
+    assert {entry["name"] for entry in removed} == V7_RETIREMENTS
+    for entry in removed:
+        assert entry["release_note"] == "retired for v7 (TJ 2026-11-24)"
+        assert (ROOT / entry["config"]).is_file()
+        assert (ROOT / entry["report"] / "report.json").is_file()
+    cards = set()
+    names = set()
+    endpoints = set()
+    for entry in v7["entries"]:
+        values = _effective(entry, v7)
+        assert entry["name"] not in names | V7_RETIREMENTS
+        names.add(entry["name"])
+        assert len(entry["gpus"]) == int(values["RTX_GPUS"])
+        assert ",".join(map(str, entry["gpus"])) == values["COORDINATOR_GPUS"]
+        assert len(entry["sparks"]) == int(values["SPARK_COUNT"])
+        assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
+        assert not {"BENCH_SIMULATED", "BENCH_HARDWARE_CLASS", "GPU_MEMORY_CAP"}.intersection(values)
+        for rank, host in enumerate(entry["sparks"]):
+            assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        for key in ("ADDR", "EXPERT_PORT"):
+            if key in entry["set"]:
+                assert (key, values[key]) not in endpoints
+                endpoints.add((key, values[key]))
+        if values["MODEL_ID"] in MC_CHECKPOINTS | {HY4_MC}:
+            assert values["CORE_VIEW"] == "k8-compact"
+        identity = (entry["family"], values["MODEL_ID"], len(entry["gpus"]), len(entry["sparks"]))
+        assert identity not in cards
+        cards.add(identity)
+    kept = {(e["family"], _effective(e, v6)["MODEL_ID"], len(e["gpus"]), len(e["sparks"]))
+            for e in v6["entries"] if e["name"] not in V7_RETIREMENTS}
+    assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)}
+    primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
+    assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
+                       for g in (1, 2) if row[f"{g}rtx"]["status"] != "na"}
+    assert {(row["family"], row["checkpoint"], row["spark_ranks"], row["1rtx"]["status"])
+            for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "pending") for n in (1, 4)}
+    hy4, = [row for row in published["cells"] if row["checkpoint"] == HY4_MC]
+    assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "pending"
+
+
+def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
+    main = json.loads((ROOT / V7).read_text())
+    compact = json.loads((ROOT / V7_COMPACT).read_text())
+    published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    compare = {"original", "k6-compact", "fp8-compact"}
+    bases = {(e["family"], _effective(e, main)["MODEL_ID"]): e for e in main["entries"]
+             if e["gpus"] == [0, 1] and _effective(e, main).get("CORE_VIEW") == "k8-compact"}
+    names = {e["name"] for e in main["entries"]}
+    ports = {(k, e["set"][k]) for e in main["entries"] for k in ("ADDR", "EXPERT_PORT") if k in e["set"]}
+    compared = set()
+    for entry in compact["entries"]:
+        assert entry["name"] not in names
+        names.add(entry["name"])
+        values = _effective(entry, compact)
+        view = values["CORE_VIEW"]
+        identity = (entry["family"], values["MODEL_ID"])
+        base = bases[identity]
+        assert entry["gpus"] == base["gpus"] and entry["sparks"] == base["sparks"]
+        for key in ("ADDR", "EXPERT_PORT"):
+            if key in entry["set"]:
+                assert (key, values[key]) not in ports
+                ports.add((key, values[key]))
+        ignore = {"ADDR", "EXPERT_PORT", "CORE_VIEW"}
+        assert {k: v for k, v in values.items() if k not in ignore} == {
+            k: v for k, v in _effective(base, main).items() if k not in ignore}
+        assert (*identity, view) not in compared
+        compared.add((*identity, view))
+    assert compared == {(*identity, view) for identity in bases for view in compare}
+    assert {model for _, model in bases} == MC_CHECKPOINTS | {HY4_MC}
+    assert {(study["family"], study["checkpoint"]) for study in published["mc_views"]} == set(bases)
+    for study in published["mc_views"]:
+        assert set(study["views"]) == compare | {"k8-compact"}
+        row = next(row for row in published["cells"] if row["checkpoint"] == study["checkpoint"])
+        assert study["views"]["k8-compact"] == row["2rtx"].get("report")
+        if study["checkpoint"] == HY4_MC:
+            assert not any(study["views"].values())
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
@@ -1182,11 +1280,10 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     published = {entry["name"]: entry for entry in
                  json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
     assert all(published.get(entry["name"], {}).get("report") == entry["report"] for entry in retired)
-    v6 = json.loads((ROOT / "scripts/bench/release-smoke-v6.json").read_text())
-    assert {name: entry["report"] for name, entry in published.items()} == {
-        entry["name"]: entry["report"] for entry in v6["retired"]
-    }
-    assert set(published) - {entry["name"] for entry in retired} == {
+    v6 = json.loads((ROOT / V6).read_text())
+    for entry in v6["retired"]:
+        assert published[entry["name"]]["report"] == entry["report"]
+    assert {entry["name"] for entry in v6["retired"]} - {entry["name"] for entry in retired} == {
         "v41-flash-reference-tp4", "glm53f-exl3-5090", "v4-flash-reference-tp4",
         "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec", "qwen38-27b-fp8-min-nospec",
         "glm53-exl3-min", "glm53-exl3-max", "glm53-exl3-k6core-min",
@@ -1215,13 +1312,13 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
 
 
 @pytest.mark.parametrize("filename", ["scripts/bench/release-smoke-v4.json",
-                                    "scripts/bench/kits/gate/matrix-gate.json"])
+                                    "scripts/tests/fixtures/retired-gate-cards.json"])
 def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) -> None:
     matrix = json.loads((ROOT / filename).read_text())
     entries = {entry["name"]: entry for entry in matrix["entries"]}
     pins = keys(ROOT / "cuteafd.config")
-    # The gate kit keeps only the live 2x card; the 1x cell retired in v6.
-    sizes = (("max", [0, 1], 0),) if "matrix-gate" in filename else (("min", [1], 1), ("max", [0, 1], 0))
+    # Only the 2x card was live at the start of v7.
+    sizes = (("max", [0, 1], 0),) if "retired-gate-cards" in filename else (("min", [1], 1), ("max", [0, 1], 0))
     for size, gpus, sparks in sizes:
         entry = entries[f"glmf-exlr8-k4-{size}"]
         config = keys(ROOT / entry["config"])
@@ -1252,7 +1349,7 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
         for key in ("ADDR", "EXPERT_PORT"):
             assert sum(other.get("set", {}).get(key) == entry["set"][key]
                        for other in entries.values()) == 1
-    if "matrix-gate" in filename:
+    if "retired-gate-cards" in filename:
         assert entries["glmf-exlr8-k4-max"]["prefill_lengths"] == [65536]
 
 
@@ -1278,11 +1375,11 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     assert not any(row["checkpoint"] == old_model for row in published["cells"])
     current = next(row for row in published["cells"] if row["checkpoint"] == config["MODEL_ID"])
-    for column in ("1rtx", "2rtx"):
-        assert current[column]["status"] == "current"
-        report = json.loads((ROOT / current[column]["report"] / "report.json").read_text())
-        settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
-        assert settings["core-view"] == "original"
+    assert current["1rtx"]["status"] == "pending"
+    assert current["2rtx"]["status"] == "current"
+    report = json.loads((ROOT / current["2rtx"]["report"] / "report.json").read_text())
+    settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
+    assert settings["core-view"] == "k8-compact"
     for suffix in ("5090", "min", "max"):
         retired = next(entry for entry in published["retired"] if entry["name"] == f"glm53f-exl3-k6-{suffix}")
         assert retired["release_note"] == "replaced by K4 MC original"
@@ -1366,12 +1463,10 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    # v6 adds a K6 minimum card and keeps original as the reference maximum.
-    assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
-    assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k6-compact-min")
-    assert row["2rtx"]["report"].endswith("-kimi-k31-mc-original-max")
+    assert row["1rtx"]["status"] == "pending"
+    assert row["2rtx"]["status"] == "current"
     study, = [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
-    assert study["views"]["original"] == row["2rtx"]["report"]
+    assert study["views"]["k8-compact"] == row["2rtx"]["report"]
     for view in ("k8-compact", "k6-compact", "fp8-compact"):
         assert study["views"][view].endswith(f"-kimi-k31-mc-{view}-max")
     assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])

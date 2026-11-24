@@ -1,5 +1,10 @@
 # Inkling 2 Small
 
+The v7 release keeps the EXL3 K4 MC cards, using K8 compact on both layouts
+and comparing original, K6 compact and FP8 compact on the two-RTX layout.
+The native NVFP4 and MXFP8 cards are retired; their checkpoints and configs
+remain supported.
+
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
 the pool then grows into remaining admitted memory, within native encoding

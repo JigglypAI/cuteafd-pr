@@ -39,6 +39,9 @@ pub fn family_title(family: &str) -> &str {
         "qwen3_5" => "Qwen 3.5 / 3.8 dense",
         "kimi_k3" => "Kimi K3",
         "step5" => "Step-5",
+        "hy4_flash" => "Hy4-flash",
+        "inkling2" => "Inkling 2 Small",
+        "minimax_m3" => "MiniMax M3.1 Flash",
         other => other,
     }
 }
@@ -163,10 +166,11 @@ impl MatrixRow {
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
     pub mc_views: Vec<McViews>,
+    supplemental: Vec<Supplemental>,
     pub retired: Vec<Retired>,
 }
 
-/// A checkpoint's four views, each pinned to a measured two-RTX report.
+/// A checkpoint's four views on its max layout. Null means not measured yet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McViews {
@@ -178,16 +182,20 @@ pub struct McViews {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct McViewReports {
-    original: PathBuf,
-    k8_compact: PathBuf,
-    k6_compact: PathBuf,
-    fp8_compact: PathBuf,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    original: Option<PathBuf>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    k8_compact: Option<PathBuf>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    k6_compact: Option<PathBuf>,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    fp8_compact: Option<PathBuf>,
 }
 
 impl McViewReports {
-    fn ordered(&self) -> [(&'static str, &Path); 4] {
-        [("original", &self.original), ("k8-compact", &self.k8_compact),
-            ("k6-compact", &self.k6_compact), ("fp8-compact", &self.fp8_compact)]
+    fn ordered(&self) -> [(&'static str, Option<&Path>); 4] {
+        [("k8-compact", self.k8_compact.as_deref()), ("original", self.original.as_deref()),
+            ("k6-compact", self.k6_compact.as_deref()), ("fp8-compact", self.fp8_compact.as_deref())]
     }
 }
 
@@ -201,6 +209,7 @@ fn validate_mc_views(rows: &[MatrixRow], entries: &[McViews]) -> Result<()> {
         let parent = Path::new("benchmarks").join(family);
         let mut reports = BTreeSet::new();
         for (view, report) in entry.views.ordered() {
+            let Some(report) = report else { continue };
             if !report_directory(report) || report.parent() != Some(parent.as_path()) {
                 bail!("{checkpoint} {view}: report must be benchmarks/{family}/<directory>");
             }
@@ -210,9 +219,12 @@ fn validate_mc_views(rows: &[MatrixRow], entries: &[McViews]) -> Result<()> {
         }
         let max = rows.iter().find(|row| &row.family == family && &row.checkpoint == checkpoint)
             .map(|row| &row.cells[1]);
-        if !max.is_some_and(|cell| cell.status == Status::Current
-            && cell.report.as_deref() == Some(entry.views.original.as_path())) {
-            bail!("{family}/{checkpoint}: original must pin the same report as the current 2rtx cell");
+        if !max.is_some_and(|cell| match cell.status {
+            Status::Current => cell.report.is_some() && cell.report == entry.views.k8_compact,
+            Status::Pending => entry.views.k8_compact.is_none(),
+            _ => false,
+        }) {
+            bail!("{family}/{checkpoint}: k8-compact must match the 2rtx cell's current report or pending status");
         }
     }
     Ok(())
@@ -264,7 +276,27 @@ struct RawMatrix {
     #[serde(default)]
     mc_views: Vec<McViews>,
     #[serde(default)]
+    supplemental: Vec<RawSupplemental>,
+    #[serde(default)]
     retired: Vec<Retired>,
+}
+
+#[derive(Debug, Clone)]
+struct Supplemental {
+    family: String,
+    checkpoint: String,
+    spark_ranks: usize,
+    cell: Cell,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSupplemental {
+    family: String,
+    checkpoint: String,
+    spark_ranks: usize,
+    #[serde(rename = "1rtx")]
+    one_rtx: RawCell,
 }
 
 #[derive(Deserialize)]
@@ -337,7 +369,19 @@ impl Matrix {
         }
         validate_mc_views(&rows, &raw.mc_views)?;
         validate_retired(&raw.retired)?;
-        Ok(Matrix { rows, mc_views: raw.mc_views, retired: raw.retired })
+        let mut supplemental = Vec::new();
+        let mut layouts = BTreeSet::new();
+        for RawSupplemental { family, checkpoint, spark_ranks, one_rtx } in raw.supplemental {
+            anyhow::ensure!((1..=8).contains(&spark_ranks)
+                && rows.iter().any(|row| row.family == family && row.checkpoint == checkpoint)
+                && layouts.insert((family.clone(), checkpoint.clone(), spark_ranks)),
+                "invalid or duplicate supplemental layout: {family}/{checkpoint}, {spark_ranks} Sparks");
+            let cell = cell(Column::OneRtx, one_rtx, &family, &checkpoint)?;
+            anyhow::ensure!(cell.status != Status::Current || cell.report.is_some(),
+                "{family}/{checkpoint}: current supplemental card needs a pinned report");
+            supplemental.push(Supplemental { family, checkpoint, spark_ranks, cell });
+        }
+        Ok(Matrix { rows, mc_views: raw.mc_views, supplemental, retired: raw.retired })
     }
 }
 
@@ -568,8 +612,8 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 11] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
-    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5"];
+const FAMILIES: [&str; 14] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
+    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5", "inkling2", "minimax_m3", "hy4_flash"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -766,6 +810,7 @@ fn render_results(placed: &[Placed], matrix: &Matrix, rows: &[Row]) -> Result<St
         out.push_str("</tr>\n");
     }
     out.push_str("</table>\n\n");
+    out.push_str(&supplemental_results(placed, &matrix.supplemental)?);
     out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking \
         off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and \
         drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache \
@@ -775,18 +820,47 @@ fn render_results(placed: &[Placed], matrix: &Matrix, rows: &[Row]) -> Result<St
     Ok(out)
 }
 
+fn supplemental_results(placed: &[Placed], entries: &[Supplemental]) -> Result<String> {
+    if entries.is_empty() { return Ok(String::new()); }
+    let escape = crate::render::svg::escape;
+    let mut out = String::from("### Supplemental layouts\n\n<table>\n<tr><th>Model · quant</th><th>Layout</th><th>Card</th></tr>\n");
+    for entry in entries {
+        let cell = match entry.cell.status {
+            Status::Current => {
+                let dir = entry.cell.report.as_ref().context("supplemental card needs a pinned report")?;
+                let p = placed.iter().find(|p| &p.dir == dir && accepted(&p.report)
+                    && p.report.server.hardware.used_gpus() == 1
+                    && p.report.server.hardware.sparks.len() == entry.spark_ranks
+                    && !p.report.server.column_5090() && !p.report.server.simulated_5090()
+                    && p.report.server.family.as_deref() == Some(entry.family.as_str())
+                    && p.report.server.checkpoint() == entry.checkpoint)
+                    .with_context(|| format!("{}: no measured report for the supplemental layout", dir.display()))?;
+                Resolved::Card(p)
+            }
+            Status::Pending => Resolved::Pending(entry.cell.reason.clone()),
+            Status::Held => Resolved::Held(entry.cell.reason.clone()),
+            Status::Na => Resolved::Na(entry.cell.reason.clone()),
+        };
+        out.push_str(&format!("<tr><td>{}</td><td>1× RTX + {}× Spark{}</td>{}</tr>\n",
+            escape(&entry.checkpoint), entry.spark_ranks, if entry.spark_ranks == 1 { "" } else { "s" }, grid_cell(&cell)));
+    }
+    out.push_str("</table>\n\n");
+    Ok(out)
+}
+
 fn mc_view_results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     validate_mc_views(&matrix.rows, &matrix.mc_views)?;
     if matrix.mc_views.is_empty() { return Ok(String::new()); }
     let escape = crate::render::svg::escape;
     let mut out = String::from("\n### Multi-core views\n\nEach multi-core checkpoint shares one set of routed experts \
-        across four core precisions selectable via `CORE_VIEW`.\n\n\
-        <table>\n<tr><th>Model · quant</th><th>original</th><th>k8-compact</th><th>k6-compact</th><th>fp8-compact</th></tr>\n");
+        across four core precisions selectable via `CORE_VIEW`. The two-RTX `k8-compact` card is the comparison base.\n\n\
+        <table>\n<tr><th>Model · quant</th><th>k8-compact</th><th>original</th><th>k6-compact</th><th>fp8-compact</th></tr>\n");
     for entry in &matrix.mc_views {
         let checkpoint = &entry.checkpoint;
         let views = entry.views.ordered();
         let mut reports = Vec::with_capacity(views.len());
         for (view, dir) in views {
+            let Some(dir) = dir else { reports.push((view, None)); continue };
             let p = placed.iter().find(|p| p.dir == dir)
                 .with_context(|| format!("{checkpoint} {view}: missing MC report {}", dir.display()))?;
             let report = &p.report;
@@ -798,16 +872,19 @@ fn mc_view_results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
                 bail!("{checkpoint} {view}: {} must be a measured two-RTX Release-smoke report for this checkpoint and view",
                     dir.display());
             }
-            reports.push((view, p));
+            reports.push((view, Some(p)));
         }
-        let original = &reports[0].1.report;
-        let sparks = original.server.hardware.sparks.len();
-        let hardware = short_hardware(original);
+        let reference = reports.iter().find_map(|(_, p)| *p);
+        let hardware = reference.map_or_else(|| "2× RTX".into(), |p| short_hardware(&p.report));
         out.push_str(&format!("<tr>\n<td width=\"20%\" valign=\"top\"><b>{}</b><br><sub>{}</sub></td>\n",
             escape(checkpoint), escape(&hardware)));
         for (view, p) in reports {
-            if p.report.server.hardware.sparks.len() != sparks {
-                bail!("{checkpoint} {view}: MC views must use the same layout as original");
+            let Some(p) = p else {
+                out.push_str("<td width=\"20%\" valign=\"top\">pending</td>\n");
+                continue;
+            };
+            if reference.is_some_and(|base| p.report.server.hardware.sparks.len() != base.report.server.hardware.sparks.len()) {
+                bail!("{checkpoint} {view}: MC views must use the same layout");
             }
             let svg = escape(&link(&p.dir, "card.svg"));
             let alt = escape(&format!("{checkpoint} ({view}) on {hardware}"));
@@ -1061,7 +1138,7 @@ mod tests {
     fn release_smoke_families_have_named_publication_pages() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let smoke: Value = serde_json::from_str(
-            &std::fs::read_to_string(root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+            &std::fs::read_to_string(root.join("scripts/bench/release-smoke-v7.json")).unwrap()).unwrap();
         let families: BTreeSet<_> = smoke["entries"].as_array().unwrap().iter()
             .map(|entry| entry["family"].as_str().unwrap()).collect();
         assert!(!families.is_empty());
@@ -1494,7 +1571,7 @@ mod tests {
         let doc = serde_json::json!({"schema": MATRIX_SCHEMA,
             "cells": [{"family": "deepseek_v41", "checkpoint": reports[0].report.server.checkpoint(),
                 "1rtx": {"status": "na", "reason": "not measured"},
-                "2rtx": {"status": "current", "report": reports[0].dir}}],
+                "2rtx": {"status": "current", "report": reports[1].dir}}],
             "mc_views": [{"family": "deepseek_v41", "checkpoint": reports[0].report.server.checkpoint(),
                 "views": {"original": reports[0].dir, "k8-compact": reports[1].dir,
                     "k6-compact": reports[2].dir, "fp8-compact": reports[3].dir}}],
@@ -1510,14 +1587,15 @@ mod tests {
         let (mc, rest) = html.split_once("\n<table>\n<tr><th>Model · quant</th><th>1× RTX</th>").unwrap();
         let (main, retired) = rest.split_once("\n### Retired\n").unwrap();
         assert!(mc.trim_start().starts_with("### Multi-core views\n"));
-        assert!(mc.contains("<th>original</th><th>k8-compact</th><th>k6-compact</th><th>fp8-compact</th>"));
+        assert!(mc.contains("<th>k8-compact</th><th>original</th><th>k6-compact</th><th>fp8-compact</th>"));
         assert!(mc.contains("<b>org/MC-&lt;&amp;&quot;</b>"));
         assert!(mc.contains("alt=\"org/MC-&lt;&amp;&quot; (k8-compact) on "));
         assert!(mc.contains("href=\"benchmarks/deepseek_v41/k8&lt;&amp;&quot;/card.svg\""));
         assert!(mc.contains("src=\"benchmarks/deepseek_v41/k8&lt;&amp;&quot;/card.svg\""));
         assert!(!mc.contains("org/MC-<&"));
         assert_eq!(mc.matches("<img ").count(), 4);
-        assert_eq!(main.matches("original/card.svg").count(), 2);
+        assert_eq!(main.matches("k8<&\"/card.svg").count(), 2);
+        assert!(!main.contains("original/card.svg"));
         assert!(!main.contains("compact/card.svg"));
         assert!(retired.contains("Last card"));
     }
@@ -1559,9 +1637,14 @@ mod tests {
         let mut duplicate = doc.clone();
         duplicate["mc_views"].as_array_mut().unwrap().push(doc["mc_views"][0].clone());
         assert!(Matrix::parse(&duplicate.to_string()).unwrap_err().to_string().contains("listed twice"));
-        let mut different_original = doc;
-        different_original["mc_views"][0]["views"]["original"] = "benchmarks/deepseek_v41/not-the-main-card".into();
-        assert!(Matrix::parse(&different_original.to_string()).unwrap_err().to_string().contains("current 2rtx cell"));
+        let mut different_base = doc.clone();
+        different_base["mc_views"][0]["views"]["k8-compact"] = "benchmarks/deepseek_v41/not-the-main-card".into();
+        assert!(Matrix::parse(&different_base.to_string()).unwrap_err().to_string().contains("k8-compact must match"));
+        let mut pending = doc;
+        pending["cells"][0]["2rtx"] = serde_json::json!({"status": "pending", "reason": "not measured"});
+        pending["mc_views"][0]["views"]["k8-compact"] = Value::Null;
+        let matrix = Matrix::parse(&pending.to_string()).unwrap();
+        assert!(mc_view_results(&mc_fixture().0, &matrix).unwrap().contains(">pending</td>"));
     }
 
     #[test]
@@ -1575,21 +1658,13 @@ mod tests {
         assert_eq!(rendered.trim(), existing);
         let (mc, rest) = rendered.split_once("</table>\n\n<table>\n<tr><th>Model · quant</th><th>1× RTX</th>").unwrap();
         assert!(mc.trim_start().starts_with("### Multi-core views"));
-        assert_eq!(mc.matches("<img ").count(), 4 * matrix.mc_views.len());
-        let compact: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
-            root.join("scripts/bench/release-smoke-v6-mc-compact.json")).unwrap()).unwrap();
-        let published: BTreeSet<_> = matrix.mc_views.iter().flat_map(|entry| entry.views.ordered())
-            .filter(|(view, _)| *view != "original").map(|(_, path)| path).collect();
-        assert_eq!(published.len(), compact.entries.len());
+        let measured: BTreeSet<_> = matrix.mc_views.iter().flat_map(|entry| entry.views.ordered())
+            .filter_map(|(_, path)| path).collect();
+        assert_eq!(mc.matches("<img ").count(), measured.len());
+        assert!(mc.contains(">pending</td>"));
+        assert!(rest.contains("### Supplemental layouts"));
         let index = std::fs::read_to_string(root.join("benchmarks/README.md")).unwrap();
-        for entry in &compact.entries {
-            // A re-carded view keeps its smoke entry name and adds a `-recard` suffix.
-            let suffix = format!("-{}", entry.name);
-            let dir = published.iter().find(|path| {
-                let path = path.to_string_lossy();
-                path.ends_with(&suffix) || path.ends_with(&format!("{suffix}-recard"))
-            })
-                .unwrap_or_else(|| panic!("{} is missing from mc_views", entry.name));
+        for dir in measured {
             assert!(root.join(dir).join("card.svg").is_file());
             assert!(index.contains(&link(dir.strip_prefix("benchmarks").unwrap(), "report.svg")));
         }
@@ -1634,7 +1709,7 @@ mod tests {
         let old: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
             root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
         let current: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
-            root.join("scripts/bench/release-smoke-v6.json")).unwrap()).unwrap();
+            root.join("scripts/bench/release-smoke-v7.json")).unwrap()).unwrap();
         let pins = |entries: &[Retired]| entries.iter()
             .map(|entry| (entry.name.clone(), entry.report.clone())).collect::<BTreeMap<_, _>>();
         let archived_ml4: Vec<_> = old.retired.iter().filter(|entry|
@@ -1661,7 +1736,10 @@ mod tests {
             // v6 retirements: the cells the v6 set replaces. The 5090 column retires
             // without entries: those cards share a live min/max recipe's config.
             "kimi-k3-min", "glm53-exlr8-max", "glmf-exlr8-k4-min",
-            "glm53f-exl3-min", "glm53f-exl3-max"]));
+            "glm53f-exl3-min", "glm53f-exl3-max",
+            // v7 retirements.
+            "v41-flash-min", "v41-flash-max", "v4-flash-min", "glm53-exlr8-min", "glmf-exlr8-k4-max",
+            "inkling2-nvfp4-min", "inkling2-mxfp8-max", "qwen35-9b-bf16-min", "qwen38-27b-bf16-min", "qwen38-27b-fp8-min"]));
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
