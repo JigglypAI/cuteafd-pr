@@ -438,8 +438,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CUTEAFD_NAMESPACE_ROOT": str(namespace), "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
-               "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3"
-                   or checkpoints.get(values.get("MODEL_ID", served), {}).get("quantization_config", {}).get("quant_method") == "exl3" else "0",
+               "CAPTURE_EXL3": "1" if checkpoints.get(values.get("MODEL_ID", served), {}).get("quantization_config", {}).get("quant_method") == "exl3" else "0",
                "CAPTURE_FIRST_LAYER": first, "CAPTURE_LAST_LAYER": last, "CAPTURE_RELEASE": "1" if release_entry else "",
                "CAPTURE_SERVED_MODEL": served,
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),

@@ -617,9 +617,6 @@ support draft/MTP comparisons or `--save-logits`.
 | `MODEL_ID` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | HF repo id | Checkpoint to serve; starting configs always set it. |
 | `MODEL_REVISION` | `1bae0e1088993b9b82de08f59de5be5a34e42170` | empty or 40–64 lowercase hex | Empty takes the hub checkout. |
 | `SERVED_MODEL_ID` | `MODEL_ID` | string | Public id in the API. |
-| `MODEL_VARIANT` | `flash` | `flash`, `pro` | V4.1 only; `pro` requires `EXPERT_FORMAT=exl3`. |
-| `EXPERT_FORMAT` | `native` | `native`, `exl3` | V4.1 routed-expert format. |
-| `SPARKINFER_EXL3` | `disable` | `auto`, `disable`, `force` | V4.1; `disable` needs `native`, `force` needs `exl3`. |
 | `INSTANCE` | unset | `[A-Za-z0-9_.-]` | Namespaces containers and state. |
 | `WIP_INSTANCE`, `WIP_ROOT` | unset | instance / absolute path | `--wip` slot staging. |
 | `WIP_BUILD_SEED` | `kakapo` | seed | Site build seed; every launch path accepts it. |
@@ -797,7 +794,7 @@ The old `-HQA` checkpoints were withdrawn from Hugging Face. Historical results 
 | `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports its full MC selection (q/k/v/o, optional gate, pre/post-expert projections and padded vocabulary head); it stays explicit, not default. Kimi K3.1 supports its full MC selection (KDA/MLA projections, shared FFN, routed latent projections and vocabulary head). GLM/Step support their selected target core; Step includes MTP core, never routed experts. Unselected operands stay native. GLM and Step require v52e coordinator exports. Measured speed/quality costs are in Optional performance levers; original stays default, FP8 stays opt-in. Already-FP8 sources refuse. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
-| `ATTENTION_PRECISION` | `bf16` | `bf16`, `fp8` | Shared MLA quality tier for prefill, decode and verification. The default `bf16` uses the fastest qualified kernel that meets BF16-tier accuracy, regardless of operand format. The opt-in `fp8` selects a faster, lower-quality route where available. Neither GLM 5.3 nor GLM Flash has a separate lower tier for native prefill: GLM 5.3 uses native BF16 and GLM Flash uses two-term E4M3 Q2P2 under both settings. The key still selects the qualified split-decode tier. Neither tier changes projection or weight precision or KV storage. Kimi K3 compact-record native prefill already widens to BF16 and uses BF16 MMAs: both settings keep it, and K3 prefill has no lower tier. K3.1 sparse MLA and V4.1 also keep their qualified attention under either setting. Non-MLA families without an FP8-tier program keep their native attention under either setting. Plan, serve and golden use `--attention-precision`. |
+| `ATTENTION_PRECISION` | `bf16` | `bf16`, `fp8` | Shared MLA quality tier for prefill, decode and verification. The default `bf16` uses the fastest qualified kernel that meets BF16-tier accuracy, regardless of operand format. The opt-in `fp8` selects a faster, lower-quality route where available. Neither GLM 5.3 nor GLM Flash has a separate lower tier for native prefill: GLM 5.3 uses native BF16 and GLM Flash uses two-term E4M3 Q2P2 under both settings. The key still selects the qualified split-decode tier. Neither tier changes projection or weight precision or KV storage. Kimi K3 compact-record native prefill already widens to BF16 and uses BF16 MMAs: both settings keep it, and K3 prefill has no lower tier. K3.1 sparse MLA keeps its qualified attention under either setting. V4.1 accepts `fp8` but resolves it to `bf16`; it has no FP8 attention tier. Non-MLA families without an FP8-tier program keep their native attention under either setting. Plan, serve and golden use `--attention-precision`. |
 | `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
@@ -891,7 +888,7 @@ when the server has no drafter or its effective draft policy is `off`.
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
-| `AUDIO` | `auto` | `auto`, `off` | Bundled audio tower. |
+| `AUDIO` | `auto` (V4.1: `off`) | `auto`, `off` (V4.1: `off` only) | Bundled audio tower. V4.1 has no audio encoder. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
 | `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
@@ -1217,7 +1214,7 @@ Media:
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | ✓ (`auto`/`off`; auto starts none) |
-| `AUDIO` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
+| `AUDIO` | `off` (default; no tower) | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
 
 Native EXLR8 (`EXLR8_MANIFEST`): GLM 5.3/ML4 and GLM Flash, the only
 architectures EXLR8 checkpoints declare. Placement is 1–2 RTX plus 1–8 Sparks; GLM Flash TP2 also
@@ -1241,9 +1238,6 @@ original core is already FP8, not an MC publication.
 | `MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MODEL_REVISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SERVED_MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MODEL_VARIANT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXPERT_FORMAT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPARKINFER_EXL3` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1300,7 +1294,7 @@ original core is already FP8, not an MC publication.
 | `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ATTENTION_PRECISION` | ✓ (`fp8` resolves to `bf16`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
@@ -1350,7 +1344,7 @@ original core is already FP8, not an MC publication.
 | `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Media** | | | | | | | | | | |  | |  |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `AUDIO` | ✓ (`off` only) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

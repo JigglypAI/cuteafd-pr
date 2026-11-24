@@ -105,9 +105,9 @@ def parse_doc() -> tuple[dict[str, dict[str, bool]], set[str]]:
                 if key.startswith("**"):
                     continue
                 cells = row[1:]
-                assert all(cell in {"✓", "✗"} for cell in cells), row
+                assert all(re.fullmatch(r"[✓✗](?: \(.+\))?", cell) for cell in cells), row
                 assert key not in matrix, f"duplicate matrix row: {key}"
-                matrix[key] = {column: cell == "✓" for column, cell in zip(COLUMNS, cells)}
+                matrix[key] = {column: cell.startswith("✓") for column, cell in zip(COLUMNS, cells)}
             continue
         if header and header[0] == "Key":
             for row in rows:
@@ -584,3 +584,18 @@ def test_attention_precision_is_shared_and_has_no_legacy_alias():
             if row[0] == "`ATTENTION_PRECISION`"]
     assert len(rows) == 1
     assert rows[0][1:3] == ["`bf16`", "`bf16`, `fp8`"]
+
+
+def test_v41_public_id_and_option_limits_are_documented():
+    assert MATRIX["SERVED_MODEL_ID"]["V4.1"]
+    assert MATRIX["AUDIO"]["V4.1"]
+    assert MATRIX["ATTENTION_PRECISION"]["V4.1"]
+    text = DOC.read_text()
+    assert "| `AUDIO` | `off` (default; no tower) |" in text
+    assert "| `ATTENTION_PRECISION` | ✓ (`fp8` resolves to `bf16`) |" in text
+
+
+def test_retired_v41_keys_are_not_known_or_documented():
+    for key in ("MODEL_VARIANT", "EXPERT_FORMAT", "SPARKINFER_EXL3", "SPARK_REDUCTION_MIN_ROWS", "KV_POOL_TOKENS"):
+        assert key not in MATRIX and key not in DOCUMENTED and key not in UNION
+        assert run_bash(f"release_known_key {key}").returncode != 0

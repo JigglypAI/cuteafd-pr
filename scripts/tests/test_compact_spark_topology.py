@@ -65,7 +65,7 @@ class CompactSparkTopologyTest(unittest.TestCase):
                 self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
 
     def test_only_active_hosts_and_rails_are_required(self):
-        result = self.config('SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n'
+        result = self.config('SPARK_COUNT=2\n'
                              'SPARK_2_HOST=\nSPARK_3_HOST=\nSPARK_2_LANE_A=\nSPARK_3_LANE_A=\n'
                              'SPARK_2_LANE_B=\nSPARK_3_LANE_B=',
                              'release_hosts_csv; release_lane_a_csv; release_lane_b_csv; release_expert_hosts_csv')
@@ -84,7 +84,7 @@ release_stop_persistent_remote_container() { echo "persistent:$1"; }
 release_stop_services coord spark
 release_stop_wip_containers
 '''
-        result = self.config('SPARK_COUNT=2\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto', command)
+        result = self.config('SPARK_COUNT=2', command)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(set(result.stdout.splitlines()),
                          {'release:ostrich', 'release:dodo', 'persistent:ostrich', 'persistent:dodo'})
@@ -97,8 +97,6 @@ release_stop_wip_containers
 
 
     # --- v10 three-rank profiles: implicit compact TP3, explicit native bypass --
-
-    COMPACT3 = 'SPARK_COUNT=3\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto'
 
     def test_implicit_counts_are_admitted(self):
         for count in (2, 3):

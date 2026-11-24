@@ -846,7 +846,7 @@ spark_tp_roles=
         script = r'''
 source scripts/lib/release-common.sh
 release_load_config cuteafd.config
-printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" \
+printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" \
   "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" \
   "$MAX_OUTPUT_TOKENS" "$ADDR" "$EXPERT_PORT" "$RTX_GPUS"
 '''
@@ -862,8 +862,6 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
             [
                 "deepseek-ai/DeepSeek-V4.1-Flash",
                 "dba1be0a40aa45a94ad051997016db3960a90277",
-                "native",
-                "disable",
                 "16",
                 "20",
                 "auto",

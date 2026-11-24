@@ -366,7 +366,7 @@ def test_slot_check_every_host_and_seal(monkeypatch):
 
 
 @pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
-@pytest.mark.parametrize('declared_by', ['config', 'model', 'format'])
+@pytest.mark.parametrize('declared_by', ['config', 'model'])
 def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path, monkeypatch):
     values = {'SPARK_COUNT': str(count)}
     name = 'unlabelled-native-card'
@@ -376,10 +376,8 @@ def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, ta
         snap.mkdir(parents=True)
         (snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'modelopt', 'moe_quant_algo': 'NVFP4'}}))
         values['MODEL_REVISION'] = 'rev'
-    elif declared_by == 'model':
-        values['MODEL_ID'] = 'nvidia/Model-NVFP4'
     else:
-        values['EXPERT_FORMAT'] = 'nvfp4'
+        values['MODEL_ID'] = 'nvidia/Model-NVFP4'
     matrix_entry = {**entry, 'name': name, 'family': family, 'set': values}
     build = cards.build_scopes([matrix_entry])
     built = set(build['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
@@ -1537,7 +1535,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     cards.build_arms({'baseline': 'HEAD', 'candidate': 'HEAD'}, arms, [card], tmp_path, 'task', True)
     cfg = cards.config(tmp_path / 'build-candidate.config')
-    assert 'SPARK_TP' not in cfg and 'SPARK_EP' not in cfg and 'MODEL_VARIANT' not in cfg
+    assert 'SPARK_TP' not in cfg and 'SPARK_EP' not in cfg
     assert cfg['RTX_EXPERT_LAYERS'] == '0' and cfg['MODEL_ID'].startswith('XiaomiMiMo/')
     tag = 'tc-' + subprocess.run([sys.executable, str(ROOT / 'scripts/build/dev-toolchain.py')], capture_output=True, text=True).stdout.strip()
     assert cfg['COORDINATOR_DOCKER_DEV'] == 'cuteafd-coordinator-dev:' + tag
@@ -2034,7 +2032,7 @@ def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatc
     ({'SPARK_COUNT': '5'}, 'tp5'),
     ({'SPARK_COUNT': '6'}, 'tp6'),
     ({'SPARK_COUNT': '8'}, 'tp8'),
-    ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
+    ({'SPARK_COUNT': '2'}, 'tp2'),
     ({'SPARK_COUNT': '0'}, None),
 ])
 def test_v41_tp_role_matches_the_launcher_derivation(tmp_path, keys, role):
@@ -2042,8 +2040,7 @@ def test_v41_tp_role_matches_the_launcher_derivation(tmp_path, keys, role):
     config.write_text('MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n')
     card = dict(name='v', family='deepseek_v41', config=str(config), set=keys, sparks=[])
     assert cards.slot_needs(card)['tp_role'] == role
-    glmf_keys = ({**keys, 'MODEL_ID': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC'}
-                 if keys.get('EXPERT_FORMAT') == 'exl3' else keys)
+    glmf_keys = {**keys, 'MODEL_ID': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC'}
     assert cards.slot_needs({**card, 'family': 'glm5_flash', 'set': glmf_keys})['tp_role'] is None
 
 
