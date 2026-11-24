@@ -69,6 +69,8 @@ pub enum SpeculatorSpec {
     NativeMtp { layers: usize },
     /// Dense bundled dSpark described by the checkpoint's native config.
     BundledDspark { layers: usize },
+    /// Bundled Hy4-flash DFly2, sharing target latent KV and recall.
+    Dfly2 { layers: usize, target_layers: Vec<usize> },
     /// DeepSeek V4.x dSpark drafter stages shipped in the checkpoint.
     Dspark { stages: usize, experts: usize, top_k: usize, target_layers: Vec<usize> },
 }
@@ -80,6 +82,7 @@ pub enum DraftOwnership {
     None,
     NativeMtp,
     BundledDspark,
+    BundledDfly2,
 }
 
 impl DraftOwnership {
@@ -87,6 +90,7 @@ impl DraftOwnership {
         match (family, speculator) {
             ("mimo_v2" | "qwen4" | "qwen3_5" | "step5", "mtp") => Self::NativeMtp,
             ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2", "dspark") => Self::BundledDspark,
+            ("hy4_flash", "dfly2") => Self::BundledDfly2,
             _ => Self::None,
         }
     }

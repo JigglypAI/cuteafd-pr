@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
-from hy4_flash.forward import AttentionTap, Layer, Model, native_projection, recalled_context, reference
+from hy4_flash.forward import (AttentionFirst, AttentionTap, Drafter, Layer, Model,
+                               native_projection, recalled_context, reference)
 
 
 def test_staged_attention_matches_independent_f32_reference():
@@ -72,6 +73,55 @@ def test_dfly_context_uses_last_committed_recall_without_duplication():
     assert recalled_context(AttentionTap(kv, rope_key, groups), 3, 2).tolist() == [0, 1, 2]
     dense = groups[:, :0]
     assert recalled_context(AttentionTap(kv, rope_key, dense), 5, 2).tolist() == [0, 1, 2, 3, 4]
+
+
+def test_dfly_absorbed_recall_matches_independent_expanded_mla():
+    """Serving-style UK/UV absorption must preserve the vendor F32 equations."""
+    torch.manual_seed(424)
+    h, nope, rope, value, latent, base = 2, 4, 4, 3, 6, 10_000
+    cfg = SimpleNamespace(attention=lambda _: (h, nope, rope, value),
+                          layer_types=[reference.SPARSE], rms_norm_eps=1e-5,
+                          compressed_indexer_compress_ratio=2,
+                          rope_parameters={reference.SPARSE: {"rope_theta": base}})
+    split = torch.randn(h, nope + value, latent)
+    layer = Layer(0, "model.dfly_layers.0.", {
+        "self_attn.q_b_proj.weight": torch.randn(h * (nope + rope), 5),
+        "self_attn.kv_b_proj.weight": split.flatten(0, 1),
+        "self_attn.learnable_sink_param": torch.randn(h),
+    })
+    model = Model(SimpleNamespace(config=cfg))
+    draft = Drafter.__new__(Drafter)
+    draft.config, draft.model, draft.layers = cfg, model, [layer]
+    draft.kv_layers, draft.index_layers = (0,), (0,)
+    end, width = 7, 6
+    groups = torch.full((end, 3), -1, dtype=torch.int32)
+    groups[-1] = torch.tensor([2, 1, 3])
+    target = AttentionTap(torch.randn(end, latent), torch.randn(end, rope), groups)
+    first = AttentionFirst(torch.randn(width, 5), torch.randn(width, latent),
+                           torch.randn(width, rope), torch.rand(width, h * value))
+    expected = draft.attention_output_inputs(first, 0, {0: target}, end)
+
+    # Keep this calculation independent of reference attention_expand: read
+    # the committed latent rows and apply UK to the query, UV to its average.
+    selected = torch.tensor([4, 5, 2, 3, 6])
+    pos = torch.arange(end, end + width)
+    cos, sin = reference.phase(pos, rope, base)
+    raw_q = (first.normalized_q @ layer.weights["self_attn.q_b_proj.weight"].T).view(width, h, nope + rope)
+    q_nope, q_rope = raw_q.split([nope, rope], -1)
+    q_rope = reference.rotate(q_rope, cos, sin)
+    absorbed = torch.einsum("qhd,hdk->qhk", q_nope, split[:, :nope])
+    kv = torch.cat((target.kv[selected], first.kv))
+    kr = torch.cat((target.rope_key[selected], reference.rotate(first.rope_key[:, None], cos, sin)[:, 0]))
+    scores = (torch.einsum("qhk,tk->qht", absorbed, kv)
+              + torch.einsum("qhd,td->qht", q_rope, kr)) * (nope + rope) ** -0.5
+    visible = torch.arange(len(kv))[None, :] <= len(selected) + torch.arange(width)[:, None]
+    scores = scores.masked_fill(~visible[:, None], -torch.inf)
+    sink = layer.weights["self_attn.learnable_sink_param"]
+    probability = torch.cat((scores, sink[None, :, None].expand(width, -1, -1)), -1).softmax(-1)[..., :-1]
+    averaged = torch.einsum("qht,tk->qhk", probability, kv)
+    actual = torch.einsum("qhk,hvk->qhv", averaged, split[:, nope:]).flatten(1) * first.gate
+    rel_l2 = (actual - expected).norm() / expected.norm()
+    assert rel_l2 < 1e-4, rel_l2
 
 
 def test_engram_calibration_rounds_fetched_rows_in_bf16(monkeypatch):

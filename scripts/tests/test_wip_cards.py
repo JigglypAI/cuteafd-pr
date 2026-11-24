@@ -1735,6 +1735,8 @@ def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None, 
     def summarize(job, code):
         row = dict(card=job['card'], arm=job['arm'], repeat=job['repeat'], simulated=False,
                    status='pass' if code == 0 else 'failed', exit_code=code)
+        if not code:
+            row['precheck'] = {'speculator': 'dspark'}
         if code:
             row.update(error='launcher said no', failure_kind='launch')
         cards.save(Path(job['state']) / 'result.json', row)
@@ -2158,7 +2160,7 @@ def test_lossless_row_dumps_reach_the_smoke_entry_only_when_asked(entry, tmp_pat
     assert e['set']['PROBE_DUMP_ROOT'] == str(job / 'lossless-rows') and (job / 'lossless-rows').is_dir()
     # Apart from the dump itself, the entry is the plain one.
     e.pop('lossless_dump')
-    assert {k for k in e if e[k] != plain[k]} <= {'set', 'config', 'prelaunch'}
+    assert {k for k in e if e[k] != plain[k]} <= {'set', 'config', 'prelaunch', 'precheck'}
     e['set'].pop('PROBE_DUMP_ROOT')
     assert {k for k in e['set'] if e['set'][k] != plain['set'][k]} == {'API_KEY_FILE'}
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
@@ -2331,9 +2333,9 @@ def test_client_runs_against_the_live_server_after_readiness(entry, tmp_path):
                          client=client)
     hook = job['entry']['precheck']
     out = Path(job['state']) / 'client'
-    assert out.is_dir() and hook['required'] and hook['timeout_s'] == cards.CLIENT_TIMEOUT_S == 3600
-    assert hook['argv'][:3] == ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={tmp_path / "key"}']
-    assert hook['argv'][-len(client):] == client and job['client'] == hook['argv']
+    assert out.is_dir() and hook['required'] and hook['timeout_s'] == cards.CLIENT_TIMEOUT_S + 180 == 3780
+    assert job['client'][:3] == ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={tmp_path / "key"}']
+    assert job['client'][-len(client):] == client and hook['argv'][2].index('--precheck') < hook['argv'][2].index('/opt/x/agentic')
     assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['precheck'] == hook
     # A card that already has a precheck (an expected pool) runs it first, then the client.
     job = cards.generate(none, 'b', dict(instance='q', slot='s'), tmp_path, tmp_path / 'key', {}, set(), 4096, 1,
@@ -2369,7 +2371,7 @@ def test_client_dry_run_shows_the_hook_and_requires_panels_none(entry, tmp_path,
     assert cards.main() == 0
     job = json.loads((state / 'plan.json').read_text())['jobs'][0]
     assert job['entry']['baseline'] is False and job['entry']['profile'] == 'panels:'
-    assert job['entry']['precheck']['timeout_s'] == 5400
+    assert job['entry']['precheck']['timeout_s'] == 5580
     output = capsys.readouterr().out
     assert '# smoke client (after readiness' in output and '/opt/x/agentic record --output s.json' in output
 
@@ -3454,21 +3456,56 @@ def test_trace_rejects_nonempty_off_only_cycles(entry, tmp_path):
     assert 'no speculator' in cards.summarize_job(job, 0)['error']
 
 
-def test_planned_speculator_identity_is_stable_and_explicit(entry, tmp_path):
+@pytest.mark.parametrize('speculator', ['dspark', 'dfly2'])
+def test_planned_speculator_identity_is_stable_and_explicit(entry, tmp_path, speculator):
     job = make(entry, tmp_path)
-    cards.planned_speculator(job, {'speculator': 'dspark'})
-    assert job['planned_speculator'] == 'dspark'
+    cards.planned_speculator(job, {'speculator': speculator})
+    assert job['planned_speculator'] == speculator
     with pytest.raises(ValueError, match='changed since enqueue'):
         cards.planned_speculator(job, {'speculator': 'off'})
     job.pop('planned_speculator')
     job['entry']['set']['SPECULATOR'] = 'off'
     cards.planned_speculator(job, {'speculator': 'off'})
     with pytest.raises(ValueError, match='differs from requested'):
-        cards.planned_speculator(job, {'speculator': 'dspark'})
+        cards.planned_speculator(job, {'speculator': speculator})
     job.pop('planned_speculator')
     job['entry']['set'].update(SPECULATOR='auto', DRAFT_LENGTH='5')
     with pytest.raises(ValueError, match='no speculator'):
         cards.planned_speculator(job, {'speculator': 'off'})
+
+
+@pytest.mark.parametrize('mode, settings', [
+    ('dfly2', [{'name': 'speculator', 'value': 'dfly2', 'source': 'resolved'}]),
+    ('off', [{'name': 'mtp', 'value': '0'}, {'name': 'dspark', 'value': 'false'}]),
+    ('mtp', [{'name': 'mtp', 'value': '3'}]),
+    ('dspark', [{'name': 'dspark', 'value': 'true'}]),
+    ('dspark', [{'name': 'draft', 'value': '/models/redhat-dspark'}]),
+    ('dflash2', [{'name': 'draft', 'value': '/models/dflash2'}]),
+])
+def test_precheck_attests_the_served_speculator(entry, tmp_path, monkeypatch, mode, settings):
+    job = make(entry, tmp_path)
+    job['planned_speculator'] = mode
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    monkeypatch.setattr(cards, 'http', lambda url, path, **kw: {'settings': settings})
+    cards.precheck(job)
+    assert json.loads((Path(job['state']) / 'precheck.json').read_text())['speculator'] == mode
+    job['planned_speculator'] = 'dfly2' if mode != 'dfly2' else 'off'
+    with pytest.raises(ValueError, match='differs from served'):
+        cards.precheck(job)
+    assert json.loads((Path(job['state']) / 'precheck.json').read_text())['status'] == 'failed'
+
+
+def test_report_fails_silent_drafter_off_even_if_strict_panel_skips(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:spec_lossless_set'}, tmp_path)
+    job['planned_speculator'] = 'dfly2'
+    report_dir = Path(job['state']) / 'reports' / 'one'
+    report_dir.mkdir(parents=True)
+    report = {'server': {'configuration': {'settings': [{'name': 'speculator', 'value': 'off', 'source': 'resolved'}]}},
+              'panels': [{'id': 'spec_lossless_set', 'status': 'unsupported'}]}
+    (report_dir / 'report.json').write_text(json.dumps(report))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed'
+    assert 'planned speculator dfly2 differs from served off' in row['error']
 
 
 @pytest.mark.parametrize('profile,expected', [('', 'off'), ('draft-timing', 'on (perturbing)'),
@@ -4548,7 +4585,8 @@ def test_serving_turn_is_bounded_by_its_jobs_budgets(entry, tmp_path, monkeypatc
         pass
     with cards.serving_turn([short, long], {}, 5):
         pass
-    expected = 100 + 200 + 120 + short['entry']['prelaunch']['timeout_s'] + cards.SMOKE_STOP_GRACE_S + cards.JOB_DRIVER_SLACK_S
+    expected = (100 + 200 + 120 + short['entry']['prelaunch']['timeout_s']
+                + short['entry']['precheck']['timeout_s'] + cards.SMOKE_STOP_GRACE_S + cards.JOB_DRIVER_SLACK_S)
     assert seen[0] == expected == cards.job_max_run(short)
     assert seen[1] == cards.job_max_run(short) + cards.job_max_run(long)
     assert cards.job_max_run(long) - cards.job_max_run(short) == 4800

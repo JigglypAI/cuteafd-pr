@@ -108,6 +108,7 @@ pub(super) fn layout(
         catalog,
         cfg,
         model_core: &model.core,
+        dfly2: opts.hy4_dfly2,
         kv_format,
         manifest_path: manifest_path.as_deref(),
         coordinator: Coordinator::Planned { rtx_bytes: opts.rtx_bytes.clone() },

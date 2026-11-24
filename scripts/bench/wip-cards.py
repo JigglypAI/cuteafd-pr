@@ -525,8 +525,14 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or probes & IMAGE_PROBES or ('memory' in probes and hosts):
-        entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=1800 if probes & IMAGE_PREFIX_PROBES else 180, required=True)
+    # Attest the deployment against the live server before any existing hook or timing.
+    previous = entry.get('precheck')
+    check = hook + ['--precheck', str(dest / 'job.json')]
+    check_timeout = 1800 if probes & IMAGE_PREFIX_PROBES else 180
+    if previous:
+        check = precheck_argv(check, previous['argv'])
+        check_timeout += previous.get('timeout_s', 0)
+    entry['precheck'] = dict(argv=check, timeout_s=check_timeout, required=True)
     if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
         sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
         window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
@@ -549,7 +555,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         argv = ['env', f'CUTEAFD_CLIENT_OUT={out}', f'CUTEAFD_API_KEY_FILE={key_file}',
                 'sh', '-c', 'cd "$CUTEAFD_CLIENT_OUT" && exec "$@"', 'client', *client]
         previous = entry.get('precheck')
-        entry['precheck'] = dict(argv=window_argv([previous['argv'], argv]) if previous else argv,
+        entry['precheck'] = dict(argv=precheck_argv(previous['argv'], argv) if previous else argv,
                                  timeout_s=client_timeout + (previous['timeout_s'] if previous else 0), required=True)
         if entry['precheck']['timeout_s'] > 7200:
             raise ValueError(card + ': --client-timeout plus the card\'s own precheck exceeds smoke\'s 7200 s hook limit')
@@ -814,7 +820,7 @@ def speculating(values):
 def planned_speculator(job, deployment):
     """Attest the identity, not just that deployment admission succeeded."""
     selected = deployment.get('speculator')
-    if selected not in {'off', 'mtp', 'dspark', 'dflash2'}:
+    if selected not in {'off', 'mtp', 'dspark', 'dflash2', 'dfly2'}:
         raise ValueError('launcher deployment preflight returned no resolved speculator identity')
     values = job['entry']['set']
     requested = values.get('SPECULATOR', 'auto')
@@ -826,6 +832,35 @@ def planned_speculator(job, deployment):
     if selected == 'off' and values.get('DRAFT_LENGTH') and speculating(values):
         raise ValueError('DRAFT_LENGTH requested but the planned launch has no speculator')
     job['planned_speculator'] = selected
+
+
+def served_speculator(settings):
+    """Normalize the server's startup settings, not the launch config request."""
+    options = {item['name']: item.get('value') for item in settings if 'name' in item}
+    resolved = next((item.get('value') for item in settings
+                     if item.get('name') == 'speculator' and item.get('source') == 'resolved'), None)
+    if resolved is not None:
+        return resolved
+    if options.get('dspark') == 'true':
+        return 'dspark'
+    draft = options.get('draft')
+    if draft and draft != 'false':
+        return 'dspark' if 'dspark' in draft.lower() else 'dflash2'
+    if str(options.get('mtp', '')).isdigit() and int(options['mtp']) > 0:
+        return 'mtp'
+    return 'off'
+
+
+def attest_served_speculator(job, settings):
+    selected = job.get('planned_speculator')
+    if selected is None:
+        return None
+    if not settings:
+        raise ValueError(f'no served startup settings for planned speculator {selected}')
+    served = served_speculator(settings)
+    if selected != served:
+        raise ValueError(f'planned speculator {selected} differs from served {served}')
+    return served
 
 
 def preflight_at_grant(job, arm):
@@ -1426,6 +1461,9 @@ def precheck(job):
     dest = Path(job['state'])
     result = {}
     try:
+        if job.get('planned_speculator') is not None:
+            status = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status', timeout=10)
+            result['speculator'] = attest_served_speculator(job, status.get('settings'))
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
         text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & IMAGE_PROBES else ''
@@ -1997,6 +2035,11 @@ def cold_purge_argv(hosts):
     return [nest, 'drop-caches', *[arg for host in hosts for arg in ('--host', host)]]
 
 
+def precheck_argv(first, second):
+    """Stop on failed readiness evidence; preserve the client's actual exit."""
+    return ['sh', '-c', shlex.join(first) + ' && exec ' + shlex.join(second), 'card-precheck']
+
+
 def window_argv(commands):
     """One hook argv for one or more window commands: a single command runs as
     is; several run in order, every one attempted, failing if any failed."""
@@ -2282,7 +2325,12 @@ def summarize_job(job, exit_code):
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
-        for setting in report.get('server', {}).get('configuration', {}).get('settings', []):
+        settings = report.get('server', {}).get('configuration', {}).get('settings', [])
+        try:
+            row['served_speculator'] = attest_served_speculator(job, settings)
+        except ValueError as error:
+            fail(row, str(error), 'measurement')
+        for setting in settings:
             if setting.get('name') == 'per-layer-timing':
                 row['instrumentation'].update(per_layer_timing=setting['value'], source='server resolved')
         row['table_caveats'], row['table_contaminated'] = table_backend_findings(table_backend_phases(report))
@@ -2426,6 +2474,12 @@ def summarize_job(job, exit_code):
         path = dest / (key + '.json')
         if path.exists():
             row[key] = json.loads(path.read_text())
+    if job.get('planned_speculator') is not None and not row.get('served_speculator'):
+        evidence = row.get('precheck', {})
+        if evidence.get('speculator') != job['planned_speculator']:
+            fail(row, evidence.get('error') or 'missing served speculator attestation', 'measurement')
+        else:
+            row['served_speculator'] = evidence['speculator']
     if job.get('nonce_seed'):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = prompt_token_hashes(text)
@@ -3854,9 +3908,11 @@ def main():
         for job in jobs:
             dest = Path(job['state'])
             result = dest / 'result.json'
-            if result.exists() and json.loads(result.read_text()).get('status') == 'pass':
-                kept[job['state']] = json.loads(result.read_text())
-                continue
+            if result.exists():
+                previous = json.loads(result.read_text())
+                if previous.get('status') == 'pass' and (previous.get('precheck') or {}).get('speculator') is not None:
+                    kept[job['state']] = previous
+                    continue
             leftovers = [p for p in dest.iterdir() if p.name in ('exit', 'result.json', 'driver.log', 'smoke', 'reports',
                          'trace-check.json', 'speculation-trace.jsonl', 'precheck.json', 'console.jsonl',
                          'console-frames.jsonl', 'policy-stats.jsonl', 'memory.jsonl', 'ready.log', 'profile')]

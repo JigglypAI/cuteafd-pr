@@ -50,7 +50,11 @@ pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTree
     let ownership = match role {
         ReadRole::Coordinator { speculator: true, .. } | ReadRole::Drafter =>
             super::spec::DraftOwnership::selected(family.id(),
-                if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" } else { "mtp" }),
+                match family.id() {
+                    "deepseek_v4" | "deepseek_v41" => "dspark",
+                    "hy4_flash" => "dfly2",
+                    _ => "mtp",
+                }),
         _ => super::spec::DraftOwnership::None,
     };
     Ok(checkpoint.tensor_names().filter(|name| {

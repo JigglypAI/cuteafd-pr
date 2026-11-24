@@ -3,6 +3,7 @@
 //! coordinator weight arenas, and shared-contract execution layouts.
 pub mod admission;
 pub mod config;
+pub mod draft;
 pub mod engram;
 pub mod execution;
 pub mod weight_layout;

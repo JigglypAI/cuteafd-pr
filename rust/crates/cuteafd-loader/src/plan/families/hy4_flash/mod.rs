@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use anyhow::{ensure, Result};
 
 use crate::families::hy4_flash::weight_layout::{core_contract, HEAD_STEM};
-use crate::families::hy4_flash::{Hy4DflyConfig, Hy4FlashConfig, Hy4VisionConfig};
+use crate::families::hy4_flash::{draft, Hy4DflyConfig, Hy4FlashConfig, Hy4VisionConfig};
 use crate::formats::trellis_core::CoreProjection;
 use crate::plan::{
     checkpoint::Checkpoint,
@@ -190,22 +190,9 @@ impl Model {
             .map(|(stem, c)| (format!("{stem}.weight"), c.shape.clone()))
             .collect();
         if let Some(dfly_cfg) = &dfly {
-            let attn = cfg.attention(0);
-            let dfly_mlp = 9216usize;
-            for l in 0..dfly_cfg.layers {
-                let p = format!("model.dfly_layers.{l}");
-                for (sub, shape) in [
-                    ("self_attn.q_a_proj", vec![cfg.q_lora_rank, h]),
-                    ("self_attn.q_b_proj", vec![attn.heads * attn.qk_head_dim(), cfg.q_lora_rank]),
-                    ("self_attn.kv_a_proj_with_mqa", vec![cfg.kv_lora_rank + attn.qk_rope_dim, h]),
-                    ("self_attn.kv_b_proj", vec![attn.heads * (attn.qk_nope_dim + attn.v_head_dim), cfg.kv_lora_rank]),
-                    ("self_attn.linear_gate", vec![attn.heads * attn.v_head_dim, h]),
-                    ("self_attn.o_proj", vec![h, attn.heads * attn.v_head_dim]),
-                    ("mlp.gate_proj", vec![dfly_mlp, h]),
-                    ("mlp.up_proj", vec![dfly_mlp, h]),
-                    ("mlp.down_proj", vec![h, dfly_mlp]),
-                ] {
-                    expected.insert(format!("{p}.{sub}.weight"), shape);
+            for (stage, &layer) in dfly_cfg.target_kv_layers.iter().enumerate() {
+                for (sub, shape) in draft::matrix_shapes(&cfg, layer) {
+                    expected.insert(format!("{}{stage}.{sub}.weight", draft::PREFIX), shape.to_vec());
                 }
             }
         }
@@ -339,7 +326,7 @@ fn build_spec(
     ];
     if let Some(d) = dfly {
         notes.push(format!(
-            "bundled DFly2 drafter (optional, follow-up): {} layers (kv taps {:?}, index taps {:?}, top-{})",
+            "bundled DFly2 drafter: {} layers (kv taps {:?}, index taps {:?}, top-{})",
             d.layers, d.target_kv_layers, d.target_index_layers, d.target_index_topk
         ));
     }
@@ -360,7 +347,7 @@ fn build_spec(
             routed_scaling: Some(cfg.routed_scaling_factor),
             groups: Some((cfg.n_group, cfg.topk_group)),
         }),
-        speculator: dfly.map(|d| SpeculatorSpec::BundledDspark { layers: d.layers }),
+        speculator: dfly.map(|d| SpeculatorSpec::Dfly2 { layers: d.layers, target_layers: d.target_kv_layers.clone() }),
         tables: vec![MappedTableSpec { name: "engram".into(), layers: cfg.engram_layers.clone() }],
         vision,
         notes,
@@ -386,7 +373,7 @@ impl Family for Hy4Flash {
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
-        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+        Some(crate::plan::spark_executions::SparkDecode { rows: crate::placement::families::hy4_flash::DECODE_ROWS })
     }
     fn eager_native_core_headers(&self) -> bool { true }
     fn eager_expert_header(&self, name: &str) -> bool {
@@ -473,7 +460,7 @@ impl Family for Hy4Flash {
             Component::RoutedExpert => "Wire hy4f EXL3 K4 MUL1 routed expert package (H1536, I1536, E512, K16, swiglu_limit=10.0) on the MUL1 branches (#415 / #2538); see #2478.",
             Component::MappedTable | Component::TableProjection => "Wire FP8-only Hy4EngramTable + shared look-ahead and 4-stream GPU Engram gate kernel; see #2478.",
             Component::Vision => "Optional 27-layer ViT vision tower is a follow-up item on #2478; text serving runs with --vision off.",
-            Component::Speculator => "Optional 5-layer DFly2 drafter is a follow-up item on #2478; text serving runs without speculation first.",
+            Component::Speculator => "Bundled DFly2 requires the validated Hy4-flash draft headers and matching coordinator programs; use SPECULATOR=off for target-only serving.",
             _ => "Implement Hy4-flash text forward, golden parity, and serve-hy4f over the shared scheduler; see #2478.",
         };
         Some(Hint {

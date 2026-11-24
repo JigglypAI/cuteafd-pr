@@ -1639,6 +1639,7 @@ if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; spe
 if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
+if [[ "$family" == hy4_flash && "$speculator" == auto ]]; then speculator=off; fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
 
@@ -1683,7 +1684,7 @@ if [[ -z "$speculator" ]]; then
 
 fi
 case "$family:$speculator" in
-  minimax_m3:dspark|inkling2:dspark) ;;
+  minimax_m3:dspark|inkling2:dspark|hy4_flash:dfly2) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -2073,6 +2074,7 @@ if [[ $family == hy4_flash ]]; then
   case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$hy4_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
+  [[ "$speculator" != dfly2 ]] || family_args+=(--dfly2)
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"

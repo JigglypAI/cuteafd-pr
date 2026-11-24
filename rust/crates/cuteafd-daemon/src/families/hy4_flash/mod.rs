@@ -8,6 +8,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod cache;
+mod draft;
 pub(crate) mod execution;
 pub(crate) mod golden;
 mod graph_sites;

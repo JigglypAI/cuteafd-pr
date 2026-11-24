@@ -68,6 +68,7 @@ pub struct FactsRequest<'a> {
     pub cfg: &'a Hy4FlashConfig,
     pub model_core: &'a BTreeMap<String, CoreProjection>,
     pub kv_format: Hy4KvCache,
+    pub dfly2: bool,
     pub manifest_path: Option<&'a Path>,
     pub coordinator: Coordinator,
     pub attention: AttentionPlacement,
@@ -575,6 +576,20 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             "Check dense tensor header extents.",
         ))?;
 
+    let draft = request.dfly2.then(|| {
+        use super::{draft, Hy4DflyConfig};
+        let checkpoint = request.checkpoint;
+        let config = Hy4DflyConfig::from_hf(&checkpoint.config, cfg)?.context("no bundled DFly2 config")?;
+        let source = checkpoint.view.as_ref().map(|view| {
+            crate::plan::Checkpoint::open_view_for_role(view, "Hy4 DFly2", |name| name.starts_with(draft::PREFIX))
+        }).transpose()?;
+        draft::Admission::new(source.as_ref().unwrap_or(checkpoint), cfg, &config, request.model_core,
+            request.kv_format, request.sequences as usize, request.decode_rows as usize)
+    }).transpose().map_err(|error| refused(
+        format!("Hy4 DFly2 admission refused: {error:#}"),
+        "Use a supported bundled Hy4 drafter or SPECULATOR=off.",
+    ))?;
+
     Ok(Hy4Inputs {
         cfg: cfg.clone(),
         kv_format: request.kv_format,
@@ -588,6 +603,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         prefix_mark_slots,
         targets,
         target_mount_load,
+        draft,
         placement: request.attention,
         modes,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry {

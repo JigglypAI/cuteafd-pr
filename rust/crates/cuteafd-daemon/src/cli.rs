@@ -524,7 +524,7 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) config: Option<PathBuf>,
     /// Speculator to inventory (auto selects the family's release default).
-    #[arg(long, default_value = "auto", value_parser = ["auto", "off", "mtp", "dflash2", "dspark"])]
+    #[arg(long, default_value = "auto", value_parser = ["auto", "off", "mtp", "dflash2", "dspark", "dfly2"])]
     pub(crate) speculator: String,
     /// Explicitly include speculator inputs, even when the config disables them.
     #[arg(long, conflicts_with = "no_speculator")]

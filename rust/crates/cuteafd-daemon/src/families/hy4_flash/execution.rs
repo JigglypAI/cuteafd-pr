@@ -2,7 +2,7 @@
 //! supporting golden single-sequence verification and batched multi-sequence serving
 //! through the shared `run_prefill_units` (`PrefillHooks`) executor and zero-host-hop
 //! `DeviceLogits` vocabulary head handoff.
-use super::cache::{Hy4CacheRank, Hy4Placement, Hy4Prefix};
+use super::cache::{slice_buf, Hy4CacheRank, Hy4Placement, Hy4Prefix};
 use super::graphs::{Hy4Graphs, Key as GraphKey, Section as GraphSection};
 use super::native::Hy4NativeScratch;
 use super::programs::{Hy4Programs, MlaSplitPlan};
@@ -57,6 +57,7 @@ const EXPERTS: usize = 512;
 const TOPK: usize = 16;
 const IDX_HEADS: usize = 16;
 const IDX_DIM: usize = 128;
+const IDX_KEY_BYTES: usize = IDX_DIM * 2;
 const CANDIDATE_TOPK: usize = 2048;
 
 /// Which rows of a batch compute terminal `hc_head` + `lm_head` FP32 logits.
@@ -1262,6 +1263,11 @@ pub(crate) struct Hy4Engine<'a> {
     expert_usage: Option<ExpertUsage<'a>>,
     count_expert_usage: bool,
     terminal: bool,
+    // Provisional key rows; the committed incomplete group remains untouched
+    // until target acceptance tells us which prefix of each member survived.
+    verify_keys: Option<Vec<Allocation<'a>>>,
+    verifying: bool,
+    draft: Option<super::draft::Drafter<'a>>,
 }
 
 impl<'a> Hy4Engine<'a> {
@@ -1274,6 +1280,7 @@ impl<'a> Hy4Engine<'a> {
         cfg: Hy4FlashConfig,
         kv_format: Hy4KvCache,
         max_rows: usize,
+        decode_rows: usize,
         prefill_waves: usize,
         max_pages: usize,
         skip_routed_experts: bool,
@@ -1288,7 +1295,7 @@ impl<'a> Hy4Engine<'a> {
             cfg,
             kv_format,
             max_rows,
-            max_rows.min(DECODE_ROWS as usize),
+            decode_rows,
             prefill_waves,
             max_pages,
             1,
@@ -1490,6 +1497,9 @@ impl<'a> Hy4Engine<'a> {
             expert_usage: None,
             count_expert_usage: false,
             terminal: false,
+            verify_keys: None,
+            verifying: false,
+            draft: None,
         };
         engine.assert_disjoint_wave_engram_buffers()?;
         Ok(engine)
@@ -1572,6 +1582,80 @@ impl<'a> Hy4Engine<'a> {
     }
 
     /// Attach a bootstrapped Spark expert link for routed layers not onboarded onto the RTX GPUs.
+    pub(crate) fn allocate_verify_keys(&mut self) -> Result<()> {
+        ensure!(self.verify_keys.is_none(), "Hy4 DFly2 verify keys already allocated");
+        self.verify_keys = Some(self.ranks.iter().map(|rank| {
+            Allocation::new(rank.device,
+                cuteafd_loader::families::hy4_flash::draft::verify_key_bytes(&self.cfg, self.decode_rows),
+                Tag::workspace("hy4_flash/dfly2/verify-keys"))
+        }).collect::<Result<Vec<_>>>()?);
+        Ok(())
+    }
+
+    pub(crate) fn set_provisional(&mut self, enabled: bool) -> Result<()> {
+        ensure!(!enabled || self.verify_keys.is_some(), "Hy4 speculative verify is not admitted");
+        self.verifying = enabled;
+        Ok(())
+    }
+
+    pub(crate) fn commit_provisional_keys(
+        &self, slot: usize, start: usize, first_row: usize, keep: usize,
+    ) -> Result<()> {
+        let keys = self.verify_keys.as_ref().context("Hy4 missing provisional DSA keys")?;
+        ensure!(keep > 0 && first_row + keep <= self.decode_rows, "Hy4 accepted verify extent differs");
+        let pending_range = accepted_pending_copy(start, keep);
+        for (rank, owner) in self.ranks.iter().zip(keys) {
+            rank.device.run(|| {
+                let mut counts = rank.cache.pending_counts.borrow_mut();
+                for (layer, count) in counts[slot].iter_mut().enumerate() {
+                    ensure!(*count == start % 4, "Hy4 committed DSA frontier moved during verify");
+                    if let Some((src, dst, rows)) = pending_range {
+                        let src_off = (layer * self.decode_rows + first_row + src) * IDX_KEY_BYTES;
+                        let src = slice_buf(owner.buffer, src_off, rows * IDX_KEY_BYTES)?;
+                        let dst = slice_buf(rank.cache.pending_key_slot(slot, layer)?, dst * IDX_KEY_BYTES, src.bytes)?;
+                        // SAFETY: both views are on this stream's device. The
+                        // committed owner and provisional source are disjoint.
+                        unsafe { rank.device.library.copy_d2d_async(dst, src, src.bytes, rank.stream.raw)?; }
+                    }
+                    *count = (start + keep) % 4;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn attach_drafter(&mut self, draft: super::draft::Drafter<'a>) -> Result<()> {
+        self.allocate_verify_keys()?;
+        self.draft = Some(draft);
+        Ok(())
+    }
+
+    pub(super) fn invalidate_draft(&self, slot: usize) {
+        if let Some(draft) = &self.draft { draft.invalidate(slot); }
+    }
+
+    pub(super) fn draft_valid(&self, placement: &Hy4Placement) -> bool {
+        self.draft.as_ref().is_some_and(|d| d.valid(placement.slot, placement.len))
+    }
+
+    pub(super) fn draft_propose(&self, placement: &Hy4Placement, bonus: u32, depth: usize) -> Result<Vec<u32>> {
+        let Some(draft) = &self.draft else { return Ok(Vec::new()); };
+        let r = &self.ranks[0];
+        let embedding = r.weights.embedding.as_ref().context("DFly2 target embedding missing")?;
+        draft.propose(&r.stream, embedding, placement.slot, placement.len, bonus, depth,
+            r.weights.inv_freq_dsa.buffer, |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
+            |hidden| self.project_vocab_tile(0, hidden, 1))
+    }
+
+    pub(super) fn accept_draft(&self, slot: usize, row: usize, pos: usize) -> Result<()> {
+        if let Some(draft) = &self.draft {
+            let r = &self.ranks[0];
+            r.device.run(|| draft.accept(slot, row, pos, &r.stream))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn attach_spark(&mut self, link: SparkLink<'a>, onboarded_layers: impl IntoIterator<Item = usize>) {
         self.spark = Some(link);
         self.onboarded_layers = onboarded_layers.into_iter().collect();
@@ -1820,6 +1904,14 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
         }
+        if let Some(draft) = &self.draft {
+            draft.inventory(weights_inv, retained_inv)?;
+        }
+        if let Some(keys) = &self.verify_keys {
+            for (rank, keys) in keys.iter().enumerate() {
+                retained_inv.device(&format!("hy4_flash/dfly2/verify-keys/gpu{rank}"), keys.buffer)?;
+            }
+        }
         for upload in &self.metadata_uploads {
             retained_inv.pinned(upload.layout.id(), upload.backing.buffer)?;
         }
@@ -1978,6 +2070,12 @@ impl<'a> Hy4Engine<'a> {
             "Hy4 decode/verify uses {rows} rows, exceeds admitted {}-row split-K owner", self.decode_rows);
         ensure!(!unit.segments.is_empty(), "Hy4 unit must carry explicit segments");
         ensure!(unit.segments.len() <= self.max_sequences, "Hy4 batch exceeds max_sequences {}", self.max_sequences);
+
+        if let Some(draft) = &self.draft {
+            for segment in &unit.segments {
+                if let Some(p) = placements.get(segment.sequence) { draft.invalidate(p.slot); }
+            }
+        }
 
         let swa_ring_pages = self.ranks[0].cache.swa_ring_pages;
         let swa_ring_rows = self.ranks[0].cache.swa_ring_rows;
@@ -2174,7 +2272,8 @@ impl<'a> Hy4Engine<'a> {
             })?;
         }
 
-        let dump_rows = if self.dump_dir.is_some() && members.len() == 1 && members[0].pos_start == 0 {
+        let dump_rows = if self.dump_dir.is_some() && members.len() == 1
+            && (members[0].pos_start == 0 || priority == ReadPriority::Decode) {
             rows.min(16)
         } else {
             0
@@ -2303,8 +2402,15 @@ impl<'a> Hy4Engine<'a> {
             let idx_cache = r.cache.dsa_index_layer(dsa_idx)?;
             let ip = format!("{p}.self_attn.compressed_indexer");
             let inv_freq = r.weights.inv_freq_dsa.buffer.ptr;
-            // Assemble completed 4-token groups across all batch members into idx_group_tok.
+            // SAFETY: key scratch, provisional keys and the packed group's cache
+            // entries all remain owned across the stream's writes.
             r.device.run(|| unsafe {
+                if self.verifying {
+                    let keys = self.verify_keys.as_ref().context("Hy4 missing provisional keys")?;
+                    let rank = usize::from(r.device.id != self.ranks[0].device.id);
+                    let dst = slice_buf(keys[rank].buffer, dsa_idx * self.decode_rows * IDX_KEY_BYTES, rows * IDX_KEY_BYTES)?;
+                    r.device.library.copy_d2d_async(dst, r.shared.idx_tk.buffer, dst.bytes, r.stream.raw)?;
+                }
                 let mut batch_groups = 0usize;
                 for m in &batch.members {
                     let pending = r.cache.pending_counts.borrow()[m.slot][dsa_idx];
@@ -2343,7 +2449,7 @@ impl<'a> Hy4Engine<'a> {
                         r.device.library.copy_d2d_async(dst_cur, src_cur, copy_from_cur * IDX_DIM * 2, r.stream.raw)?;
                         batch_groups += complete;
                     }
-                    if new_pending > 0 {
+                    if !self.verifying && new_pending > 0 {
                         if complete == 0 {
                             let dst = CuteafdDeviceBuffer {
                                 ptr: pending_buf.ptr.cast::<u8>().wrapping_add(pending * IDX_DIM * 2).cast(),
@@ -2366,7 +2472,9 @@ impl<'a> Hy4Engine<'a> {
                             r.device.library.copy_d2d_async(pending_buf, src, new_pending * IDX_DIM * 2, r.stream.raw)?;
                         }
                     }
-                    r.cache.pending_counts.borrow_mut()[m.slot][dsa_idx] = new_pending;
+                    if !self.verifying {
+                        r.cache.pending_counts.borrow_mut()[m.slot][dsa_idx] = new_pending;
+                    }
                 }
                 if batch_groups > 0 {
                     r.programs.indexer_pool_group.launch(
@@ -2450,6 +2558,22 @@ impl<'a> Hy4Engine<'a> {
                     )
                 })
             }
+            if r.device.id == self.ranks[0].device.id {
+                if let Some(draft) = &self.draft {
+                    r.device.run(|| {
+                        for member in &batch.members {
+                            let end = member.row_start + member.row_len;
+                            let start = if self.verifying { member.row_start } else { end - 1 };
+                            for row in start..end {
+                                let src = slice_buf(r.shared.idx_cand_slots.buffer, row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
+                                draft.capture_recall(self.verifying, if self.verifying { row } else { member.slot }, layer, src, &r.stream)?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            Ok(())
         };
 
         let max_groups = batch.max_seq_end / 4;
@@ -2891,20 +3015,15 @@ impl<'a> Hy4Engine<'a> {
     /// vocabulary head into `r0.shared.head_logits_f32 [count, vocab]` with zero host hop.
     fn project_head_tile(&self, wave_slot: usize, y_row_off: usize, count: usize) -> Result<DeviceLogits> {
         ensure!(count > 0 && count <= 64, "Hy4 head tile count {count} outside 1..=64");
+        let r0 = &self.ranks[0];
+        let input = slice_buf(r0.waves[wave_slot].y.buffer, y_row_off * H * 2, count * H * 2)?;
+        self.project_vocab_tile(wave_slot, input, count)
+    }
+
+    fn project_vocab_tile(&self, wave_slot: usize, x0_buf: CuteafdDeviceBuffer, count: usize) -> Result<DeviceLogits> {
         let vocab = self.cfg.vocab_size;
         let r0 = &self.ranks[0];
-        let w0 = &r0.waves[wave_slot];
-        let head_out = r0
-            .shared
-            .head_logits_f32
-            .as_ref()
-            .context("rank 0 missing head_logits_f32")?
-            .buffer;
-        let x0_buf = CuteafdDeviceBuffer {
-            ptr: w0.y.buffer.ptr.cast::<u8>().wrapping_add(y_row_off * H * 2).cast(),
-            bytes: count * H * 2,
-            ..w0.y.buffer
-        };
+        let head_out = r0.shared.head_logits_f32.as_ref().context("rank 0 missing head_logits_f32")?.buffer;
         if self.ranks.len() == 1 {
             let out_buf = CuteafdDeviceBuffer {
                 bytes: count * vocab * 4,
@@ -2967,6 +3086,25 @@ impl<'a> Hy4Engine<'a> {
         })
     }
 
+    fn capture_draft_hidden(&self, batch: &ActiveBatch, first: usize, packed: bool) -> Result<()> {
+        let Some(draft) = &self.draft else { return Ok(()); };
+        let r = &self.ranks[0];
+        r.device.run(|| {
+            for (index, member) in batch.members.iter().enumerate() {
+                let end = member.row_start + member.row_len;
+                let start = if self.verifying { member.row_start.max(first) } else { end - 1 };
+                if start < first { continue; }
+                for row in start..end {
+                    let src = if packed { index } else { row - first };
+                    draft.capture_hidden(self.verifying, if self.verifying { row } else { member.slot },
+                        slice_buf(r.waves[batch.wave_slot].y.buffer, src * H * 2, H * 2)?, &r.stream)?;
+                }
+                if !self.verifying { draft.publish(member.slot, member.pos_start + member.row_len); }
+            }
+            Ok(())
+        })
+    }
+
     /// Run terminal `hc_head` + sharded FP32 `lm_head` -> zero-host-hop `DeviceLogits` tiles.
     fn finish_head(
         &self,
@@ -3023,6 +3161,7 @@ impl<'a> Hy4Engine<'a> {
                         r0.stream.raw,
                     )
                 })?;
+                self.capture_draft_hidden(batch, 0, true)?;
                 let logits = self.project_head_tile(wave_slot, 0, count)?;
                 on_tile(0, logits)
             }
@@ -3048,6 +3187,7 @@ impl<'a> Hy4Engine<'a> {
                         r0.stream.raw,
                     )
                 })?;
+                self.capture_draft_hidden(batch, first_row, false)?;
                 if batch.dump_rows > 0 && first_row == 0 {
                     self.dump_bf16("hc_head_y", w0.y.buffer, batch.dump_rows * H)?;
                 }
@@ -3075,6 +3215,8 @@ impl<'a> Hy4Engine<'a> {
         if self.graphs_active() {
             self.set_graph_cycle(priority);
         }
+        ensure!(!self.verifying || (units.len() == 1 && units[0].rows.len() <= self.decode_rows),
+            "Hy4 provisional verification requires one admitted decode unit");
         let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
         let staged_frontiers = initial_starts.clone();
         let staged_engram_tails: Vec<[u32; 2]> = placements.iter().map(|p| p.engram_tail).collect();
@@ -3262,8 +3404,10 @@ impl<'a> Hy4Engine<'a> {
                     for m in &batch.members {
                         let p = &mut self.placements[m.sequence];
                         p.len = m.pos_start + m.row_len;
-                        p.state_len = p.len;
-                        p.engram_tail = m.next_engram_tail;
+                        if !self.engine.verifying {
+                            p.state_len = p.len;
+                            p.engram_tail = m.next_engram_tail;
+                        }
                     }
                     Ok(())
                 }
@@ -3772,6 +3916,17 @@ fn stage_segment_frontier_and_tail(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `src` is local to this verify member; `dst` is inside its live pending group.
+fn accepted_pending_copy(start: usize, accepted: usize) -> Option<(usize, usize, usize)> {
+    let old = start % 4;
+    let new = (start + accepted) % 4;
+    match new {
+        0 => None,
+        _ if old + accepted < 4 => Some((0, old, accepted)),
+        _ => Some((accepted - new, 0, new)),
+    }
+}
+
 fn build_hy4_spark_request(
     identity: u64,
     version: u64,
@@ -3814,6 +3969,28 @@ fn build_hy4_spark_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_verify_commits_only_the_accepted_indexer_and_engram_tail() {
+        // Exercise every C4 alignment and every rejection position, including
+        // history-copy extensions that cross several compressed groups.
+        for start in 0..8 {
+            for proposed in 1..=16 {
+                let tokens = (0..start + proposed).map(|i| i as u32 + 10).collect::<Vec<_>>();
+                let old = advance_tail([0, 0], &tokens[..start], start);
+                for keep in 1..=proposed {
+                    let mut pending = [0u32; 3];
+                    pending[..start % 4].copy_from_slice(&tokens[start - start % 4..start]);
+                    if let Some((src, dst, rows)) = accepted_pending_copy(start, keep) {
+                        pending[dst..dst + rows].copy_from_slice(&tokens[start + src..start + src + rows]);
+                    }
+                    let end = start + keep;
+                    assert_eq!(&pending[..end % 4], &tokens[end - end % 4..end]);
+                    assert_eq!(advance_tail(old, &tokens[start..], keep), advance_tail([0, 0], &tokens[..end], end));
+                }
+            }
+        }
+    }
 
     #[test]
     fn hy4_spark_request_uses_latent_1536_k16_fp8k32_compact_bf16() -> Result<()> {

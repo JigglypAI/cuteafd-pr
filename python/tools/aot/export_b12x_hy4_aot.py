@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import _pinned_sparkinfer
 
 
-GROUPS = ("ihc", "engram", "attention", "indexer", "pointwise", "projections")
+GROUPS = ("ihc", "engram", "attention", "indexer", "pointwise", "projections", "draft")
 
 
 def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096, max_context: int = 262144):
@@ -141,13 +141,43 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             for name, (width, outputs, dtype) in shapes.items()
         }
 
+    if group == "draft" and tp == 1:
+        from b12x.integration.cuteafd import hy4_mla as mla
+        from b12x.integration.cuteafd.context_split import compile_paged_staging_gather_aot
+
+        draft = {
+            "draft_gated_residual": lambda: p.compile_gated_residual_bf16_aot(width=3072),
+            "draft_silu": lambda: p.compile_post_silu_split_aot(width=9216, limit=1e30),
+            "draft_correction_silu": lambda: p.compile_post_silu_split_aot(width=3072, limit=1e30),
+        }
+        for kv in ("bf16", "fp8"):
+            g = mla.Hy4MlaGeometry(kv_cache=kv)
+            draft[f"draft_gather_{kv}"] = lambda g=g: compile_paged_staging_gather_aot(
+                row_bytes=g.record_bytes, page_rows=1)
+            draft[f"draft_attention_{kv}"] = lambda g=g: mla.compile_hy4_mla_attention_aot(
+                g, max_rows=6, max_context=2048 + 6, mode="decode", page_size=1)
+        for name, width, outputs in (
+            ("gate_up", 3072, 9216), ("down", 9216, 3072),
+            ("join", 6144, 3072), ("correction_down", 3072, 3072),
+        ):
+            draft[f"draft_proj_{name}"] = lambda width=width, outputs=outputs: p.compile_bf16_projection_aot(
+                width=width, outputs=outputs)
+        return draft
+    if group == "draft":
+        return {}  # TP2 shares the rank-0 TP1 drafter and sharded target head.
+
     raise ValueError(f"unknown Hy4-flash export group: {group}")
 
 
 def programs(tp: int, decode_rows: int, max_rows: int, max_context: int):
     """Entries for the shared Programs dispatcher in export_b12x_dsv4_aot.py."""
+    def capacity(name):
+        if name.startswith("draft_"):
+            return 6
+        return decode_rows if "swa_decode" in name else max_rows
+
     return [
-        (name, name, {"max_rows": decode_rows if "swa_decode" in name else max_rows}, build)
+        (name, name, {"max_rows": capacity(name)}, build)
         for group in GROUPS
         for name, build in builders(
             tp, group, decode_rows=decode_rows, max_rows=max_rows, max_context=max_context

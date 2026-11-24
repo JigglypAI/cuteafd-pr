@@ -111,6 +111,7 @@ pub struct LayoutOptions {
     pub dense_qwen_mtp: bool,
     pub minimax_dspark: bool,
     pub inkling_dspark: bool,
+    pub hy4_dfly2: bool,
     /// Explicitly disable GLM Flash external speculation and its arenas.
     pub glmf_drafter_disabled: bool,
     /// GLM Flash external draft checkpoint; absent resolves the launcher default from HF_HOME.
@@ -328,6 +329,7 @@ impl Default for LayoutOptions {
             dense_qwen_mtp: false,
             minimax_dspark: false,
             inkling_dspark: false,
+            hy4_dfly2: false,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
             glmf_dense_manifest: None,
@@ -991,7 +993,7 @@ impl Shape {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
             Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
             // Dense bundled dSpark has its own admission, not native MTP cache stages.
-            Some(super::spec::SpeculatorSpec::BundledDspark { .. }) => 0,
+            Some(super::spec::SpeculatorSpec::BundledDspark { .. } | super::spec::SpeculatorSpec::Dfly2 { .. }) => 0,
             None => 0,
         };
         let native_layers = if policy.all_native_stages && options.native_mtp_layers > 0 { discovered }

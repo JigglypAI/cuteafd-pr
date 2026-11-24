@@ -1086,7 +1086,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         });
     }
     if args.speculator == "auto" && family != "qwen4" { args.speculator = default.into(); }
-    anyhow::ensure!(["auto", "off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
+    anyhow::ensure!(["auto", "off", "mtp", "dspark", "dflash2", "dfly2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
     anyhow::ensure!(!(args.no_speculator && args.include_speculator), "--no-speculator conflicts with --include-speculator");
     if args.no_speculator {
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
@@ -1098,7 +1098,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2", "dspark") => true,
         _ => false,
@@ -2771,6 +2771,7 @@ mod tests {
             ("mimo_v2", "SPECULATOR", "dflash2", DraftOwnership::None),
             ("mimo_v2", "SPECULATOR", "mtp", DraftOwnership::NativeMtp),
             ("qwen4", "SPECULATOR", "off", DraftOwnership::None),
+            ("hy4_flash", "SPECULATOR", "dfly2", DraftOwnership::BundledDfly2),
             ("deepseek_v4", "DSPARK", "off", DraftOwnership::None),
             ("deepseek_v41", "DSPARK", "on", DraftOwnership::BundledDspark),
         ] {

@@ -120,6 +120,7 @@ pub(crate) struct Hy4Backend<'a> {
     concurrency: usize,
     decode_rows: usize,
     unit_rows: usize,
+    decode_rows: usize,
     prefill_waves: usize,
     vocab: usize,
     pad_id: u32,
@@ -156,6 +157,7 @@ impl<'a> Hy4Backend<'a> {
             concurrency,
             decode_rows,
             unit_rows,
+            decode_rows,
             prefill_waves,
             vocab,
             pad_id,
@@ -241,7 +243,6 @@ impl<'a> Hy4Backend<'a> {
         pool: &RefPagePool,
         allow_graphs: bool,
     ) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, "Hy4 DFly2 speculative verify is not yet enabled");
         ensure!(
             !sequences.is_empty() && sequences.len() <= self.concurrency && self.pending.borrow().is_none(),
             "Hy4 decode requires admitted requests and prior commit"
@@ -280,7 +281,8 @@ impl<'a> Hy4Backend<'a> {
         };
         let mut logits = None;
         let mut engine = self.engine.borrow_mut();
-        let run = |engine: &mut Hy4Engine<'a>| {
+        engine.set_provisional(speculative)?;
+        let mut run = |engine: &mut Hy4Engine<'a>| {
             engine.run_units(
                 &mut placements,
                 &sources,
@@ -293,11 +295,13 @@ impl<'a> Hy4Backend<'a> {
                 },
             )
         };
-        if allow_graphs {
-            run(&mut engine)?;
+        let result = if allow_graphs && !speculative {
+            run(&mut engine)
         } else {
-            engine.without_graphs(run)?;
-        }
+            engine.without_graphs(run)
+        };
+        engine.set_provisional(false)?;
+        result?;
         for ((placement, _), next) in sequences.iter_mut().zip(placements) {
             **placement = next;
         }
@@ -408,6 +412,11 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             "Hy4 restored request frontier differs"
         );
         placement.set_engram_tail_from_prefix(&tokens[..resume], self.pad_id);
+        Ok(())
+    }
+
+    fn restore_draft(&self, placement: &Hy4Placement, _: usize, _: &[u32], _: &mut Draft) -> Result<()> {
+        self.engine.borrow().invalidate_draft(placement.slot);
         Ok(())
     }
 
@@ -582,7 +591,6 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             .iter()
             .map(|sequence| {
                 ensure!(sequence.start == sequence.placement.len, "Hy4 packed start differs");
-                ensure!(!sequence.neural, "Hy4 DFly2 neural drafting is not yet enabled");
                 self.check(sequence.placement, sequence.tokens, pool)?;
                 Ok((sequence.start, sequence.tokens.len()))
             })
@@ -687,10 +695,22 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     fn draft(
         &self,
         sequences: &mut [scheduler::DraftSeq<'_, Hy4Placement, Draft>],
-        _: &mut scheduler::DraftTiming,
+        timing: &mut scheduler::DraftTiming,
         _: &mut TokenSelector<'_>,
     ) -> Result<Vec<Vec<u32>>> {
-        Ok(vec![vec![]; sequences.len()])
+        let start = std::time::Instant::now();
+        let engine = self.engine.borrow();
+        let proposals = sequences.iter().map(|request| {
+            match request.seq.anchor.filter(|_| request.depth > 0 && engine.draft_valid(request.placement)) {
+                Some(anchor) => {
+                    timing.steps += 1;
+                    engine.draft_propose(request.placement, anchor, request.depth)
+                }
+                None => Ok(Vec::new()),
+            }
+        }).collect();
+        timing.seconds += start.elapsed().as_secs_f64();
+        proposals
     }
 
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Hy4Placement, Draft, usize>], speculative: bool) -> Result<()> {
@@ -699,7 +719,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             .borrow_mut()
             .take()
             .context("Hy4 accept lacks submitted receipt")?;
-        ensure!(!speculative && sent.len() == verified.len(), "Hy4 accept inventory differs");
+        ensure!(sent.len() == verified.len(), "Hy4 accept inventory differs");
         for ((slot, start, tokens), request) in sent.iter().zip(verified.iter()) {
             ensure!(
                 *slot == request.history
@@ -709,12 +729,35 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
                 "Hy4 accept receipt differs"
             );
         }
+        let engine = self.engine.borrow();
+        for request in verified {
+            let Some((kept, after)) = request.kept else { continue; };
+            if speculative {
+                ensure!(kept > 0 && kept <= request.rows.len()
+                    && request.placement.len == request.start + kept
+                    && request.placement.state_len == request.start,
+                    "Hy4 provisional acceptance moved outside the committed prefix");
+                engine.commit_provisional_keys(request.history, request.start, request.first_row, kept)?;
+                let placement = &mut request.placement;
+                placement.engram_tail = cuteafd_loader::families::hy4_flash::advance_tail(
+                    placement.engram_tail, request.rows, kept);
+                placement.state_len = placement.len;
+            }
+            if request.neural {
+                if speculative {
+                    engine.accept_draft(request.history, request.first_row + kept - 1, request.placement.len)?;
+                }
+                request.seq.anchor = Some(after);
+            }
+        }
         Ok(())
     }
 
-    fn cancel(&self, _: &Hy4Placement) -> Result<()> {
+    fn cancel(&self, placement: &Hy4Placement) -> Result<()> {
         let _ = self.pending.borrow_mut().take();
-        self.engine.borrow().drain()
+        let engine = self.engine.borrow();
+        engine.invalidate_draft(placement.slot);
+        engine.drain()
     }
 }
 
