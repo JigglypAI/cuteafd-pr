@@ -1510,6 +1510,7 @@ def precheck(job):
         if job.get('planned_speculator') is not None:
             status = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status', timeout=10)
             result['speculator'] = attest_served_speculator(job, status.get('settings'))
+            result['drafter'] = status.get('drafter')
         if 'memory' in job['probes'] and job['entry'].get('sparks'):
             spark_memory_boundary(job, 'ready')
         text = ready_log(job) if job['expected_pool'] is not None or set(job['probes']) & IMAGE_PROBES else ''
@@ -2543,6 +2544,8 @@ def summarize_job(job, exit_code):
         path = dest / (key + '.json')
         if path.exists():
             row[key] = json.loads(path.read_text())
+    if row.get('drafter') is None and (row.get('precheck') or {}).get('drafter') is not None:
+        row['drafter'] = row['precheck']['drafter']
     if job.get('planned_speculator') is not None and not row.get('served_speculator'):
         evidence = row.get('precheck', {})
         if evidence.get('speculator') != job['planned_speculator']:

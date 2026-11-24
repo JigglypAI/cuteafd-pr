@@ -3046,7 +3046,8 @@ impl Opened {
                 Some(dspark::Drafter::Dspark(_)) => Some((Kind::Dspark, Placement::Whole, 0)),
             };
             if let Some((kind, placement, lead)) = resolved {
-                report::publish(report::admitted(kind, placement, lead, &physical, &admitted_plan)?);
+                report::publish(report::from_plan(kind, placement, lead, &physical, &admitted_plan,
+                    |owner| owner.id.starts_with("glmf.draft."))?);
             }
         }
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;

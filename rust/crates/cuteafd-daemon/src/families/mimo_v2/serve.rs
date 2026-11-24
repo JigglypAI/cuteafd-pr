@@ -1394,7 +1394,10 @@ mod lane_tests {
         assert!(completed < once && once < capture && capture < replace);
         assert!(!publish.contains("graph_capture_stats"), "diagnostics belong to HTTP stats fetches");
         assert!(publish.contains("cache.serving_stats()"));
-        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+        let api = include_str!("../../shared/api.rs");
+        assert!(api.contains("profile.stats_diagnostics = Some(collect_stats)"));
+        let collect = api.split_once("fn collect_stats(").unwrap().1.split_once("\n}").unwrap().0;
+        assert!(collect.contains("crate::shared::probe::graph_capture_stats(stats)"));
     }
 
     #[test]

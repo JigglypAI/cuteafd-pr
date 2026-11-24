@@ -123,10 +123,7 @@ impl ApiPolicy {
         let drafter = cuteafd_bench::context::drafter().unwrap_or(cuteafd_bench::report::DrafterLayout::NONE);
         tracing::info!(layout = %drafter.label(), "resolved serving drafter");
         cuteafd_bench::context::set_drafter(drafter);
-        profile.stats_diagnostics = Some(|stats| {
-            crate::shared::probe::graph_capture_stats(stats);
-            stats["drafter"] = serde_json::json!(cuteafd_bench::context::drafter());
-        });
+        profile.stats_diagnostics = Some(collect_stats);
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };
@@ -199,6 +196,11 @@ impl ApiPolicy {
         } else { router }
     }
 }
+fn collect_stats(stats: &mut serde_json::Value) {
+    crate::shared::probe::graph_capture_stats(stats);
+    stats["drafter"] = serde_json::json!(cuteafd_bench::context::drafter());
+}
+
 /// The bench page's include/skip switch for benchmark requests in usage history.
 fn usage_toggle(store: Arc<cuteafd_usage::Store>) -> cuteafd_bench::UsageToggle {
     let read = store.clone();
@@ -315,7 +317,7 @@ fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn every_serving_profile_publishes_shared_draft_pass_totals() {
+    async fn every_serving_profile_publishes_draft_totals_and_startup_layout() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
         let snapshot = tempfile::tempdir().unwrap();
@@ -329,6 +331,8 @@ mod tests {
             std::time::Duration::from_secs(1), cuteafd_api::openai::ConsoleHub::disabled(), profile);
         let response = router.oneshot(Request::get("/v1/stats").body(Body::empty()).unwrap()).await.unwrap();
         let stats: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(stats["drafter"], serde_json::json!({"kind":"none", "placement":null,
+            "ranks":[], "lead":null, "arena_bytes":[]}));
         assert!(stats["totals"]["draft_verify_passes"].is_u64());
         assert!(stats["totals"]["accepted_drafts"].is_u64());
         assert_eq!(stats["verify"]["drafted_tokens"], 99, "preserve private diagnostics");

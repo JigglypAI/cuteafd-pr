@@ -245,7 +245,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     if let (Some(draft), Some(lead)) = (&built.drafter, built.draft_home) {
         use crate::shared::draft::report::{self, Kind, Placement};
         let placement = if draft.tp2.is_empty() { Placement::Whole } else { Placement::Split };
-        report::publish(report::admitted(Kind::Dflash2, placement, lead, &device_ids, &built.solved)?);
+        report::publish(report::from_plan(Kind::Dflash2, placement, lead, &device_ids, &built.solved,
+            |owner| owner.id.starts_with("muse.drafter."))?);
     }
     let placement = &built.placement;
     {

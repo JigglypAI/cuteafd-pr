@@ -566,8 +566,7 @@ fn with_backend<T>(args: &ServeArgs,
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     if mtp.is_some() {
-        use crate::shared::draft::report::{self, Kind, Placement};
-        report::publish(report::admitted(Kind::Mtp, Placement::Whole, u8::try_from(head_rank)?, &ids, &admission.solved)?);
+        crate::shared::draft::report::publish(mtp_report(&ids, &admission, inputs.sequences)?);
     }
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     let backend = backend.with_vision(crate::shared::vision::perception::Binding::new(&args.snapshot,
@@ -599,6 +598,18 @@ pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item
         .context("Step-5 sampled owner overflow")?;
     ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
     total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
+}
+
+fn mtp_report(ids: &[i32], admission: &cuteafd_loader::placement::families::step5::Admission, sequences: usize)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let head = admission.ownership.execution().spec().head_gpu;
+    let state = &admission.cache.ranks[usize::from(head)];
+    let first = state.sliding.iter().find(|ring| ring.mtp).context("Step-5 missing admitted MTP rings")?;
+    let mut layout = report::admitted(Kind::Mtp, Placement::Whole, head, ids, &admission.solved)?;
+    let active = (state.bytes - first.key.offset).checked_mul(sequences as u64).context("Step-5 MTP state overflow")?;
+    layout.arena_bytes[0] = layout.arena_bytes[0].checked_add(active).context("Step-5 MTP report overflow")?;
+    Ok(layout)
 }
 
 fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {

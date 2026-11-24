@@ -3389,7 +3389,9 @@ fn draft_layout_report(layout: &DraftLayout, home: u8, devices: &[i32], plan: &c
         DraftLayout::Mla(layout) => (Kind::Dflash2,
             if layout.context_split() { Placement::Split } else if home == 0 { Placement::Whole } else { Placement::Remote }, home),
     };
-    report::admitted(kind, placement, lead, devices, plan)
+    report::from_plan(kind, placement, lead, devices, plan, |owner|
+        owner.group.starts_with("block dSpark ") || owner.id.starts_with("kimi/draft-head/")
+            || matches!(owner.group.as_str(), "Kimi K6 draft head scratch" | "Kimi FP8 draft head scratch"))
 }
 
 #[cfg(test)]

@@ -1494,7 +1494,10 @@ mod lane_tests {
             .split_once("\nfn schedule(").unwrap().0;
         assert!(publish.contains("capture(\"first_request\")"));
         assert!(!publish.contains("graph_capture_stats"));
-        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+        let api = include_str!("../../shared/api.rs");
+        assert!(api.contains("profile.stats_diagnostics = Some(collect_stats)"));
+        let collect = api.split_once("fn collect_stats(").unwrap().1.split_once("\n}").unwrap().0;
+        assert!(collect.contains("crate::shared::probe::graph_capture_stats(stats)"));
     }
 
     #[test]

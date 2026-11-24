@@ -167,7 +167,16 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         .map_or(ResidentWeights::default(), |(_, bytes)| bytes);
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
-    if mtp { publish_drafter(&[args.device], &solved)?; }
+    if mtp {
+        use cuteafd_loader::serving_capacity::qwen_cache_geometry;
+        let full = qwen_cache_geometry(cfg, layers, true, args.kv_format)?.ranks[0];
+        let target = qwen_cache_geometry(cfg, layers, false, args.kv_format)?.ranks[0];
+        let pending = (full.active_state_per_sequence_bytes - target.active_state_per_sequence_bytes)
+            .checked_mul(args.slots as u64).context("Qwen MTP pending charge overflow")?;
+        let mut report = mtp_report(&[args.device], &solved, &inputs.expert_arenas)?;
+        report.arena_bytes[0] = report.arena_bytes[0].checked_add(pending).context("Qwen MTP report overflow")?;
+        crate::shared::draft::report::publish(report);
+    }
     publish_reconciliation(args, &inventory.gpus, &solved, sparks)?;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
@@ -178,21 +187,23 @@ pub(super) fn preallocate(library: &NativeLibrary, args: &EngineArgs,
         ExpertAdmission { placement, candidate: selected, draft_budget }))
 }
 
-/// Publish the admission identity the shared Ready and first-request memory
-/// reconciliation reads (`shared::memory_report::reconcile`). The capture
+/// MTP owns a whole draft on the entry GPU even when the target is split.
 /// returns before sampling without `memory_reconciliation_provenance`, so
 /// `/v1/stats` would report no `delta_vs_measured` or `graph_reserve_slack`
 /// for the family. Identity only: hashes of the native library and program
 /// manifest, the served layout, and one inventory sample per physical GPU in
 /// rank order (the capture indexes `devices` by the `rtxN` owner row).
-pub(super) fn publish_drafter(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
+pub(super) fn mtp_report(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan,
+    expert_arenas: &[cuteafd_loader::serving_capacity::WeightArenaLayout]) -> Result<crate::shared::draft::report::DrafterLayout> {
     use crate::shared::draft::report::{self, Kind, Placement};
-    report::publish(report::from_plan(Kind::Mtp, Placement::Whole, 0, devices, plan, |owner|
+    report::from_plan(Kind::Mtp, Placement::Whole, 0, devices, plan, |owner|
         matches!(owner.id.as_str(), "qwen.records.mtp" | "qwen.owner0.mtp.records" | "qwen.owner0.mtp.pending")
-            || owner.group.starts_with("MTP ") || owner.group == "prefill MTP step")?);
-    Ok(())
+            || owner.group.starts_with("MTP ") || owner.group == "prefill MTP step"
+            || expert_arenas.iter().any(|arena| arena.id() == owner.id))
 }
 
+/// Publish the admission identity the shared Ready and first-request memory
+/// reconciliation reads (`shared::memory_report::reconcile`). The capture
 pub(super) fn publish_reconciliation(args: &EngineArgs, devices: &[RuntimeSample],
     solved: &cuteafd_loader::placement::planner::ResolvedPlan, spark_world: usize) -> Result<()> {
     use sha2::{Digest, Sha256};

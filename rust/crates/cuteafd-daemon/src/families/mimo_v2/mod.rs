@@ -1483,8 +1483,21 @@ impl Opened {
                     Some((Kind::Dflash2, if draft.is_split() { Placement::Split } else { Placement::Whole }))
                 } else if engine.mtp.is_some() { Some((Kind::Mtp, Placement::Whole)) } else { None };
                 if let Some((kind, placement)) = draft {
-                    report::publish(report::from_plan(kind, placement, 0, &physical, &preflight.solved,
-                        |owner| owner.group == "draft.fp8_scratch" || owner.group.starts_with("mtp."))?);
+                    let mut layout = report::from_plan(kind, placement, 0, &physical, &preflight.solved,
+                        |owner| owner.group == "draft.fp8_scratch")?;
+                    if kind == Kind::Mtp {
+                        use cuteafd_loader::serving_capacity::{mimo_cache_geometry, MIMO_RING_ROWS};
+                        use cuteafd_loader::placement::planner::independent_backing_slack;
+                        let target = mimo_cache_geometry(&self.cfg, layers, physical.len(), args.kv_formats(), 0)?.ranks[0];
+                        let full = mimo_cache_geometry(&self.cfg, layers, physical.len(), args.kv_formats(), args.mtp)?.ranks[0];
+                        let stage = args.rings as u64 * MIMO_RING_ROWS
+                            * self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding, args.kv_formats()) as u64;
+                        let history = args.rings as u64 * MIMO_RING_ROWS * self.cfg.hidden as u64 * 2;
+                        let tail = independent_backing_slack(std::iter::repeat_n(stage, args.mtp).chain([history]))?;
+                        layout.arena_bytes[0] += (full.active_state_per_sequence_bytes - target.active_state_per_sequence_bytes)
+                            * args.rings as u64 + full.fixed_state_bytes - target.fixed_state_bytes + tail;
+                    }
+                    report::publish(layout);
                 }
             }
             body(&engine, preflight.host_config)

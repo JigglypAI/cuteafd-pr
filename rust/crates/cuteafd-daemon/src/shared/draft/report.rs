@@ -25,10 +25,15 @@ pub(crate) fn from_plan(kind: Kind, placement: Placement, lead: u8, devices: &[i
         let location = Location::coordinator(logical as u8);
         let owners = facts.allocations.iter().filter(|owner| owner.location == location && owner.view.is_none()
             && live(owner.lifetime) && (owner.category == Category::Drafter || extra(owner))).collect::<Vec<_>>();
-        let tails = facts.allocation_granularity.iter().filter(|tail| tail.location == location
-            && live(tail.lifetime) && tail.backings.iter().all(|backing|
-                owners.iter().any(|owner| owner.id == backing.backing)));
-        let bytes = owners.iter().map(|owner| Ok(owner.bytes)).chain(tails.map(|tail| tail.bytes().map_err(anyhow::Error::from)))
+        let totals = facts.allocation_granularity.iter().filter(|tail| tail.location == location && live(tail.lifetime))
+            .map(|tail| -> Result<u64> {
+                let owns = |backing: &&cuteafd_loader::placement::planner::GranularityBacking|
+                    owners.iter().any(|owner| owner.id == backing.backing);
+                if tail.backings.iter().all(|backing| owns(&backing)) { return Ok(tail.bytes()?); }
+                Ok(cuteafd_loader::placement::planner::independent_backing_slack(
+                    tail.backings.iter().filter(owns).flat_map(|backing| backing.requests.iter().copied()))?)
+            });
+        let bytes = owners.iter().map(|owner| Ok(owner.bytes)).chain(totals)
             .try_fold(0u64, |sum, n| sum.checked_add(n?).context("admitted drafter bytes overflow"))?;
         ranks.push(Rank::Gpu(device));
         arena_bytes.push(bytes);
