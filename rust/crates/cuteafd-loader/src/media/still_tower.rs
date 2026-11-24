@@ -19,7 +19,7 @@ pub struct StillTowerInventory {
 
 impl StillTowerInventory {
     pub fn from_checkpoint(checkpoint: &Checkpoint, max_output_rows: usize) -> Result<Self> {
-        if matches!(checkpoint.model_type(), Some("inkling2" | "step5_vl")) {
+        if matches!(checkpoint.model_type(), Some("inkling2" | "inkling2_loop" | "step5_vl")) {
             use super::perception_vision::{PerceptionGeometry, PerceptionKind};
             let geometry = PerceptionGeometry::from_config(&checkpoint.config).map_err(anyhow::Error::msg)?;
             let physical = geometry.resident_weights(checkpoint.tensors.iter().map(|t| &t.meta))

@@ -5,6 +5,7 @@ pub mod glm;
 pub mod hy4;
 pub mod hy4_flash;
 pub mod inkling2;
+pub mod inkling2_mini;
 pub mod kimi;
 pub mod mimo;
 pub mod minimax;

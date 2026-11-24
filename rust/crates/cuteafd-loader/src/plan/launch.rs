@@ -75,6 +75,11 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             // Every Inkling 2 layer is routed; the bundled dSpark drafter is dense.
             ("inkling2", 0, Some(cfg.layers - 1))
         }
+        "inkling2_loop" => {
+            let cfg = crate::families::inkling2_mini::Inkling2MiniConfig::from_hf(config)?;
+            // Every physical layer is routed (TP1 local); the bundled dSpark drafter is dense.
+            ("inkling2_mini", 0, Some(cfg.text.layers - 1))
+        }
         "minimax_m3_vl" => {
             let cfg = crate::families::minimax_m3::MiniMaxM3Config::from_hf(config)?;
             let first = cfg.moe.iter().position(|&moe| moe).unwrap_or(cfg.layers);

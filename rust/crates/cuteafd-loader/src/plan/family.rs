@@ -233,7 +233,7 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 17] = [
+static REGISTRY: [&dyn Family; 18] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM5,
@@ -247,6 +247,7 @@ static REGISTRY: [&dyn Family; 17] = [
     &super::families::mistral_large4::MISTRAL_LARGE4,
     &super::families::minimax::MINIMAX_M3,
     &super::families::inkling2::INKLING2,
+    &super::families::inkling2_mini::INKLING2_MINI,
     &super::families::hy4_flash::HY4_FLASH,
     &super::families::hy4::HY4,
     &super::families::dflash::DFLASH2,

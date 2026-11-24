@@ -18,7 +18,7 @@ impl StillEncoder {
         let rows = match checkpoint.model_type() {
             Some("kimi_k3" | "kimi_k31") => crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
             Some("minimax_m3_vl") => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
-            Some("inkling2" | "step5_vl") => 4096,
+            Some("inkling2" | "inkling2_loop" | "step5_vl") => 4096,
             Some("hy_v4_flash") => crate::families::hy4_flash::vision::MAX_MERGED_ROWS,
             _ => anyhow::bail!("unsupported independent still tower"),
         };

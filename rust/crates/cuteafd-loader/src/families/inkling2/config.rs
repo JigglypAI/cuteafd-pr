@@ -147,6 +147,10 @@ impl Inkling2Config {
 
     pub fn from_hf(root: &Value) -> Result<Self> {
         ensure!(root["model_type"] == "inkling2", "Inkling 2 requires model_type=inkling2, found {}", root["model_type"]);
+        Self::parse_text_config(root)
+    }
+
+    pub(crate) fn parse_text_config(root: &Value) -> Result<Self> {
         let v = root.get("text_config").filter(|v| v.is_object()).context("Inkling 2 requires text_config")?;
         let layers = int(v, "num_hidden_layers")?;
         let (heads, kv_heads, head_dim) = (int(v, "num_attention_heads")?, int(v, "num_key_value_heads")?, int(v, "head_dim")?);
@@ -279,6 +283,10 @@ impl Inkling2VisionConfig {
 
 impl Inkling2MtpConfig {
     pub fn from_hf(root: &Value, text: &Inkling2Config) -> Result<Option<Self>> {
+        Self::from_hf_with_target(root, text.hidden, text.layers)
+    }
+
+    pub fn from_hf_with_target(root: &Value, target_hidden: usize, target_visits: usize) -> Result<Option<Self>> {
         let Some(v) = root.get("mtp_config") else { return Ok(None) };
         ensure!(v.is_object(), "Inkling 2 mtp_config must be an object");
         ensure!(v["markov_head_type"] == "rnn_hidden", "Inkling 2 MTP head must be rnn_hidden, found {}", v["markov_head_type"]);
@@ -287,11 +295,11 @@ impl Inkling2MtpConfig {
         }
         let layers = int(v, "num_hidden_layers")?;
         let hidden = int(v, "hidden_size")?;
-        ensure!(hidden == text.hidden, "Inkling 2 MTP hidden {hidden} differs from the target's {}", text.hidden);
+        ensure!(hidden == target_hidden, "Inkling 2 MTP hidden {hidden} differs from the target's {target_hidden}");
         let targets = v["target_layer_ids"].as_array().context("Inkling 2 mtp_config lacks target_layer_ids")?
             .iter().map(|id| id.as_u64().map(|id| id as usize).context("Inkling 2 MTP target layer id")).collect::<Result<Vec<_>>>()?;
-        ensure!(targets.len() >= 2 && targets.windows(2).all(|w| w[0] < w[1]) && targets.last() == Some(&text.layers),
-            "Inkling 2 MTP target_layer_ids must be ascending and end at the target layer count ({})", text.layers);
+        ensure!(targets.len() >= 2 && targets.windows(2).all(|w| w[0] < w[1]) && targets.last() == Some(&target_visits),
+            "Inkling 2 MTP target_layer_ids must be ascending and end at the target layer count ({target_visits})");
         let block = int(v, "block_size")?;
         ensure!(block >= 2, "Inkling 2 MTP block {block} drafts nothing");
         let (heads, kv_heads) = (int(v, "num_attention_heads")?, int(v, "num_key_value_heads")?);

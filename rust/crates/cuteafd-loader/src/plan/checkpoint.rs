@@ -546,6 +546,14 @@ impl Checkpoint {
     }
 
     fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
+        // Inkling 2 checkpoints carry per-layer native NVFP4/MXFP8 expert headers
+        // (with hf_quant_config.json quant_method=inkling2) and Inkling 2 Mini also
+        // includes a bare vLLM-compat quantization_config stub in config.json.
+        if self.model_type() == Some("inkling2_loop")
+            || self.quantize_config.as_ref().and_then(|q| q.get("quant_method")).and_then(Value::as_str) == Some("inkling2")
+        {
+            return Ok(ModuleNumerics::CheckpointPrecision);
+        }
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
         if root.get("quant_method").and_then(Value::as_str) == Some("mxfp8") {

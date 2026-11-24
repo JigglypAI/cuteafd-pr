@@ -41,6 +41,20 @@ impl PerceptionGeometry {
                 ],
                 (1024, 23, 16, 4096, 20, 32, 4608),
             ),
+            Some("inkling2_loop") => (
+                PerceptionKind::Inkling2,
+                vec![
+                    ("hidden_size", 1024),
+                    ("num_hidden_layers", 23),
+                    ("num_attention_heads", 16),
+                    ("native_patch_size", 20),
+                    ("temporal_patch_size", 2),
+                    ("adapter_merge_size", 2),
+                    ("projection_hidden_dim", 4096),
+                    ("posemb_grid_size", 32),
+                ],
+                (1024, 23, 16, 4096, 20, 32, 2304),
+            ),
             Some("step5_vl") => (
                 PerceptionKind::Step5,
                 vec![

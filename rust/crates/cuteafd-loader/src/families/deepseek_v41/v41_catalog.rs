@@ -933,6 +933,14 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         }
         return fp8_catalog(snapshot, shape);
     }
+    if config["model_type"] == "inkling2_loop" {
+        let cfg = crate::families::inkling2_mini::Inkling2MiniConfig::from_hf(config)?;
+        let t = &cfg.text;
+        let shape = RoutedExpertShape { layers: t.layers, first_layer: 0,
+            experts: t.experts, topk: t.topk, hidden: t.hidden, intermediate: t.intermediate,
+            draft_stages: 0, draft_experts: 0, activation: cuteafd_core::ExpertActivation::Situ4_25 };
+        return fp8_catalog(snapshot, shape);
+    }
     if config["model_type"] == "minimax_m3_vl" {
         let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(config)?;
         let first_layer = cfg.moe.iter().position(|&moe| moe).context("MiniMax M3 has no routed layers")?;

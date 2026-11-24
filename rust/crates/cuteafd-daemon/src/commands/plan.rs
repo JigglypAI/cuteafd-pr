@@ -746,7 +746,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
         layout.minimax_dspark = family == "minimax_m3" && args.speculator == "dspark";
-        layout.inkling_dspark = family == "inkling2" && args.speculator == "dspark";
+        layout.inkling_dspark = matches!(family, "inkling2" | "inkling2_mini") && args.speculator == "dspark";
         resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
@@ -1099,7 +1099,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
-        "minimax_m3" | "inkling2" => "dspark",
+        "minimax_m3" | "inkling2" | "inkling2_mini" => "dspark",
         "hy4_flash" if args.spark_ranks.unwrap_or(args.available_sparks) == 0
             && (args.speculator == "auto" || args.include_speculator)
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
@@ -1148,7 +1148,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2" | "inkling2_mini", "dspark") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
