@@ -39,7 +39,7 @@ CHECKPOINTS = {"deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"}
 GPU_UUIDS = ("GPU-00000000-0000-0000-0000-000000000000", "GPU-11111111-1111-1111-1111-111111111111")
 GPU_PCI = ("00000000:01:00.0", "00000000:02:00.0")
 HOSTS = ("ostrich", "dodo", "emu", "kiwi", "rhea", "moa")
-# The gate kit's V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
+# The archived V4.1 gate cards, as
 # wip-cards.py generates their configs for a WIP arm.
 LEGACY_KIT_CARDS = ("v41-flash-max", "v41-flash-min", "v41-flash-ref-tp4")
 KIT_CARDS = LEGACY_KIT_CARDS + ("v41-flash-sim5090",)
@@ -268,7 +268,7 @@ def kit_config(name: str, directory: Path) -> Path:
     spec = importlib.util.spec_from_file_location("wip_cards", ROOT / "scripts" / "bench" / "wip-cards.py")
     cards = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cards)
-    matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+    matrix = json.loads((ROOT / "scripts/tests/fixtures/retired-gate-cards.json").read_text())
     entry = next(e for e in matrix["entries"] if e["name"] == name)
     entry = {**entry, "config": str(ROOT / entry["config"])}
     key = directory / "api-key"
