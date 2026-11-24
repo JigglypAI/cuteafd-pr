@@ -99,7 +99,8 @@ pub struct Entry {
     /// Seconds allowed for the launch to become ready.
     #[serde(default)]
     pub timeout_s: Option<u64>,
-    /// Seconds allowed for the benchmark run once ready (default 900).
+    /// Seconds allowed for the benchmark run once ready (default 900), per
+    /// same-server pass when `sweep_passes` is above 1.
     #[serde(default)]
     pub run_timeout_s: Option<u64>,
     /// Runs with nothing else at once (default: deepseek_v41 entries).
@@ -181,7 +182,16 @@ pub struct Entry {
     pub context_suffix: Option<u64>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub panel_config: crate::panel_config::PanelConfigs,
+    /// Same-server passes (default 1): the client-side sweep runs this many
+    /// times against one launch, and the server's `context_load` panel runs
+    /// this many passes (`RunOptions::passes`). `sweep.json` keeps every pass
+    /// under `passes`; its top level is the final pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_passes: Option<u32>,
 }
+
+/// Most same-server passes an entry may ask for (the server caps panel passes at 20).
+pub const MAX_SWEEP_PASSES: u32 = 20;
 
 /// `open` runs once after the sweep's first warm-up, just before its first
 /// timed request; `close` runs when the sweep ends (passed or failed) and again
@@ -548,7 +558,13 @@ impl Entry {
             context_suffix: self.context_suffix.or(defaults.context_suffix),
             panel_config: defaults.panel_config.iter().chain(self.panel_config.iter())
                 .map(|(k, v)| (k.clone(), v.clone())).collect(),
+            sweep_passes: self.sweep_passes.or(defaults.sweep_passes),
         }
+    }
+
+    /// Same-server passes of the sweep and of `context_load` (default 1).
+    fn passes(&self) -> u32 {
+        self.sweep_passes.unwrap_or(1)
     }
 
     /// V4.1 runs with nothing else at once (one entry at a time, no parallel
@@ -1056,6 +1072,25 @@ fn check_post_load(entry: &Entry) -> Result<()> {
     Ok(())
 }
 
+/// `sweep_passes` is 1..=[`MAX_SWEEP_PASSES`] and has something to repeat:
+/// a client-side sweep or a profile that runs `context_load`.
+fn check_sweep_passes(entry: &Entry, profile: &str) -> Result<()> {
+    let passes = entry.passes();
+    anyhow::ensure!((1..=MAX_SWEEP_PASSES).contains(&passes), "{}: sweep_passes must be 1..={MAX_SWEEP_PASSES}, got {passes}", entry.name);
+    if passes > 1 && !entry.sweeps() && !runs_context_load(profile) {
+        bail!("{}: sweep_passes repeats the client-side sweep and context_load; this entry runs neither", entry.name);
+    }
+    Ok(())
+}
+
+/// Whether a profile (a built-in name or `panels:a,b`) includes `context_load`.
+fn runs_context_load(profile: &str) -> bool {
+    match profile.strip_prefix("panels:") {
+        Some(list) => list.split(',').any(|id| id.trim() == "context_load"),
+        None => crate::profiles::builtin().iter().any(|p| p.name == profile && p.panels.iter().any(|p| p.id == "context_load")),
+    }
+}
+
 pub fn run(args: SmokeArgs) -> Result<()> {
     let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(&args.matrix)
         .with_context(|| format!("{}", args.matrix.display()))?).context("parsing the matrix")?;
@@ -1092,6 +1127,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             crate::sweep::parse_lengths(&text).map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         }
         check_post_load(&entry)?;
+        check_sweep_passes(&entry, entry.profile.as_deref().or(matrix.profile.as_deref()).unwrap_or("smoke"))?;
         if entry.window.is_some() && !entry.sweeps() {
             bail!("{}: window needs levels, prefill_lengths or sweep_verify (it frames the sweep's timed requests)", entry.name);
         }
@@ -1139,14 +1175,14 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     check_nested_holds(&pending)?;
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 matched_panel_window={} sweep_verify={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} lossless_concurrency={} context_lengths={:?} context_levels={:?} context_suffix={} panel_config={} fabric={} worker_stop={} warm_prelude=server-v1 matched_panel_window={} sweep_verify={} sweep_passes={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.lossless_concurrency.unwrap_or(1), e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), serde_json::json!(e.panel_config), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.matched_panel_window.unwrap_or(false),
-                e.sweep_verify.as_ref().map_or("-".into(), |v| serde_json::json!(v).to_string()), e.set);
+                e.sweep_verify.as_ref().map_or("-".into(), |v| serde_json::json!(v).to_string()), e.passes(), e.set);
         }
         return Ok(());
     }
@@ -1288,7 +1324,7 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
                         pair(p.foreign_sent_bytes,p.foreign_received_bytes)));
                 }
             }
-            if let Some(line) = o.sweep.as_ref().and_then(|sweep| graph_band_line(&sweep.graph_bands)) {
+            if let Some(line) = o.sweep.as_ref().and_then(|sweep| graph_band_line(&sweep.pass_graph_bands())) {
                 out.push_str(&format!("\nGraph captures {}: {line}\n", e.name));
             }
             for caveat in &o.caveats { out.push_str(&format!("\nNote {}: {caveat}\n",e.name)); }
@@ -1302,11 +1338,14 @@ fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, se
 fn graph_band_line(bands: &[Value]) -> Option<String> {
     if bands.is_empty() { return None; }
     let flagged: Vec<String> = bands.iter().filter(|band| band["zero_captures"] != true).map(|band| {
+        let name = match band["pass"].as_u64() {
+            Some(pass) => format!("pass {pass} {}", band["band"].as_str().unwrap_or("?")),
+            None => band["band"].as_str().unwrap_or("?").to_string(),
+        };
         if band["available"] == true {
-            format!("{} {} process / {} device-cache captures", band["band"].as_str().unwrap_or("?"),
-                band["captures"], band["device_captures"])
+            format!("{name} {} process / {} device-cache captures", band["captures"], band["device_captures"])
         } else {
-            format!("{} unavailable ({})", band["band"].as_str().unwrap_or("?"), band["reason"].as_str().unwrap_or("?"))
+            format!("{name} unavailable ({})", band["reason"].as_str().unwrap_or("?"))
         }
     }).collect();
     Some(if flagged.is_empty() {
@@ -1704,8 +1743,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 (client.warm_prelude(tokens)?, "server-v1")
             }
         };
-        let run_sweep = || -> Result<crate::sweep::Sweep> {
-            let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
+        // One pass of the sweep. The window opens before the first pass's first
+        // timed request and closes after the last pass (or a failed one).
+        let sweep_pass = |pass: u32, last: bool| -> Result<crate::sweep::Sweep> {
+            let open: crate::sweep::OnTimed = entry.window.as_ref().filter(|_| pass == 1).map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
                 Box::new(|| {
                     window_open.set(true);
                     window_hook("window-open", &window.open, &url, &config_path)
@@ -1728,10 +1769,23 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                     entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
                     &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open, &concurrency)
             };
+            if !last && sweep.is_ok() {
+                return sweep;
+            }
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
             Ok(sweep)
+        };
+        // Every pass against this one launch; the final pass is the headline.
+        let run_sweep = || -> Result<crate::sweep::Sweep> {
+            let passes = entry.passes();
+            let mut sweeps = Vec::new();
+            for pass in 1..=passes {
+                if passes > 1 { eprintln!("{}: sweep pass {pass} of {passes} on the same server", entry.name); }
+                sweeps.push(sweep_pass(pass, pass == passes)?);
+            }
+            crate::sweep::Sweep::from_passes(sweeps).context("sweep ran no pass")
         };
         if sweeping && panels.as_ref().is_some_and(Vec::is_empty) {
             let sweep = run_sweep()?;
@@ -1739,17 +1793,19 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
             outcome.dir = Some(dir.display().to_string());
-            outcome.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
-                .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref()))
-                .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()));
+            outcome.fabric.extend(sweep.fabric_phases());
             outcome.sweep = Some(sweep);
             return Ok(None);
         }
-        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
+        // context_load repeats on this launch; the server ignores the override
+        // when the profile does not plan the panel.
+        let passes = if entry.passes() > 1 { vec![("context_load".to_string(), entry.passes())] } else { vec![] };
+        let options = crate::cli::RunOptions { url: url.clone(), profile, panels, passes, baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
             root: out_root.to_path_buf(),
             api_key: api_key.clone(), quiet: true,
-            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
+            // run_timeout_s bounds each same-server pass of the profile.
+            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900) * u64::from(entry.passes()))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
                 .transpose()?, lossless_dump: entry.lossless_dump.clone(), lossless_concurrency: entry.lossless_concurrency, context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix, panel_config: entry.panel_config.clone() };
         let (mut report, dir) = if entry.matched_panel_window == Some(true) {
@@ -1778,9 +1834,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         if sweeping {
             let sweep = run_sweep()?;
             std::fs::write(dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
-            report.fabric.extend(sweep.points.iter().filter_map(|p| p.fabric.as_ref())
-                .chain(sweep.prefill.iter().filter_map(|p| p.fabric.as_ref()))
-                .filter_map(|p| serde_json::from_value::<crate::fabric::Phase>(p.clone()).ok()));
+            report.fabric.extend(sweep.fabric_phases());
             crate::cli::write_exports(&report, &dir, &options.export)?;
             outcome.sweep = Some(sweep);
         }
@@ -1933,6 +1987,35 @@ pub fn describe(matrix: &Matrix) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sweep_passes_merge_validate_and_name_the_pass() {
+        use serde_json::json;
+        let defaults = Entry { sweep_passes: Some(2), ..Entry::default() };
+        let sweep = Entry { name: "s".into(), levels: Some(vec![1, 16]), ..Entry::default() }.merged(&defaults);
+        assert_eq!(sweep.passes(), 2);
+        check_sweep_passes(&sweep, "panels:").unwrap();
+        assert_ne!(sweep.key(), Entry { sweep_passes: None, ..sweep.clone() }.key(), "passes change the resume key");
+        let encoded = serde_json::to_value(&sweep).unwrap();
+        assert_eq!(encoded["sweep_passes"], 2);
+        assert_eq!(serde_json::from_value::<Entry>(encoded).unwrap(), sweep);
+        assert!(serde_json::to_value(Entry::default()).unwrap().get("sweep_passes").is_none());
+        assert_eq!(Entry::default().passes(), 1);
+        // context_load alone repeats inside the server run.
+        let context = Entry { name: "c".into(), sweep_passes: Some(2), ..Entry::default() };
+        check_sweep_passes(&context, "panels:context_load").unwrap();
+        check_sweep_passes(&context, "long").unwrap();
+        let err = check_sweep_passes(&context, "panels:baseline").unwrap_err().to_string();
+        assert!(err.contains("runs neither"), "{err}");
+        assert!(check_sweep_passes(&context, "smoke").is_err());
+        for bad in [0, MAX_SWEEP_PASSES + 1] {
+            assert!(check_sweep_passes(&Entry { sweep_passes: Some(bad), ..sweep.clone() }, "panels:").is_err());
+        }
+        let band = json!({"band": "levels C1", "pass": 1, "available": true, "captures": 4, "device_captures": 2, "zero_captures": false});
+        let clean = json!({"band": "levels C1", "pass": 2, "available": true, "captures": 0, "device_captures": 0, "zero_captures": true});
+        assert_eq!(super::graph_band_line(&[band, clean]).unwrap(),
+            "1 of 2 timed bands not capture-free: pass 1 levels C1 4 process / 2 device-cache captures");
+    }
+
     #[test]
     fn graph_band_line_names_only_bands_that_captured() {
         use serde_json::json;

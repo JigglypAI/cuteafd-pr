@@ -519,7 +519,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
             sample['argv'] = window_argv([previous['argv'], sample['argv']])
             sample['timeout_s'] += previous.get('timeout_s', 0)
         window['close'] = sample
-    timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
+    timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) * entry_passes(entry) + 120
     if probes & {'memory', 'console'} or trace:
         entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
@@ -664,12 +664,58 @@ def sweeping(entry):
     return bool(entry.get('levels') or entry.get('prefill_lengths') or entry.get('sweep_verify'))
 
 
+# Same-server passes: smoke caps them like the server caps panel passes.
+MAX_SWEEP_PASSES = 20
+
+
+def entry_passes(entry):
+    """Same-server passes of the sweep and context_load (`sweep_passes`, default 1)."""
+    return int(entry.get('sweep_passes') or 1)
+
+
+def runs_context_load(profile):
+    """Whether a profile runs the server's context_load panel (explicit panels, or the
+    built-in profiles that plan it)."""
+    if profile.startswith('panels:'):
+        return 'context_load' in [p.strip() for p in profile[7:].split(',')]
+    return profile in ('long', 'full')
+
+
+def pass_snapshots(sweep, context_records):
+    """Every same-server pass's per-band evidence, in order: the sweep's points
+    (speed), prefill points, graph bands (#2649 deltas, #2670 sites and thermals)
+    and phase thermals, plus that pass's context_load points and bands. Bands
+    carry their pass number when there is more than one pass."""
+    sweeps = (sweep.get('passes') or [sweep]) if sweep else []
+    count = max(len(sweeps), len(context_records))
+    if count <= 1:
+        return []
+    snapshots = []
+    for index in range(count):
+        number = index + 1
+        snapshot = dict(passes=count, **{'pass': number})
+        if index < len(sweeps):
+            one = sweeps[index]
+            snapshot['sweep'] = dict(points=one.get('points', []), prefill=one.get('prefill', []),
+                                     thermal=one.get('thermal', {}),
+                                     graph_bands=[{**band, 'pass': number} for band in one.get('graph_bands', [])])
+            if one.get('verify'):
+                snapshot['sweep']['verify'] = one['verify']
+        if index < len(context_records):
+            record = context_records[index]
+            snapshot['context_load'] = dict(points=record.get('points', []), thermal=record.get('thermal'),
+                                            graph_bands=[{**band, 'pass': number} for band in record.get('graph_bands', [])])
+        snapshots.append(snapshot)
+    return snapshots
+
+
 def job_max_run(job):
     """Seconds one job may hold the serving turn: smoke's launch and run budget
     (timeout_s + run_timeout_s + 120 s, the observer's bound), every hook's own
     timeout, smoke's teardown and the driver's checks around it."""
     entry = job['entry']
-    run = int(entry.get('run_timeout_s', 900))
+    # run_timeout_s bounds each same-server pass (smoke scales the panel deadline).
+    run = int(entry.get('run_timeout_s', 900)) * entry_passes(entry)
     bound = int(entry.get('timeout_s', 900)) + run + 120
     if sweeping(entry) and entry.get('profile') != 'panels:':
         bound += run  # panels and a sweep: smoke bounds only the panels by run_timeout_s
@@ -677,7 +723,7 @@ def job_max_run(job):
     bound += sum(int(hook['timeout_s']) for hook in hooks if hook)
     if entry.get('prefill_purge'):
         # Before each prefill point's warm-up and again before its timed request.
-        points = len(entry.get('prefill_lengths') or []) * (2 if entry.get('prefill_repeat') else 1)
+        points = len(entry.get('prefill_lengths') or []) * (2 if entry.get('prefill_repeat') else 1) * entry_passes(entry)
         bound += 2 * points * int(entry['prefill_purge']['timeout_s'])
     return bound + SMOKE_STOP_GRACE_S + JOB_DRIVER_SLACK_S
 
@@ -2301,6 +2347,7 @@ def summarize_job(job, exit_code):
     if 'artifacts' in job: row['artifacts'] = job['artifacts']
     if 'launcher' in job: row['launcher'] = job['launcher']
     report = None
+    context_records, sweep = [], None
     reports = list((dest / 'reports').glob('**/report.json'))
     if job.get('grouped'):
         reports = [path for path in reports if path.parent.name.endswith('-' + job['entry']['name'])]
@@ -2359,8 +2406,9 @@ def summarize_job(job, exit_code):
         context_panel = next((p for p in report.get('panels', []) if p.get('id') == 'context_load'), None)
         if context_panel:
             records = context_panel.get('passes', [])
+            context_records = records
             latest = records[-1] if records else {}
-            if any(p.get('status') == 'failed' for p in latest.get('points', [])):
+            if any(p.get('status') == 'failed' for record in records for p in record.get('points', [])):
                 fail(row, 'context_load: request or prefix-reuse failure', 'measurement')
             row['context_graph_bands'] = latest.get('graph_bands', [])
         lossless = lossless_set_result(report)
@@ -2431,7 +2479,8 @@ def summarize_job(job, exit_code):
         else:
             sweep = json.loads(sweeps[0].read_text())
             if not outcome.get('fabric'):
-                row['fabric'].extend(p['fabric'] for p in [*sweep.get('points', []), *sweep.get('prefill', [])] if p.get('fabric'))
+                row['fabric'].extend(p['fabric'] for one in (sweep.get('passes') or [sweep])
+                                     for p in [*one.get('points', []), *one.get('prefill', [])] if p.get('fabric'))
             row['sweep'] = sweep.get('points', [])
             for point in row['sweep']:
                 key = (f"sustained C{point['c']}" if point['phase'] == 'sustained' else
@@ -2454,6 +2503,21 @@ def summarize_job(job, exit_code):
             row['graph_bands'] = sweep.get('graph_bands', [])
     # context_load's timed points join the sweep's bands in one per-band table.
     row['graph_bands'] = [*row.get('graph_bands', []), *row.pop('context_graph_bands', [])]
+    # Same-server passes: every pass's snapshot, and every pass's bands in the
+    # table; the headline metrics above are the final pass's.
+    snapshots = pass_snapshots(sweep, context_records)
+    if snapshots:
+        row['passes'] = snapshots
+        row['headline_pass'] = len(snapshots)
+        row['graph_bands'] = [band for snapshot in snapshots for part in ('sweep', 'context_load')
+                              for band in (snapshot.get(part) or {}).get('graph_bands', [])]
+    expected = entry_passes(job['entry'])
+    recorded = [(name, n) for name, n in (('sweep', len(sweep.get('passes') or [sweep]) if sweep else 0),
+                                          ('context_load', len(context_records))) if n]
+    for name, count in recorded:
+        if expected > 1 and count != expected:
+            fail(row, f'sweep_passes={expected} but {name} recorded {count} pass(es) on the server '
+                 '(build the smoke binary from a checkout with --sweep-passes)', 'measurement')
     row['peaks'] = peaks(dest)
     row['spark_memory'] = spark_memory_report(dest)
     row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
@@ -2716,8 +2780,13 @@ def write_summary(state, rows, arms):
     rerun = any(row['ab_verdict'] == 'rerun' for row in rows)
     caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c)
                for r in rows for c in [*r.get('fabric_caveats', []), *r.get('table_caveats', [])]]
+    passes = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], **{'pass': p['pass']}, passes=p['passes'],
+                   headline=p['pass'] == r.get('headline_pass'),
+                   graph_bands=[b for part in ('sweep', 'context_load') for b in (p.get(part) or {}).get('graph_bands', [])])
+              for r in rows for p in r.get('passes', [])]
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
-                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats))
+                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats,
+                                    **({'passes': passes} if passes else {})))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -2731,6 +2800,10 @@ def write_summary(state, rows, arms):
                   for r in rows if r.get('matched_panel_window')]
     if warm_paths:
         text += 'Matched prelude paths: ' + ', '.join(warm_paths) + '.\n\n'
+    multipass = sorted({r['headline_pass'] for r in rows if r.get('headline_pass')})
+    if multipass:
+        text += ('Headline speed is the final same-server pass (pass ' + '/'.join(map(str, multipass)) + ' of each '
+                 'launch); every pass is in summary.json `passes` / `rows[].passes` and sweep.json `passes`.\n\n')
     # Before -> after per card and metric: medians of passing real-hardware rows,
     # ratio after/before, and the paired median where pairs exist.
     if len(names) > 1:
@@ -2789,16 +2862,18 @@ def write_summary(state, rows, arms):
         text += ('## Graph Captures Per Timed Band\n\n/v1/stats and /v1/thermal read just before and after each timed band '
                  '(sweep bands and context_load points). Throttle columns are the worst GPU: power-cap = software cap + power brake '
                  'seconds, thermal = software + hardware slowdown seconds. Eager sites: eager runs per site, spanning sites marked *.\n\n')
-        text += ('| Card | Arm | Repeat | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free '
+        text += ('Pass: same-server pass (`--sweep-passes`); the first captures shapes for the first time, '
+                 'later passes should be capture-free.\n\n')
+        text += ('| Card | Arm | Repeat | Pass | Band | Process captures | Device-cache captures | Misses | Eager runs | Capture-free '
                  '| Power-cap s | Thermal s | Busy SM MHz | Max C | Min headroom C | Eager sites |\n'
-                 '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |\n')
+                 '| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |\n')
         for r in rows:
             for band in r.get('graph_bands', []):
                 free = {True: 'yes', False: 'NO'}.get(band.get('zero_captures'), 'unavailable: ' + str(band.get('reason')))
                 thermal = band.get('thermal') or {}
                 sites = ', '.join(f"{s['site']}{'*' if s.get('spans_devices') else ''} {s.get('eager_runs', 0)}"
                                   for s in band.get('sites') or [] if s.get('eager_runs'))
-                text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], band.get('band'), band.get('captures'),
+                text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], band.get('pass', 1), band.get('band'), band.get('captures'),
                                                    band.get('device_captures'), band.get('misses'), band.get('eager_runs'), free,
                                                    thermal.get('power_cap_s'), thermal.get('thermal_slowdown_s'),
                                                    thermal.get('busy_sm_clock_mhz'), thermal.get('max_temperature_c'),
@@ -3522,6 +3597,10 @@ def main():
     parser.add_argument('--verify-context', type=int, metavar='N', help='--verify-shapes history tokens per request (default 1024)')
     parser.add_argument('--verify-repeats', type=int, metavar='N', help='--verify-shapes timed repeats per shape (default 20)')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
+    parser.add_argument('--sweep-passes', type=int, default=1, metavar='N',
+                        help=f'run the client sweep (--levels/--prefill-lengths/--verify-shapes) and context_load N times '
+                        f'against one server launch (1..{MAX_SWEEP_PASSES}, default 1); every pass is kept, the headline is the '
+                        'final pass. For graph-cache convergence: pass 1 captures, later passes should not')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
                         '(default 192); longer runs give profiled waves more decode steps at every width, and 0 omits '
                         'max_tokens so the server output default bounds each request (KV-reservation admission probes)')
@@ -3675,6 +3754,8 @@ def main():
         parser.error('--prefill-idle-seconds needs --prefill-lengths and finite nonnegative representable seconds')
     if args.sweep_tokens is not None and not (args.levels and 0 <= args.sweep_tokens <= 8192):
         parser.error('--sweep-tokens needs --levels and 0 (omit max_tokens) or 1..8192 tokens')
+    if not 1 <= args.sweep_passes <= MAX_SWEEP_PASSES:
+        parser.error(f'--sweep-passes takes 1..{MAX_SWEEP_PASSES} same-server passes')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -3779,6 +3860,12 @@ def main():
                 card['post_load_c1'] = True
                 if args.post_load_repeat:
                     card['post_load_repeat'] = True
+    if args.sweep_passes > 1:
+        for card in cards:
+            if not (sweeping(card) or runs_context_load(card.get('profile', 'smoke'))):
+                parser.error('--sweep-passes repeats the client sweep and context_load: pass --levels, --prefill-lengths, '
+                             '--verify-shapes or --panels with context_load')
+            card['sweep_passes'] = args.sweep_passes
     probes, arm_probes = probe_selection(args.probe, cards, arms)
     expected = {card['name']: card.get('expected_pool') for card in cards}
     for item in args.expect_pool:
@@ -3909,6 +3996,8 @@ def main():
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
             if args.context_suffix is not None:
                 print('# context_suffix=' + str(job['entry']['context_suffix']))
+            if args.sweep_passes > 1:
+                print(f"# sweep_passes={args.sweep_passes}: one server launch, {args.sweep_passes} passes of the sweep and context_load")
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
             if job.get('client'):
                 print('# smoke client (after readiness, in the card\'s turn): ' + shlex.join(job['client']))
@@ -3953,7 +4042,8 @@ def main():
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
         (['context_suffix'] if args.context_suffix is not None else []) + \
         (['panel_config'] if panel_config else []) + (['sweep_verify'] if verify else []) + \
-        (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
+        (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else []) + \
+        (['sweep_passes'] if args.sweep_passes > 1 else [])
     for job in {(j['launcher']['repo'], bool(j['entry'].get('matched_panel_window'))): j for j in reversed(jobs)}.values():
         requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])
         binary_supports(job['binary'], job['launcher']['repo'], job,
