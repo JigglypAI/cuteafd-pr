@@ -206,8 +206,10 @@ pub(crate) mod tests {
         let mut runtime = VitRuntime::load(spec, &library, 0, required.total_bytes()).unwrap();
         // SAFETY: the same trusted native library the tower owner loaded.
         let native = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }.unwrap();
+        // Per-image fixtures carry `grid`; `batch/` is the reference's own batched turn.
+        let meta_of = |p: &Path| -> Option<serde_json::Value> { serde_json::from_slice(&std::fs::read(p.join("meta.json")).ok()?).ok() };
         let mut fixtures: Vec<_> = std::fs::read_dir(&golden).unwrap().map(|e| e.unwrap().path())
-            .filter(|p| p.join("meta.json").is_file()).collect();
+            .filter(|p| meta_of(p).is_some_and(|m| m.get("grid").is_some())).collect();
         fixtures.sort();
         assert!(!fixtures.is_empty(), "no Hy4 vision fixtures under {}", golden.display());
         let mut report = serde_json::Map::new();
@@ -251,6 +253,30 @@ pub(crate) mod tests {
         runtime.native.encode_batch_into(&batch_rgb, &batch_grids, &lut, &mut batched).unwrap();
         let identical = batched == singles;
         report.insert("batch_equals_singles".into(), identical.into());
+        if let Some(meta) = meta_of(&golden.join("batch")) {
+            let order: Vec<String> = serde_json::from_value(meta["order"].clone()).unwrap();
+            let names: Vec<String> = fixtures.iter().map(|f| f.file_name().unwrap().to_string_lossy().into()).collect();
+            // The reference batched its members in its own order; compare each member's slice.
+            let rows: Vec<usize> = serde_json::from_value(meta["rows"].clone()).unwrap();
+            let reference = read_f32(&golden.join("batch/stage_out.f32"));
+            let mut ours_start = std::collections::BTreeMap::new();
+            let mut at = 0;
+            for (name, grid) in names.iter().zip(&batch_grids) {
+                let n = cuteafd_ffi::vision::output_rows(*grid, true) * 3072;
+                ours_start.insert(name.clone(), (at, n)); at += n;
+            }
+            let (mut cursor, mut worst_batch) = (0usize, 1f64);
+            for (name, r) in order.iter().zip(&rows) {
+                let n = r * 3072;
+                let (start, len) = ours_start[name];
+                assert_eq!(len, n, "{name}: batch rows differ from the reference");
+                let ours: Vec<f32> = batched[start..start + len].iter().map(|v| bf16(*v)).collect();
+                worst_batch = worst_batch.min(compare(&ours, &reference[cursor..cursor + n]).0);
+                cursor += n;
+            }
+            report.insert("batch_vs_reference_worst_cosine".into(), worst_batch.into());
+            worst_cos = worst_cos.min(worst_batch);
+        }
         report.insert("worst_cosine".into(), worst_cos.into());
         report.insert("worst_output_rel_l2".into(), worst_out.into());
         let text = serde_json::to_string_pretty(&report).unwrap();
