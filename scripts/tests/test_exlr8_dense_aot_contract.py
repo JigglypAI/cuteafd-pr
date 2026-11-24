@@ -730,7 +730,14 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     expected_fp8.update((k, n, rows, "bf16") for _, k, n, _ in compact.INKLING_SHAPES
         if n not in (201088, 100608, 100480) for rows in (64, 4096))
     assert fp8 == expected_fp8
-    assert len(namespace["work"]) == 12 + 1 + 13 + 2 + len(expected_fp8) + len(draft_head_shards)
+    assert len(namespace["work"]) == 18 + 1 + 13 + 2 + len(expected_fp8) + len(draft_head_shards)
+    expected_m128 = [
+        (f"inkling2_{kind}_attention_decode_{fmt}_v2_m128{tp}",
+         dict(kind=kind, route="decode", max_rows=128, kv_format=fmt))
+        for tp in ("", "_tp2")
+        for kind in ("local", "global")
+        for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
+    ]
     assert names == [
         (f"inkling2_{kind}_attention_{route}_{fmt}_v2_m{rows}{tp}",
          dict(kind=kind, route=route, max_rows=rows, kv_format=fmt))
@@ -738,7 +745,7 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         for kind in ("local", "global")
         for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
         for route, rows in (("decode", 64), ("prefill", 4096))
-    ]
+    ] + expected_m128
     # Non-default capacities reach the pinned compiler and the stem.
     custom = namespace["inkling2_attention_programs"](16, 2048)
     assert [(suffix, thunk()["max_rows"]) for suffix, _, _, thunk in custom] == [
@@ -747,6 +754,11 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
         for kind in ("local", "global")
         for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
         for route, rows in (("decode", 16), ("prefill", 2048))
+    ] + [
+        (f"{kind}_attention_decode_{fmt}_v2_m128{tp}", 128)
+        for tp in ("", "_tp2")
+        for kind in ("local", "global")
+        for fmt in (("bf16", "fp8") if kind == "global" else ("bf16",))
     ]
     # Appended after every existing program, like MiniMax: the per-geometry loop skips it.
     source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
