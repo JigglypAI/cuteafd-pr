@@ -890,7 +890,7 @@ fn deployment_device_audit_accepts_real_v41_missing_export_refusal() {
 fn assert_v41_sim5090_head_pools(root: &std::path::Path, snapshot: &std::path::Path,
     programs: &std::path::Path, hf_home: &std::path::Path) {
     let matrix: serde_json::Value = serde_json::from_slice(&std::fs::read(
-        root.join("scripts/bench/kits/gate/matrix-gate.json")).unwrap()).unwrap();
+        root.join("scripts/tests/fixtures/retired-gate-cards.json")).unwrap()).unwrap();
     let entry = matrix["entries"].as_array().unwrap().iter()
         .find(|entry| entry["name"] == "v41-flash-sim5090").unwrap();
     let mut config = std::fs::read_to_string(root.join(entry["config"].as_str().unwrap())).unwrap();
