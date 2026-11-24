@@ -682,11 +682,11 @@ pub(crate) fn begin_visit<'a>(
         (
             members.iter().map(|m| m.rows.len().div_ceil(tile_rows)).sum(),
             members.len(),
-            unit.layout.buffers["page_table"] / (cache.layout.sequences * 4),
+            unit.layout.metadata.page_table_width,
             cache.layout.ring_stride_records(),
         )
     } else {
-        (rows.div_ceil(tile_rows), 1, owner.layout().buffers["page_table"] / 4, 1088)
+        (rows.div_ceil(tile_rows), 1, owner.layout().metadata.page_table_width, 1088)
     };
     let batch = Batch {
         rows,

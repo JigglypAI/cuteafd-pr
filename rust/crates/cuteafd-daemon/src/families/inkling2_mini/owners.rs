@@ -214,9 +214,10 @@ impl<'a> UnitOwner<'a> {
         Ok(seg)
     }
 
+    /// Packs all 9 read-only per-unit metadata planes into one contiguous staging
+    /// slice and uploads them once to the unit's `"metadata"` device buffer.
     pub fn packed_metadata(
         &self,
-        cache_slot: usize,
         cache: &super::cache::CacheBank<'a>,
         members: &[PackedMember],
         uploads: &mut crate::shared::token_table::RetainedUploads<'a>,
@@ -232,83 +233,76 @@ impl<'a> UnitOwner<'a> {
             "Inkling 2 Mini packed cache members alias or exceed admitted request slots"
         );
         let rows = members.last().context("Mini packed metadata is empty")?.rows.end;
-        let mut positions = Vec::with_capacity(rows);
-        let mut local = Vec::with_capacity(rows);
-        let mut global = Vec::with_capacity(rows);
-        let mut ring = Vec::with_capacity(rows);
-        let mut conv = Vec::with_capacity(rows);
-        let mut first = Vec::with_capacity(rows);
-        for member in members {
-            ensure!(
-                member.rows.start == positions.len() && member.metadata.rows() == member.rows.len(),
-                "Mini packed metadata members do not cover unit rows"
-            );
-            positions.extend_from_slice(&member.metadata.positions);
-            local.extend(member.metadata.local_slots.iter().map(|&slot| slot + member.rows.start as i64));
-            global.extend_from_slice(&member.metadata.global_slots);
-            ring.extend(
-                member
-                    .metadata
-                    .ring_slots
-                    .iter()
-                    .map(|&slot| slot + (member.sequence * cache.layout.ring_stride_records()) as i64),
-            );
-            conv.extend(std::iter::repeat_n(member.sequence as i64, member.rows.len()));
-            first.extend(std::iter::repeat_n(member.rows.start as i32, member.rows.len()));
-        }
-        ensure!(
-            rows <= self.layout.rows && cache_slot < cache.layout.slots.len(),
-            "Mini packed metadata extent differs"
-        );
-        for (name, values) in [
-            ("positions", positions),
-            ("cache_slots", local),
-            ("global_slots", global),
-            ("ring_slots", ring),
-            ("conv_slots", conv),
-        ] {
-            let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-            // SAFETY: admitted destinations and completion-fenced pinned upload source.
-            unsafe {
-                uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?;
-            }
-        }
-        let bytes = first.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-        // SAFETY: same whole-unit metadata lifetime.
-        unsafe {
-            uploads.upload(self.buffer("first")?, &bytes, self.stream.raw)?;
-        }
+        ensure!(rows <= self.layout.rows, "Mini packed metadata extent differs");
+        let meta = &self.layout.metadata;
+        let width = meta.page_table_width;
+        let upload_bytes = meta
+            .page_table
+            .start
+            .checked_add(
+                members
+                    .len()
+                    .checked_mul(width)
+                    .and_then(|n| n.checked_mul(4))
+                    .context("Mini packed page table byte extent overflow")?,
+            )
+            .context("Mini packed metadata byte extent overflow")?;
+        ensure!(upload_bytes <= meta.bytes, "Mini packed metadata exceeds contiguous owner");
+
+        let mut packed = vec![0u8; upload_bytes];
+        let write_i64 = |buf: &mut [u8], span: &std::ops::Range<usize>, row: usize, value: i64| {
+            let at = span.start + row * 8;
+            buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        let write_i32 = |buf: &mut [u8], span: &std::ops::Range<usize>, idx: usize, value: i32| {
+            let at = span.start + idx * 4;
+            buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+
         let step = if self.decode_attention {
             DECODE_TILE_ROWS
         } else {
             PREFILL_TILE_ROWS
         };
-        let tiles = members
-            .iter()
-            .flat_map(|m| m.rows.clone().step_by(step))
-            .map(|row| row as i32)
-            .collect::<Vec<_>>();
-        let indices = members
-            .iter()
-            .enumerate()
-            .flat_map(|(table, m)| std::iter::repeat_n(table as i32, m.rows.len()))
-            .collect::<Vec<_>>();
-        let width = self.layout.buffers["page_table"] / (cache.layout.sequences * 4);
-        let mut pages = vec![0i32; members.len() * width];
+        let mut row_cursor = 0usize;
+        let mut tile_cursor = 0usize;
+        let ring_stride = cache.layout.ring_stride_records() as i64;
         for (table, member) in members.iter().enumerate() {
+            ensure!(
+                member.rows.start == row_cursor && member.metadata.rows() == member.rows.len(),
+                "Mini packed metadata members do not cover unit rows"
+            );
             ensure!(member.metadata.page_table.len() <= width, "Mini member page table exceeds stride");
-            pages[table * width..table * width + member.metadata.page_table.len()]
-                .copy_from_slice(&member.metadata.page_table);
+            let row_offset = member.rows.start as i64;
+            let ring_base = (member.sequence as i64) * ring_stride;
+            let conv_slot = member.sequence as i64;
+            let first_row = member.rows.start as i32;
+            let table_idx = table as i32;
+            for i in 0..member.rows.len() {
+                let r = row_cursor + i;
+                write_i64(&mut packed, &meta.positions, r, member.metadata.positions[i]);
+                write_i64(&mut packed, &meta.cache_slots, r, member.metadata.local_slots[i] + row_offset);
+                write_i64(&mut packed, &meta.global_slots, r, member.metadata.global_slots[i]);
+                write_i64(&mut packed, &meta.ring_slots, r, member.metadata.ring_slots[i] + ring_base);
+                write_i64(&mut packed, &meta.conv_slots, r, conv_slot);
+                write_i32(&mut packed, &meta.first, r, first_row);
+                write_i32(&mut packed, &meta.table_indices, r, table_idx);
+            }
+            for tile_row in member.rows.clone().step_by(step) {
+                write_i32(&mut packed, &meta.tile_rows, tile_cursor, tile_row as i32);
+                tile_cursor += 1;
+            }
+            let page_base = meta.page_table.start + table * width * 4;
+            for (p, &page) in member.metadata.page_table.iter().enumerate() {
+                let at = page_base + p * 4;
+                packed[at..at + 4].copy_from_slice(&page.to_le_bytes());
+            }
+            row_cursor += member.rows.len();
         }
-        for (name, values) in [("tile_rows", tiles), ("table_indices", indices), ("page_table", pages)] {
-            if name == "page_table" && !cache.layout.global_slots.contains(&cache_slot) {
-                continue;
-            }
-            let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-            // SAFETY: completion-fenced pinned upload source.
-            unsafe {
-                uploads.upload(self.buffer(name)?, &bytes, self.stream.raw)?;
-            }
+
+        // SAFETY: one batched H2D copy into the contiguous admitted `"metadata"` owner.
+        unsafe {
+            uploads.upload(self.buffer("metadata")?, &packed, self.stream.raw)?;
         }
         Ok(())
     }
@@ -336,6 +330,14 @@ impl<'a> UnitOwner<'a> {
     }
 
     pub fn buffer(&self, name: &str) -> Result<Buffer> {
+        if let Some(span) = self.layout.metadata.span(name) {
+            let backing = self
+                .buffers
+                .get("metadata")
+                .context("Inkling 2 Mini unit lacks contiguous metadata owner")?
+                .buffer;
+            return super::cache::view(backing, span.start, span.len());
+        }
         Ok(self
             .buffers
             .get(name)
@@ -511,5 +513,96 @@ impl<'a> RequestOwners<'a> {
             prefill,
             cache,
         })
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use cuteafd_loader::families::{
+        inkling2::execution::UnitMetadata,
+        inkling2_mini::{Inkling2MiniConfig, InklingKvCache},
+    };
+
+    fn test_mini_config() -> Result<Inkling2MiniConfig> {
+        Inkling2MiniConfig::from_hf(&serde_json::from_str(include_str!(
+            "../../../../cuteafd-loader/src/families/inkling2_mini/fixtures/config.json"
+        ))?)
+    }
+
+    #[test]
+    fn packed_metadata_uploads_all_nine_planes_in_one_batched_h2d_copy() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        let device = crate::shared::memory::device::Device {
+            library: &library,
+            id: 0,
+        };
+        let stream = Rc::new(Stream::new(device)?);
+        let cfg = test_mini_config()?;
+        let cache = super::super::cache::CacheBank::new(
+            vec![stream.clone()],
+            MiniCacheLayout::with_format(&cfg, 2, 4, InklingKvCache::Fp8)?,
+            0,
+        )?;
+        let mut unit = UnitOwner::new(stream.clone(), MiniUnitLayout::serving(&cfg, 4, 128, InklingKvCache::Fp8, 2)?)?;
+        let mut uploads = unit.uploads(&cfg, 2)?;
+        let members = vec![
+            PackedMember {
+                sequence: 1,
+                rows: 0..1,
+                metadata: UnitMetadata::new(&cfg.text, 63..64, &[2], 4)?,
+            },
+            PackedMember {
+                sequence: 0,
+                rows: 1..4,
+                metadata: UnitMetadata::new(&cfg.text, 65..68, &[0, 3], 4)?,
+            },
+        ];
+
+        let before = fixture.events()?.chars().filter(|&c| c == 'C').count();
+        unit.packed_metadata(&cache, &members, &mut uploads)?;
+        stream.drain()?;
+        let after = fixture.events()?.chars().filter(|&c| c == 'C').count();
+        assert_eq!(after - before, 1, "all 9 metadata planes must land in one batched H2D copy");
+
+        let i64s = |name: &str| -> Result<Vec<i64>> {
+            let buffer = unit.buffer(name)?;
+            assert_eq!(buffer.ptr as usize % 16, 0, "{name} device view must be 16-byte aligned");
+            let mut bytes = vec![0u8; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        let i32s = |u: &UnitOwner<'_>, name: &str| -> Result<Vec<i32>> {
+            let buffer = u.buffer(name)?;
+            assert_eq!(buffer.ptr as usize % 16, 0, "{name} device view must be 16-byte aligned");
+            let mut bytes = vec![0u8; buffer.bytes];
+            library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+
+        assert_eq!(i64s("positions")?, [63, 65, 66, 67]);
+        assert_eq!(i64s("cache_slots")?, [0, 1, 2, 3]);
+        assert_eq!(i64s("global_slots")?, [191, 193, 194, 195]);
+        assert_eq!(i64s("conv_slots")?, [1, 0, 0, 0]);
+        let stride = cache.layout.ring_stride_records() as i64;
+        assert_eq!(i64s("ring_slots")?, [stride + 63, 65, 66, 67]);
+        assert_eq!(i32s(&unit, "first")?, [0, 1, 1, 1]);
+        assert_eq!(i32s(&unit, "table_indices")?, [0, 1, 1, 1]);
+        assert_eq!(&i32s(&unit, "tile_rows")?[..2], [0, 1]);
+        assert_eq!(i32s(&unit, "page_table")?, [2, 0, 0, 3]);
+
+        // Decode mode writes 1-row tiles, still in one single batched H2D copy.
+        unit.decode_attention = true;
+        let before_decode = fixture.events()?.chars().filter(|&c| c == 'C').count();
+        unit.packed_metadata(&cache, &members, &mut uploads)?;
+        stream.drain()?;
+        let after_decode = fixture.events()?.chars().filter(|&c| c == 'C').count();
+        assert_eq!(after_decode - before_decode, 1);
+        assert_eq!(i32s(&unit, "tile_rows")?, [0, 1, 2, 3]);
+        Ok(())
     }
 }

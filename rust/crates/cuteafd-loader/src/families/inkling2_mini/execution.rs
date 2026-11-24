@@ -11,17 +11,107 @@ pub const DECODE_TILE_ROWS: usize = 1;
 /// Decode/verify bounded batch width (C16 or C8 x 8-token MTP block).
 pub const DECODE_ROWS: usize = 64;
 
+/// Contiguous 16-byte-aligned device layout for all 9 read-only per-unit metadata planes.
+/// Uploaded once in `begin_unit` via a single batched H2D copy and read by all 48 visits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiniMetadataLayout {
+    pub positions: std::ops::Range<usize>,
+    pub cache_slots: std::ops::Range<usize>,
+    pub global_slots: std::ops::Range<usize>,
+    pub ring_slots: std::ops::Range<usize>,
+    pub conv_slots: std::ops::Range<usize>,
+    pub first: std::ops::Range<usize>,
+    pub tile_rows: std::ops::Range<usize>,
+    pub table_indices: std::ops::Range<usize>,
+    pub page_table: std::ops::Range<usize>,
+    pub page_table_width: usize,
+    pub bytes: usize,
+}
+
+impl MiniMetadataLayout {
+    pub fn new(rows: usize, sequences: usize, page_table_width: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && sequences > 0 && page_table_width > 0,
+            "Inkling 2 Mini metadata layout dimensions must be non-zero"
+        );
+        let mut cursor = 0usize;
+        let mut alloc = |bytes: usize| -> Result<std::ops::Range<usize>> {
+            let start = cursor;
+            let end = start.checked_add(bytes).context("Inkling 2 Mini metadata overflow")?;
+            cursor = end
+                .checked_add(15)
+                .map(|n| n / 16 * 16)
+                .context("Inkling 2 Mini metadata alignment overflow")?;
+            Ok(start..end)
+        };
+        let row8 = rows.checked_mul(8).context("Inkling 2 Mini metadata i64 plane overflow")?;
+        let row4 = rows.checked_mul(4).context("Inkling 2 Mini metadata i32 plane overflow")?;
+        let page_bytes = sequences
+            .checked_mul(page_table_width)
+            .and_then(|n| n.checked_mul(4))
+            .context("Inkling 2 Mini metadata page table overflow")?;
+        let positions = alloc(row8)?;
+        let cache_slots = alloc(row8)?;
+        let global_slots = alloc(row8)?;
+        let ring_slots = alloc(row8)?;
+        let conv_slots = alloc(row8)?;
+        let first = alloc(row4)?;
+        let tile_rows = alloc(row4)?;
+        let table_indices = alloc(row4)?;
+        let page_table = alloc(page_bytes)?;
+        Ok(Self {
+            positions,
+            cache_slots,
+            global_slots,
+            ring_slots,
+            conv_slots,
+            first,
+            tile_rows,
+            table_indices,
+            page_table,
+            page_table_width,
+            bytes: cursor,
+        })
+    }
+
+    pub fn span(&self, name: &str) -> Option<std::ops::Range<usize>> {
+        Some(match name {
+            "positions" => self.positions.clone(),
+            "cache_slots" => self.cache_slots.clone(),
+            "global_slots" => self.global_slots.clone(),
+            "ring_slots" => self.ring_slots.clone(),
+            "conv_slots" => self.conv_slots.clone(),
+            "first" => self.first.clone(),
+            "tile_rows" => self.tile_rows.clone(),
+            "table_indices" => self.table_indices.clone(),
+            "page_table" => self.page_table.clone(),
+            _ => return None,
+        })
+    }
+}
+
 /// Named per-unit GPU scratch owners for Inkling 2 Mini TP1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiniUnitLayout {
     pub rows: usize,
     pub blocks: usize,
     pub kv_format: InklingKvCache,
+    pub metadata: MiniMetadataLayout,
     pub buffers: BTreeMap<String, usize>,
 }
 
 impl MiniUnitLayout {
     pub fn with_format(cfg: &Inkling2MiniConfig, rows: usize, context: usize, kv_format: InklingKvCache) -> Result<Self> {
+        Self::with_format_sequences(cfg, rows, context, kv_format, 1)
+    }
+
+    fn with_format_sequences(
+        cfg: &Inkling2MiniConfig,
+        rows: usize,
+        context: usize,
+        kv_format: InklingKvCache,
+        sequences: usize,
+    ) -> Result<Self> {
         let t = &cfg.text;
         let lp = &cfg.loop_cfg;
         ensure!(
@@ -30,6 +120,7 @@ impl MiniUnitLayout {
         );
         cfg.release_geometry()?;
         let blocks = t.layers.div_ceil(t.res_block) + 1; // 24 / 6 + 1 = 5
+        let metadata = MiniMetadataLayout::new(rows, sequences, context.div_ceil(64))?;
         let mut buffers = BTreeMap::new();
         let mut add = |name: &str, width: usize, bytes: usize| -> Result<()> {
             let extent = rows
@@ -89,24 +180,19 @@ impl MiniUnitLayout {
             add(name, width, bytes)?;
         }
 
-        // MoE routing, MXFP8 wire quantizer (layers 20..24), and metadata planes.
+        // MoE routing and MXFP8 wire quantizer (layers 20..24).
         for (name, width, bytes) in [
             ("route_logits", t.experts, 4),
             ("route_ids", t.topk, 4),
             ("route_weights", t.topk, 4),
             ("expert_wire", t.hidden + t.hidden / 32, 1), // 2376 B/row
             ("expert_output", t.hidden, 2),
-            ("table_indices", 1, 4),
-            ("tile_rows", 1, 4),
-            ("positions", 1, 8),
-            ("first", 1, 4),
-            ("conv_slots", 1, 8),
-            ("ring_slots", 1, 8),
-            ("cache_slots", 1, 8),
         ] {
             add(name, width, bytes)?;
         }
 
+        // Single contiguous device owner holding all 9 read-only per-unit metadata planes.
+        buffers.insert("metadata".into(), metadata.bytes);
         buffers.insert("attention_scratch".into(), 64 * 32 * t.heads * (128 * 4 + 4));
         buffers.insert("ring".into(), 1088 * 4096);
         buffers.insert(
@@ -116,7 +202,6 @@ impl MiniUnitLayout {
                 .checked_mul(64 * kv_format.record_bytes(t.kv_heads, t.head_dim))
                 .context("Inkling 2 Mini global cache overflow")?,
         );
-        buffers.insert("page_table".into(), context.div_ceil(64) * 4);
         for (name, width) in [
             ("attn_conv_history", t.hidden),
             ("mlp_conv_history", t.hidden),
@@ -129,6 +214,7 @@ impl MiniUnitLayout {
             rows,
             blocks,
             kv_format,
+            metadata,
             buffers,
         })
     }
@@ -140,13 +226,7 @@ impl MiniUnitLayout {
         kv_format: InklingKvCache,
         sequences: usize,
     ) -> Result<Self> {
-        let mut layout = Self::with_format(cfg, rows, context, kv_format)?;
-        layout.buffers.insert(
-            "page_table".into(),
-            sequences
-                .checked_mul(context.div_ceil(64) * 4)
-                .context("Inkling 2 Mini request page table bank overflow")?,
-        );
+        let mut layout = Self::with_format_sequences(cfg, rows, context, kv_format, sequences)?;
         for name in [
             "ring",
             "global_cache",
@@ -157,10 +237,6 @@ impl MiniUnitLayout {
         ] {
             layout.buffers.remove(name);
         }
-        layout.buffers.insert(
-            "global_slots".into(),
-            rows.checked_mul(8).context("Inkling 2 Mini global slot extent overflow")?,
-        );
         Ok(layout)
     }
 
@@ -178,37 +254,17 @@ impl MiniUnitLayout {
         Ok(layout)
     }
 
-    /// Bounded pinned upload source schedule for one unit's full 48-visit walk.
+    /// Bounded pinned upload source schedule per unit, independent of visit count:
+    /// one token-id upload (`rows * 4`) plus one batched metadata upload (`metadata.bytes`).
     pub fn upload_shape(
         &self,
-        cfg: &Inkling2MiniConfig,
+        _cfg: &Inkling2MiniConfig,
         members: usize,
     ) -> Result<crate::shared::token_table::UploadShape> {
         ensure!(members > 0 && members <= self.rows, "Inkling 2 Mini upload members outside unit");
         let mut shape = crate::shared::token_table::UploadShape::default();
-        let visits = cfg.total_visits();
-        let repeats = visits.checked_mul(2).context("Mini upload repetitions overflow")?;
-        shape.append(
-            &[
-                self.rows * 8,
-                self.rows * 8,
-                self.rows * 8,
-                self.rows * 8,
-                self.rows * 8,
-                self.rows * 4,
-                self.rows * 4,
-                self.rows * 4,
-            ],
-            repeats,
-        )?;
-        shape.append(
-            &[self.buffers["page_table"]],
-            cfg.global_cache_slots()
-                .len()
-                .checked_mul(2)
-                .context("Mini global page upload repetitions overflow")?,
-        )?;
-        shape.append(&[self.rows * 4], 1)?;
+        // Up to 4 back-to-back units in flight before stream drain (token ids + batched metadata).
+        shape.append(&[self.rows * 4, self.metadata.bytes], 4)?;
         Ok(shape)
     }
 
@@ -364,8 +420,26 @@ mod tests {
         let prefill = MiniUnitLayout::serving(&cfg, 2048, 262_144, InklingKvCache::Fp8, 16)?;
         assert!(!prefill.buffers.contains_key("ring"));
         assert!(!prefill.buffers.contains_key("decode_zero_bf16"));
+        assert!(prefill.buffers.contains_key("metadata"));
+        for name in [
+            "positions",
+            "cache_slots",
+            "global_slots",
+            "ring_slots",
+            "conv_slots",
+            "first",
+            "tile_rows",
+            "table_indices",
+            "page_table",
+        ] {
+            let span = prefill.metadata.span(name).expect("named metadata span");
+            assert_eq!(span.start % 16, 0, "{name} must be 16-byte aligned");
+            assert!(span.end <= prefill.metadata.bytes, "{name} exceeds contiguous metadata");
+            assert!(!prefill.buffers.contains_key(name), "{name} should live inside contiguous metadata");
+        }
         let upload = prefill.upload_shape(&cfg, 16)?;
         assert!(upload.capacity_bytes()? >= upload.bytes);
+        assert_eq!(upload.ranges, 8, "upload fences must stay O(1), independent of 48 visits");
         Ok(())
     }
 
