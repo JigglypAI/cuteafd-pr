@@ -4700,7 +4700,7 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
 }
 
 #[test]
-fn glmf_tp2_auto_preserves_selected_prefill_options() {
+fn glmf_tp2_dflash_preserves_selected_prefill_options() {
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     let manifest = write_glm5_flash_workspaces(dir.path());
@@ -4721,38 +4721,44 @@ fn glmf_tp2_auto_preserves_selected_prefill_options() {
             layout: Some(layout::LayoutOptions {
                 host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
                 head_split: true, context_tokens: 32768, pool_tokens: Some(32768),
-                glmf_tp2_dflash_auto: true, glmf_drafter_snapshot: Some(draft.path().into()),
+                tp2_dflash: true, glmf_drafter_snapshot: Some(draft.path().into()),
                 workspace_manifest: Some(manifest.clone()), ..Default::default()
             }), ..sparks(ranks) };
-        let automatic = plan(dir.path(), &options).unwrap();
-        assert!(automatic.solver_placement.is_some(), "{}", render(&automatic));
-        let selected = automatic.tp2_dflash.unwrap();
-        let layout = options.layout.as_mut().unwrap();
-        layout.glmf_tp2_dflash_auto = false;
-        layout.tp2_dflash = selected;
-        let explicit = plan(dir.path(), &options).unwrap();
-        assert!(explicit.solver_placement.is_some(), "{}", render(&explicit));
-        assert!(automatic.prefill_unit_rows.is_some());
-        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves, automatic.prefill_span_rows),
-            (explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows));
+        let split = plan(dir.path(), &options).unwrap();
+        let placement = split.solver_placement.as_ref().unwrap_or_else(|| panic!("{}", render(&split)));
+        assert_eq!(split.tp2_dflash, Some(true));
+        assert!(placement.items.iter().all(|items| items.iter().any(|item|
+            item.group == "weight arena" && item.category == cuteafd_core::memory_layout::Category::Drafter)));
+        options.layout.as_mut().unwrap().tp2_dflash = false;
+        let whole = plan(dir.path(), &options).unwrap();
+        assert!(whole.solver_placement.is_some(), "{}", render(&whole));
+        assert_eq!(whole.tp2_dflash, Some(false));
+        assert!(split.prefill_unit_rows.is_some());
+        assert_eq!((split.prefill_unit_rows, split.prefill_waves, split.prefill_span_rows),
+            (whole.prefill_unit_rows, whole.prefill_waves, whole.prefill_span_rows));
     }
 }
 
 #[test]
-fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
+fn glmf_tp2_dflash_refuses_manual_budget_and_spark_range_keeps_whole_single_gpu() {
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     let manifest = write_glm5_flash_workspaces(dir.path());
-    let options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+    let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
         layout: Some(layout::LayoutOptions {
             host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             pool_tokens: Some(32768), context_tokens: 32768, drafter_bytes: 256 << 20,
-            tp2_dflash: true, glmf_tp2_dflash_auto: true,
+            tp2_dflash: true,
             workspace_manifest: Some(manifest), ..Default::default()
         }), ..sparks(4) };
     let report = plan(dir.path(), &options).unwrap();
-    assert!(report.solver_placement.is_some(), "{}", render(&report));
-    assert_eq!(report.tp2_dflash, Some(false));
+    assert!(report.solver_placement.is_none());
+    assert!(render(&report).contains("TP2 DFlash requires two coordinator GPUs and checkpoint-derived physical owners"));
+    options.layout.as_mut().unwrap().tp2_dflash = false;
+    let whole = plan(dir.path(), &options).unwrap();
+    assert!(whole.solver_placement.is_some(), "{}", render(&whole));
+    assert_eq!(whole.tp2_dflash, Some(false));
+    options.layout.as_mut().unwrap().tp2_dflash = true;
     let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&options).unwrap();
     let single = columns.iter().find(|column| column.rtx_gpus == 1).unwrap();
     assert!(single.range.is_some(), "{single:?}");

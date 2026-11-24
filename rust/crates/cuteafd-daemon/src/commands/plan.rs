@@ -481,9 +481,11 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2
-            && (family != "glm5_flash" || args.drafter_gib == 0.0),
+    // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
+    let split = args.rtx == 2 || (family == "glm5_flash" && args.spark_range);
+    let applicable = crate::cli::tp2_dflash_default(family, args.layout && split,
         args.speculator == "dflash2");
+    let default_on = applicable && (family != "glm5_flash" || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
         Some("off") => false,
@@ -497,16 +499,11 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
             None => args.tp2_dflash.unwrap_or(configured),
         }
     } else { args.tp2_dflash.unwrap_or(configured) };
-    anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+    anyhow::ensure!(!enabled || applicable,
         "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
+    anyhow::ensure!(!enabled || family != "glm5_flash" || args.drafter_gib == 0.0,
+        "TP2 DFlash requires checkpoint-derived physical owners; --drafter-gib forces whole placement");
     Ok(enabled)
-}
-
-fn glmf_tp2_dflash_auto(args: &PlanArgs, family: &str,
-    cfg: &std::collections::BTreeMap<String, String>) -> bool {
-    family == "glm5_flash" && args.layout && args.rtx == 2 && args.drafter_gib == 0.0 && args.speculator == "dflash2"
-        && args.tp2_dflash.is_none() && cfg.get("TP2_DFLASH").is_none_or(String::is_empty)
 }
 
 fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
@@ -515,7 +512,6 @@ fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: 
     let split = tp2_dflash(args, family, cfg)?;
     if let Some(layout) = &mut options.layout {
         layout.tp2_dflash = split;
-        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(args, family, cfg);
         if family == "glm5_flash" { layout.glmf_drafter_snapshot = args.drafter_snapshot.clone(); }
     }
     Ok(())
@@ -716,7 +712,6 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
         layout.tp2_dflash = tp2_dflash;
-        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
         if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
@@ -1607,7 +1602,6 @@ mod tests {
                 resolve_exlr8_draft(&mut request, dir.path(), family, &cfg, &mut resolved).unwrap();
                 let layout = resolved.layout.unwrap();
                 assert_eq!(layout.tp2_dflash, explicit.unwrap_or(configured != Some("off")));
-                assert_eq!(layout.glmf_tp2_dflash_auto, explicit.is_none() && configured.is_none());
                 // Invalid topology must fail in the early-return path, before native admission.
                 request.rtx = 1;
                 request.tp2_dflash = Some(true);
@@ -1618,21 +1612,24 @@ mod tests {
     }
 
     #[test]
-    fn glmf_tp2_auto_requires_two_gpus_and_checkpoint_budget() {
+    fn glmf_tp2_default_requires_two_gpus_dflash2_and_checkpoint_budget() {
         let dir = tempfile::tempdir().unwrap();
         for rtx in [1, 2] {
             for drafter_gib in [0.0, 12.0] {
-                let mut request = args(dir.path(), 0, false);
-                request.rtx = rtx;
-                request.drafter_gib = drafter_gib;
-                request.speculator = "dflash2".into();
-                let cfg = Default::default();
-                let expected = rtx == 2 && drafter_gib == 0.0;
-                assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).unwrap(), expected);
-                assert_eq!(glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg), expected);
-                let cfg = [("TP2_DFLASH".into(), "off".into())].into_iter().collect();
-                assert!(!tp2_dflash(&request, "glm5_flash", &cfg).unwrap());
-                assert!(!glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg));
+                for speculator in ["dflash2", "off", "dspark"] {
+                    let mut request = args(dir.path(), 0, false);
+                    request.rtx = rtx;
+                    request.drafter_gib = drafter_gib;
+                    request.speculator = speculator.into();
+                    let cfg = Default::default();
+                    let eligible = rtx == 2 && drafter_gib == 0.0 && speculator == "dflash2";
+                    assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).unwrap(), eligible);
+                    request.tp2_dflash = Some(true);
+                    assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).is_ok(), eligible);
+                    request.tp2_dflash = Some(false);
+                    let cfg = [("TP2_DFLASH".into(), "on".into())].into_iter().collect();
+                    assert!(!tp2_dflash(&request, "glm5_flash", &cfg).unwrap());
+                }
             }
         }
     }

@@ -23,36 +23,6 @@ pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::F
 fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions,
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
-    if options.glmf_tp2_dflash_auto {
-        options.tp2_dflash = options.rtx_bytes.len() == 2 && options.drafter_bytes == 0;
-    }
-    if options.glmf_tp2_dflash_auto && options.head_split && options.rtx_bytes.len() == 2
-        && !options.glmf_drafter_disabled && options.drafter_bytes == 0 {
-        let mut whole_report = report.clone();
-        let mut whole_options = options.clone();
-        whole_options.glmf_tp2_dflash_auto = false;
-        whole_options.tp2_dflash = false;
-        let mut whole = layout_with_native(&mut whole_report, model, input, &mut whole_options, exlr8);
-        let mut split_report = report.clone();
-        let mut split_options = whole_options.clone();
-        split_options.tp2_dflash = true;
-        let mut split = layout_with_native(&mut split_report, model, input, &mut split_options, exlr8);
-        let whole_pool = whole_report.solver_placement.as_ref().map(|p| p.pool_tokens);
-        let split_pool = split_report.solver_placement.as_ref().map(|p| p.pool_tokens);
-        let selected = glmf::prefer_tp2_dflash(whole_pool, split_pool);
-        let note = format!("TP2_DFLASH auto: {}; whole pool {whole_pool:?}, split pool {split_pool:?}",
-            if selected { "split" } else { "whole" });
-        if selected {
-            split.notes.push(note);
-            *options = split_options;
-            *report = split_report;
-            return split;
-        }
-        whole.notes.push(note);
-        *options = whole_options;
-        *report = whole_report;
-        return whole;
-    }
     report.tp2_dflash = Some(options.tp2_dflash);
     let remote_experts = report.spark_ranks > 0 && (exlr8.is_some() || report.experts.as_ref().is_some_and(|contract|
         model.spec().moe.as_ref().is_some_and(|moe|
@@ -279,7 +249,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             let requests = crate::families::glm5::draft_physical::draft_device_requests(config,
                 slots, batch, &draft_sms, options.glmf_draft_representation,
                 options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
-            // GPU1-whole remains unqualified; only GPU0-whole competes with TP2.
+            // GPU1-whole remains unqualified.
             let bridge = None;
             anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
                 "drafter weight override {} differs from checkpoint-resident weights {}",

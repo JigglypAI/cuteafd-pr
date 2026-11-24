@@ -1767,10 +1767,10 @@ fi
 tp2_dflash_default=off
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
-  [[ "$family" != glm5_flash && "$family" != kimi_k3 ]] || tp2_dflash_default=auto
+  [[ "$family" != kimi_k3 ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
-case "$tp2_dflash" in on|off) ;; auto) [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == kimi_k3 && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
   release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
 if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
@@ -2433,7 +2433,7 @@ audio_encoder_hash=""
   [[ -z "$decode_rows" ]] || plan_draft_args+=(--decode-rows "$decode_rows")
   [[ -z "$decode_rows" || "$decode_rows" == auto || -z "${draft_length:-}" ]] || plan_draft_args+=(--draft-length "$draft_length")
   plan_draft_args+=("${attention_precision_args[@]}")
-  if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
+  if [[ "$family:$speculator" == qwen3_5:dspark ]] || [[ "$family" == glm5_flash && $draft_model_args -gt 0 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   if [[ "$family" == kimi_k3 && ( "$speculator" == dflash2 || "$speculator" == dspark ) ]]; then
@@ -2448,7 +2448,8 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
-    if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
+    if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]] ||
+       [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-context-slots || "${family_args[i]}" == --draft-sequences ) ]]; then
       plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
     fi
   done
@@ -2714,7 +2715,7 @@ audio_encoder_hash=""
     esac
   fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
-  if [[ ( "$family" == glm5_flash || "$family" == kimi_k3 ) && "$tp2_dflash" == auto ]]; then
+  if [[ "$family" == kimi_k3 && "$tp2_dflash" == auto ]]; then
     tp2_dflash_bool="$(jq -er '.tp2_dflash | if . == true then "true" elif . == false then "false" else error("missing drafter choice") end' <<<"$plan_json")"
     family_args+=(--tp2-dflash "$tp2_dflash_bool")
     echo "$family planner selected TP2_DFLASH=$tp2_dflash_bool"

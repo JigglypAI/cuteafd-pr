@@ -157,8 +157,6 @@ pub struct LayoutOptions {
     pub tp2_dspark_experts: bool,
     /// External DFlash attention/FFN split over the two target ranks.
     pub tp2_dflash: bool,
-    /// GLM Flash compares whole movable and head-split physical drafter plans.
-    pub glmf_tp2_dflash_auto: bool,
     pub glmf_draft_representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
     pub glmf_draft_fp8_mode: u8,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
@@ -355,7 +353,6 @@ impl Default for LayoutOptions {
             draft_sequences: None,
             tp2_dspark_experts: false,
             tp2_dflash: false,
-            glmf_tp2_dflash_auto: false,
             glmf_draft_representation: crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
             glmf_draft_fp8_mode: 0,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
