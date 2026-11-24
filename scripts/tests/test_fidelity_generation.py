@@ -188,7 +188,7 @@ def test_openrouter_reasoning_budget_only_on_uncached_requests(api, monkeypatch)
     assert len(state["calls"]) == 2
 
 
-@pytest.mark.parametrize("family", ["inkling2", "qwen3_5", "kimi_k3", "minimax_m3"])
+@pytest.mark.parametrize("family", ["inkling2", "inkling2_mini", "qwen3_5", "kimi_k3", "minimax_m3"])
 def test_openrouter_explicit_inkling_effort_preserves_other_family_wire_bytes(api, monkeypatch, family):
     import urllib.request
     client, state = api
@@ -209,7 +209,7 @@ def test_openrouter_explicit_inkling_effort_preserves_other_family_wire_bytes(ap
     original = body()
     expected = {**original, **client.extra_body}
     expected.pop("reasoning_effort")
-    if family != "inkling2":
+    if family not in ("inkling2", "inkling2_mini"):
         expected["reasoning"] = {"max_tokens": 1024}
     result = client(original)
     expected_bytes = json.dumps(expected, ensure_ascii=False, separators=(",", ":")).encode()

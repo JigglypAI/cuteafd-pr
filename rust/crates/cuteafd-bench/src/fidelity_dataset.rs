@@ -542,6 +542,29 @@ fn inkling_reference_sources(provenance: &Value, manifest: &Value) -> bool {
         && hash(&helper["helper_harness_commit"], 40)
 }
 
+const INKLING2_MINI_ROOT: &str = "thinkingmachines/Inkling-2-Mini";
+const INKLING2_MINI_ROOT_REVISION: &str = "7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6";
+
+fn inkling_mini_reference_sources(provenance: &Value, manifest: &Value) -> bool {
+    let sha256 = |value: &Value| value.as_str().is_some_and(|s| s.len() == 64
+        && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    let source = &provenance["source_pin"];
+    let snapshot = &source["snapshot"];
+    let identity = &provenance["snapshot_identity"];
+    manifest["root_checkpoint"]["id"] == INKLING2_MINI_ROOT
+        && manifest["root_checkpoint"]["revision"] == INKLING2_MINI_ROOT_REVISION
+        && source["revision"] == INKLING2_MINI_ROOT_REVISION && manifest["vocab"] == 200058
+        && provenance["source_identity_provider"] == "families.inkling2_mini.golden"
+        && source["transformers"]["revision"] == "89c632fd826f68ecadd176320e9b2c070918f4f2"
+        && source["vllm"]["revision"] == "a0c1f162f4ded00f0f40928698b4b5816f4d3bd7"
+        && source["sglang"]["revision"] == "daba437630ff7c1e02a9b1d88a7d8414376acff7"
+        && ["reference_adapter_sha256", "reference_runner_sha256", "inkling_primitives_sha256",
+            "shape_invariant_sha256"].iter().all(|key| sha256(&source[*key]))
+        && snapshot["config.json"] == identity["config_sha256"]
+        && snapshot["hf_quant_config.json"] == "7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143"
+        && snapshot["model.safetensors.index.json"] == "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838"
+}
+
 const HY4_ROOT: &str = "tencent/Hy4-flash";
 const HY4_ROOT_REVISION: &str = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959";
 const HY4_UPSTREAM: &str = "c2ec850510a37978ea83df226589623d5f2be776";
@@ -650,6 +673,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             hy4_full_reference_sources(provenance, manifest)
         } else if manifest["family"] == "inkling2" {
             inkling_reference_sources(provenance, manifest)
+        } else if manifest["family"] == "inkling2_mini" {
+            inkling_mini_reference_sources(provenance, manifest)
         } else if manifest["family"] == "deepseek_v41" {
             // The checkpoint's own inference/model.py, the kernel emulation and the harness.
             source["revision"] == manifest["root_checkpoint"]["revision"]
