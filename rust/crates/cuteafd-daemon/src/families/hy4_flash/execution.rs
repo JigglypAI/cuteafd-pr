@@ -2101,12 +2101,11 @@ impl<'a> Hy4Engine<'a> {
 
     pub(super) fn retained_draft_graph_rows(&self, members: usize) -> usize {
         self.draft.as_ref().map_or(0, |draft| {
+            // Lead rank owns the graphed DraftFusion and DraftCorrection sections
+            // (plus DraftLayer on TP1); TP2 keeps the 5-layer draft body eager on
+            // both ranks so rank 1 preserves 100% of its bounded target graph cache.
             let rows = members * draft.cfg.block_rows();
-            self.ranks[..draft.tp()]
-                .iter()
-                .map(|r| r.graphs.retained_draft_rows(rows))
-                .min()
-                .unwrap_or(0)
+            self.ranks[0].graphs.retained_draft_rows(rows)
         })
     }
 
