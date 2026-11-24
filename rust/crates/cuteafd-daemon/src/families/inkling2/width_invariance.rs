@@ -296,8 +296,6 @@ fn wide_batch_oracle(
         let off = if stride_max == 0 { 0 } else { (s * 17) % (stride_max + 1) };
         let slice = &tokens[off..off + needed];
         seq_slices.push(slice);
-        for requests in execution.request_ranks() { requests.cache.reset(s)?; }
-        execution.draft.as_ref().unwrap().drafter.reset_context(s, 0)?;
         let base_page = (s * pages_per_seq) as u32;
         let mut p = Placement {
             media: None,
@@ -306,7 +304,7 @@ fn wide_batch_oracle(
             len: 0,
             state_len: 0,
         };
-        execution.draft.as_ref().unwrap().drafter.admit_pages(s, args.prefill + width)?;
+        InklingPrefix::for_execution(execution).bind_slot(&mut p, Some(args.prefill + width))?;
         let mut units = crate::shared::prefill_pipeline::sequence_units(args.prefill, args.prefill_rows, args.prefill_waves as usize, execution.cfg.layers)?;
         for unit in &mut units {
             unit.segments = vec![UnitSegment { sequence: 0, rows: 0..unit.rows.len(), tokens: unit.rows.clone(), prompt_end: false, snapshot: false, head: false }];
