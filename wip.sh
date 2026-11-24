@@ -1618,17 +1618,59 @@ wip_distribute_locks() {
   printf '%s\n' "${locks[@]}" | sort -u | paste -sd, -
 }
 
+# wip_distribute_bound BYTES: the enforced hold bound (seconds) for distributing a
+# sealed Spark slot of BYTES: 300 s of fixed cost (SSH, fingerprints, sparknest
+# seal and replicate) plus BYTES at a conservative 50 MB/s (5% of the seed's
+# 10 GbE link), within [600, 3600]; an unknown size takes the ceiling. Measured
+# distributions take 9-22 s to 3-6 hosts for ~0.3 GB archives, so the floor
+# leaves a wide margin while staying short enough to backfill (hwlock.py).
+wip_distribute_bound() {
+  local bytes="$1" bound=3600
+  [[ "$bytes" =~ ^[0-9]+$ ]] && bound=$((300 + bytes / 50000000))
+  ((bound >= 600)) || bound=600
+  ((bound <= 3600)) || bound=3600
+  printf '%s\n' "$bound"
+}
+
+# wip_write_distribute_job FILE: a standalone script that runs
+# distribute_expert_slot with this shell's functions and plain variables, for
+# hwlock to run as its child. Exported scalars come from the environment, so
+# hwlock's CUTEAFD_HW_LOCKS_HELD reaches the job; read-only and Bash's own
+# dynamic variables are not replayed.
+wip_write_distribute_job() (
+  set +u
+  local file="$1" name attrs
+  {
+    printf 'set -euo pipefail\n'
+    declare -f
+    for name in $(compgen -v); do
+      case "$name" in
+        BASH*|COPROC*|COMP_*|EPOCH*|CUTEAFD_HW_LOCKS_HELD|DIRSTACK|EUID|FUNCNAME|GROUPS|HISTCMD|LINENO|OLDPWD|OPTARG|OPTIND|PIPESTATUS|PPID|PWD|RANDOM|SECONDS|SHELLOPTS|SHLVL|SRANDOM|UID|_) continue ;;
+      esac
+      attrs="${!name@a}"
+      [[ "$attrs" != *r* ]] || continue
+      [[ "$attrs" != *x* || "$attrs" == *[aA]* ]] || continue
+      declare -p "$name"
+    done
+    printf 'distribute_expert_slot\n'
+  } >"$file"
+)
+
 # The seed container was stopped when its lease ended. Distribution uses only
-# tar/file operations; stop the seed again even when transfer fails. It runs
-# in a fair hwlock turn on the targets' serving locks, unless the caller
-# already holds them (CUTEAFD_HW_LOCKS_HELD).
+# tar/file operations; stop the seed again even when transfer fails. Unless the
+# caller already holds the targets' serving locks (CUTEAFD_HW_LOCKS_HELD), the
+# transfer runs as hwlock's child in a fair turn on them, bounded by
+# --max-run (wip_distribute_bound), so hwlock enforces the hold and a short
+# distribution can backfill ahead of older tickets it cannot delay.
 wip_distribute_sealed_expert() (
   ((wip_spark_leg)) || return 0
+  wip_distribute_restarted=0 wip_distribute_job=
+  trap 'rm -f "$wip_distribute_job"; ((wip_distribute_restarted == 0)) || ssh -o BatchMode=yes "$seed_host" "docker stop -t 10 \"$spark_container\" >/dev/null"' EXIT
   local running locks lock missing=""
   running="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{.State.Running}}' '$spark_container'")"
   if [[ "$running" != true ]]; then
     ssh -o BatchMode=yes "$seed_host" "docker start '$spark_container' >/dev/null"
-    trap 'ssh -o BatchMode=yes "$seed_host" "docker stop -t 10 \"$spark_container\" >/dev/null"' EXIT
+    wip_distribute_restarted=1
   fi
   wip_check_expert_readiness
   locks="$(wip_distribute_locks)"
@@ -1639,19 +1681,25 @@ wip_distribute_sealed_expert() (
     distribute_expert_slot
     return
   fi
-  local wait_seconds="${CUTEAFD_WIP_DISTRIBUTE_WAIT_S:-14400}" lock_dir="$HOME/.cache/cuteafd" fd
+  local wait_seconds="${CUTEAFD_WIP_DISTRIBUTE_WAIT_S:-14400}" bytes bound status=0
   [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || release_die "CUTEAFD_WIP_DISTRIBUTE_WAIT_S must be positive seconds"
-  echo "WIP Spark distribution: waiting for a fair turn on $missing (${wait_seconds}s)"
-  # As release_with_export_locks: queue fairly, then hold the flocks (canonical
-  # order) on this subshell's descriptors for the transfer only.
-  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$missing" --wait "$wait_seconds" -- true ||
-    release_die "no fair turn on $missing for Spark WIP slot distribution within ${wait_seconds}s"
-  for lock in sparks rhea moa; do
-    [[ ",$missing," == *",$lock,"* ]] || continue
-    exec {fd}>"$lock_dir/$lock.lock"
-    flock -w "$wait_seconds" "$fd" || release_die "timed out waiting for $lock.lock"
-  done
-  distribute_expert_slot
+  bytes="$(ssh -o BatchMode=yes "$seed_host" \
+    "docker exec '$spark_container' du -sb '/wip/slots/$slot/spark-expert'" 2>/dev/null | cut -f1)" || bytes=
+  bound="$(wip_distribute_bound "$bytes")"
+  wip_distribute_job="$(mktemp -t cuteafd-wip-distribute.XXXXXX)"
+  wip_write_distribute_job "$wip_distribute_job"
+  echo "WIP Spark distribution: waiting for a fair turn on $missing (wait ${wait_seconds}s; hold bounded at ${bound}s for ${bytes:-unknown} bytes)"
+  # build-process.py owns the transfer's process group, so the bound's SIGTERM
+  # stops every SSH stream before hwlock releases the locks.
+  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$missing" --wait "$wait_seconds" --max-run "$bound" -- \
+    python3 "$repo_root/scripts/build/build-process.py" --grace 60 -- bash "$wip_distribute_job" || status=$?
+  case "$status" in
+    0) ;;
+    75) release_die "no fair turn on $missing for Spark WIP slot distribution within ${wait_seconds}s" ;;
+    77) release_die "hwlock refused a nested turn on $missing for Spark WIP slot distribution; run wip.sh under one hwlock call covering $locks" ;;
+    124) release_die "Spark WIP slot distribution overran its ${bound}s bound on $missing and was stopped" ;;
+    *) release_die "Spark WIP slot distribution on $missing failed (exit $status)" ;;
+  esac
 )
 
 wip_build_selected_roles() {
