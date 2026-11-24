@@ -226,8 +226,8 @@ def derive(repo, matrix, scope='all', environ=None):
                 continue
             if kind not in ('fp8', 'bf16', 'nvfp4', 'nvfp4a4', 'mxfp8') and not kind.startswith('exl3-k'):
                 continue
-            if family == 'glmfdense':
-                continue  # Dense-only MLPs have no Spark package.
+            if family in ('glmfdense', 'inkling2_mini'):
+                continue  # Dense-only / local-only families have no Spark package.
             format = 'exl3' if kind.startswith('exl3-k') else kind
             formats = (format, 'nvfp4a4') if format == 'nvfp4' and family != 'step5' else (format,)
             counts.update(f'{family}:{alias}={world}' for alias in formats

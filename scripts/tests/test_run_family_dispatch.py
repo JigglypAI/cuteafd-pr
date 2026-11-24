@@ -6174,4 +6174,4 @@ def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):
         "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nATTENTION_PLACEMENT=layers\nVISION=off\nAUDIO=off\n",
     )
     assert result.returncode == 2
-    assert "inkling2_mini is TP1-only (heads)" in result.stderr
+    assert "inkling2_mini attention placement is TP1-only (heads)" in result.stderr
