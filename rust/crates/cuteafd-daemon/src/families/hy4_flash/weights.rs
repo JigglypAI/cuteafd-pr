@@ -741,15 +741,17 @@ impl<'a> Hy4RankWeights<'a> {
         dense.release();
         // Keep at most one quantized KV-B conversion live. The push group
         // publishes regular weights first; a failed conversion never exposes
-        // the uninitialized absorbed view to execution.
+        // the uninitialized absorbed view to execution. Only target arena
+        // views are eligible: the compact inventory includes the drafter.
         for r in &ranks {
-            for (stem, proj) in &model.core {
-                if !stem.ends_with(".self_attn.kv_b_proj") {
+            for (name, dst) in &r.views {
+                let Some(stem) = name.strip_suffix(".weight").filter(|stem| stem.ends_with(".self_attn.kv_b_proj")) else {
                     continue;
-                }
+                };
+                let Some(proj) = model.core.get(stem) else { continue };
                 let local_heads = proj.shape[0] / gpus / (cfg.qk_nope_dim + cfg.v_head_dim);
                 dequant_kv_b_trellis_absorbed(r.device, programs, checkpoint, proj, r.rank, gpus, local_heads,
-                    cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, r.weight(stem)?)?;
+                    cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, dst.buffer)?;
             }
         }
         Ok(ranks)
