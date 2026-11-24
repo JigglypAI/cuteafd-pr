@@ -464,8 +464,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
     // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
     let split = args.rtx == 2 || (family == "glm5_flash" && args.spark_range);
-    let applicable = args.layout && split && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark");
+    let applicable = crate::cli::tp2_dflash_default(family, args.layout && split,
+        args.speculator == "dflash2");
     let default_on = applicable && (family != "glm5_flash" || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
