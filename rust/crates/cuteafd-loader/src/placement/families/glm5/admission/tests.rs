@@ -2261,20 +2261,16 @@ fn bf16_target_receipt_matches_selected_physical_representation() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_snapshot(dir.path(), &config, &tensors, None);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
-    let mut totals = Vec::new();
-    for bf16 in [false, true] {
-        let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, bf16,
-            &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
-        let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
-        let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
-        assert_eq!(device[0] - host[0], 64 * 256 * 2);
-        assert_eq!(device[1], host[1]);
-        assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
-        let groups = target.weights[0].1.resident_groups().unwrap();
-        assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
-        totals.push(device.into_iter().sum::<u64>());
-    }
-    assert!(totals[1] > totals[0], "native BF16 must not use the FP8 admission");
+    let target = TargetFacts::checkpoint(&checkpoint, 2, 2, None, true,
+        &[EmbeddingHome::Device(0), EmbeddingHome::HostPinned], None).unwrap();
+    let device = target.device_weight_bytes(EmbeddingHome::Device(0)).unwrap();
+    let host = target.device_weight_bytes(EmbeddingHome::HostPinned).unwrap();
+    assert_eq!(device[0] - host[0], 64 * 256 * 2);
+    assert_eq!(device[1], host[1]);
+    assert!(target.device_weight_bytes(EmbeddingHome::Device(1)).is_err());
+    let groups = target.weights[0].1.resident_groups().unwrap();
+    assert_eq!(device, groups.iter().map(|rank| rank.iter().map(|entry| entry.2).sum()).collect::<Vec<u64>>());
+    assert!(target.weights[0].1.owners.iter().all(|owner| !owner.format.starts_with("fp8")));
 }
 
 #[test]

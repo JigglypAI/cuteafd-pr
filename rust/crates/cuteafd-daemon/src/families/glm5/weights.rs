@@ -556,7 +556,7 @@ impl<'a> GlmLoader<'a> {
     }
 
     /// Native block FP8 `names` row-concatenated: the E4M3 values and the
-    /// FP32 grids land unchanged. None for any other storage (quantized at load).
+    /// FP32 grids land unchanged. None for per-tensor FP8, whose scalar is expanded at load.
     #[allow(clippy::type_complexity)]
     fn fp8_lands(&self, names: &[String]) -> Result<Option<((Vec<Land>, usize), (Vec<Land>, usize))>> {
         if !self.native_fp8(names)? { return Ok(None); }
@@ -568,6 +568,76 @@ impl<'a> GlmLoader<'a> {
         }
         let grids = names.iter().map(|n| landing::block_grid(self.catalog, n)).collect::<Vec<_>>();
         Ok(Some((landing::concat(self.catalog, names)?, landing::concat(self.catalog, &grids)?)))
+    }
+
+    /// The row-concatenation of BF16 `names`: its bytes, rows and columns.
+    fn bf16_rows(&self, names: &[String]) -> Result<(Vec<u8>, usize, usize)> {
+        let mut out = Vec::new();
+        let (mut rows, mut cols) = (0usize, None);
+        for name in names {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            ensure!(dtype == DType::Bf16 && shape.len() == 2, "{name}: expected a BF16 matrix, found {dtype:?} {shape:?}");
+            ensure!(cols.is_none_or(|c| c == shape[1]), "{names:?} do not share columns");
+            cols = Some(shape[1]);
+            rows += shape[0];
+            out.extend_from_slice(&bytes);
+        }
+        Ok((out, rows, cols.context("no BF16 parts")?))
+    }
+
+    /// The BF16 weights `names` concatenated by rows, sliced over `ranks` along `axis`:
+    /// rank `r` takes part `r` of every concatenated weight's rows (so a head- or
+    /// intermediate-split `gate | up` stays gate rows then up rows), or of the columns.
+    fn bf16_split(&self, key: &str, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        if ranks == 1 {
+            return Ok(vec![self.upload(key, &self.bf16_rows(names)?.0)?]);
+        }
+        let parts = names.iter().map(|n| self.bf16_rows(std::slice::from_ref(n))).collect::<Result<Vec<_>>>()?;
+        ensure!(axis == Axis::Rows || parts.len() == 1, "{names:?}: concatenated weights split by rows");
+        (0..ranks).map(|rank| {
+            let mut bytes = Vec::new();
+            for (values, rows, cols) in &parts {
+                ensure!(if axis == Axis::Rows { rows % ranks == 0 } else { cols % ranks == 0 },
+                    "{names:?}: [{rows}, {cols}] does not split over {ranks} GPUs");
+                bytes.extend(slice_2d(values, *rows, *cols, 2, axis, rank, ranks));
+            }
+            self.on_rank(rank, |_| self.upload(key, &bytes))
+        }).collect()
+    }
+
+    /// Block FP8 KV-B relayout preserves the checkpoint bytes and scales.
+    fn kv_b(&self, dense: &DenseLoad<'a>, cfg: &GlmDsaConfig, layer: usize, ranks: usize)
+        -> Result<Vec<((DeviceAllocation<'a>, DeviceAllocation<'a>), (DeviceAllocation<'a>, DeviceAllocation<'a>))>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
+        let name = cfg.weight(layer, Op::KvB).context("kv_b source")?;
+        let (heads, nope, v, lat) = (cfg.heads, cfg.nope_dim(layer), cfg.v_head_dim, cfg.kv_lora_rank);
+        let rows = nope + v;
+        ensure!(heads % ranks == 0 && landing::native_fp8_block(self.catalog, &name)?,
+            "{name}: FP8 kv_b requires a block scale grid and even head split");
+        let (source, _) = Land::whole(self.catalog, &name, 0)?.rect(self.catalog)?;
+        let (grid, _) = Land::whole(self.catalog, &landing::block_grid(self.catalog, &name), 0)?.rect(self.catalog)?;
+        let (share, uk_head, uv_head) = (heads / ranks, lat * nope, v * lat);
+        let window = kv_b_window(rows * lat, grid.bytes())?;
+        (0..ranks).map(|rank| self.on_rank(rank, |stream| {
+            let uk = self.allocate("w_uk_fp8", (share * uk_head).max(256))?;
+            let uv = self.allocate("w_uv_fp8", (share * uv_head).max(256))?;
+            let uk_s = self.allocate("w_uk_scale", (share * uk_head / 64 * 4).max(256))?;
+            let uv_s = self.allocate("w_uv_scale", (share * uv_head / 64 * 4).max(256))?;
+            for first in (0..share).step_by(window) {
+                let count = (share - first).min(window);
+                let row0 = (rank * share + first) * rows;
+                let values = source.sub(row0..row0 + count * rows);
+                let job = Job::AbsorbFp8 { at: 0, grid_at: values.bytes(), grid_bytes: grid.bytes(), row0,
+                    heads: count, nope, v, lat,
+                    uk: view(uk.buffer, first * uk_head, count * uk_head)?,
+                    uv: view(uv.buffer, first * uv_head, count * uv_head)?,
+                    uk_scale: view(uk_s.buffer, first * uk_head / 64 * 4, count * uk_head / 64 * 4)?,
+                    uv_scale: view(uv_s.buffer, first * uv_head / 64 * 4, count * uv_head / 64 * 4)? };
+                self.dense_step(dense, Step { device: uk.buffer.device_id, rects: vec![values, grid.clone()], jobs: vec![job] }, stream)?;
+            }
+            Ok(((uk, uk_s), (uv, uv_s)))
+        })).collect()
     }
 
     /// BF16 `kv_b` lands one contiguous head share per rank. The shared
@@ -585,8 +655,8 @@ impl<'a> GlmLoader<'a> {
         let (share, uk_head, uv_head) = (heads / ranks, lat * nope * 2, v * lat * 2);
         let window = kv_b_window(uk_head + uv_head, 0)?;
         (0..ranks).map(|rank| self.on_rank(rank, |stream| {
-            let uk = self.allocate("w_uk", share * uk_head)?;
-            let uv = self.allocate("w_uv", share * uv_head)?;
+            let uk = self.allocate("w_uk", (share * uk_head).max(256))?;
+            let uv = self.allocate("w_uv", (share * uv_head).max(256))?;
             for first in (0..share).step_by(window) {
                 let count = (share - first).min(window);
                 let row0 = (rank * share + first) * rows;
@@ -819,13 +889,13 @@ impl<'a> GlmLoader<'a> {
         use routes::{Operation, layer_routes};
         let scoped = self.scoped(format!("layer.{layer}.operand."));
         let ranks = self.ranks();
-        let dense = layer < cfg.first_moe_layer;
+        let is_dense = layer < cfg.first_moe_layer;
         let gate = cfg.stem(layer, Op::Gate).context("FFN gate")?;
-        let mlp_numerics = if native_shared && !dense {
+        let mlp_numerics = if native_shared && !is_dense {
             cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision
         } else { checkpoint.module_numerics(&gate)? };
         let mut layers = (0..ranks).map(|rank| GlmLayer {
-            dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full, mlp_numerics,
+            dense: is_dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full, mlp_numerics,
             split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
             attention_resident: owner.is_none_or(|owner| usize::from(owner) == rank),
             operands: HashMap::new(), native: HashMap::new(), native_projections: HashMap::new(), core: Default::default(),

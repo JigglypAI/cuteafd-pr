@@ -118,32 +118,30 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
                 }
                 let owners = (0..cfg.layers).map(|l| (l % 2) as u8).collect::<Vec<_>>();
                 let owners = whole.then_some(owners.as_slice());
-                for native_bf16 in [false, true] {
-                    for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
-                        let expected = WeightInventory::from_checkpoint(
-                            &checkpoint,
-                            ranks,
-                            cfg.layers,
-                            owners,
-                            native_bf16,
-                            false,
-                            home,
-                        )?;
-                        let actual = replay(
-                            &catalog,
-                            &cfg,
-                            &checkpoint,
-                            ranks,
-                            owners,
-                            native_bf16,
-                            home,
-                        )?;
-                        assert_eq!(
-                            signatures(expected.owners.into_iter().map(|o| o.allocation)),
-                            signatures(actual),
-                            "{model} ranks={ranks} whole={whole} bf16={native_bf16} home={home:?}"
-                        );
-                    }
+                for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                    let expected = WeightInventory::from_checkpoint(
+                        &checkpoint,
+                        ranks,
+                        cfg.layers,
+                        owners,
+                        true,
+                        false,
+                        home,
+                    )?;
+                    let actual = replay(
+                        &catalog,
+                        &cfg,
+                        &checkpoint,
+                        ranks,
+                        owners,
+                        true,
+                        home,
+                    )?;
+                    assert_eq!(
+                        signatures(expected.owners.into_iter().map(|o| o.allocation)),
+                        signatures(actual),
+                        "{model} ranks={ranks} whole={whole} home={home:?}"
+                    );
                 }
             }
         }
