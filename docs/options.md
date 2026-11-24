@@ -366,6 +366,11 @@ TP2 head handoff remain eager. `SPECULATION_TRACE` uses the shared speculation t
 Stored K8/K6 views load the bundled K8 MUL1 linears, except KV-B, which follows
 the target's absorbed-BF16 layout. `SPECULATOR=off` admits no drafter storage. Hy4-flash uses the shared `DECODE_ROWS` budget
 (up to 64 target rows, including anchors; `auto` is 64).
+The original-core minimum card is one RTX PRO 6000 with no Sparks. With the
+bundled drafter enabled, its measured pool is 538,368 tokens (754,944 with the
+drafter off, same 512 MiB graph reserve and KV cap). Both clear the 262,144-token
+context floor. This layout intentionally falls short of the 2,097,152-token soft
+placement target even without the drafter; it does not add a Spark to reach it.
 `RTX_EXPERT_LAYERS=auto|all|N`,
 `PREFILL_ROWS`, `PREFILL_WAVES` (1–3), `PREFILL_PACKING=unrestricted`,
 `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`, `PREFIX_CACHE_ENTRIES`,
