@@ -499,6 +499,61 @@ fn compact_dso() -> Result<(Fixture, NativeLibrary)> {
 }
 
 #[test]
+fn bf16_kv_b_mount_and_push_match_dev_layout_byte_for_byte() -> Result<()> {
+    use crate::shared::experts::rtx::dense::fill_records_by_mount;
+    use std::os::unix::fs::FileExt;
+    let (fixture, library) = compact_dso()?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (config, mut tensors) = fixture::glm5_compact_weights();
+    let name = "model.layers.0.self_attn.kv_b_proj.weight";
+    tensors.retain(|t| t.0 != format!("{name}_scale_inv"));
+    tensors.iter_mut().find(|t| t.0 == name).unwrap().1 = "BF16";
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let tensor = catalog.tensor(name)?;
+    let (d, v, lat) = (cfg.nope_dim(0), cfg.v_head_dim, cfg.kv_lora_rank);
+    let raw = (0..cfg.heads * (d + v) * lat).flat_map(|i| (i as u16).wrapping_mul(40503).to_le_bytes()).collect::<Vec<_>>();
+    std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+        .write_all_at(&raw, tensor.metadata.byte_offset)?;
+    let sink = std::rc::Rc::new(super::landing::PushSink::default());
+    let stream = std::ptr::null_mut();
+    for push in [None, Some(sink.clone())] {
+        let loader = GlmLoader { library: &library, catalog: &catalog, device: 0, stream,
+            peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
+            arenas: None, allocation_prefix: String::new(), push };
+        let mount = DenseLoad::mount(&library);
+        let parts = loader.kv_b_bf16(&mount, &cfg, 0, 2)?;
+        if loader.push.is_some() {
+            let (records, _) = sink.take();
+            assert_eq!(records.steps.len(), 2);
+            fill_records_by_mount(&library, &records, |_| stream)?;
+        }
+        for (head, (uk, uv)) in parts.into_iter().enumerate() {
+            let base = head * (d + v) * lat * 2;
+            let mut k = Vec::new();
+            for col in 0..lat {
+                for row in 0..d {
+                    let at = base + (row * lat + col) * 2;
+                    k.extend_from_slice(&raw[at..at + 2]);
+                }
+            }
+            let expected_v = &raw[base + d * lat * 2..base + (d + v) * lat * 2];
+            loader.on_rank(head, |_| {
+                let mut actual = vec![0; k.len()];
+                library.copy_d2h(&mut actual, uk.buffer)?;
+                assert_eq!(actual, k);
+                actual.resize(expected_v.len(), 0);
+                library.copy_d2h(&mut actual, uv.buffer)?;
+                assert_eq!(actual, expected_v);
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn whole_attention_owner1_allocates_on_its_physical_device() -> Result<()> {
     compact_real_load(Some(&[1, 0]), false, EmbedPlacement::Gpu)
 }
@@ -605,7 +660,7 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
     let source = catalog.tensor(cfg.embedding())?;
     let source = EmbedSource::new(root.path(), &source.shard, &source.metadata, cfg.hidden)?;
     let (embedding, (weights, peers)) = TokenEmbedding::load_with(&library, source, placement, || {
-        loader.model(&cfg, cfg.layers, owners, false)
+        loader.model(&cfg, cfg.layers, owners, false, layout_inventory.dense_mount)
     }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
     let devices = CoordinatorDevices::new(&[0, 1])?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(
@@ -861,7 +916,7 @@ fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Resu
         stream: std::ptr::null_mut(), peers: vec![crate::shared::peer_split::RankDevice {
             device: 1, stream: std::ptr::null_mut() }], arenas: Some(std::rc::Rc::new(arenas)),
         allocation_prefix: String::new(), push: Some(sink.clone()) };
-    let (_, mut peers) = loader.model(&cfg, cfg.layers, None, false)?;
+    let (_, mut peers) = loader.model(&cfg, cfg.layers, None, false, inventory.dense_mount)?;
     let _ = sink.take();
     fixture.quiet_events(&library, false)?;
     let before = fixture.events()?.matches('D').count();
@@ -1249,7 +1304,7 @@ fn compact_ml4_query_vectors_and_native_index_equal_real_layer_requests() -> Res
             Device { library: &library, id: rank }, layout, crate::shared::memory::TEST_ARENA)?))
     }).collect::<Result<BTreeMap<_, _>>>()?;
     let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
-    let layers = loader.layer(&cfg, 0, &checkpoint, &core, None, false)?;
+    let layers = loader.layer(&DenseLoad::mount(&library), &cfg, 0, &checkpoint, &core, None, false)?;
     let mut actual = crate::shared::memory::receipts::Inventory::new(
         CoordinatorDevices::new(&[0, 1])?,
         "glm.weights",

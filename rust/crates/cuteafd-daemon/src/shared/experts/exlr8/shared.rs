@@ -285,8 +285,7 @@ mod receipt_tests {
                     assert_eq!(actual, pointers.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
                 }
                 let mut weights = cuteafd_loader::placement::families::glm5::weights::WeightInventory {
-                    ranks: world, owners: vec![], core_loading: Default::default(), kv_b_loading: Default::default(),
-                    row_loading: Default::default(), attention_mount: Default::default(),
+                    ranks: world, owners: vec![], core_loading: Default::default(), dense_mount: Default::default(),
                 };
                 let all = (0..world).map(|r| {
                     let mut rank_plans = plans.clone();

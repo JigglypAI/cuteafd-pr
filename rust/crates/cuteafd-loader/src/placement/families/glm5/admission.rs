@@ -979,8 +979,6 @@ impl<'a> ProductionInput<'a> {
             let sync = self.sync_upload_bytes.max(self.draft.sync_upload_bytes)
                 .max(native_load.as_ref().map_or(0, |load| load.sync_upload_bytes))
                 .max(weights.core_loading.sync_upload_bytes)
-                .max(weights.kv_b_loading.sync_upload_bytes)
-                .max(weights.row_loading.sync_upload_bytes)
                 .max(self.context.checked_mul(self.cfg.qk_rope_head_dim as u64)
                     .and_then(|bytes| bytes.checked_mul(4)).ok_or_else(|| invalid("rotary upload overflow"))?)
                 .max(filler.map_or(0, |batch| batch.packed_bytes as u64));

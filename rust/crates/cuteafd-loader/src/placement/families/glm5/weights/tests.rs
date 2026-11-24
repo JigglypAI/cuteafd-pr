@@ -110,11 +110,11 @@ fn native_attention_mount_separates_native_and_converted_read_owners() -> Result
     assert_eq!(converted.full_row_cache, 2 * converted.pinned_source);
     assert!(converted.pinned_tables > 0);
     let inventory = WeightInventory { ranks: 2, owners: vec![], core_loading: Default::default(),
-        kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: converted };
+        dense_mount: converted };
     let components = inventory.loading_components(1)?;
     assert_eq!(components.len(), 3);
-    for owner in converted.allocations("glm.load.native_attention") {
-        assert!(owner.id.starts_with("glm.load.native_attention."));
+    for owner in converted.allocations("glm.load.dense_mount") {
+        assert!(owner.id.starts_with("glm.load.dense_mount."));
         assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
     }
     Ok(())
@@ -365,28 +365,19 @@ fn core_load_payload_peak_adds_full_source_to_one_local_pack_not_ranks_or_layers
             assert_eq!(inventory.core_loading.sync_upload_bytes,
                 (512 * 256 * 6 / 8 / ranks) as u64);
             let components = inventory.loading_components(16).unwrap();
-            assert_eq!(components.len(), 1);
-            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
+            assert_eq!(components.len(), 2);
+            let ComponentKind::Allowance(allowance) = &components[1].kind else { panic!("heap is not exact") };
             assert_eq!(allowance.location, Location::HOST);
             assert_eq!(allowance.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
-            assert!(allowance.assumed);
-            assert!(allowance.source.contains("unmeasured"));
-            assert!(allowance.source.contains("excludes allocator/metadata"));
-            assert!(allowance.source.contains("concurrent draft prefetch"));
-            assert_eq!(allowance.bytes, ((source + packed) as u64)
-                .max(inventory.kv_b_loading.heap_payload_bytes));
-            assert_eq!(components[0].bytes.at(16).unwrap(), allowance.bytes);
-            // Pinned upload is a shared maximum fact, not another allocation
-            // emitted by each rank or by this target-only subset.
-            assert!(!components.iter().any(|c| matches!(&c.kind,
-                ComponentKind::Allocation { .. })));
+            assert!(allowance.assumed && allowance.source.contains("unmeasured"));
+            assert_eq!(allowance.bytes, (source + packed) as u64);
+            assert_eq!(components[1].bytes.at(16).unwrap(), allowance.bytes);
         }
     }
     let (config, tensors) = testing::glm5_compact_weights();
     let plain = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
     assert_eq!(plain.core_loading, CoreLoading::default());
-    assert_eq!(plain.kv_b_loading, KvBLoading::default());
-    assert_eq!(plain.row_loading.heap_payload_bytes, 128 * 256 + 2 * 256 * 2 + 8);
+    assert_eq!(plain.dense_mount.pinned_source, 1 << 20);
     assert_eq!(plain.loading_components(16).unwrap().len(), 1);
     assert!(plain.loading_components(0).is_err());
 }
@@ -399,7 +390,7 @@ fn unsplit_k6_head_can_set_both_heap_and_single_upload_maxima() {
         let packed = 2048 * 256 * 6 / 8 + (2048 + 256) * 2;
         assert_eq!(inventory.core_loading.heap_payload_bytes, packed * 2 + 4);
         assert_eq!(inventory.core_loading.sync_upload_bytes, 2048 * 256 * 6 / 8);
-        assert_eq!(inventory.loading_components(8).unwrap().len(), 1);
+        assert_eq!(inventory.loading_components(8).unwrap().len(), 2);
     }
     let (config, tensors) = core_checkpoint(2048, false);
     let body = ordinary(&config, &tensors, 2, None, false, EmbeddingHome::Device(0));
@@ -408,44 +399,36 @@ fn unsplit_k6_head_can_set_both_heap_and_single_upload_maxima() {
 }
 
 #[test]
-fn bf16_kv_b_load_adds_source_outputs_and_one_slice_then_maxes_serial_core() {
-    let source = 2 * (64 + 128) * 128 * 2;
-    let largest = 2 * 128 * 128 * 2;
-    for core in [false, true] {
-        let (config, tensors) = if core { core_checkpoint(256, true) } else {
-            let (config, tensors) = testing::glm5_compact_weights();
-            (config, tensors.into_iter().filter(|t| !t.0.ends_with("_scale_inv"))
-                .map(|(name, dtype, shape)| (name,
-                    if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape)).collect())
-        };
-        for (ranks, owners, parts) in [(1, None, 1), (2, None, 2),
-            (2, Some([0, 1]), 1), (2, Some([1, 0]), 1)] {
+fn kv_b_and_rows_admit_one_pinned_mount_owner() {
+    use crate::shared::dense_read::{PINNED_FLOOR_BYTES, STEP_BYTES};
+    let (config, tensors) = testing::glm5_compact_weights();
+    for (ranks, owners) in [(1, None), (2, None), (2, Some([0, 1])), (2, Some([1, 0]))] {
+        for bf16 in [false, true] {
+            let tensors = if bf16 { tensors.iter().filter(|t| !t.0.ends_with("_scale_inv"))
+                .map(|(name, dtype, shape)| (name.clone(), if *dtype == "F8_E4M3" { "BF16" } else { *dtype }, shape.clone()))
+                .collect() } else { tensors.clone() };
             let inventory = ordinary(&config, &tensors, ranks,
-                owners.as_ref().map(|o| o.as_slice()), true, EmbeddingHome::HostPinned);
-            assert_eq!(inventory.kv_b_loading.heap_payload_bytes, source * 2 + largest / parts);
-            assert_eq!(inventory.kv_b_loading.sync_upload_bytes, largest / parts);
-            let components = inventory.loading_components(16).unwrap();
-            assert_eq!(components.len(), 1);
-            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
-            assert_eq!(allowance.bytes, inventory.core_loading.heap_payload_bytes
-                .max(source * 2 + largest / parts));
-            assert!(allowance.assumed && allowance.source.contains("largest single-rank upload slice")
-                && allowance.source.contains("other target operations"));
-            assert_eq!(allowance.location, Location::HOST);
-            assert_eq!(allowance.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+                owners.as_ref().map(|owners| owners.as_slice()), bf16, EmbeddingHome::HostPinned);
+            assert_eq!(inventory.dense_mount.pinned_source, PINNED_FLOOR_BYTES as u64);
+            let owners = inventory.dense_mount.allocations("glm.load.dense_mount");
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].location, Location::PINNED);
+            assert_eq!(owners[0].lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+            assert_eq!(inventory.loading_components(16).unwrap().len(), 1);
         }
     }
+    assert_eq!(kv_b_window(448 * 512 * 2, 0).unwrap(), STEP_BYTES / (448 * 512 * 2));
+    assert!(kv_b_window(STEP_BYTES, 4).is_err());
+    assert!(kv_b_window(0, 0).is_err());
+    let cols: usize = 6144;
+    let window = dequant_window(cols).unwrap();
+    let extent = |rows: usize| rows * cols + rows.div_ceil(128) * cols.div_ceil(128) * 4;
+    assert_eq!(window % 128, 0);
+    assert!(extent(window) <= STEP_BYTES && extent(window + 128) > STEP_BYTES);
 }
 
 #[test]
-fn bf16_kv_b_loading_refuses_bad_geometry_and_overflow_without_partial_update() {
-    for (source, uk, uv, ranks) in [(2, 1, 1, 0), (2, 1, 1, 3),
-        (2, 1, 1, 2), (1, 0, 1, 1), (2, 2, 2, 1),
-        (u64::MAX, u64::MAX - 1, 1, 1), (u64::MAX, u64::MAX, 1, 1)] {
-        let mut loading = KvBLoading::default();
-        assert!(loading.include(source, uk, uv, ranks).is_err());
-        assert_eq!(loading, KvBLoading::default());
-    }
+fn bf16_kv_b_loading_refuses_bad_geometry() {
     let (config, mut tensors) = core_checkpoint(256, true);
     tensors.iter_mut().find(|t| t.0 == "model.layers.0.self_attn.kv_b_proj.weight")
         .unwrap().2[0] -= 1;
@@ -457,75 +440,7 @@ fn bf16_kv_b_loading_refuses_bad_geometry_and_overflow_without_partial_update() 
 }
 
 #[test]
-fn row_reader_heap_holds_all_members_and_one_grid_without_rank_multiplication() {
-    let (config, tensors) = testing::glm5_compact_weights();
-    for ranks in [1, 2] {
-        let choices = if ranks == 1 { vec![None] } else {
-            vec![None, Some([0, 1]), Some([1, 0])]
-        };
-        for owners in choices {
-            let mixed = ordinary(&config, &tensors, ranks,
-                owners.as_ref().map(|o| o.as_slice()), false, EmbeddingHome::HostPinned);
-            assert_eq!(mixed.row_loading, RowLoading {
-                heap_payload_bytes: 128 * 256 + 2 * 256 * 2 + 8,
-                sync_upload_bytes: 128 * 256,
-            });
-            let components = mixed.loading_components(16).unwrap();
-            let ComponentKind::Allowance(allowance) = &components[0].kind else { panic!("heap is not exact") };
-            assert_eq!(allowance.bytes, mixed.row_loading.heap_payload_bytes);
-            assert!(allowance.assumed && allowance.source.contains("all raw members")
-                && allowance.source.contains("retained thread-local staging")
-                && allowance.source.contains("device dequantization temporaries"));
-
-            let bf16 = tensors.iter().filter(|t| !t.0.ends_with("_scale_inv"))
-                .map(|(name, dtype, shape)| (name.clone(),
-                    if *dtype == "F8_E4M3" { "BF16" } else { *dtype }, shape.clone()))
-                .collect::<Vec<_>>();
-            let bf16 = ordinary(&config, &bf16, ranks,
-                owners.as_ref().map(|o| o.as_slice()), true, EmbeddingHome::HostPinned);
-            assert_eq!(bf16.row_loading, RowLoading {
-                heap_payload_bytes: (128 + 2) * 256 * 2,
-                sync_upload_bytes: 128 * 256 * 2,
-            });
-        }
-    }
-
-    let both_fp8 = tensors.iter().flat_map(|(name, dtype, shape)| {
-        if name == "model.layers.0.self_attn.indexer.weights_proj.weight" {
-            testing::fp8("model.layers.0.self_attn.indexer.weights_proj", 2, 256, None)
-        } else { vec![(name.clone(), *dtype, shape.clone())] }
-    }).collect::<Vec<_>>();
-    let inventory = ordinary(&config, &both_fp8, 2, None, false, EmbeddingHome::HostPinned);
-    assert_eq!(inventory.row_loading, RowLoading {
-        heap_payload_bytes: (128 + 2) * 256 + 8,
-        sync_upload_bytes: 128 * 256,
-    });
-
-    // The unsplit FP8 head uses the same row reader and can set both maxima.
-    let mut config = config;
-    config["vocab_size"] = serde_json::json!(1024);
-    let tensors = tensors.into_iter().flat_map(|(name, dtype, mut shape)| {
-        if name == "lm_head.weight" { return testing::fp8("lm_head", 1024, 256, None); }
-        if name == "model.embed_tokens.weight" { shape[0] = 1024; }
-        vec![(name, dtype, shape)]
-    }).collect::<Vec<_>>();
-    for ranks in [1, 2] {
-        let inventory = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::HostPinned);
-        assert_eq!(inventory.row_loading, RowLoading {
-            heap_payload_bytes: 1024 * 256 + 8 * 2 * 4,
-            sync_upload_bytes: 1024 * 256,
-        });
-        let root = tempfile::tempdir().unwrap();
-        write_snapshot(root.path(), &config, &tensors, None);
-        let checkpoint = Checkpoint::open(root.path()).unwrap();
-        let head_only = WeightInventory::from_checkpoint(&checkpoint, ranks, 0,
-            None, false, false, EmbeddingHome::HostPinned).unwrap();
-        assert_eq!(head_only.row_loading, inventory.row_loading);
-    }
-}
-
-#[test]
-fn row_reader_refuses_bad_members_and_scales_without_partial_update() {
+fn row_reader_refuses_bad_members_and_scales() {
     let (config, tensors) = testing::glm5_compact_weights();
     let root = tempfile::tempdir().unwrap();
     write_snapshot(root.path(), &config, &tensors, None);
@@ -560,16 +475,11 @@ fn row_reader_refuses_bad_members_and_scales_without_partial_update() {
             _ => unreachable!(),
         }
         let headers = Headers(tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect());
-        let before = RowLoading { heap_payload_bytes: 17, sync_upload_bytes: 13 };
-        let mut actual = before.clone();
-        assert!(actual.include(&headers, &names).is_err(), "mutation {bad}");
-        assert_eq!(actual, before);
+        assert!(row_mount(&headers, &names).is_err(), "mutation {bad}");
     }
     let headers = Headers(checkpoint.tensors.iter().map(|t| (t.meta.name.as_str(), &t.meta)).collect());
-    let mut loading = RowLoading::default();
-    assert!(loading.include(&headers, &[]).is_err());
-    assert!(loading.include(&headers, &[names[0].clone(), "missing".into()]).is_err());
-    assert_eq!(loading, RowLoading::default());
+    assert!(row_mount(&headers, &[]).is_err());
+    assert!(row_mount(&headers, &[names[0].clone(), "missing".into()]).is_err());
 }
 
 #[test]
