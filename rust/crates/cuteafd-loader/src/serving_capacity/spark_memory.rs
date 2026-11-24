@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 pub const INVENTORY: &str = include_str!("spark_memory.json");
 pub const SERVING_HOSTS: [&str; 6] = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"];
 
-pub fn measured_bytes(host: &str) -> Result<u64> {
+fn census_parts(host: &str) -> Result<(u64, u64)> {
     static TABLE: OnceLock<serde_json::Value> = OnceLock::new();
     let table = TABLE.get_or_init(|| serde_json::from_str(INVENTORY).expect("checked-in Spark inventory"));
     let host = host.split(':').next().unwrap_or(host);
@@ -18,11 +18,24 @@ pub fn measured_bytes(host: &str) -> Result<u64> {
         .with_context(|| format!("missing idle MemAvailable measurement for Spark {host} in serving_capacity/spark_memory.json; supply --spark-memory-cap"))?;
     let bytes = kib.checked_mul(1024).context("Spark MemAvailable bytes overflow")?;
     if bytes == 0 { bail!("empty MemAvailable measurement for Spark {host}"); }
-    Ok(bytes)
+    capacity_parts(bytes, &table["hosts"][host]["carveout_bytes"])
+}
+
+pub fn measured_bytes(host: &str) -> Result<u64> {
+    measured_bytes_for(host, 0, 1)
+}
+
+pub fn measured_bytes_for(host: &str, rank: usize, expert_ranks: usize) -> Result<u64> {
+    Ok(credited(census_parts(host)?, rank, expert_ranks))
 }
 
 pub fn serving_bytes() -> Vec<u64> {
-    SERVING_HOSTS.iter().map(|host| measured_bytes(host).expect("measured serving pool")).collect()
+    serving_bytes_for(SERVING_HOSTS.len())
+}
+
+pub fn serving_bytes_for(expert_ranks: usize) -> Vec<u64> {
+    SERVING_HOSTS.iter().enumerate().map(|(rank, host)|
+        measured_bytes_for(host, rank, expert_ranks).expect("measured serving pool")).collect()
 }
 
 static LIVE: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
@@ -59,13 +72,17 @@ pub fn sample_parts(samples: &str) -> Result<Vec<(u64, u64)>> {
         anyhow::ensure!(row["boot_id"].as_str().is_some_and(|id| !id.is_empty())
             && row["age_seconds"].as_f64().is_some_and(|age| age >= 0.0),
             "Spark sample requires boot_id and age_seconds");
-        let carveout = match row.get("carveout_bytes") {
-            None | Some(serde_json::Value::Null) => 0,
-            Some(value) => value.as_u64().context("carveout_bytes must be a byte count")?,
-        };
-        anyhow::ensure!(carveout % (2 << 20) == 0, "carveout_bytes must be whole 2 MiB slices");
-        Ok((bytes, if cuteafd_ffi_attic_enabled() { carveout } else { 0 }))
+        capacity_parts(bytes, &row["carveout_bytes"])
     }).collect()
+}
+
+fn capacity_parts(bytes: u64, carveout: &serde_json::Value) -> Result<(u64, u64)> {
+    let carveout = match carveout {
+        serde_json::Value::Null => 0,
+        value => value.as_u64().context("carveout_bytes must be a byte count")?,
+    };
+    anyhow::ensure!(carveout % (2 << 20) == 0, "carveout_bytes must be whole 2 MiB slices");
+    Ok((bytes, if cuteafd_ffi_attic_enabled() { carveout } else { 0 }))
 }
 
 /// `--spark-carveout off` (process-wide) plans without the carveout.
@@ -167,8 +184,25 @@ mod tests {
     }
 
     #[test]
+    fn offline_and_live_samples_credit_only_expert_ranks() {
+        let samples = SERVING_HOSTS.iter().map(|host| {
+            let (bytes, carveout_bytes) = census_parts(host).unwrap();
+            serde_json::json!({"bytes": bytes, "carveout_bytes": carveout_bytes,
+                "age_seconds": 0, "boot_id": "fixture"})
+        }).collect::<Vec<_>>();
+        for experts in [0, 3, SERVING_HOSTS.len()] {
+            let offline = serving_bytes_for(experts);
+            assert_eq!(offline, sample_bytes_for(&serde_json::to_string(&samples).unwrap(), experts).unwrap());
+            for (rank, host) in SERVING_HOSTS.iter().enumerate() {
+                let (ordinary, carveout) = census_parts(host).unwrap();
+                assert_eq!(offline[rank], ordinary + if rank < experts { carveout } else { 0 });
+            }
+        }
+    }
+
+    #[test]
     fn exact_per_host_measurements_and_missing_fail_closed() {
-        assert_eq!(measured_bytes("dodo").unwrap(), 121_171_588 * 1024);
+        assert_eq!(measured_bytes("dodo").unwrap(), 121_171_588 * 1024 + 2_143_289_344);
         assert_eq!(measured_bytes("10.55.0.2:19441").unwrap(), measured_bytes("dodo").unwrap());
         assert_ne!(measured_bytes("ostrich").unwrap(), measured_bytes("rhea").unwrap());
         assert!(measured_bytes("unknown").is_err());

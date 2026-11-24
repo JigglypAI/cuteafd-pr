@@ -448,6 +448,7 @@ of every quant, mixed placement or hardware combination.
 
 <!-- release-v2-limits -->
 - **Memory vs. kernel support:** checkpoint context and compiled index extent are 1,048,576 tokens. Default effective context is separately bounded by the admitted pool and reported on each card; below 262,144 is a per-cell agentic-floor finding. A memory-fitting layout alone does not qualify a full-length prompt.
+- Automatic bundled vision can reduce the KV pool below the target, but not below `KV_MIN_TOKENS`.
 - The tr3 quant's bundled chat template has no image markers or base-model hint. `VISION=auto` (the default) serves it text only: the encoder plan turns vision off with one note naming the reason and the override, and no tower is placed or loaded. Corrected cards use `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash` explicitly, which serves images with the official template. An explicit `VISION=spark[:rank]` or `rtx[:gpu]` without it still fails at start-up, naming the same gap and override. This is a configuration finding, not proof of a text-quality defect.
 - Greedy speculative output is not launch-deterministic (historical unchanged lazy/lazy runs diverged at token 6); live draft-cost timing is a candidate, not a proven cause.
 - Synchronized ~440 ms Spark response gaps (normally 15-18 ms) were observed once; coordinator/transport cause is unproven.

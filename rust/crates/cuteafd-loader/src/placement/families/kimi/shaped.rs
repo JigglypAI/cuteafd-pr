@@ -81,7 +81,7 @@ mod tests {
                     let index: usize = template.id.rsplit('.').next().unwrap().parse()?;
                     assert_eq!(component.bytes.at(pages)?, sm120_request_backing(requests[index])?);
                 }
-                let contract = Contract { components: components.clone(), floor_fallback: None,
+                let contract = Contract { components: components.clone(),
                     resident_weight_limit: None, phase_order: PhaseOrder::DRAFT_THEN_TARGET,
                     spark_reply_formats: None, page_rows: recipe.page_rows(), pool_page_multiple: 1,
                     maximum_pages: recipe.maximum_pages, gpus: 2,

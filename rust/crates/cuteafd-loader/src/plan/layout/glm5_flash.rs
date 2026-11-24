@@ -384,8 +384,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
             .max().map_or(spark_ranks, |rank| spark_ranks.max(rank + 1));
         process.spark_rank_caps = options.spark_capacities(process.physical_sparks);
-        process.auto_vision = report.vision == crate::plan::MediaMode::Auto;
-        if process.auto_vision && weights > 0 {
+        if report.vision == crate::plan::MediaMode::Auto && weights > 0 {
             process.encoders.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
                 replicas: vec![], reason: "auto vision disabled to preserve the GLM Flash KV pool floor".into(), shortfall: 0 });
         }

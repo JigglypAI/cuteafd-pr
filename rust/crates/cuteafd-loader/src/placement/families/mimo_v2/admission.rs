@@ -586,7 +586,7 @@ impl Recipe for MimoRecipe<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
         if request.context.maximum == 0 { return Err(invalid("zero context")); }
         let maximum = self.maximum_pages;
-        let mut contract = Contract { floor_fallback: None,
+        let mut contract = Contract {
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.spark_ranks > 0).then_some(cuteafd_core::spark_reply::SparkReplyFormats {
                 prefill: Some(self.spark_reply_formats.prefill(false)), decode: Some(self.spark_reply_formats.decode()) }),

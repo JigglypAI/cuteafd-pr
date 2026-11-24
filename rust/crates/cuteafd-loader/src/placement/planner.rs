@@ -613,7 +613,7 @@ pub struct ResolvedPlan {
     /// Immutable preparation witness, shared by offline and runtime admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_policy: Option<crate::placement::PoolPolicy>,
-    /// Rejected earlier encoder choices at the admitted pool and onboarding.
+    /// Rejected earlier encoder choices at the admitted topology and relevant pool floor.
     pub encoder_diagnostics: Vec<(String, u64)>,
     pub request: Request,
     pub decisions: Decisions,

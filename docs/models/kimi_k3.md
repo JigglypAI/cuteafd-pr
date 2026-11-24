@@ -67,6 +67,9 @@ coverage explicitly: Layers 26 decode windows and Context 51 windows
 states exact, zero mismatches, with matching Serve/Golden admission. This is
 77 exact windows, not a completed 72+72-window proof (#1777/#2128).
 
+`VISION=auto` keeps the bundled still tower when the KV pool can still meet
+`KV_MIN_TOKENS`; use `VISION=off` for text-only serving.
+
 ## Core views
 
 The old Kimi K3 `-HQA` checkpoint was withdrawn from Hugging Face.

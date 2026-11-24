@@ -42,6 +42,9 @@ Historical, retired standalone recipes remain available: EXL3
 [min](../../examples/configs/glm53-exl3-k6core-min.config) /
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 
+For checkpoints with a supported bundled vision tower, `VISION=auto` admits it
+when the KV pool still meets `KV_MIN_TOKENS`.
+
 ## Core views
 
 The old `-HQA` checkpoint was withdrawn from Hugging Face. Use the published MC checkpoint for selectable core views.

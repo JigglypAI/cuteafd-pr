@@ -614,7 +614,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let admitted = prepared.admit(request)?;
     let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
     if report.vision == crate::plan::MediaMode::Auto && weights > 0 && encoder.kind == EncoderKind::Off {
-        encoder.reason = format!("Auto disabled image input at the pool-first/onboarding solution: {}; free memory or choose a smaller layout",
+        encoder.reason = format!("Auto disabled image input to preserve the KV pool floor: {}; free memory or choose a smaller layout",
             admitted.solved.encoder_diagnostics.iter().map(|(reason, _)| reason.as_str()).collect::<Vec<_>>().join("; "));
         encoder.shortfall = admitted.solved.encoder_diagnostics.iter().map(|(_, bytes)| *bytes).filter(|bytes| *bytes > 0).min().unwrap_or(0);
         tracing::warn!(reason = %encoder.reason, shortfall_bytes = encoder.shortfall, "bundled vision disabled by shared admission");

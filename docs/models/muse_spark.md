@@ -282,7 +282,8 @@ context.
 ## Media
 
 The starting configs serve the checkpoint's bundled vision and PCM audio
-towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Both
+towers (`VISION=auto`, `AUDIO=auto`); set either to `off` to drop it. Automatic
+vision is preserved whenever the joint layout still meets `KV_MIN_TOKENS`. Both
 prefer Sparks in Auto mode (min: vision on rank 0, 4,860,356,960 B; audio on
 rank 1, 246,586,368 B). If no Spark admits a tower and its scratch plus
 headroom, Auto falls back to an RTX with enough memory. Explicit `--vision rtx`

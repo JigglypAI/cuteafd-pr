@@ -1007,16 +1007,24 @@ pub fn solve_prepared(
         assignments: 0,
         last: Refusal::Unsupported,
     };
-    if let Some(fallback) = contract.floor_fallback {
-        let domain = domains.get(fallback.variable)
-            .filter(|domain| domain.contains(&fallback.option))
-            .ok_or_else(|| Refusal::InvalidFact("invalid pool-floor fallback choice".into()))?;
-        let mut preferred = domains.clone();
-        preferred[fallback.variable] = domain.iter().copied()
-            .filter(|&option| option != fallback.option).collect();
-        let floor = if matches!(request.pool, Pin::Exact(_)) { wanted } else { minimum };
-        if !preferred[fallback.variable].is_empty() && search.feasible(preferred.clone(), floor)? {
-            domains = preferred;
+    // Automatic vision is decided at the minimum viable pool (or the exact
+    // pin). Once enabled, choose its placement and maximize the pool normally.
+    // Explicit modes have no competing on/off candidates.
+    if let Some((variable, Variable::Encoder(vision_on))) = contract.variables.iter().enumerate()
+        .find(|(_, variable)| matches!(variable, Variable::Encoder(_)))
+    {
+        let domain = &domains[variable];
+        if domain.iter().any(|&option| vision_on[option])
+            && domain.iter().any(|&option| !vision_on[option])
+        {
+            let mut preferred = domains.clone();
+            preferred[variable].retain(|&option| vision_on[option]);
+            let floor = if matches!(request.pool, Pin::Exact(_)) { wanted } else { minimum.max(multiple) };
+            if search.feasible(preferred.clone(), floor)? {
+                domains = preferred;
+            } else {
+                domains[variable].retain(|&option| !vision_on[option]);
+            }
         }
     }
     let pages = if search.feasible(domains.clone(), wanted)? {
@@ -1088,12 +1096,14 @@ pub fn solve_prepared(
             "component cost vectors differ from exact phase evaluator".into(),
         ));
     }
-    // Diagnose alternatives at this exact solution. Do not shrink the pool or
-    // rerun the optimizer merely to explain why Auto disabled image input.
+    // Diagnose alternatives with the selected topology. For rejected vision,
+    // show the shortfall at the admission floor, not at the larger text pool.
     let mut encoder_diagnostics = Vec::new();
     for (variable, domain) in contract.variables.iter().enumerate() {
-        if !matches!(domain, Variable::Encoder(_)) { continue; }
+        let Variable::Encoder(vision_on) = domain else { continue; };
         for option in 0..selected[variable] {
+            let diagnostic_pages = if vision_on[option] && !vision_on[selected[variable]]
+                && matches!(request.pool, Pin::Auto) { minimum.max(multiple) } else { pages };
             let mut alternative = selected.clone();
             alternative[variable] = option;
             if contract.requires.iter().any(|rule| alternative[rule.when.variable] == rule.when.option
@@ -1101,11 +1111,11 @@ pub fn solve_prepared(
                 encoder_diagnostics.push((format!("encoder candidate {option}: no active Spark worker at the admitted onboarding"), 0));
                 continue;
             }
-            let alternate_facts = contract.facts(&alternative, pages)?;
+            let alternate_facts = contract.facts(&alternative, diagnostic_pages)?;
             let mut refusal = evaluate(&alternate_facts, &budgets).err();
             if refusal.is_none() {
                 if let Some(limit) = request.resident_weight_limit {
-                    refusal = costs.weights(&alternative, pages)?.iter().enumerate().find_map(|(gpu, required)|
+                    refusal = costs.weights(&alternative, diagnostic_pages)?.iter().enumerate().find_map(|(gpu, required)|
                         (required.0 > limit.0).then_some(Refusal::ResidentWeightLimit {
                             gpu: gpu as u8, required: required.0, limit: limit.0 }));
                 }

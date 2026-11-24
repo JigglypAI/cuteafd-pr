@@ -6289,7 +6289,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!((tower(crate::media::still_tower::vision_weight_arena_label()), tower("vision scratch")), (898_680_904, 447_778_048));
     let ledger = auto.phase_ledger.as_ref().expect("recipe phase ledger");
     assert!(ledger.budgets.iter().any(|b| b.id == "host"));
-    // Pool first: where the tower and the pinned pool cannot both fit, Auto
+    // When the tower and the pinned pool cannot both fit, Auto
     // turns vision off with the solver's reason instead of shrinking the pool.
     let base = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     let used = base.memory_layout.as_ref().unwrap().devices[0].used_bytes();
@@ -6298,7 +6298,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     let crowded = plan(dir.path(), &PlanOptions { layout: Some(tight), ..options.clone() }).unwrap();
     let declined = crowded.encoder.as_ref().unwrap();
     assert_eq!(declined.kind, EncoderKind::Off, "{}", render(&crowded));
-    assert!(declined.reason.contains("pool-first"), "{}", declined.reason);
+    assert!(declined.reason.contains("KV pool floor"), "{}", declined.reason);
     assert_eq!(crowded.memory_layout.as_ref().unwrap().pool_tokens, 32768);
     assert!(!crowded.memory_layout.as_ref().unwrap().devices[0].items.iter().any(|i| i.group == crate::media::still_tower::vision_weight_arena_label()));
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();

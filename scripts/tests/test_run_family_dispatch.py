@@ -1732,12 +1732,11 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert {"records", "state", "decode step", "prefill step", "weight arena"} <= groups, groups
     assert "graph reserve: qwen4.graphs.0" in groups, groups
     report = deployment["report"]
-    # The tower is the solve's choice: at the automatic 2M target one RTX keeps
-    # the pool and Auto turns vision off (pool first), no pre-solve guess.
+    # Automatic vision uses the KV minimum, not the 2M target, and the
+    # launcher passes the admitted owner (or Off) to serving.
     encoder = report["encoder"]
-    assert encoder["kind"]["kind"] == "off", encoder
-    assert "pool-first" in encoder["reason"], encoder
-    assert "vision tower" not in groups, groups
+    assert encoder["kind"]["kind"] == "rtx", encoder
+    assert "vision packed weight arena" in groups, groups
     # Host owners come from the same recipe (no charge_host pass): PLE staging
     # and row cache, retained upload bounds and logits, against a host budget.
     host = {item["group"] for item in report["host_ledger"]["items"]}
@@ -1751,6 +1750,7 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     serve = shlex.split(next(line for line in result.stderr.splitlines()
                              if "serve-qwen4 --snapshot" in line))
     assert "--local-experts" in serve, serve
+    assert serve[serve.index("--vision") + 1] == f"rtx:{encoder['kind']['gpu']}", serve
     assert serve[serve.index("--pool-tokens") + 1] == "0", serve
     assert "prefill reserve does not fit" not in result.stderr
 

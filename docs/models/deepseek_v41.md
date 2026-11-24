@@ -79,8 +79,9 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   admission decides fit; the packed qualification covers RTX PRO 6000 MXFP4
   min/max, not 5090/32 GB, NVFP4 or StridedPLE performance. Packed does not
   bypass independent expert/projection or StridedPLE+NVFP4 restrictions.
-- Optional vision tower (MoonViT-style) when the checkpoint carries
-  `vision_config`.
+- Bundled vision tower (MoonViT-style) when the checkpoint carries
+  `vision_config`. `VISION=auto` admits it whenever the KV pool still meets
+  `KV_MIN_TOKENS`.
 
 ## Settings
 

@@ -8,37 +8,43 @@
       "measured_at": "2026-11-16T08:31:00Z",
       "uptime": "about 5 minutes",
       "fresh_boot": true,
-      "timestamp_approximate": true
+      "timestamp_approximate": true,
+      "carveout_bytes": 2143289344
     },
     "dodo": {
       "mem_available_kib": 121171588,
       "measured_at": "2026-11-16T08:31:20Z",
       "uptime": "up 0 minutes",
-      "fresh_boot": true
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "emu": {
       "mem_available_kib": 121082712,
       "measured_at": "2026-11-16T08:32:03Z",
       "uptime": "up 0 minutes",
-      "fresh_boot": true
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "kiwi": {
       "mem_available_kib": 121166344,
       "measured_at": "2026-11-16T08:32:49Z",
       "uptime": "up 0 minutes",
-      "fresh_boot": true
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "rhea": {
       "mem_available_kib": 121178876,
       "measured_at": "2026-11-16T08:36:11Z",
       "uptime": "up 0 minutes",
-      "fresh_boot": true
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "moa": {
       "mem_available_kib": 121171588,
       "measured_at": "2026-11-16T08:39:36Z",
       "uptime": "up 0 minutes",
-      "fresh_boot": true
+      "fresh_boot": true,
+      "carveout_bytes": 2143289344
     },
     "kakapo": {
       "mem_available_kib": 120695860,
@@ -55,5 +61,5 @@
       "fresh_boot": false
     }
   },
-  "notes": "dodo and moa genuinely have equal MemAvailable readings in rolling-reboot-2026-11-16T0829Z.txt; boot identity belongs to live probe samples, not this offline census."
+  "notes": "MemAvailable is the Nov 16 idle reference. The separate expert-only carveout allowance was verified on Nov 24 with spark-attic 0.1.6. Live startup samples supersede both values."
 }

@@ -2,7 +2,9 @@
 
 The v7 Release-smoke checkpoint is `wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC`
 with EXL3 K4 MUL1 routed experts and host-resident FP8 Engram tables. The
-cards use automatic KV sizing and `CORE_VIEW=k8-compact`.
+cards use automatic KV sizing and `CORE_VIEW=k8-compact`. With bundled vision
+support, `VISION=auto` admits the tower whenever the KV pool still meets
+`KV_MIN_TOKENS`.
 
 | Layout | Starting config |
 |---|---|

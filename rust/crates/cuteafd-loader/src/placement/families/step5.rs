@@ -691,7 +691,6 @@ impl Recipe for Step5Recipe<'_> {
             return Err(Refusal::InvalidFact("Step-5 invalid contract extent".into()));
         }
         let mut contract = Contract {
-            floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (self.inputs.inventory.spark_ranks > 0).then(|| cuteafd_core::spark_reply::SparkReplyFormats {
                 prefill: Some(request.spark_reply_formats.prefill(false)),

@@ -438,7 +438,7 @@ impl Recipe for QwenSingle<'_> {
             requires.extend(experts.requirements(inputs.spark_ranks, variable));
         }
         inputs.encoders.extend(&mut variables, &mut components, 1, inputs.blas_head, self.maximum_pages)?;
-        Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+        Ok(Contract { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (inputs.spark_ranks > 0)
                 .then(|| reply_formats(inputs.spark_reply_format, inputs.spark_ranks)),
             resident_weight_limit: request.resident_weight_limit, page_rows: page, pool_page_multiple: 1,
@@ -1225,7 +1225,7 @@ impl Recipe for QwenDual<'_> {
                 destination: vec![0, 1], counts: vec![a.layers] });
         }
         inputs.encoders.extend(&mut variables, &mut components, 2, inputs.blas_head, self.maximum_pages)?;
-        Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+        Ok(Contract { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (inputs.spark_ranks > 0).then(|| reply_formats(SparkReplyFormat::Bf16, inputs.spark_ranks)),
             resident_weight_limit: request.resident_weight_limit, page_rows: page, pool_page_multiple: 1,
             maximum_pages: self.maximum_pages, gpus: 2, variables, requires, components })

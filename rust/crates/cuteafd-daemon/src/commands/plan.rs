@@ -156,11 +156,12 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         if args.memory.spark_memory_cap.is_none() {
             let invalid = |error: anyhow::Error| PlanError::InvalidOption {
                 option: "Spark memory inventory", reason: error.to_string() };
+            use cuteafd_loader::serving_capacity::spark_memory;
+            let expert_ranks = args.spark_ranks.unwrap_or(usize::MAX);
             layout.spark_rank_bytes = if let Some(samples) = &args.spark_memory_samples {
                 // Ranks past the requested expert world host media only: no
                 // routed-expert arena, so no display-carveout credit (#2546).
-                cuteafd_loader::serving_capacity::spark_memory::sample_bytes_for(samples,
-                    args.spark_ranks.unwrap_or(usize::MAX)).map_err(invalid)?
+                spark_memory::sample_bytes_for(samples, expert_ranks).map_err(invalid)?
             } else {
                 let cfg = launch_config(args.config.as_deref()).map_err(invalid)?;
                 let hosts = configured_spark_hosts(&cfg).into_iter()
@@ -168,16 +169,17 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 if args.spark_ranks == Some(0) {
                     Vec::new()
                 } else if hosts.iter().any(|host| host.starts_with("REPLACE-ME")) {
-                    cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
+                    spark_memory::serving_bytes_for(expert_ranks)
                 } else if !hosts.is_empty() {
-                    hosts.iter().map(|host| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(host))
+                    hosts.iter().enumerate().map(|(rank, host)|
+                        spark_memory::measured_bytes_for(host, rank, expert_ranks))
                         .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
                 } else if !args.deployment_peers.is_empty() {
                     args.deployment_peers.iter().take(args.spark_ranks.unwrap_or(args.available_sparks))
-                        .map(|peer| cuteafd_loader::serving_capacity::spark_memory::measured_bytes(peer))
+                        .enumerate().map(|(rank, peer)| spark_memory::measured_bytes_for(peer, rank, expert_ranks))
                         .collect::<anyhow::Result<Vec<_>>>().map_err(invalid)?
                 } else {
-                    cuteafd_loader::serving_capacity::spark_memory::serving_bytes()
+                    spark_memory::serving_bytes_for(expert_ranks)
                 }
             };
         }
@@ -3164,7 +3166,7 @@ mod tests {
         assert!(error.contains("unknown") && error.contains("spark_memory.json"));
         std::fs::write(&config, "SPARK_0_HOST=REPLACE-ME-spark-0\n").unwrap();
         assert_eq!(options(&request).unwrap().layout.unwrap().spark_capacities(6),
-            cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
+            cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(2));
     }
 
     #[test]
@@ -3199,10 +3201,10 @@ mod tests {
         request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
-        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
+        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(4).into_iter().max().unwrap());
         let layout = options.layout.unwrap();
         assert_eq!(layout.spark_allocation_budget_bytes, None);
-        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
+        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(4));
     }
 
     #[test]
