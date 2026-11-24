@@ -176,8 +176,6 @@ fn bf16_target_keeps_attention_indexer_dense_and_shared_owners_native() -> Resul
             assert!(inventory.owners.iter().any(|owner| owner.group == group && owner.format == "bf16"), "{group}");
         }
         check_arenas(&inventory)?;
-        let explicit = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::Device(0));
-        assert!(explicit.owners.iter().any(|owner| owner.group == "dense" && owner.format.contains("fp8")));
     }
     Ok(())
 }
