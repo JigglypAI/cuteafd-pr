@@ -196,6 +196,22 @@ impl<'a> InklingPrefix<'a> {
             == placement.units.len(), "Inkling prefix placement aliases physical pages");
         Ok(())
     }
+    /// Shared request-slot binding entry point for both serving (`PrefixFamily::bind`)
+    /// and golden/width-invariance runners: validates `placement`, resets every rank's
+    /// target cache bank, binds the recurrent drafter context slot when attached, and
+    /// optionally admits draft pages up to `admit_capacity`.
+    pub fn bind_slot(&self, placement: &mut Placement, admit_capacity: Option<usize>) -> Result<()> {
+        self.validate(placement, placement.len)?;
+        for bank in self.banks() {
+            bank.reset(placement.slot)?;
+            bank.drain()?;
+        }
+        if let Some(draft) = &self.draft {
+            draft.drafter.bind_slot(placement.slot, 0, admit_capacity)?;
+        }
+        placement.state_len = 0;
+        Ok(())
+    }
 }
 impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
     type Placement = Placement;
@@ -248,10 +264,7 @@ impl cuteafd_engine::prefix::PrefixFamily for InklingPrefix<'_> {
             .into_iter().map(crate::shared::prefix::cuda_copy::range).collect())
     }
     fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        self.validate(placement, placement.len)?;
-        for bank in self.banks() { bank.reset(placement.slot)?; }
-        if let Some(draft)=&self.draft{draft.drafter.reset_context(placement.slot,0)?;}
-        placement.state_len = 0;
+        self.bind_slot(placement, None)?;
         Ok(())
     }
     fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {

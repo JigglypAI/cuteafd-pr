@@ -650,7 +650,8 @@ GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
 GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "glm5": "dflash2", "glm5_flash": "dflash2",
                             "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
-                            "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2"}
+                            "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2",
+                            "inkling2_mini": "dspark"}
 def _default_speculator(family: str, model: str) -> str:
     if family == "kimi_k3":
         return "dspark" if "K3.1" in model else "dflash2"

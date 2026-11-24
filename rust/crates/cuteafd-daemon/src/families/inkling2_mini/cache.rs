@@ -350,6 +350,21 @@ impl<'a> MiniPrefix<'a> {
         );
         Ok(())
     }
+
+    /// Shared request-slot binding entry point for both serving (`PrefixFamily::bind`)
+    /// and golden/oracle runners: validates `placement`, resets the 48-slot target
+    /// cache bank, binds the recurrent drafter context slot when a drafter is engaged,
+    /// and optionally admits draft pages up to `admit_capacity`.
+    pub fn bind_slot(&self, placement: &mut Placement, admit_capacity: Option<usize>) -> Result<()> {
+        self.validate(placement, placement.len)?;
+        self.bank.reset(placement.slot)?;
+        self.bank.drain()?;
+        if let Some(draft) = &self.draft {
+            draft.drafter.bind_slot(placement.slot, 0, admit_capacity)?;
+        }
+        placement.state_len = 0;
+        Ok(())
+    }
 }
 
 impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
@@ -480,12 +495,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
     }
 
     fn bind(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        self.validate(placement, placement.len)?;
-        self.bank.reset(placement.slot)?;
-        if let Some(draft) = &self.draft {
-            draft.drafter.reset_context(placement.slot, 0)?;
-        }
-        placement.state_len = 0;
+        self.bind_slot(placement, None)?;
         Ok(())
     }
 

@@ -633,6 +633,21 @@
         "SPARK_5_LANE_A": "10.55.0.6",
         "SPARK_5_LANE_B": "10.55.1.6"
       }
+    },
+    {
+      "name": "inkling2-mini-1x-rtx",
+      "family": "inkling2_mini",
+      "config": "examples/configs/inkling2-mini-1x-rtx.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8773",
+        "EXPERT_PORT": "19873",
+        "EXPERT_BACKEND": "local",
+        "SPARK_COUNT": "0"
+      }
     }
   ]
 }

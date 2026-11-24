@@ -57,7 +57,7 @@ pub(crate) struct GoldenArgs {
     pub prefill_rows: usize,
     #[arg(long, default_value_t = 2)]
     pub prefill_waves: u64,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub dspark: bool,
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -163,6 +163,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let rows = tokens.len() - 1;
     let vocab = cfg.text.unpadded_vocab_size;
     let mut values = vec![0f32; rows * vocab];
+    let prefix = super::cache::MiniPrefix::for_execution(&execution);
     let mut placement = super::cache::Placement {
         units: (0..pages_needed).collect(),
         slot: 0,
@@ -170,8 +171,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         state_len: 0,
         media: None,
     };
-    execution.requests.cache.reset(0)?;
-    execution.requests.cache.drain()?;
+    prefix.bind_slot(&mut placement, Some(rows))?;
 
     let mut units = sequence_units(rows, args.prefill_rows, args.prefill_waves as usize, cfg.total_visits())?;
     for u in &mut units {
@@ -210,8 +210,6 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         let mut by_width: Vec<(usize, Vec<u32>)> = Vec::new();
         for &w in &widths {
             ensure!(w >= 1 && w <= tail_len, "width {w} exceeds tail_len {tail_len}");
-            execution.requests.cache.reset(1)?;
-            execution.requests.cache.drain()?;
             let mut p = super::cache::Placement {
                 units: (pages_needed..2 * pages_needed).collect(),
                 slot: 1,
@@ -219,6 +217,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                 state_len: 0,
                 media: None,
             };
+            prefix.bind_slot(&mut p, Some(prefix_len + tail_len))?;
             let pre_u = Unit {
                 index: 0,
                 sequence: 0,
@@ -284,8 +283,6 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             let mut graphed_bits = Vec::new();
             for (graphed, out) in [(false, &mut eager_bits), (true, &mut graphed_bits)] {
                 for rep in 0..3 {
-                    execution.requests.cache.reset(1)?;
-                    execution.requests.cache.drain()?;
                     let mut p = super::cache::Placement {
                         units: (pages_needed..2 * pages_needed).collect(),
                         slot: 1,
@@ -293,6 +290,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                         state_len: 0,
                         media: None,
                     };
+                    prefix.bind_slot(&mut p, Some(prefix_len + 1))?;
                     let pre_u = Unit {
                         index: 0,
                         sequence: 0,

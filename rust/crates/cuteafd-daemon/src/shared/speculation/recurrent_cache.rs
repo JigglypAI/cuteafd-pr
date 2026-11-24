@@ -22,6 +22,17 @@ impl ContextState {
         if let Some(binding)=self.bindings[slot].take(){self.pool.release(binding)?;}
         self.bindings[slot]=Some(self.pool.bind(slot,origin)?);Ok(())
     }
+    /// Shared slot-binding entry point for both serving (`PrefixFamily::bind`) and
+    /// golden/oracle runners: resets/binds `slot` at `origin` and, when `admit` is
+    /// `Some((end, block))`, admits draft pages through `end` for the given block size.
+    pub fn bind_slot(&mut self,slot:usize,origin:usize,admit:Option<(usize,usize)>)->Result<DraftBinding> {
+        self.reset(slot,origin)?;
+        let binding=self.binding(slot)?;
+        if let Some((end,block))=admit {
+            self.pool.admit(binding,end,block)?;
+        }
+        Ok(binding)
+    }
     pub fn quarantine(&mut self,slot:usize) {
         if let Some(binding)=self.bindings.get(slot).copied().flatten() {
             self.pool.quarantine(binding).expect("live recurrent binding belongs to its pool");
@@ -62,6 +73,94 @@ mod tests {
         assert!(state.pool.destinations(next)?.iter().all(|row|!destinations.contains(row)));
         assert_eq!(state.pool.free(),0);
         Ok(())
+    }
+
+    #[test]
+    fn bind_slot_binds_every_slot_and_rebinds_without_leaking_pages() -> Result<()> {
+        // Exercise both Inkling 2 Mini (4 slots, block=8, 48-visit golden width-invariance/graph-parity)
+        // and Inkling 2 Small (16 slots, block=8, width-invariance) recurrent page-pool geometries.
+        for (slots, context, target_tokens, block, end, seed) in [
+            (4usize, 4096usize, 32 * 64, 8usize, 127usize, 2001u64),
+            (16usize, 4096usize, 64 * 64, 8usize, 72usize, 2002u64),
+        ] {
+            let mut state = ContextState::new(slots, context, target_tokens, seed)?;
+            let initial_free = state.pool.free();
+            // Unbound slots must fail with the exact guard error seen when a golden skips binding.
+            for slot in 0..slots {
+                let err = state.binding(slot).unwrap_err();
+                assert!(err.to_string().contains("unbound recurrent context slot"), "{err:#}");
+            }
+            // Binding every slot through the shared entry point admits draft pages for prefill.
+            for slot in 0..slots {
+                let binding = state.bind_slot(slot, 0, Some((end, block)))?;
+                assert_eq!(state.binding(slot)?, binding);
+                let reservation = state.pool.reserve(binding, 0, end)?;
+                state.pool.commit(reservation, end)?;
+                assert_eq!(state.pool.frontier(binding)?, (0, end));
+            }
+            // Repeatedly re-binding a slot (width-invariance & graph-parity replay loops)
+            // releases its prior draft pages cleanly without leaking pool capacity.
+            let free_after_bind = state.pool.free();
+            for _ in 0..6 {
+                let binding = state.bind_slot(1, 0, Some((end, block)))?;
+                let reservation = state.pool.reserve(binding, 0, end)?;
+                state.pool.commit(reservation, end)?;
+            }
+            assert_eq!(state.pool.free(), free_after_bind);
+            // Releasing every slot returns all pool pages.
+            for slot in 0..slots {
+                state.bind_slot(slot, 0, None)?;
+            }
+            assert_eq!(state.pool.free(), initial_free);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn golden_and_serve_share_recurrent_slot_binding_across_families() {
+        // Inkling 2 Mini: serve (`MiniPrefix::bind`) and golden (`inkling2_mini/golden.rs`)
+        // must both go through `MiniPrefix::bind_slot` so drafter context binding never diverges.
+        let mini_cache = include_str!("../../families/inkling2_mini/cache.rs");
+        let mini_golden = include_str!("../../families/inkling2_mini/golden.rs");
+        assert!(mini_cache.contains("pub fn bind_slot("), "MiniPrefix must expose shared bind_slot");
+        let mini_serve_bind = mini_cache.split("fn bind(&self, placement: &mut Placement)").nth(1)
+            .expect("MiniPrefix::bind").split("fn discard(").next().expect("MiniPrefix::bind body");
+        assert!(mini_serve_bind.contains("self.bind_slot(placement, None)"),
+            "Mini serve bind must delegate to MiniPrefix::bind_slot");
+        assert!(mini_golden.contains("MiniPrefix::for_execution(&execution)"),
+            "Mini golden must build MiniPrefix::for_execution");
+        assert!(mini_golden.contains("prefix.bind_slot("),
+            "Mini golden must bind slots via shared MiniPrefix::bind_slot");
+        assert!(!mini_golden.contains("requests.cache.reset(") && !mini_golden.contains("drafter.reset_context("),
+            "Mini golden must not bypass MiniPrefix::bind_slot with raw reset calls");
+
+        // Inkling 2 Small: serve (`InklingPrefix::bind`) and width-invariance golden
+        // (`inkling2/width_invariance.rs`) must both go through `InklingPrefix::bind_slot`.
+        let small_cache = include_str!("../../families/inkling2/cache.rs");
+        let small_wi = include_str!("../../families/inkling2/width_invariance.rs");
+        assert!(small_cache.contains("pub fn bind_slot("), "InklingPrefix must expose shared bind_slot");
+        let small_serve_bind = small_cache.split("fn bind(&self, placement: &mut Placement)").nth(1)
+            .expect("InklingPrefix::bind").split("fn discard(").next().expect("InklingPrefix::bind body");
+        assert!(small_serve_bind.contains("self.bind_slot(placement, None)"),
+            "Inkling 2 Small serve bind must delegate to InklingPrefix::bind_slot");
+        assert!(small_wi.contains("InklingPrefix::for_execution(&execution)"),
+            "Inkling 2 Small width-invariance golden must build InklingPrefix::for_execution");
+        assert!(small_wi.contains("prefix.bind_slot("),
+            "Inkling 2 Small width-invariance golden must bind slots via shared InklingPrefix::bind_slot");
+        assert!(!small_wi.contains("requests.cache.reset(") && !small_wi.contains("drafter.reset_context(")
+                && !small_wi.contains("drafter.admit_pages("),
+            "Inkling 2 Small width-invariance golden must not duplicate bind/admit outside InklingPrefix::bind_slot");
+
+        // Audited sibling families: GLM Flash KDA and Kimi K3 goldens do not use `recurrent_cache`
+        // (if either adopts `recurrent_cache` in the future, this assertion flags it for shared bind_slot wiring).
+        for (name, src) in [
+            ("glm5_flash/mod.rs", include_str!("../../families/glm5_flash/mod.rs")),
+            ("glm5_flash/speculate.rs", include_str!("../../families/glm5_flash/speculate.rs")),
+            ("kimi_k3/golden.rs", include_str!("../../families/kimi_k3/golden.rs")),
+        ] {
+            assert!(!src.contains("recurrent_cache"),
+                "{name} adopted recurrent_cache; wire it to the shared bind_slot entry point and cover it here");
+        }
     }
 }
 
