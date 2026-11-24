@@ -317,7 +317,7 @@ def reference_precision(meta, panel):
             return label
     # Mini's golden module imports Torch; unrelated references must package without it.
     if panel.get('family') == 'inkling2_mini' and meta.get('root_arithmetic') == inkling2_mini_root():
-        return 'official mixed NVFP4/MXFP8 checkpoint, computed in F32'
+        return 'official mixed NVFP4/MXFP8 checkpoint with BF16 dense compute and F32 islands'
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
 
 

@@ -26,10 +26,11 @@ def native_expert_control(qdq):
         source = qdq(hidden)
         for i in ids.unique().tolist():
             row, slot = torch.where(ids == i)
-            gate_up = F.linear(source[row], self.gate_up_proj[i])
+            gate_up = F.linear(source[row], self.gate_up_proj[i].float()).to(hidden.dtype).float()
             y = self._apply_gate(gate_up) * weights[row, slot, None]
-            result.index_add_(0, row, F.linear(qdq(y), self.down_proj[i]))
-        return result
+            down = F.linear(qdq(y.to(hidden.dtype)), self.down_proj[i].float()).to(hidden.dtype)
+            result.index_add_(0, row, down.float())
+        return result.to(hidden.dtype)
     return run
 
 
@@ -60,7 +61,10 @@ def main():
         for text in PROMPTS]
     head = weights.tensor(TEXT + "unembed.weight").float()
     native = [head_forward(h, head, cfg).cpu() for h in forward(weights, cfg, batches)]
-    unquantized = [head_forward(h, head, cfg).cpu() for h in forward(weights, cfg, batches, native=False)]
+    unquantized = [cfg.final_logit_softcapping *
+                   (F.linear(h, head[:cfg.unpadded_vocab_size].to(h.dtype)).float().cpu()
+                    / cfg.final_logit_softcapping).tanh()
+                   for h in forward(weights, cfg, batches, native=False)]
     del head
     weights.close()
     if torch.device(a.device).type == "cuda":
@@ -95,7 +99,7 @@ def main():
                 placement[f"{layer}.{name}"] = a.device
             placement[f"{layer}.mlp.experts"] = "disk"
     model, info = Inkling2LoopForConditionalGeneration.from_pretrained(
-        a.snapshot, config=config, dtype=torch.float32, device_map=placement,
+        a.snapshot, config=config, dtype=torch.bfloat16, device_map=placement,
         offload_folder=offload, local_files_only=True, attn_implementation="eager",
         experts_implementation="eager", output_loading_info=True)
     if any(info.get(k) for k in ("missing_keys", "mismatched_keys", "error_msgs", "conversion_errors")):
@@ -120,13 +124,18 @@ def main():
             expert._old_forward = implementation
         else:
             expert.forward = implementation
-    matched = [model(input_ids=ids[None], use_cache=False).logits[0].cpu() for ids in batches]
+    model.lm_head.float()
+    head_cast = model.lm_head.register_forward_pre_hook(lambda _module, args: (args[0].float(),))
+    try:
+        matched = [model(input_ids=ids[None], use_cache=False).logits[0].cpu() for ids in batches]
+    finally:
+        head_cast.remove()
     checks = [{"prompt": text, "native_vs_hf_qdq_control": compare(ours, adapted),
                "native_vs_hf_stock": compare(ours, raw), "without_qdq_vs_hf_stock": compare(no_qdq, raw),
                "hf_stock_cached_last": cached}
               for text, ours, adapted, raw, no_qdq, cached in zip(PROMPTS, native, matched, stock, unquantized,
                                                                 cache_evidence, strict=True)]
-    result = {"comparison": "Stock HF dequantizes the experts and does not QDQ their activations; matched control changes only HF expert forward. Both use F32.",
+    result = {"comparison": "Stock HF dequantizes the experts and does not QDQ their activations; matched control replaces the expert forward with native QDQ and upcasts the head. Dense compute is BF16 with HF F32 islands.",
               "upstream": HF, "revision": a.snapshot.name, "prompts": checks,
               "passed": all(c["native_vs_hf_qdq_control"]["max_abs"] <= .25
                             and c["native_vs_hf_qdq_control"]["top1_equal"] == c["native_vs_hf_qdq_control"]["rows"]

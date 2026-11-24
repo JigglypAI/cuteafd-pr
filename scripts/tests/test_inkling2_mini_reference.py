@@ -41,6 +41,33 @@ def test_controller_uses_normed_inputs_but_blends_raw_values():
     torch.testing.assert_close(model.controller(x, message, layer, "attn", eps), expected)
 
 
+def test_controller_narrows_rank_projection_before_f32_forget_and_gain():
+    x, message = torch.tensor([[1.11, -.16]]), torch.tensor([[-1.79, .42]])
+    down = torch.tensor([[.79, -.28, .16, .43]], dtype=torch.bfloat16)
+    forget = torch.tensor([[.71], [-.39]], dtype=torch.bfloat16)
+    gain = torch.tensor([[-.23], [.84]], dtype=torch.bfloat16)
+    layer = {f"controllers.attn.{name}_weight": w for name, w in (
+        ("down", down), ("forget", forget), ("gain", gain))}
+    rms = lambda y: y * (y.square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+    paired = torch.cat((rms(x), rms(message)), -1)
+    rank = (paired.bfloat16() @ down.T).float()
+    expected = (1 - (rank @ forget.float().T).tanh()) * x + (rank @ gain.float().T).tanh() * message
+    assert torch.equal(model.controller(x, message, layer, "attn", 1e-6), expected)
+
+
+def test_bf16_attention_joint_f32_sink_softmax_and_f32_gate():
+    q = torch.tensor([[[.75, 1.25]]], dtype=torch.bfloat16)
+    k = torch.tensor([[[.58, -.62]]], dtype=torch.bfloat16)
+    v = torch.tensor([[[1.42, -2.31]]], dtype=torch.bfloat16)
+    rel = torch.tensor([[[.22]]], dtype=torch.bfloat16)
+    gate = torch.tensor([[[.43, -.73]]], dtype=torch.bfloat16)
+    sink = torch.tensor([[.81]], dtype=torch.bfloat16)
+    score = (q.squeeze(1) @ k.squeeze(1).T) * (2 ** -.5) + rel.reshape(1, 1)
+    attended = torch.cat((score, sink), -1).float().softmax(-1)[:, :1].bfloat16() @ v.squeeze(1)
+    expected = (attended.float() * gate.squeeze(1).float().sigmoid()).bfloat16().unsqueeze(1)
+    assert torch.equal(model.relative_attention(q, k, v, rel, gate, sink, None), expected)
+
+
 def test_nvfp4_decodes_low_nibble_first_and_scales_per_expert():
     packed = torch.tensor([[0x91, 0xF7, 0xB5, 0xA6, 0, 0, 0, 0]], dtype=torch.uint8)
     scale = torch.tensor([[2]], dtype=torch.float8_e4m3fn)

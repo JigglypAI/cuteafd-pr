@@ -109,14 +109,18 @@ class Weights(small.Weights):
                         or group.get("weight_transform") != fmt + "_nearest" or group.get("output_dtype") != storage
                         or (fmt == "nvfp4" and group.get("weight_scale_format") != "amax_denominator")):
                     raise ValueError(f"unexpected Mini expert policy: {name}")
-            elif ".experts." not in name and (group is None or group.get("weight_transform") != "cast"
-                    or group.get("compute_dtype") != {"F32": "float32", "BF16": "bfloat16"}[dtype]):
-                raise ValueError(f"unexpected Mini dense precision: {name}")
+            elif ".experts." not in name:
+                precision = {"F32": "float32", "BF16": "bfloat16"}[dtype]
+                fwd_output = "float32" if name == TEXT + "unembed.weight" else None
+                if (group is None or group.get("weight_transform") != "cast"
+                        or group.get("compute_dtype") != precision or group.get("output_dtype") != precision
+                        or group.get("fwd_output_dtype") != fwd_output):
+                    raise ValueError(f"unexpected Mini dense precision: {name}")
 
     def load_layer(self, index):
         prefix = TEXT + f"layers.{index}."
         return {(n.removeprefix(prefix) if n.startswith(prefix) else n.removeprefix(TEXT)):
-                (self.tensor(n) if ".experts." in n else self.tensor(n).float()) for n in self.contracts[index]}
+                self.tensor(n) for n in self.contracts[index]}
 
 
 def e2m1_values(device):
@@ -180,10 +184,11 @@ def message_queries(query_mlp, key_value):
 def controller(x, message, layer, kind, eps):
     stem = "controllers." + kind + "."
     paired = torch.cat((small.rms_norm(x, None, eps), small.rms_norm(message, None, eps)), -1)
-    rank = linear(paired, layer[stem + "down_weight"])
-    forget = linear(rank, layer[stem + "forget_weight"]).tanh()
-    gain = linear(rank, layer[stem + "gain_weight"]).tanh()
-    return (1. - forget) * x + gain * message
+    down = layer[stem + "down_weight"]
+    rank = linear(paired.to(down.dtype), down).float()
+    forget = linear(rank, layer[stem + "forget_weight"].float()).tanh()
+    gain = linear(rank, layer[stem + "gain_weight"].float()).tanh()
+    return (1. - forget) * x.float() + gain * message.float()
 
 
 def relative_attention(q, k, v, relative, gate, sinks, window):
@@ -211,8 +216,9 @@ def relative_attention(q, k, v, relative, gate, sinks, window):
         scores = (query @ keys.transpose(1, 2)) * dim ** -.5 + bias
         scores.masked_fill_(~valid, -float("inf"))
         sink = F.pad(sinks[start:end].T, (0, qpad)).unsqueeze(-1)
-        p = torch.cat((scores, sink), -1).softmax(-1)[..., :-1]
-        output[start:end] = (p @ values)[:, :end-start].transpose(0, 1) * gate[start:end].sigmoid()
+        p = torch.cat((scores, sink), -1).float().softmax(-1)[..., :-1].to(q.dtype)
+        attended = (p @ values)[:, :end-start].transpose(0, 1)
+        output[start:end] = (attended.float() * gate[start:end].float().sigmoid()).to(q.dtype)
     return output
 
 
@@ -220,7 +226,8 @@ def attention(inputs, layer, cfg, index):
     local = index in cfg.local_layer_ids
     heads, kv_heads, dim = cfg.geometry(index)
     names = ("attn_norm",) * 3 if local else ("q_input_norm", "k_input_norm", "v_input_norm")
-    xq, xk, xv = (small.rms_norm(x, layer[name + ".weight"], cfg.rms_norm_eps)
+    dtype = layer["attn.wq_du.weight"].dtype
+    xq, xk, xv = (small.rms_norm(x, layer[name + ".weight"], cfg.rms_norm_eps).to(dtype)
                   for x, name in zip(inputs, names, strict=True))
 
     def project(x, name):
@@ -235,17 +242,17 @@ def attention(inputs, layer, cfg, index):
         stem = "attn." + name + "_sconv."
         dynamic = None if local else linear(x, layer[stem + "weight_proj"]).reshape(-1, kv_heads, cfg.sconv_kernel_size)
         value = small.short_conv(project(x, proj), layer[stem + ("weight" if local else "static_w")], dynamic)
-        kv.append(value.reshape(-1, kv_heads, dim))
+        kv.append(value.to(dtype).reshape(-1, kv_heads, dim))
     k, v = kv
     clip = small.l2_clip
-    q = clip(q, cfg.qk_l2_clip_threshold, 1e-6, layer["attn.q_l2_clip.scale"])
-    k = clip(k, cfg.qk_l2_clip_threshold, 1e-6)
-    v = small.rms_norm(v, None, cfg.rms_norm_eps)
-    r = clip(r, cfg.rel_l2_clip_threshold, 1e-6, layer["attn.rel_l2_clip.scale"])
+    q = clip(q, cfg.qk_l2_clip_threshold, 1e-6, layer["attn.q_l2_clip.scale"]).to(dtype)
+    k = clip(k, cfg.qk_l2_clip_threshold, 1e-6).to(dtype)
+    v = small.rms_norm(v, None, cfg.rms_norm_eps).to(dtype)
+    r = clip(r, cfg.rel_l2_clip_threshold, 1e-6, layer["attn.rel_l2_clip.scale"]).to(dtype)
     if not local and cfg.log_scaling_n_floor is not None:
         positions = torch.arange(1, len(q) + 1, device=q.device)
         tau = 1 + cfg.log_scaling_alpha * (positions.float() / cfg.log_scaling_n_floor).clamp_min(1.).log()
-        q, r = q * tau[:, None, None], r * tau[:, None, None]
+        q, r = ((x.float() * tau[:, None, None]).to(dtype) for x in (q, r))
     relative = linear(r, layer["attn.rel_logits_proj.proj"].T.contiguous())
     out = relative_attention(q, k, v, relative, gate, sinks, cfg.sliding_window_size if local else None)
     return linear(out.reshape(len(q), -1), layer["attn.wo_ud.weight"])
@@ -269,12 +276,12 @@ class Experts:
 
     def __call__(self, x):
         layer, cfg = self.layer, self.cfg
-        scores = linear(x, layer["mlp.gate.weight"]).sigmoid()
+        scores = linear(x.float(), layer["mlp.gate.weight"].float()).sigmoid()
         ids = (scores + layer["mlp.gate.bias"]).argsort(dim=-1, descending=True, stable=True)[:, :cfg.num_experts_per_tok]
         weights = scores.gather(-1, ids)
         gammas = (weights / (weights.sum(-1, keepdim=True) + 1e-20)) * cfg.route_scale
         inputs = self.qdq[0](x) if self.native else x
-        slots = x.new_empty((len(x), cfg.num_experts_per_tok, cfg.hidden_size))
+        slots = x.new_empty((len(x), cfg.num_experts_per_tok, cfg.hidden_size), dtype=torch.float32)
         rows, choices = torch.where(torch.ones_like(ids, dtype=torch.bool))
         ordered = ids.flatten().argsort(stable=True)
         counts = torch.bincount(ids.flatten(), minlength=cfg.n_routed_experts).tolist()
@@ -288,16 +295,18 @@ class Experts:
             if expert not in self.decoded:
                 self.decoded[expert] = (self.weight(0, expert), self.weight(1, expert))
             up, down = self.decoded[expert]
-            gate_up = linear(inputs[r], up)
             gamma = gammas[r, c]
-            values = small.capped_swiglu(gate_up, gamma if self.native else torch.ones_like(gamma),
-                                          cfg.mlp_gate_softcap, cfg.mlp_up_softcap)
             if self.native:
-                slots[r, c] = linear(self.qdq[1](values), down)
+                gate_up = linear(inputs[r], up).to(x.dtype).float()
+                values = small.capped_swiglu(gate_up, gamma, cfg.mlp_gate_softcap, cfg.mlp_up_softcap)
+                slots[r, c] = linear(self.qdq[1](values.to(x.dtype)), down).to(x.dtype).float()
             else:
-                slots[r, c] = linear(values, down) * gamma[:, None]
+                gate_up = linear(inputs[r], up.to(x.dtype)).float()
+                values = small.capped_swiglu(gate_up, torch.ones_like(gamma),
+                                            cfg.mlp_gate_softcap, cfg.mlp_up_softcap).to(x.dtype)
+                slots[r, c] = linear(values, down.to(x.dtype)).float() * gamma[:, None]
         # Sum in ascending expert id, like HF eager index_add, not router order.
-        return slots.gather(1, ids.argsort(-1)[..., None].expand_as(slots)).sum(1)
+        return slots.gather(1, ids.argsort(-1)[..., None].expand_as(slots)).sum(1).to(x.dtype)
 
 
 def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None):
@@ -309,23 +318,25 @@ def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None):
     if messages is not None:
         inputs = tuple(controller(x, m, layer, kind, eps)
                        for x, m, kind in zip(inputs, messages[:3], ("attn", "k", "v"), strict=True))
-    out = small.short_conv(attention(inputs, layer, cfg, index), layer["attn_sconv.weight"])
+    dtype = partial.dtype
+    out = small.short_conv(attention(inputs, layer, cfg, index), layer["attn_sconv.weight"]).to(dtype).float()
     if index % cfg.n_layers_per_attn_res_block == 0:
         blocks = (*blocks, partial)
     else:
-        out = partial + out
+        out = partial.float() + out
     mlp_in = small.attn_res(blocks, out, layer[f"attn_res.mlp_queries.{index}"], eps)[0]
     if messages is not None:
         mlp_in = controller(mlp_in, messages[3], layer, "mlp", eps)
-    mlp_in = small.rms_norm(mlp_in, layer["mlp_norm.weight"], eps)
-    mlp = small.short_conv(experts(mlp_in), layer["mlp_sconv.weight"])
-    return out + mlp, blocks
+    mlp_in = small.rms_norm(mlp_in, layer["mlp_norm.weight"], eps).to(dtype)
+    mlp = small.short_conv(experts(mlp_in), layer["mlp_sconv.weight"]).to(dtype)
+    return (out + mlp.float()).to(dtype), blocks
 
 
 def forward(weights, cfg, token_batches, *, native=True):
     """Layer-major text forward. Each state is one unpadded token sequence."""
     embed, norm = (weights.tensor(TEXT + key) for key in ("embed.weight", "embed_norm.weight"))
-    states = [(small.rms_norm(F.embedding(ids, embed), norm, cfg.rms_norm_eps), ()) for ids in token_batches]
+    states = [(small.rms_norm(F.embedding(ids, embed), norm, cfg.rms_norm_eps).to(embed.dtype), ())
+              for ids in token_batches]
     del embed, norm
     queries = message_queries(*(weights.tensor(TEXT + "middle_cycle_cross_pass_" + k)
                                 for k in ("queries", "kv_queries")))
@@ -353,4 +364,4 @@ def forward(weights, cfg, token_batches, *, native=True):
         end_of_pass = visit(initial.copy(), range(cfg.core_start, cfg.core_end), previous)
     final = visit(end_of_pass, range(cfg.core_end, cfg.num_hidden_layers))
     query, norm = (weights.tensor(TEXT + key) for key in ("attn_res.output_query", "norm.weight"))
-    return [small.output_norm(p, b, query, norm, cfg) for p, b in final]
+    return [small.output_norm(p, b, query, norm, cfg).to(p.dtype) for p, b in final]

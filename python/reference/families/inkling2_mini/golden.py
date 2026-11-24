@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score the pinned Inkling 2 Mini text panel with native W4A4/W8A8 F32 math."""
+"""Score Inkling 2 Mini with native mixed precision and save F32 logits."""
 from __future__ import annotations
 
 import argparse
@@ -31,8 +31,8 @@ PINS = {
 HF = {"repository": "https://github.com/huggingface/transformers", "revision": "89c632fd826f68ecadd176320e9b2c070918f4f2",
       "version": "5.24.0"}
 ROOT_ARITHMETIC = {
-    "source": "Independent PyTorch F32 oracle; Inkling 2 Mini checkpoint and Transformers 5.24.0 fixed-loop semantics",
-    "arithmetic": "Checkpoint BF16 and F32 tensors cast exactly to F32 for computation. Native NVFP4 weights and per-token fouroversix_mae activation QDQ; native MXFP8 weights and group32 MXFP8 activation QDQ. Each logical loop visit has distinct causal state. No MTP or vision.",
+    "source": "Independent PyTorch mixed-precision oracle; Inkling 2 Mini checkpoint and Transformers 5.24.0 fixed-loop semantics",
+    "arithmetic": "BF16 embeddings, dense projections, attention QK/PV, controller down projections and layer-state boundaries. F32 weighted RMS/L2 and log scale, block/message attention residuals and mixing, controller forget/gain and blending, short convolution, router, joint attention/sink softmax and output sigmoid/multiply. Native NVFP4 per-token fouroversix_mae or MXFP8 group32 QDQ around expert GEMMs, with F32 reduction and BF16 model boundary. F32 head projection from BF16 checkpoint weights and F32 softcap. Distinct causal state per visit; no MTP or vision.",
 }
 
 
@@ -67,7 +67,7 @@ def start_f32():
 @torch.inference_mode()
 def execute(a):
     started = time.monotonic()
-    arithmetic = start_f32()
+    arithmetic = {**start_f32(), "execution": "checkpoint mixed precision", "logits_dtype": "float32"}
     cfg, weights = open_snapshot(a.snapshot, a.device)
     if a.check_only:
         print(f"verified {len(weights.formats)} packed Mini expert projections; {len(weights.contracts)} physical layers")
@@ -104,7 +104,8 @@ def execute(a):
                   seconds=time.monotonic() - started, platform=platform, torch=torch.__version__,
                   tokenizers=importlib.metadata.version("tokenizers"), transformers="not used in reference forward",
                   attention="eager", mtp=False, use_cache=False, prefix_qualification=proof, fixed_rows=ROWS,
-                  arithmetic=arithmetic, root_arithmetic=ROOT_ARITHMETIC)
+                  arithmetic=arithmetic, root_arithmetic=ROOT_ARITHMETIC,
+                  native_fp32_parameters="Declared F32 tensors preserved; BF16 checkpoint tensors used with official F32 islands.")
     print(f"Mini reference complete: {rows} scored rows in {time.monotonic()-started:.1f}s", flush=True)
 
 
