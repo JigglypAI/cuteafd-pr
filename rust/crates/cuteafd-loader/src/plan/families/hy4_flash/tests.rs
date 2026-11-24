@@ -788,3 +788,45 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
     assert!(inputs.admit(too_many).is_err(), "out-of-range RTX_EXPERT_LAYERS=99 must refuse");
     Ok(())
 }
+
+#[test]
+fn hy4_flash_cache_geometry_auto_resolves_context_on_2gpu_and_whole_on_1gpu() -> anyhow::Result<()> {
+    use crate::plan::family::FamilyModel;
+    use crate::serving_capacity::{CacheOptions, KvPlacement};
+
+    let (dir, _manifest) = concurrency_matrix_snapshot();
+    let selected = CheckpointView::select(dir.path(), CoreView::Original)?;
+    let checkpoint = crate::plan::Checkpoint::open_view(&selected)?;
+    let model = Model::open(&checkpoint)?;
+
+    let two_auto = model
+        .cache_geometry(CacheOptions {
+            coordinator_ranks: 2,
+            attention_placement: None,
+            ..CacheOptions::default()
+        })?
+        .expect("2-GPU auto cache geometry");
+    assert_eq!(two_auto.placement, KvPlacement::PartitionedContext);
+    assert_eq!(two_auto.logical_unit_rows, 128);
+
+    let two_heads = model
+        .cache_geometry(CacheOptions {
+            coordinator_ranks: 2,
+            attention_placement: Some(AttentionPlacement::Heads),
+            ..CacheOptions::default()
+        })?
+        .expect("2-GPU heads cache geometry");
+    assert_eq!(two_heads.placement, KvPlacement::Replicated);
+    assert_eq!(two_heads.logical_unit_rows, 64);
+
+    let one_auto = model
+        .cache_geometry(CacheOptions {
+            coordinator_ranks: 1,
+            attention_placement: None,
+            ..CacheOptions::default()
+        })?
+        .expect("1-GPU auto cache geometry");
+    assert_eq!(one_auto.placement, KvPlacement::SingleDevice);
+    assert_eq!(one_auto.logical_unit_rows, 64);
+    Ok(())
+}

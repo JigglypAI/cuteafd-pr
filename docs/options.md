@@ -351,15 +351,15 @@ view (`original` default; `k8-compact` and `k6-compact` use stored trellis cores
 `fp8-compact` converts the original BF16 core tensors at load with block-128
 FP8). `KV_CACHE=fp8|bf16` defaults to `fp8` for absorbed MLA KV and keeps the
 FP8 indexer key cache default. `ATTENTION_PLACEMENT=auto` selects whole layers
-on one RTX GPU and `context` (ContextSplit, no DSA KV replication) on two RTX
-GPUs; `serve-hy4f` currently refuses two-GPU `auto`/`context` loudly until
-ContextSplit LSE and cross-GPU scored-indexer exports land (#2579), while
-explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
-refuses). `EMBEDDING=gpu` is required
+on one RTX GPU and `context` (ContextSplit, parity-owned DSA KV/index pages with
+no DSA KV replication and head-split SWA-512) on two RTX GPUs; explicit
+`ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
+refuses in `serve-hy4f`). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
 `off`). `SPECULATOR=auto` (default) uses the checkpoint's bundled five-stage
-DFly2 on Spark-free layouts, including explicit two-RTX `heads`; Spark layouts
-retain their drafter-off default. `SPECULATOR=dfly2` explicitly enables it. It reuses committed target MLA KV
+DFly2 on Spark-free layouts, including two-RTX `context` (default) and explicit
+`heads`; Spark layouts retain their drafter-off default. `SPECULATOR=dfly2`
+explicitly enables it. It reuses committed target MLA KV
 and compressed-indexer recall; a fully restored prefix takes one target-only
 round before proposing. Proposals batch across requests; rank-local draft and
 verify sections graph exact live rows. Recall gathering, metadata uploads and
@@ -1134,9 +1134,9 @@ family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context | ✓ heads |
-| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ context⁵ | ✓ heads |
+| `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓⁵ | ✓ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✓⁵ | ✗ |
 | `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (two RTX) |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
@@ -1154,7 +1154,10 @@ explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
 mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
 `context` and `layers` for MLA layers on two GPUs; `auto` selects `context`
 on two GPUs and retains whole-owned layers on one. KDA stays head-split on
-two GPUs, independent of the MLA placement.
+two GPUs, independent of the MLA placement. ⁵ Hy4-flash `auto` selects
+`context` (ContextSplit, parity-owned KV/index) for MLA/DSA layers and
+head-split for SWA-512 layers on two GPUs, and retains whole-owned layers on
+one; explicit `heads` opts into replicated-KV head-split across all layers.
 
 Token embedding placement (`EMBEDDING`; `cuteafd plan --embedding-placement`):
 

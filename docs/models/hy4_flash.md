@@ -6,6 +6,13 @@ cards use automatic KV sizing and `CORE_VIEW=k8-compact`. With bundled vision
 support, `VISION=auto` admits the tower whenever the KV pool still meets
 `KV_MIN_TOKENS`.
 
+On two RTX GPUs, `ATTENTION_PLACEMENT=auto` (default) resolves to mixed
+placement through the family resolver: ContextSplit (`context`) on the 12
+MLA/DSA layers (parity-owned KV/index pages with no DSA KV replication, ~2.0×
+KV pool capacity) and head-split on the 30 SWA-512 layers. Explicit
+`ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split across all
+layers; single-GPU layouts keep whole layers.
+
 | Layout | Starting config |
 |---|---|
 | 1 RTX PRO 6000, no Sparks | [Min](../../examples/configs/hy4-flash-exl3-k4-mc-min.config) |

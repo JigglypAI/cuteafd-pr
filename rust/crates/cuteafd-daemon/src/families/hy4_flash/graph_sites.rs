@@ -7,10 +7,11 @@ use crate::shared::decode_graph::sites::{Scope, Table};
 pub(super) const SITES: &Table = &[(
     "hy4_flash.section",
     Scope::Local,
-    "execution.rs: rank-local decode sections captured on each rank's exclusive stream; \
-     Engram H2D/PeerExchange, DSA indexer pending D2D/pool/score/topk, TP2 PeerExchange \
-     push/wait, Spark waves send/land/reduce, DFly2 metadata and recall gathers, and \
-     TP2 head_handoff stay outside capture",
+    "execution.rs: rank-local decode sections (including ContextSplit DsaPartial and \
+     DsaAttnOut combine+gate_uv+o_proj) captured on each rank's exclusive stream; \
+     Engram H2D/PeerExchange, DSA indexer pending D2D/pool/score/topk/merge_owned, \
+     TP2 PeerExchange & ContextExchange push/wait, Spark waves send/land/reduce, \
+     DFly2 metadata and dual recall gathers, and TP2 head_handoff stay outside capture",
 )];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {
