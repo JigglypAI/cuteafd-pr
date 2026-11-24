@@ -3166,7 +3166,7 @@ mod tests {
         assert!(error.contains("unknown") && error.contains("spark_memory.json"));
         std::fs::write(&config, "SPARK_0_HOST=REPLACE-ME-spark-0\n").unwrap();
         assert_eq!(options(&request).unwrap().layout.unwrap().spark_capacities(6),
-            cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
+            cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(2));
     }
 
     #[test]
@@ -3201,10 +3201,10 @@ mod tests {
         request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
-        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes().into_iter().max().unwrap());
+        assert_eq!(options.maximum_spark_capacity(), cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(4).into_iter().max().unwrap());
         let layout = options.layout.unwrap();
         assert_eq!(layout.spark_allocation_budget_bytes, None);
-        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
+        assert_eq!(layout.spark_capacities(6), cuteafd_loader::serving_capacity::spark_memory::serving_bytes_for(4));
     }
 
     #[test]
