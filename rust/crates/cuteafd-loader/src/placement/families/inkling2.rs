@@ -44,8 +44,10 @@ use cuteafd_core::spark_reply::SparkReplyFormats;
 pub const PAGE_ROWS: u64 = 64;
 /// Prefill transport endpoints: one shared link (LaneSupport::One).
 pub const LANES: u64 = 1;
-/// Decode/verify rows per step, the Spark decode owner's admitted extent.
+/// Default decode/verify rows per step (`DECODE_ROWS=auto`).
 pub const DECODE_ROWS: u32 = 64;
+/// Maximum decode/verify rows per step supported by exported Inkling 2 decode programs.
+pub const MAX_DECODE_ROWS: u32 = 128;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
 /// What the Inkling 2 executor runs, on the shared attention-placement
@@ -135,6 +137,8 @@ pub struct InklingInputs {
     /// The resolved pool policy used for both curve preparation and admission.
     pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
+    /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: u32,
     /// Boot concurrency C: per-sequence rings, conv lags, page tables, selector.
     pub sequences: u64,
     pub prefix_entries: u64,
@@ -226,11 +230,17 @@ pub fn spark_link(gpu: u8, ranks: usize, prefill: PrefillShape, replies: SparkRe
 
 /// Typed Spark owners at the admitted unit (one prefill + one decode lane).
 pub fn spark_executions(prefill: PrefillShape, exl3: bool) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    spark_executions_for_rows(prefill, exl3, DECODE_ROWS)
+}
+
+/// Typed Spark owners at the admitted unit and explicit `decode_rows` budget.
+pub fn spark_executions_for_rows(prefill: PrefillShape, exl3: bool, decode_rows: u32)
+    -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let backend = if exl3 {
         crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::for_geometry(
             cuteafd_core::ExpertGeometry::INKLING2))
     } else { crate::plan::spark_executions::SparkBackend::Fp8 };
-    crate::plan::spark_executions::admit_family("inkling2", &backend.exports(), None, prefill.rows, prefill.waves)
+    crate::plan::spark_executions::admit_family("inkling2", &backend.exports(), Some(decode_rows), prefill.rows, prefill.waves)
 }
 
 /// Per-sequence sliding-window ring and conv-lag bytes of one layer, the
@@ -309,8 +319,8 @@ impl InklingInputs {
             staging_unit_bytes: PAGE_ROWS * record_bytes, staging_unit_rows: PAGE_ROWS,
             query_row_bytes: heads * cfg.head_dim as u64 * 2,
             partial_row_bytes: heads * (cfg.head_dim as u64 * 2 + 4),
-            candidate_row_bytes: 0, compiled_extent: self.prefill.rows.max(u64::from(DECODE_ROWS)),
-            decode_rows: u64::from(DECODE_ROWS), lanes: LANES, workspace_bytes: 0 }
+            candidate_row_bytes: 0, compiled_extent: self.prefill.rows.max(u64::from(self.decode_rows)),
+            decode_rows: u64::from(self.decode_rows), lanes: LANES, workspace_bytes: 0 }
     }
 
     fn hop_spec(&self) -> HopSpec {
@@ -322,7 +332,7 @@ impl InklingInputs {
         let terminal = if self.modes.iter().all(|mode| matches!(mode, LayerMode::Whole { .. })) {
             TerminalHome::AttentionOwner } else { TerminalHome::Head };
         HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: rows * self.cfg.hidden as u64 * 4,
-            rows: self.prefill.rows.max(u64::from(DECODE_ROWS)), lanes: LANES, entry_gpu: 0,
+            rows: self.prefill.rows.max(u64::from(self.decode_rows)), lanes: LANES, entry_gpu: 0,
             head_gpu: self.head_gpu(), terminal }
     }
 
@@ -408,7 +418,7 @@ impl InklingInputs {
         let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Inkling context"))?;
         let parts = if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) { 2 } else { 1 };
         use crate::families::inkling2::execution::UnitLayout;
-        let layout = if decode { UnitLayout::serving_decode(&self.cfg, context, self.kv_format, self.sequences as usize, parts) }
+        let layout = if decode { UnitLayout::serving_decode_rows(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize, parts) }
             else { UnitLayout::serving_head_parts(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize, parts) }
             .map_err(refusal)?;
         let mut out = Vec::new();
@@ -440,7 +450,7 @@ impl InklingInputs {
             // The grouped receive reuses one GPU transform buffer for both arenas.
             out.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum));
         }
-        if let Some(scratch) = target.trellis_scratch(rows as usize, DECODE_ROWS as usize).map_err(refusal)? {
+        if let Some(scratch) = target.trellis_scratch(rows.max(self.decode_rows) as usize, self.decode_rows.min(64) as usize).map_err(refusal)? {
             out.extend(buffer(format!("inkling2.target.{gpu}.trellis"), location, scratch.packed_bytes().map_err(refusal)? as u64,
                 Lifetime::TARGET, Category::Workspace, "serialized target trellis projection", maximum));
         }
@@ -503,12 +513,12 @@ impl InklingInputs {
             "exact retained SWA and FP32 convolution marks", maximum));
         // One decode lane on every rank (its layers' work), then one owner set
         // per in-flight prefill slot (PrefillHooks unit slots).
-        out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, DECODE_ROWS, true, maximum)?);
+        out.extend(self.unit_owners(&format!("inkling2.decode.{gpu}"), gpu, self.decode_rows, true, maximum)?);
         for slot in 0..self.prefill.waves {
             out.extend(self.unit_owners(&format!("inkling2.unit.{gpu}.{slot}"), gpu, rows, false, maximum)?);
         }
         if self.modes.iter().all(|mode| *mode == LayerMode::HeadSplit) {
-            let bytes = self.prefill.rows.max(u64::from(DECODE_ROWS)) * cfg.hidden as u64 * 4;
+            let bytes = self.prefill.rows.max(u64::from(self.decode_rows)) * cfg.hidden as u64 * 4;
             let peer = crate::serving_capacity::PeerStorageLayout::new(1, usize::try_from(bytes)
                 .map_err(|_| Refusal::Overflow("Inkling head exchange"))?,
                 crate::serving_capacity::peer_wait_diagnostics()).map_err(refusal)?;
@@ -535,14 +545,14 @@ impl InklingInputs {
         Ok(out)
     }
 
-    /// Head-rank owners: 64-row F32 logits over the stored vocabulary (trim
+    /// Head-rank owners: bounded F32 logits over the stored vocabulary (trim
     /// and softcap run in place), tokens and the normalized input rows.
     fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let head = self.head_gpu();
         let cfg = &self.cfg;
-        let rows = u64::from(DECODE_ROWS);
+        let rows = u64::from(self.decode_rows);
         let head_workspace = match self.targets[head as usize].stored_head() {
-            Some(stored) => ("compact_logits", rows * stored as u64 * 4),
+            Some(stored) => ("compact_logits", rows.min(64) * stored as u64 * 4),
             None => ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64),
         };
         let mut buffers = vec![("tokens", rows * 4, head), ("normalized", rows * cfg.hidden as u64 * 2, head),
@@ -581,6 +591,7 @@ impl Recipe for InklingInputs {
             || self.code.len() != self.gpus || self.experts.len() != self.routed.len()
             || self.spark.len() != self.routed.len() + 1
             || self.prefill.rows == 0 || self.prefill.waves == 0
+            || !(1..=MAX_DECODE_ROWS).contains(&self.decode_rows)
             || self.sequences == 0 {
             return Err(invalid("invalid extent or empty domain"));
         }
@@ -600,7 +611,7 @@ impl Recipe for InklingInputs {
         components.extend(serving::ServingOwners {
             selector: serving::SelectorOwners { location: Location::coordinator(head),
                 capacity: usize::try_from(self.sequences).map_err(|_| Refusal::Overflow("Inkling 2 selector"))?
-                    .max(DECODE_ROWS as usize), vocab: cfg.unpadded_vocab_size, device_sampling: self.device_sampling },
+                    .max(self.decode_rows as usize), vocab: cfg.unpadded_vocab_size, device_sampling: self.device_sampling },
             prefix: self.host_prefix }.components(maximum)?);
         if let Some(geometry) = &self.expert_usage {
             let devices = (0..self.gpus.min(geometry.routed_layers.len())).map(|gpu| gpu as u8).collect::<Vec<_>>();

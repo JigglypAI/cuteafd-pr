@@ -8,6 +8,7 @@ use std::ffi::c_void;
 pub struct Layout {
     pub slots:usize,
     pub width:usize,
+    pub replay_rows:usize,
     pub lag_stride:usize,
     pub layer_stride:usize,
     pub slot_stride:usize,
@@ -16,11 +17,14 @@ pub struct Layout {
 }
 impl Layout {
     pub fn contiguous(slots:usize,width:usize)->Result<Self>{
-        ensure!(slots>0 && width>0 && width<=11264,"FIR bank width/slots outside export");
+        Self::contiguous_rows(slots,width,64)
+    }
+    pub fn contiguous_rows(slots:usize,width:usize,replay_rows:usize)->Result<Self>{
+        ensure!(slots>0 && width>0 && width<=11264 && matches!(replay_rows,64|128),"FIR bank width/slots/rows outside export");
         let layer_stride=width.checked_mul(3).context("FIR layer stride overflow")?;
-        Ok(Self{slots,width,lag_stride:width,layer_stride,
+        Ok(Self{slots,width,replay_rows,lag_stride:width,layer_stride,
             slot_stride:layer_stride.checked_mul(48).context("FIR slot stride overflow")?,
-            replay_row_stride:width,replay_layer_stride:width.checked_mul(64).context("FIR replay stride overflow")?})
+            replay_row_stride:width,replay_layer_stride:width.checked_mul(replay_rows).context("FIR replay stride overflow")?})
     }
     pub fn history_bytes(self)->Result<usize>{
         self.slots.checked_mul(self.slot_stride).and_then(|n|n.checked_mul(4)).context("FIR history extent overflow")
@@ -33,21 +37,23 @@ impl Layout {
 pub struct Commit<'a>{program:Program<'a>,layout:Layout}
 impl<'a> Commit<'a>{
     pub fn load(programs:&'a Programs<'a>,layout:Layout)->Result<Self>{
-        let program=programs.program("fir_history_commit",&["checkpoint","replay","table","live"])?;
+        let name=if layout.replay_rows==64{"fir_history_commit"}else{"fir_history_commit_m128"};
+        let program=programs.program(name,&["checkpoint","replay","table","live"])?;
         let spec=program.spec();
-        ensure!(spec.capacity_rows==64 && spec.scalar_kinds==b"iiilllll" && spec.scratch.is_empty(),
+        ensure!(spec.capacity_rows as usize==layout.replay_rows && spec.scalar_kinds==b"iiilllll" && spec.scratch.is_empty(),
             "FIR commit manifest ABI/capacity differs");
         Ok(Self{program,layout})
     }
     /// Metadata validation precedes upload and every mutation. Segments and
     /// destination slots are unique and contain only actually verified inputs.
     pub fn table(&self,entries:&[(usize,usize,usize)],available:&[(usize,usize)])->Result<Vec<i32>>{
-        ensure!(!entries.is_empty() && entries.len()<=64 && entries.len()==available.len(),"FIR commit sequence inventory differs");
+        let cap=self.layout.replay_rows;
+        ensure!(!entries.is_empty() && entries.len()<=cap && entries.len()==available.len(),"FIR commit sequence inventory differs");
         let mut slots=std::collections::BTreeSet::new();
         let mut table=vec![0;entries.len()*3];
         for (index,(&(slot,first,keep),&(start,count))) in entries.iter().zip(available).enumerate(){
             ensure!(slot<self.layout.slots && slots.insert(slot) && first==start && count>0 && count<=8
-                && keep<=count && first.checked_add(count).is_some_and(|end|end<=64),"FIR commit outside staged segment or aliases slot");
+                && keep<=count && first.checked_add(count).is_some_and(|end|end<=cap),"FIR commit outside staged segment or aliases slot");
             table[index]=i32::try_from(slot)?;
             table[entries.len()+index]=i32::try_from(first)?;
             table[2*entries.len()+index]=i32::try_from(keep)?;
@@ -60,7 +66,7 @@ impl<'a> Commit<'a>{
     pub unsafe fn launch(&self,checkpoint:Buffer,replay:Buffer,table:Buffer,live:Buffer,
         sequences:usize,stream:*mut c_void)->Result<()> {
         let l=self.layout;
-        ensure!((1..=64).contains(&sequences),"FIR commit live sequence count");
+        ensure!((1..=l.replay_rows).contains(&sequences),"FIR commit live sequence count");
         let spans=[(checkpoint,l.history_bytes()?),(replay,l.replay_bytes()?),(table,sequences*12),(live,l.history_bytes()?)];
         for (buffer,bytes) in spans {
             ensure!(!buffer.ptr.is_null() && buffer.device_id==live.device_id && buffer.bytes>=bytes

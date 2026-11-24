@@ -13,6 +13,11 @@ pub struct UnitLayout {
     pub buffers: BTreeMap<String, usize>,
 }
 
+/// Compiled decode attention and FIR replay capacity covering `decode_rows`.
+pub fn replay_capacity(decode_rows: usize) -> usize {
+    if decode_rows > 64 { 128 } else { 64 }
+}
+
 impl UnitLayout {
     pub fn new(cfg: &Inkling2Config, rows: usize, context: usize) -> Result<Self> {
         Self::with_format(cfg, rows, context, InklingKvCache::Bf16)
@@ -90,7 +95,15 @@ impl UnitLayout {
 
     pub fn serving_decode(cfg: &Inkling2Config, context: usize, kv_format: InklingKvCache,
         sequences: usize, head_parts: usize) -> Result<Self> {
-        let mut layout = Self::serving_head_parts(cfg, 64, context, kv_format, sequences, head_parts)?;
+        Self::serving_decode_rows(cfg, 64, context, kv_format, sequences, head_parts)
+    }
+
+    pub fn serving_decode_rows(cfg: &Inkling2Config, decode_rows: usize, context: usize, kv_format: InklingKvCache,
+        sequences: usize, head_parts: usize) -> Result<Self> {
+        ensure!((1..=128).contains(&decode_rows), "Inkling decode rows {decode_rows} outside 1..=128 export");
+        let mut layout = Self::serving_head_parts(cfg, decode_rows, context, kv_format, sequences, head_parts)?;
+        let cap = replay_capacity(decode_rows);
+        layout.buffers.insert("attention_scratch".into(), cap * 32 * (cfg.heads / head_parts) * (128*4+4));
         // Immutable +0 operand preserves the exact eager accumulation, even for -0.
         layout.buffers.insert("decode_zero_bf16".into(), layout.buffers["attended"].max(layout.buffers["expert_output"]));
         Ok(layout)

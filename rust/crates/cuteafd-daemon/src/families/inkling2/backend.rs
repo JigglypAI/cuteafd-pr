@@ -190,7 +190,8 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     type Prefix = InklingPrefix<'a>;
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "inkling2", vocab_size: self.vocab, max_context: self.context,
-            slots: self.concurrency, prefill_rows: self.unit_rows*self.waves, decode_rows: 64 }
+            slots: self.concurrency, prefill_rows: self.unit_rows*self.waves,
+            decode_rows: self.execution.borrow().requests.decode.layout.rows }
     }
     fn message_starts(&self) -> &[&str] { &["<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.library }

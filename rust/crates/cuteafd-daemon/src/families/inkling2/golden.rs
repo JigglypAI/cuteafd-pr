@@ -36,6 +36,9 @@ pub(crate) struct GoldenArgs {
     #[arg(long, requires="width_invariance")] pub commit_invariance: bool,
     /// Compare repeated exact-width graph replays from the same prompt state.
     #[arg(long, requires="width_invariance", conflicts_with="commit_invariance")] pub graph_parity: bool,
+    /// Run a 16-sequence x 8-token (128-row) graphed verify, fidelity and FIR commit oracle.
+    #[arg(long, requires="width_invariance")] pub wide_batch: bool,
+    #[arg(long, default_value_t=64)] pub decode_rows: u32,
     #[arg(long, default_value_t=64)] pub prefill: usize,
     #[arg(long, value_delimiter=',')] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long, default_value="auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,

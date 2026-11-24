@@ -233,6 +233,214 @@ fn graph_parity(execution: &mut Execution<'_>, saved: &Placement, tokens: &[u32]
     Ok(())
 }
 
+fn kl_and_top1(candidate: &[u8], reference: &[u8], vocab: usize) -> Result<(usize, f64, f32, usize)> {
+    ensure!(candidate.len() == reference.len() && candidate.len().is_multiple_of(vocab * 4),
+        "wide-batch logit buffer length differs");
+    let rows = candidate.len() / (vocab * 4);
+    let mut top1_matches = 0usize;
+    let mut bit_identical = 0usize;
+    let mut kl_sum = 0f64;
+    let mut max_abs = 0f32;
+    for r in 0..rows {
+        let c_bytes = &candidate[r * vocab * 4..(r + 1) * vocab * 4];
+        let e_bytes = &reference[r * vocab * 4..(r + 1) * vocab * 4];
+        if c_bytes == e_bytes { bit_identical += 1; }
+        let c: Vec<f32> = c_bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let e: Vec<f32> = e_bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        ensure!(c.iter().all(|v| v.is_finite()) && e.iter().all(|v| v.is_finite()), "wide-batch nonfinite logits at row {r}");
+        let (mut c_max, mut c_arg) = (f32::NEG_INFINITY, 0usize);
+        let (mut e_max, mut e_arg) = (f32::NEG_INFINITY, 0usize);
+        for i in 0..vocab {
+            if c[i] > c_max { c_max = c[i]; c_arg = i; }
+            if e[i] > e_max { e_max = e[i]; e_arg = i; }
+            let diff = (c[i] - e[i]).abs();
+            if diff > max_abs { max_abs = diff; }
+        }
+        if c_arg == e_arg { top1_matches += 1; }
+        let c_lse = c_max as f64 + c.iter().map(|&v| ((v as f64) - c_max as f64).exp()).sum::<f64>().ln();
+        let e_lse = e_max as f64 + e.iter().map(|&v| ((v as f64) - e_max as f64).exp()).sum::<f64>().ln();
+        let mut row_kl = 0f64;
+        for i in 0..vocab {
+            let log_p = e[i] as f64 - e_lse;
+            let log_q = c[i] as f64 - c_lse;
+            row_kl += log_p.exp() * (log_p - log_q);
+        }
+        kl_sum += row_kl.max(0.0);
+    }
+    Ok((top1_matches, kl_sum / rows as f64, max_abs, bit_identical))
+}
+
+fn wide_batch_oracle(
+    execution: &mut Execution<'_>,
+    inputs: &cuteafd_loader::placement::families::inkling2::InklingInputs,
+    admitted: &cuteafd_loader::placement::families::inkling2::AdmittedInkling,
+    tokens: &[u32],
+    args: &GoldenArgs,
+) -> Result<()> {
+    use super::graphs::Mode;
+    use crate::shared::speculation::target::AcceptedPrefix;
+    let seqs = 16usize;
+    let width = 8usize;
+    let total_rows = seqs * width;
+    ensure!(args.decode_rows as usize == total_rows && args.max_sequences >= seqs && inputs.prefix_mark_slots >= seqs,
+        "Inkling wide-batch oracle requires --decode-rows 128, --max-sequences >= 16 and >= 16 prefix mark slots");
+    let needed = args.prefill + width + 1;
+    ensure!(tokens.len() >= needed, "wide-batch oracle needs >= {} tokens, got {}", needed, tokens.len());
+    let stride_max = tokens.len() - needed;
+    let bank = execution.requests.cache.clone();
+    let pages_per_seq = needed.div_ceil(64);
+    ensure!(seqs * pages_per_seq <= bank.layout.pool_pages, "wide-batch oracle exceeds admitted target pages");
+    let mut seq_slices: Vec<&[u32]> = Vec::with_capacity(seqs);
+    let mut saved: Vec<Placement> = Vec::with_capacity(seqs);
+    for s in 0..seqs {
+        let off = if stride_max == 0 { 0 } else { (s * 17) % (stride_max + 1) };
+        let slice = &tokens[off..off + needed];
+        seq_slices.push(slice);
+        for requests in execution.request_ranks() { requests.cache.reset(s)?; }
+        execution.draft.as_ref().unwrap().drafter.reset_context(s, 0)?;
+        let base_page = (s * pages_per_seq) as u32;
+        let mut p = Placement {
+            media: None,
+            units: (0..pages_per_seq as u32).map(|k| base_page + k).collect(),
+            slot: s,
+            len: 0,
+            state_len: 0,
+        };
+        execution.draft.as_ref().unwrap().drafter.admit_pages(s, args.prefill + width)?;
+        let mut units = crate::shared::prefill_pipeline::sequence_units(args.prefill, args.prefill_rows, args.prefill_waves as usize, execution.cfg.layers)?;
+        for unit in &mut units {
+            unit.segments = vec![UnitSegment { sequence: 0, rows: 0..unit.rows.len(), tokens: unit.rows.clone(), prompt_end: false, snapshot: false, head: false }];
+        }
+        execution.prefill(std::slice::from_mut(&mut p), &[&slice[..args.prefill]], &units, 1, &mut |_, _, _| Ok(()))?;
+        for requests in execution.request_ranks() { requests.cache.capture(s, s)?; requests.cache.drain()?; }
+        saved.push(p);
+    }
+    let restore_slot = |exec: &Execution<'_>, s: usize| -> Result<()> {
+        for requests in exec.request_ranks() { requests.cache.restore(s, s)?; requests.cache.drain()?; }
+        Ok(())
+    };
+    let restore_all = |exec: &Execution<'_>| -> Result<()> {
+        for requests in exec.request_ranks() {
+            for s in 0..seqs { requests.cache.restore(s, s)?; }
+            requests.cache.drain()?;
+        }
+        Ok(())
+    };
+    // 1) Solo-sequence serial width-1 reference (16 x 8 = 128 rows).
+    let mut solo_logits = Vec::with_capacity(total_rows * execution.cfg.unpadded_vocab_size * 4);
+    for s in 0..seqs {
+        restore_slot(execution, s)?;
+        let mut p = saved[s].clone();
+        for step in 0..width {
+            let row = decode(execution, &mut p, &seq_slices[s][args.prefill + step..args.prefill + step + 1])?;
+            solo_logits.extend_from_slice(&row);
+        }
+    }
+    // 2) 128-row graphed verify: 3 passes (capture, replay, replay).
+    let taps = execution.draft.as_ref().context("wide-batch oracle needs admitted FIR verifier")?.layout.config.taps.clone();
+    let slots: Vec<usize> = (0..seqs).collect();
+    let mut rows = Vec::with_capacity(total_rows);
+    for s in 0..seqs {
+        for offset in 0..width {
+            rows.push(VerifyRow { slot: s, position: args.prefill + offset, token: Some(seq_slices[s][args.prefill + offset]) });
+        }
+    }
+    let library = execution.requests.decode.stream.device.library;
+    let mut pass_digests = Vec::new();
+    let mut wide_logits = Vec::new();
+    let mut before_replay = 0u64;
+    for pass in 0..3 {
+        restore_all(execution)?;
+        let mut placements = saved.clone();
+        let mut target = super::verify_target::Target::new(execution, &mut placements);
+        let mark = target.checkpoint(&slots)?;
+        let res: Result<Vec<u8>> = (|| {
+            let logits = target.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &taps })?.logits;
+            let values = logits.to_host(library)?;
+            crate::shared::spark_waves::healthy()?;
+            Ok(values.into_iter().flat_map(f32::to_le_bytes).collect())
+        })();
+        target.restore(&mark)?;
+        let bytes = res?;
+        let sha = digest(&bytes);
+        if let Some(first) = pass_digests.first() {
+            ensure!(*first == sha, "Inkling 128-row verify changed logits on pass {pass}");
+        }
+        pass_digests.push(sha);
+        if pass == 0 { wide_logits = bytes; }
+        if pass == 1 { before_replay = cuteafd_ffi::graph_captures(); }
+    }
+    let replay_recaptures = cuteafd_ffi::graph_captures() - before_replay;
+    ensure!(replay_recaptures == 0, "Inkling 128-row verify recaptured {replay_recaptures} graphs on replay");
+    let mut retained = Vec::new();
+    for graph in std::iter::once(execution.graphs.as_ref()).chain(execution.peer.iter().map(|p| p.graphs.as_ref())) {
+        let n = graph.map_or(0, |g| g.retained(total_rows, Mode::Verify));
+        ensure!(graph.is_none() || n >= execution.cfg.layers, "Inkling 128-row verify retained only {n} graphs on a rank");
+        retained.push(n);
+    }
+    let (top1_matches, mean_kl, max_abs_diff, bit_identical_rows) = kl_and_top1(&wide_logits, &solo_logits, execution.cfg.unpadded_vocab_size)?;
+    ensure!(top1_matches == total_rows && mean_kl <= 1e-3,
+        "Inkling 128-row fidelity failed vs solo eager: top1={top1_matches}/{total_rows}, mean_kl={mean_kl}");
+    // 3) 128-row fir_history_commit_m128 accepted-prefix commit across all 16 slots.
+    restore_all(execution)?;
+    let mut placements = saved.clone();
+    let accepted: Vec<AcceptedPrefix> = (0..seqs).map(|s| AcceptedPrefix { slot: s, rows: s % 9 }).collect();
+    {
+        let mut target = super::verify_target::Target::new(execution, &mut placements);
+        let mark = target.checkpoint(&slots)?;
+        let _ = target.verify(&mark, VerifyRequest { rows: &rows, tap_sites: &taps })?;
+        target.commit(&mark, &accepted)?;
+    }
+    let mut actual_states = Vec::with_capacity(seqs);
+    let mut actual_next = Vec::with_capacity(seqs);
+    for s in 0..seqs {
+        actual_states.push(state(execution, &placements[s])?);
+        let keep = accepted[s].rows;
+        actual_next.push(decode(execution, &mut placements[s], &seq_slices[s][args.prefill + keep..args.prefill + keep + 1])?);
+    }
+    let mut commit_checks = Vec::with_capacity(seqs);
+    let mut commit_clean = true;
+    for s in 0..seqs {
+        let keep = accepted[s].rows;
+        restore_slot(execution, s)?;
+        let mut reference = saved[s].clone();
+        for step in 0..keep {
+            decode(execution, &mut reference, &seq_slices[s][args.prefill + step..args.prefill + step + 1])?;
+        }
+        let expected_state = state(execution, &reference)?;
+        let diff = state_difference(&actual_states[s], &expected_state);
+        let expected_next = decode(execution, &mut reference, &seq_slices[s][args.prefill + keep..args.prefill + keep + 1])?;
+        let next_equal = actual_next[s] == expected_next;
+        commit_clean &= diff.is_none() && next_equal;
+        commit_checks.push(serde_json::json!({"slot": s, "accepted": keep, "state_diff": diff, "next_logits_equal": next_equal}));
+    }
+    let report = serde_json::json!({
+        "pass": commit_clean,
+        "decode_rows": total_rows,
+        "sequences": seqs,
+        "width_per_sequence": width,
+        "pool_tokens": admitted.solved.pool_tokens,
+        "onboard": admitted.onboard,
+        "pass_sha256": pass_digests,
+        "replay_recaptures": replay_recaptures,
+        "retained_graphs_per_rank": retained,
+        "solo_vs_wide": {
+            "rows": total_rows,
+            "top1_matches": top1_matches,
+            "top1": top1_matches as f64 / total_rows as f64,
+            "mean_kl": mean_kl,
+            "max_abs_diff": max_abs_diff,
+            "bit_identical_rows": bit_identical_rows
+        },
+        "commit_128": { "pass": commit_clean, "slots": commit_checks }
+    });
+    std::fs::create_dir_all(&args.save_logits)?;
+    std::fs::write(args.save_logits.join("wide-batch-128.json"), serde_json::to_vec_pretty(&report)?)?;
+    println!("Inkling wide-batch-128: pass={commit_clean} top1={top1_matches}/{total_rows} mean_kl={mean_kl:.6} max_abs={max_abs_diff:.6} bit_identical={bit_identical_rows}/{total_rows} retained={retained:?} recaptures={replay_recaptures}");
+    ensure!(commit_clean, "Inkling 128-row FIR commit oracle failed; see wide-batch-128.json");
+    Ok(())
+}
+
 pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     use cuteafd_loader::{plan::Checkpoint,placement::planner::PrefillShape};
     ensure!(args.width_invariance.iter().all(|width|(1..=8).contains(width)),"Inkling width invariance supports1..=8 total verify rows, anchor included");
@@ -256,11 +464,14 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     let vision=crate::shared::vision::still::Options { vision:cuteafd_loader::plan::MediaMode::Off,..Default::default() };
     let (mut execution,inputs,admitted,_,_media)=super::startup::whole(&library,&programs,&view,&checkpoint,&cfg,super::startup::Options{
         device:args.device,split_device:args.split_device,peers:&args.peers,manifest:&args.manifest,native_lib:&args.native_lib,
-        prefill:PrefillShape{rows:args.prefill_rows as u64,waves:args.prefill_waves},sequences:args.max_sequences as u64,
+        prefill:PrefillShape{rows:args.prefill_rows as u64,waves:args.prefill_waves},decode_rows:args.decode_rows,sequences:args.max_sequences as u64,
         context_tokens:0,pool_tokens:args.pool_tokens,kv_format:args.kv_format,drafter:Some(args.draft_kv_cache),
         onboard:args.rtx_expert_layers.resolve(cfg.layers),prefix:&args.prefix,
         resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false,vision:&vision})?;
     ensure!(inputs.prefix_mark_slots>0,"width oracle has no admitted target mark");
+    if args.wide_batch {
+        return wide_batch_oracle(&mut execution, &inputs, &admitted, &tokens, args);
+    }
     let bank=execution.requests.cache.clone();
     for requests in execution.request_ranks(){requests.cache.reset(0)?;}
     execution.draft.as_ref().unwrap().drafter.reset_context(0,0)?;

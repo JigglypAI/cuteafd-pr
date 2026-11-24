@@ -353,9 +353,9 @@ impl Family for Inkling2 {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            128,
             7,
-            "Inkling 2 coordinator decode programs cover 64 rows (missing inkling2_*_m128 export)",
+            "Inkling 2 coordinator decode programs cover 128 rows (missing inkling2_*_m256 export)",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

@@ -4,18 +4,23 @@ use crate::{programs::{Program,Programs,Scalar},CuteafdDeviceBuffer as Buffer};
 use anyhow::{ensure,Context,Result};
 use std::ffi::c_void;
 
-pub struct Convolution<'a>{program:Program<'a>,width:usize,heads:usize,dynamic:bool}
+pub struct Convolution<'a>{program:Program<'a>,width:usize,heads:usize,dynamic:bool,max_rows:usize}
 impl<'a> Convolution<'a>{
     pub fn load(programs:&'a Programs<'a>,width:usize,dynamic:bool)->Result<Self>{
-        ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)|(512,false)|(512,true)),"Inkling replay convolution geometry");
+        Self::load_rows(programs,width,dynamic,64)
+    }
+    pub fn load_rows(programs:&'a Programs<'a>,width:usize,dynamic:bool,max_rows:usize)->Result<Self>{
+        ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)|(512,false)|(512,true))
+            && matches!(max_rows,64|128),"Inkling replay convolution geometry");
         let heads=if dynamic{width/128}else{1};
-        let name=format!("inkling2_conv_{}_h{width}_f32_replay",if dynamic{"dynamic"}else{"static"});
+        let suffix=if max_rows==64{""}else{"_m128"};
+        let name=format!("inkling2_conv_{}_h{width}_f32_replay{suffix}",if dynamic{"dynamic"}else{"static"});
         let program=programs.program(&name,&["x","weight","dynamic","history","first","slots","out","replay"])?;
         let spec=program.spec();let g=&spec.geometry;
-        ensure!(spec.capacity_rows==64 && spec.scalar_kinds==b"illl" && spec.scratch.is_empty()
+        ensure!(spec.capacity_rows as usize==max_rows && spec.scalar_kinds==b"illl" && spec.scratch.is_empty()
             && g["width"]==width && g["taps"]==4 && g["heads"]==heads && g["dynamic"]==dynamic
-            && g["history"]=="newest_first","FIR replay convolution manifest differs");
-        Ok(Self{program,width,heads,dynamic})
+            && g["max_rows"]==max_rows && g["history"]=="newest_first","FIR replay convolution manifest differs");
+        Ok(Self{program,width,heads,dynamic,max_rows})
     }
     /// # Safety
     /// Segment starts and slots were validated against the live request bank;
@@ -24,7 +29,7 @@ impl<'a> Convolution<'a>{
     pub unsafe fn launch(&self,buffers:[Buffer;8],rows:usize,slots:usize,
         history_slot_stride:usize,history_lag_stride:usize,replay_row_stride:usize,
         stream:*mut c_void)->Result<()> {
-        ensure!((1..=64).contains(&rows) && slots>0 && history_lag_stride>=self.width
+        ensure!((1..=self.max_rows).contains(&rows) && slots>0 && history_lag_stride>=self.width
             && history_slot_stride>=3*history_lag_stride && replay_row_stride>=self.width,
             "FIR replay convolution capacity/pitches differ");
         let history=((slots-1).checked_mul(history_slot_stride)

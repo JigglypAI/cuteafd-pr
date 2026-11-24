@@ -13,11 +13,12 @@ pub(crate) struct Submitted{pub slot:usize,pub start:usize,pub first:usize,pub r
 pub(crate) struct Verify<'a>{
  pub checkpoint:Rc<Allocation<'a>>,pub replay:Allocation<'a>,table:Allocation<'a>,
  commit:Commit<'a>,layout:Layout,mark_layout:MarkLayout,stream:Rc<Stream<'a>>,
- owner:u64,generation:Cell<u64>,pending:RefCell<Option<Vec<Submitted>>>,
+ decode_rows:usize,owner:u64,generation:Cell<u64>,pending:RefCell<Option<Vec<Submitted>>>,
 }
 impl<'a> Verify<'a>{
- pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,slots:usize,width:usize)->Result<Self>{
-  let layout=Layout::contiguous(slots,width)?;
+ pub fn new(programs:&'a Programs<'a>,stream:Rc<Stream<'a>>,slots:usize,width:usize,decode_rows:usize)->Result<Self>{
+  let replay_rows=cuteafd_loader::families::inkling2::execution::replay_capacity(decode_rows);
+  let layout=Layout::contiguous_rows(slots,width,replay_rows)?;
   let commit=Commit::load(programs,layout)?;
   let mark_layout=MarkLayout::new(&[(stream.device.id,layout.history_bytes()?)])?;
   let checkpoint=Rc::new(Allocation::new(stream.device,layout.history_bytes()?,Tag::kv("inkling2/verify-conv-checkpoint"))?);
@@ -25,10 +26,10 @@ impl<'a> Verify<'a>{
   // The attention peer produces only its K/V replay channels. Its unused
   // hidden FIR lanes remain exact zeros across every accepted-prefix commit.
   if width<11264{stream.device.library.cuda_zero_bytes(replay.buffer,replay.buffer.bytes)?;}
-  let table=Allocation::new(stream.device,64*12,Tag::workspace("inkling2/verify-conv-table"))?;
+  let table=Allocation::new(stream.device,replay_rows*12,Tag::workspace("inkling2/verify-conv-table"))?;
   let owner=NEXT_OWNER.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|id|id.checked_add(1))
    .map_err(|_|anyhow::anyhow!("Inkling verify owner identity exhausted"))?;
-  Ok(Self{checkpoint,replay,table,commit,layout,mark_layout,stream,owner,generation:Cell::new(0),pending:Default::default()})
+  Ok(Self{checkpoint,replay,table,commit,layout,mark_layout,stream,decode_rows,owner,generation:Cell::new(0),pending:Default::default()})
  }
  pub fn checkpoint(&self,live:Buffer,slots:&[(usize,usize)])->Result<Mark<'a>>{
   ensure!(self.pending.borrow().is_none() && !slots.is_empty(),"Inkling verify requires committed state");
@@ -49,7 +50,7 @@ impl<'a> Verify<'a>{
   for (row,&(slot,start)) in rows.iter().zip(&mark.slots){
    ensure!(row.slot==slot && row.start==start && row.first==total && (1..=8).contains(&row.rows),"Inkling verified receipt differs from marked slots");
    total+=row.rows;
-  }ensure!(total<=64,"Inkling verified rows exceed bounded replay");
+  }ensure!(total<=self.decode_rows,"Inkling verified rows exceed bounded replay");
   *self.pending.borrow_mut()=Some(rows);Ok(())
  }
  pub fn commit(&self,mark:&Mark<'_>,live:Buffer,accepted:&[crate::shared::speculation::target::AcceptedPrefix])->Result<Vec<(usize,usize)>>{

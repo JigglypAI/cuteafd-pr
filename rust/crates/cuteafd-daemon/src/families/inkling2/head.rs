@@ -190,22 +190,28 @@ impl<'a> Head<'a> {
             rows*cfg.unpadded_vocab_size*4)?;
         if let Some(split) = &self.split {
             let peer = peer.ok_or_else(|| anyhow::anyhow!("Inkling split head must bind its peer"))?;
-            let input = self.normalized(rows)?;
             let local = self.compact_logits.as_ref().map_or(split.lead_logits.buffer, |(_, b)| b.buffer);
             let pitch = self.compact_logits.as_ref().map_or(self.local_vocab, |(stored, _)| *stored);
             let remote = split.peer.logits.buffer;
             let peer_input = split.peer.input.buffer;
-            split.handoff.project(input, peer_input,
-                || self.project_shard(&self.stream,k,target,input,local,rows,cfg.hidden,pitch,self.bf16_head.as_ref()),
-                || self.project_shard(&split.peer.stream,peer.kernels,peer.target,peer_input,remote,rows,cfg.hidden,
-                    split.peer.pitch,split.peer.weight.as_ref()),
-                || {
-                    let dst_pitch = cfg.unpadded_vocab_size*4;
-                    let local_bytes = self.local_vocab*4;
-                    split.handoff.copy_columns(logits,local,rows,dst_pitch,pitch*4,local_bytes)?;
-                    split.handoff.copy_columns(super::cache::view(logits,local_bytes,logits.bytes-local_bytes)?,remote,
-                        rows,dst_pitch,split.peer.pitch*4,split.peer.valid*4)
-                })?;
+            let step = if self.compact_logits.is_some() { 64 } else { rows };
+            let dst_pitch = cfg.unpadded_vocab_size*4;
+            let local_bytes = self.local_vocab*4;
+            for first in (0..rows).step_by(step) {
+                let count = (rows - first).min(step);
+                let input = super::cache::view(self.normalized.buffer, first*cfg.hidden*2, count*cfg.hidden*2)?;
+                let tile_peer_input = super::cache::view(peer_input, 0, count*cfg.hidden*2)?;
+                let tile_logits = super::cache::view(logits, first*dst_pitch, count*dst_pitch)?;
+                split.handoff.project(input, tile_peer_input,
+                    || self.project_shard(&self.stream,k,target,input,local,count,cfg.hidden,pitch,self.bf16_head.as_ref()),
+                    || self.project_shard(&split.peer.stream,peer.kernels,peer.target,tile_peer_input,remote,count,cfg.hidden,
+                        split.peer.pitch,split.peer.weight.as_ref()),
+                    || {
+                        split.handoff.copy_columns(tile_logits,local,count,dst_pitch,pitch*4,local_bytes)?;
+                        split.handoff.copy_columns(super::cache::view(tile_logits,local_bytes,tile_logits.bytes-local_bytes)?,remote,
+                            count,dst_pitch,split.peer.pitch*4,split.peer.valid*4)
+                    })?;
+            }
             self.softcap(logits,rows,cfg)?;
             return Ok(logits);
         }
@@ -263,13 +269,13 @@ impl<'a> Head<'a> {
         ensure!((1..=self.rows).contains(&rows),"Inkling final norm tap rows outside head owner");
         super::cache::view(self.normalized.buffer,0,rows*4608*2)
     }
-    /// Vocabulary storage remains <=64 rows regardless of prompt length. The
+    /// Vocabulary storage remains <=128 rows regardless of prompt length. The
     /// shared consumer finishes each tile before the next overwrites it.
     pub fn project_spans(&self, k: &Kernels<'a>, owner: &UnitOwner<'a>, cache: &super::cache::CacheBank<'a>,
         sequence: usize, target: &TargetWeights<'a>, cfg: &Inkling2Config, rows: usize, candidates: usize,
         consume: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits) -> Result<()>) -> Result<()> {
-        ensure!(self.rows <= 64 && rows <= owner.layout.rows && rows > 0,
-            "Inkling serving head must be bounded to <=64 rows");
+        ensure!(self.rows <= 128 && rows <= owner.layout.rows && rows > 0,
+            "Inkling serving head must be bounded to <=128 rows");
         for span in crate::shared::probe::head_spans(rows, self.rows)? {
             let segment = owner.segment(cache, sequence, cfg.layers-1, span.clone())?;
             let logits = self.project(k, &segment, target, cfg, span.len(), candidates)?;

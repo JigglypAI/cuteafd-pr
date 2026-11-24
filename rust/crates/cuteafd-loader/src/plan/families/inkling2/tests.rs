@@ -756,7 +756,7 @@ fn shared_recipe_charges_every_owner_once_on_one_and_two_rtx() {
         }).collect() };
         let inputs = InklingInputs { cfg: cfg.clone(), kv_format: crate::families::inkling2::InklingKvCache::Bf16, gpus, spark_ranks: ranks, context: Context::automatic(1 << 20),
             pool: crate::placement::prepare_pool(pool_facts(&cfg, &modes, shared::PAGE_ROWS,
-            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, prefix_mark_slots: crate::families::inkling2::draft::prefix_mark_slots(16, 8,
+            &vec![96 << 30; gpus], Context::automatic(1 << 20), None)).unwrap(), prefill, decode_rows: shared::DECODE_ROWS, sequences: 16, prefix_entries: 8, prefix_mark_budget: 2 << 30, prefix_mark_slots: crate::families::inkling2::draft::prefix_mark_slots(16, 8,
                 (0..cfg.layers).map(|layer| shared::SequenceState::new(&cfg,cfg.local[layer]).unwrap())
                     .map(|state|state.ring_bytes+state.lag_bytes).sum(), 0, 2 << 30, false).unwrap(), targets: targets.clone(), target_fp8_scratch: vec![0; gpus], placement, modes: modes.clone(),
             routed: routed.clone(), experts,

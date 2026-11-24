@@ -120,7 +120,7 @@ impl<'a> Execution<'a> {
         version: u64, staged: bool) -> Result<DeviceLogits> {
         self.require_live()?;
         ensure!(!placements.is_empty() && placements.len() == tokens.len()
-            && unit.rows.len() <= 64 && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
+            && unit.rows.len() <= self.requests.decode.layout.rows && unit.slot == 0, "Inkling decode exceeds admitted head/owner");
         let mode = if self.requests.decode.replaying() { Mode::Verify } else { Mode::Decode };
         let cycle = if mode == Mode::Verify { Cycle::Verify } else { Cycle::Decode };
         self.for_each_graph(|graphs| graphs.cycle(cycle));

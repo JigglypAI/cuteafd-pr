@@ -100,7 +100,12 @@ impl<'a> Kernels<'a> {
     }
     pub fn bind_rank(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
         head_parts: usize) -> Result<Self> {
+        Self::bind_rank_rows(programs, kv_format, head_parts, 64)
+    }
+    pub fn bind_rank_rows(programs: &'a Programs<'a>, kv_format: cuteafd_loader::families::inkling2::InklingKvCache,
+        head_parts: usize, decode_rows: usize) -> Result<Self> {
         ensure!(matches!(head_parts, 1 | 2), "Inkling kernel head partition differs");
+        let decode_cap = cuteafd_loader::families::inkling2::execution::replay_capacity(decode_rows);
         let kv = 1024 / head_parts;
         let fir = [(4608, false), (kv, false), (kv, true)];
         let mut ops = Vec::new();
@@ -135,15 +140,15 @@ impl<'a> Kernels<'a> {
             Ok((geometry, cuteafd_ffi::fir_strided::Convolution::load(programs, geometry.0, geometry.1)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let replay = fir.into_iter().map(|geometry|
-            Ok((geometry, cuteafd_ffi::fir_replay::Convolution::load(programs, geometry.0, geometry.1)?)))
+            Ok((geometry, cuteafd_ffi::fir_replay::Convolution::load_rows(programs, geometry.0, geometry.1, decode_cap)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { projections: DraftProjections::load_with_output(programs, &[
             (4608, 6144 / head_parts), (4608, 768 / head_parts), (4608, kv),
             (4608, 48 / head_parts), (4608, 32 / head_parts), (4608, 384), (6144 / head_parts, 4608), (64, 1024)], 4096, ProjectionOutput::F32)?,
             local: Attention::load_rank(programs, Kind::Local, Route::Prefill, false, head_parts)?,
             global: Attention::load_rank(programs, Kind::Global, Route::Prefill, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?,
-            local_decode: Attention::load_rank(programs, Kind::Local, Route::Decode, false, head_parts)?,
-            global_decode: Attention::load_rank(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts)?, kv_format, head_parts,
+            local_decode: Attention::load_rank_rows(programs, Kind::Local, Route::Decode, false, head_parts, decode_cap)?,
+            global_decode: Attention::load_rank_rows(programs, Kind::Global, Route::Decode, kv_format == cuteafd_loader::families::inkling2::InklingKvCache::Fp8, head_parts, decode_cap)?, kv_format, head_parts,
             add: programs.library().f32_add()?, narrow: programs.library().f32_bf16_narrow()?,
             copy: programs.library().v41_peer_copy()?, widen_add: programs.library().bf16_f32_add()?,
             quant, compact: None, draft_head: None,
