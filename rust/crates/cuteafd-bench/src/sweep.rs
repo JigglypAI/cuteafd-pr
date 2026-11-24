@@ -170,17 +170,12 @@ impl Sweep {
     /// One row per timed band that has graph counters: its label, process
     /// captures, device-cache captures, misses and eager runs, and
     /// `zero_captures` (null when the counters were unavailable).
+    /// Each row also names the sites that moved and the band's throttle summary
+    /// (`common::graph_band`).
     pub fn graph_bands(&self) -> Vec<Value> {
-        let row = |band: String, graph: &Value| {
-            let device = |key: &str| graph["devices"].as_array().map(|devices|
-                devices.iter().filter_map(|d| d["totals"][key].as_u64()).sum::<u64>());
-            serde_json::json!({"band": band, "available": graph["available"], "captures": graph["captures"],
-                "device_captures": device("captures"), "misses": device("misses"),
-                "eager_runs": device("eager_runs"), "zero_captures": graph["zero_captures"],
-                "reason": graph["reason"]})
-        };
-        self.prefill.iter().filter_map(|p| p.graph.as_ref().map(|g| row(format!("prefill {}", p.length), g)))
-            .chain(self.points.iter().filter_map(|p| p.graph.as_ref().map(|g| row(format!("{} C{}", p.phase, p.c), g))))
+        use crate::panels::common::graph_band;
+        self.prefill.iter().filter_map(|p| p.graph.as_ref().map(|g| graph_band(format!("prefill {}", p.length), g, p.thermal.as_ref())))
+            .chain(self.points.iter().filter_map(|p| p.graph.as_ref().map(|g| graph_band(format!("{} C{}", p.phase, p.c), g, p.thermal.as_ref()))))
             .collect()
     }
 

@@ -219,8 +219,17 @@ pub fn graph_sample(stats: &Value) -> Option<Value> {
     let captures = stats["graph_captures"].as_u64();
     let cache = stats["graph_cache"].as_array();
     if captures.is_none() && cache.is_none() { return None; }
-    let devices: Vec<Value> = cache.into_iter().flatten().map(|device| json!({"device": device["device"],
-        "cycles": device["cycles"], "lane_cycles_completed": device["epochs"]["completed"]})).collect();
+    let devices: Vec<Value> = cache.into_iter().flatten().map(|device| {
+        // Spanning is declared per identity; only the ranked rows publish it.
+        let mut spans = serde_json::Map::new();
+        for row in ["top_hits", "top_churn"].iter().flat_map(|key| device[*key].as_array().into_iter().flatten()) {
+            let (Some(site), Some(span)) = (row["site"].as_str(), row["spans_devices"].as_bool()) else { continue };
+            let known = spans.get(site).and_then(Value::as_bool).unwrap_or(false);
+            spans.insert(site.to_string(), json!(known || span));
+        }
+        json!({"device": device["device"], "cycles": device["cycles"], "update_sites": device["update_sites"],
+            "site_spans": spans, "lane_cycles_completed": device["epochs"]["completed"]})
+    }).collect();
     Some(json!({"captures": captures, "sites": stats["graph_capture_sites"], "devices": devices,
         "missing_variants": stats["graph_missing_variants"]}))
 }
@@ -228,6 +237,39 @@ pub fn graph_sample(stats: &Value) -> Option<Value> {
 /// Per-device totals every graph interval reports, zero included; `updates`
 /// is soft plus hard executable updates.
 pub const GRAPH_TOTALS: [&str; 7] = ["captures", "misses", "eager_runs", "evictions", "updates", "update_failures", "hits"];
+
+/// Adds one counter delta into [`GRAPH_TOTALS`] (soft and hard updates as `updates`).
+fn add_totals(totals: &mut serde_json::Map<String, Value>, delta: &serde_json::Map<String, Value>) {
+    for (key, value) in delta {
+        let total = if key == "updates_soft" || key == "updates_hard" { "updates" } else { key.as_str() };
+        if !GRAPH_TOTALS.contains(&total) { continue; }
+        let slot = totals.entry(total.to_string()).or_insert(json!(0u64));
+        *slot = json!(slot.as_u64().unwrap_or(0) + value.as_u64().unwrap_or(0));
+    }
+}
+
+/// Per-site differences of a device's `update_sites` (site -> cycle -> counters):
+/// sites whose counters moved, with nonzero [`GRAPH_TOTALS`] and per-cycle deltas,
+/// and `spans_devices` when a ranked row of either sample named it. None when one
+/// went backwards.
+fn site_deltas(before: &Value, after: &Value) -> Option<serde_json::Map<String, Value>> {
+    let mut sites = serde_json::Map::new();
+    for (site, cycles) in after["update_sites"].as_object().into_iter().flatten() {
+        let (mut totals, mut by_cycle) = (serde_json::Map::new(), serde_json::Map::new());
+        for (cycle, counters) in cycles.as_object().into_iter().flatten() {
+            let delta = counter_delta(&before["update_sites"][site.as_str()][cycle.as_str()], counters)?;
+            add_totals(&mut totals, &delta);
+            if !delta.is_empty() { by_cycle.insert(cycle.clone(), Value::Object(delta)); }
+        }
+        if by_cycle.is_empty() { continue; }
+        let mut entry = json!({"totals": totals, "by_cycle": by_cycle});
+        if let Some(span) = after["site_spans"][site.as_str()].as_bool().or(before["site_spans"][site.as_str()].as_bool()) {
+            entry["spans_devices"] = json!(span);
+        }
+        sites.insert(site.clone(), entry);
+    }
+    Some(sites)
+}
 
 /// Nonzero differences of one counter object's integer fields; None when one went backwards.
 fn counter_delta(before: &Value, after: &Value) -> Option<serde_json::Map<String, Value>> {
@@ -289,14 +331,12 @@ pub fn graph_interval(before: Option<&Value>, after: Option<&Value>) -> Option<V
             let Some(delta) = counter_delta(&start["cycles"][cycle.as_str()], counters) else {
                 return unavailable("a device graph counter went backwards");
             };
-            for (key, value) in &delta {
-                let total = if key == "updates_soft" || key == "updates_hard" { "updates" } else { key.as_str() };
-                if let Some(slot) = totals.get_mut(total) {
-                    *slot = json!(slot.as_u64().unwrap_or(0) + value.as_u64().unwrap_or(0));
-                }
-            }
+            add_totals(&mut totals, &delta);
             if !delta.is_empty() { by_cycle.insert(cycle.clone(), Value::Object(delta)); }
         }
+        let Some(sites) = site_deltas(start, device) else {
+            return unavailable("a per-site graph counter went backwards");
+        };
         let lanes = device["lane_cycles_completed"].as_array().map(|lanes| lanes.iter().enumerate().map(|(i, n)| {
             n.as_u64().and_then(|n| n.checked_sub(start["lane_cycles_completed"][i].as_u64().unwrap_or(0)))
         }).collect::<Option<Vec<_>>>());
@@ -306,7 +346,7 @@ pub fn graph_interval(before: Option<&Value>, after: Option<&Value>) -> Option<V
             None => Value::Null,
         };
         devices.push(json!({"device": device["device"], "new_device": old.is_none(), "totals": totals,
-            "by_cycle": by_cycle, "lane_cycles_completed": lanes}));
+            "by_cycle": by_cycle, "sites": sites, "lane_cycles_completed": lanes}));
     }
     let mut eager = Vec::new();
     for variant in after["missing_variants"].as_array().into_iter().flatten() {
@@ -323,6 +363,57 @@ pub fn graph_interval(before: Option<&Value>, after: Option<&Value>) -> Option<V
     Some(json!({"available": true, "boundaries": "/v1/stats reads just before and after the timed band",
         "captures": captures, "zero_captures": zero, "capture_sites": sites, "devices": devices,
         "missing_variant_runs": eager}))
+}
+
+/// Worst-GPU throttle summary of one `/v1/thermal` window (`thermal::window`):
+/// software power cap plus hardware power brake seconds, software plus hardware
+/// thermal slowdown seconds, the lowest busy SM clock mean, the highest
+/// temperature and the lowest T.Limit headroom; per GPU under `gpus`. None
+/// without GPU rows. A field is null when no GPU reported it.
+pub fn thermal_summary(window: &Value) -> Option<Value> {
+    let gpus = window["gpus"].as_array().filter(|gpus| !gpus.is_empty())?;
+    let sum = |gpu: &Value, reasons: &[&str]| gpu["throttle_s"].is_object().then(||
+        reasons.iter().filter_map(|reason| gpu["throttle_s"][*reason].as_f64()).sum::<f64>());
+    let rows: Vec<Value> = gpus.iter().map(|gpu| json!({"index": gpu["index"],
+        "power_cap_s": sum(gpu, &["sw_power_cap", "hw_power_brake"]),
+        "thermal_slowdown_s": sum(gpu, &["sw_thermal", "hw_thermal"]),
+        "busy_sm_clock_mhz": gpu["busy"]["sm_clock_mean_mhz"], "max_temperature_c": gpu["temperature_c"]["max"],
+        "min_tlimit_headroom_c": gpu["tlimit_margin_c"]["min"]})).collect();
+    let pick = |key: &str, max: bool| rows.iter().filter_map(|row| row[key].as_f64())
+        .reduce(|a, b| if max { a.max(b) } else { a.min(b) });
+    Some(json!({"seconds": window["seconds"], "power_cap_s": pick("power_cap_s", true),
+        "thermal_slowdown_s": pick("thermal_slowdown_s", true), "busy_sm_clock_mhz": pick("busy_sm_clock_mhz", false),
+        "max_temperature_c": pick("max_temperature_c", true), "min_tlimit_headroom_c": pick("min_tlimit_headroom_c", false),
+        "gpus": rows}))
+}
+
+/// One summary row per timed band with graph counters (sweep bands and
+/// context_load points): process and device-cache captures, misses, eager
+/// runs, `zero_captures`, the sites that missed, ran eagerly, updated or
+/// captured (summed over devices, most eager runs first) and the band's
+/// [`thermal_summary`].
+pub fn graph_band(band: String, graph: &Value, thermal: Option<&Value>) -> Value {
+    let devices = graph["devices"].as_array();
+    let device = |key: &str| devices.map(|devices| devices.iter().filter_map(|d| d["totals"][key].as_u64()).sum::<u64>());
+    let mut sites: std::collections::BTreeMap<String, Value> = Default::default();
+    for (site, entry) in devices.into_iter().flatten().flat_map(|d| d["sites"].as_object().into_iter().flatten()) {
+        let row = sites.entry(site.clone()).or_insert_with(|| json!({"site": site, "eager_runs": 0u64, "misses": 0u64,
+            "updates": 0u64, "update_failures": 0u64, "captures": 0u64}));
+        for key in ["eager_runs", "misses", "updates", "update_failures", "captures"] {
+            row[key] = json!(row[key].as_u64().unwrap_or(0) + entry["totals"][key].as_u64().unwrap_or(0));
+        }
+        if let Some(span) = entry["spans_devices"].as_bool() {
+            row["spans_devices"] = json!(span || row["spans_devices"].as_bool().unwrap_or(false));
+        }
+    }
+    let mut sites: Vec<Value> = sites.into_values().filter(|row|
+        ["eager_runs", "misses", "updates", "update_failures", "captures"].iter().any(|k| row[*k].as_u64().unwrap_or(0) > 0)).collect();
+    sites.sort_by(|a, b| b["eager_runs"].as_u64().cmp(&a["eager_runs"].as_u64())
+        .then_with(|| b["misses"].as_u64().cmp(&a["misses"].as_u64())));
+    json!({"band": band, "available": graph["available"], "captures": graph["captures"],
+        "device_captures": device("captures"), "misses": device("misses"),
+        "eager_runs": device("eager_runs"), "updates": device("updates"), "zero_captures": graph["zero_captures"],
+        "reason": graph["reason"], "sites": sites, "thermal": thermal.and_then(thermal_summary)})
 }
 
 /// Differences of asynchronous total snapshots, not exact phase-isolated counts.
@@ -590,7 +681,16 @@ mod tests {
             "graph_capture_site_deltas": [],
             "graph_missing_variants": [{"family": "glm5", "shape": "c=3", "runs": decode_misses}],
             "graph_cache": [
-                {"device": 0, "charged": 335544320, "reserve": 1 << 30, "top_hits": [{"hits": 9}],
+                {"device": 0, "charged": 335544320, "reserve": 1 << 30,
+                 "top_hits": [{"hits": 9, "site": "glm5.decode", "spans_devices": false},
+                              {"hits": 3, "site": "glm5.exchange", "spans_devices": true}],
+                 "top_churn": [{"site": "glm5.decode", "spans_devices": false}],
+                 "update_sites": {
+                     "glm5.decode": {"decode": {"hits": 90 + completed, "misses": decode_misses, "eager_runs": decode_misses,
+                                                "captures": 4, "updates_soft": 2, "updates_hard": 0}},
+                     "glm5.exchange": {"verify": {"hits": 10, "misses": verify_captures, "eager_runs": verify_captures,
+                                                  "updates_hard": 1}},
+                     "glm5.idle": {"decode": {"hits": 0}}},
                  "cycles": {"decode": {"hits": 100 + completed, "misses": decode_misses, "captures": 4,
                                        "segments_launched": 3 * completed, "eager_runs": decode_misses,
                                        "evictions": 0, "updates_soft": 2, "updates_hard": 0, "update_failures": 0},
@@ -634,6 +734,83 @@ mod tests {
         assert_eq!(device["totals"]["evictions"], 1);
         assert_eq!(device["by_cycle"]["verify"], json!({"captures": 2, "evictions": 1}));
         assert_eq!(band["missing_variant_runs"], json!([{"family": "glm5", "shape": "c=3", "runs": 2}]));
+        // Per site: the rank-local decode site and the spanning exchange site each missed eagerly.
+        assert_eq!(device["sites"], json!({
+            "glm5.decode": {"totals": {"hits": 40, "misses": 2, "eager_runs": 2}, "spans_devices": false,
+                            "by_cycle": {"decode": {"hits": 40, "misses": 2, "eager_runs": 2}}},
+            "glm5.exchange": {"totals": {"misses": 2, "eager_runs": 2}, "spans_devices": true,
+                              "by_cycle": {"verify": {"misses": 2, "eager_runs": 2}}}}));
+        assert_eq!(band["devices"][1]["sites"], json!({}), "a device without update_sites reports none");
+        let row = super::graph_band("levels C16".into(), &band, None);
+        assert_eq!(row["sites"], json!([
+            {"site": "glm5.decode", "eager_runs": 2, "misses": 2, "updates": 0, "update_failures": 0, "captures": 0, "spans_devices": false},
+            {"site": "glm5.exchange", "eager_runs": 2, "misses": 2, "updates": 0, "update_failures": 0, "captures": 0, "spans_devices": true}]));
+        assert_eq!((row["device_captures"].as_u64(), row["misses"].as_u64(), row["eager_runs"].as_u64()), (Some(2), Some(2), Some(2)));
+        assert!(row["thermal"].is_null());
+        // Steady band: hits only, so no site row survives the summary.
+        let steady = super::graph_interval(before.as_ref(), steady.as_ref()).unwrap();
+        assert_eq!(steady["devices"][0]["sites"]["glm5.decode"]["totals"], json!({"hits": 32}));
+        assert_eq!(super::graph_band("levels C1".into(), &steady, None)["sites"], json!([]));
+    }
+
+    #[test]
+    fn per_site_deltas_count_updates_and_refuse_backwards_sites() {
+        let before = super::graph_sample(&graph_stats(6, 1, 3, 40));
+        let mut stats = graph_stats(6, 1, 3, 40);
+        stats["graph_cache"][0]["update_sites"]["glm5.decode"]["decode"]["updates_soft"] = json!(5);
+        stats["graph_cache"][0]["update_sites"]["glm5.decode"]["decode"]["updates_hard"] = json!(1);
+        stats["graph_cache"][0]["update_sites"]["glm5.new"] = json!({"wave": {"captures": 1}});
+        let band = super::graph_interval(before.as_ref(), super::graph_sample(&stats).as_ref()).unwrap();
+        let sites = &band["devices"][0]["sites"];
+        assert_eq!(sites["glm5.decode"]["totals"], json!({"updates": 4}));
+        assert_eq!(sites["glm5.decode"]["by_cycle"]["decode"], json!({"updates_soft": 3, "updates_hard": 1}));
+        assert_eq!(sites["glm5.new"]["totals"], json!({"captures": 1}));
+        assert!(sites["glm5.new"].get("spans_devices").is_none(), "no ranked row: spanning unknown");
+        let row = super::graph_band("context 32768 C8".into(), &band, None);
+        assert_eq!(row["updates"], 0, "device totals come from cycles, not sites");
+        assert_eq!(row["sites"].as_array().unwrap().iter().map(|s| s["site"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["glm5.decode", "glm5.new"]);
+        let mut backwards = graph_stats(6, 1, 3, 40);
+        backwards["graph_cache"][0]["update_sites"]["glm5.decode"]["decode"]["misses"] = json!(0);
+        assert_eq!(super::graph_interval(before.as_ref(), super::graph_sample(&backwards).as_ref()).unwrap()["reason"],
+            "a per-site graph counter went backwards");
+    }
+
+    /// A `/v1/thermal?from=` window as `thermal::window` serves it: one capped,
+    /// slowed GPU and one cool one.
+    fn thermal_window() -> Value {
+        json!({"from_s": 10.0, "to_s": 42.5, "seconds": 32.5, "governor_name": "gpu-powerd", "gpus": [
+            {"index": 0, "samples": 130,
+             "throttle_s": {"sw_power_cap": 12.0, "sw_thermal": 0.5, "hw_thermal": 1.25, "hw_power_brake": 0.25},
+             "busy": {"fraction": 0.98, "sm_clock_min_mhz": 1500.0, "sm_clock_mean_mhz": 2210.5},
+             "temperature_c": {"max": 83.0, "mean": 79.0}, "tlimit_margin_c": {"min": 4.0, "mean": 7.5}},
+            {"index": 1, "samples": 130,
+             "throttle_s": {"sw_power_cap": 0.0, "sw_thermal": 0.0, "hw_thermal": 0.0, "hw_power_brake": 0.0},
+             "busy": {"fraction": 0.97, "sm_clock_min_mhz": 2600.0, "sm_clock_mean_mhz": 2700.0},
+             "temperature_c": {"max": 70.0, "mean": 66.0}, "tlimit_margin_c": {"min": null, "mean": null}}]})
+    }
+
+    #[test]
+    fn thermal_summary_reports_the_worst_gpu_and_each_gpu() {
+        let summary = super::thermal_summary(&thermal_window()).unwrap();
+        assert_eq!(summary["seconds"], 32.5);
+        assert_eq!(summary["power_cap_s"], 12.25);
+        assert_eq!(summary["thermal_slowdown_s"], 1.75);
+        assert_eq!(summary["busy_sm_clock_mhz"], 2210.5);
+        assert_eq!(summary["max_temperature_c"], 83.0);
+        assert_eq!(summary["min_tlimit_headroom_c"], 4.0);
+        assert_eq!(summary["gpus"][1], json!({"index": 1, "power_cap_s": 0.0, "thermal_slowdown_s": 0.0,
+            "busy_sm_clock_mhz": 2700.0, "max_temperature_c": 70.0, "min_tlimit_headroom_c": null}));
+        // An empty window (no samples, so no reason bits) has nulls, not zeros.
+        let empty = json!({"seconds": 0.1, "gpus": [{"index": 0, "samples": 0, "throttle_s": null,
+            "busy": {"sm_clock_mean_mhz": null}, "temperature_c": {"max": null}, "tlimit_margin_c": {"min": null}}]});
+        let summary = super::thermal_summary(&empty).unwrap();
+        assert!(summary["power_cap_s"].is_null() && summary["max_temperature_c"].is_null());
+        assert!(super::thermal_summary(&json!({"seconds": 1.0, "gpus": []})).is_none());
+        assert!(super::thermal_summary(&Value::Null).is_none());
+        let band = super::graph_band("context 131072 C16".into(), &json!({"available": true, "zero_captures": true,
+            "captures": 0, "devices": []}), Some(&thermal_window()));
+        assert_eq!(band["thermal"]["power_cap_s"], 12.25);
     }
 
     #[test]
