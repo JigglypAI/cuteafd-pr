@@ -360,7 +360,9 @@ refuses). `EMBEDDING=gpu` is required
 `off`). `SPECULATOR=dfly2` opts into the checkpoint's bundled five-stage
 DFly2 on one RTX or explicit two-RTX `heads`. It reuses committed target MLA KV
 and compressed-indexer recall; a fully restored prefix takes one target-only
-round before proposing. `SPECULATION_TRACE` uses the shared speculation trace.
+round before proposing. Proposals batch across requests; rank-local draft and
+verify sections graph exact live rows. Recall gathering, metadata uploads and
+TP2 head handoff remain eager. `SPECULATION_TRACE` uses the shared speculation trace.
 Stored K8/K6 views load the bundled K8 MUL1 linears, except KV-B, which follows
 the target's absorbed-BF16 layout. `SPECULATOR=off` admits no drafter storage. Hy4-flash uses the shared `DECODE_ROWS` budget
 (up to 64 target rows, including anchors; `auto` is 64).

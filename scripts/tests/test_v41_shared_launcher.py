@@ -182,7 +182,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # Derived native_ownership makes TP explicit in serving argv, not in
         # planner argv. Only user-supplied topology keys reach the planner.
         if case in KIT_CARDS:
-            kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+            kit = json.loads((ROOT / "scripts/tests/fixtures/retired-gate-cards.json").read_text())
             entry = next(e for e in kit["entries"] if e["name"] == case)
             config = ROOT / entry["config"]
             overrides = entry.get("set", {})
@@ -263,12 +263,12 @@ def test_draft_length_reaches_serve_and_never_the_plan(tmp_root, monkeypatch, li
     assert all("--draft-length" not in plan for plan in result["plans"])
 
 
-def test_goldens_cover_every_v41_example_and_gate_card() -> None:
+def test_goldens_cover_every_v41_example_and_archived_gate_card() -> None:
     examples = {p.stem for p in (ROOT / "examples" / "configs").glob("deepseek-v41-*.config")}
     assert examples <= set(CASES) | set(SHOWCASE_BASELINES)
     assert set(SHOWCASE_BASELINES) <= examples
     assert set(SHOWCASE_BASELINES.values()) <= set(CASES)
-    kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+    kit = json.loads((ROOT / "scripts/tests/fixtures/retired-gate-cards.json").read_text())
     assert {e["name"] for e in kit["entries"] if e.get("family") == "deepseek_v41"} <= set(KIT_CARDS)
     assert {p.stem for p in FIXTURES.glob("*.json")} == set(CASES)
 

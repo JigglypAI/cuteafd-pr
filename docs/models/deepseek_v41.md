@@ -1,5 +1,9 @@
 # DeepSeek V4.1 Flash
 
+The v7 release keeps the Strided PLE cards and retires both original
+Flash-1017 cards. The original checkpoint, example configs and historical
+measurements remain available.
+
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
 the pool then grows into remaining admitted memory, within native encoding

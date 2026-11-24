@@ -155,7 +155,7 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             draft[f"draft_gather_{kv}"] = lambda g=g: compile_paged_staging_gather_aot(
                 row_bytes=g.record_bytes, page_rows=1)
             draft[f"draft_attention_{kv}"] = lambda g=g: mla.compile_hy4_mla_attention_aot(
-                g, max_rows=6, max_context=2048 + 6, mode="decode", page_size=1)
+                g, max_rows=6 * 64, max_context=2048 + 6, mode="decode", page_size=1)
         for name, width, outputs in (
             ("gate_up", 3072, 9216), ("down", 9216, 3072),
             ("join", 6144, 3072), ("correction_down", 3072, 3072),
@@ -173,7 +173,7 @@ def programs(tp: int, decode_rows: int, max_rows: int, max_context: int):
     """Entries for the shared Programs dispatcher in export_b12x_dsv4_aot.py."""
     def capacity(name):
         if name.startswith("draft_"):
-            return 6
+            return 6 * 64
         return decode_rows if "swa_decode" in name else max_rows
 
     return [

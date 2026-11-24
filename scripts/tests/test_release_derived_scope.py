@@ -637,13 +637,13 @@ def test_shared_input_staging_can_precede_explicit_copy(tmp_path):
     assert path.stat().st_ino == other.stat().st_ino
 
 
-@pytest.mark.parametrize("matrix", ["release-smoke.example.json", "release-smoke-v4.json"])
+@pytest.mark.parametrize("matrix", ["release-smoke-v4.json", "../tests/fixtures/retired-release-example-cards.json"])
 def test_release_matrix_showcases_both_compressed_v41_reply_formats(matrix):
     document = json.loads((REPO / "scripts/bench" / matrix).read_text())
     base = next(entry for entry in document["entries"] if entry["name"] == "v41-flash-max")
     assert "SPARK_PREFILL_REPLY_FORMAT" not in base["set"]
     assert "SPARK_DECODE_REPLY_FORMAT" not in base["set"]
-    assert not document["defaults"].get("run_args")
+    assert not document.get("defaults", {}).get("run_args")
     for codec in ("fp8", "nvfp4"):
         entry = next(entry for entry in document["entries"] if entry["name"] == f"v41-flash-max-{codec}-reply")
         assert entry["gpus"] == base["gpus"] and entry["sparks"] == base["sparks"]

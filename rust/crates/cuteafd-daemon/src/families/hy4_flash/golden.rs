@@ -473,7 +473,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             tokens.truncate(max_resume);
         }
         return run_resume_check(&mut engine, &tokens, &args.resume_at, args.resume_rows, unit,
-            args.resume_host, args.resume_dfly2, args.resume_verify);
+            args.resume_host, args.resume_dfly2, args.resume_verify, args.decode_graphs, args.save_logits.as_deref());
     }
 
     let vocab = cfg.vocab_size;
@@ -772,6 +772,8 @@ fn run_resume_check(
     use_host: bool,
     dfly2: bool,
     forced_verify: bool,
+    graph_parity: bool,
+    output: Option<&std::path::Path>,
 ) -> Result<()> {
     use super::cache::Hy4Placement;
     use super::execution::HeadMode;
@@ -786,6 +788,7 @@ fn run_resume_check(
     }
     let dump_root = forced_verify.then(|| engine.dump_dir.take()).flatten();
     let mut verify_exact = true;
+    let mut parity_logits = Vec::new();
     let library = engine.library();
     let family = engine.prefix()?;
     let layout = family.layout();
@@ -1010,12 +1013,44 @@ fn run_resume_check(
             } else { vec![tok] };
             let la = run_verify(engine, &mut p_a, &verify, 1)?;
             let lb = run_verify(engine, &mut p_b, &verify, 1)?;
+            if output.is_some() {
+                parity_logits.extend(la.iter().flat_map(|logit| logit.to_le_bytes()));
+            }
             if dfly2 {
                 ensure!(engine.draft_valid(&p_b), "DFly2 restore did not rejoin after one target row");
                 let expected = &tokens[..at + step + 1];
                 let tail = &expected[expected.len().saturating_sub(2)..];
                 ensure!(p_a.engram_tail.ends_with(tail) && p_b.engram_tail.ends_with(tail),
                     "DFly2 rejected rows advanced Engram state");
+                if step == 0 {
+                    // Compare the same committed taps, in singleton and two-member
+                    // schedules, with distinct anchors and a different depth per member.
+                    let members = [&p_a, &p_b].into_iter().enumerate().map(|(i, p)| {
+                        super::draft::Member { slot: p.slot, pos: p.len,
+                            bonus: if i == 0 { tok } else { (tok + 1) % vocab as u32 }, depth: 5 - i * 2 }
+                    }).collect::<Vec<_>>();
+                    let separate = members.iter().map(|m| engine.draft_batch(std::slice::from_ref(m))
+                        .map(|mut batch| batch.pop().expect("singleton DFly2 output")))
+                        .collect::<Result<Vec<_>>>()?;
+                    let together = engine.draft_batch(&members)?;
+                    if graph_parity {
+                        let eager = engine.without_graphs(|engine| engine.draft_batch(&members))?;
+                        // One eager first-touch, then replay the warmed exact member count.
+                        for _ in 0..2 {
+                            engine.graph_completed()?;
+                            let graphed = engine.draft_batch(&members)?;
+                            ensure!(graphed == eager, "DFly2 eager and graphed proposal IDs differ at {at}");
+                        }
+                        engine.graph_completed()?;
+                        ensure!(engine.retained_draft_graph_rows(members.len()) > 0,
+                            "DFly2 parity did not retain graphs at {} live members", members.len());
+                    }
+                    let matches = together == separate;
+                    if at + 1 <= 2048 {
+                        ensure!(matches, "DFly2 batched proposals differ from singleton: {together:?} vs {separate:?}");
+                    }
+                    println!("hy4f-golden DFly2 batch at {at}: proposal ids match={matches}");
+                }
             }
             if step == 0 || (dfly2 && step <= 2) {
                 let after_a = engine.dump_state(&p_a)?;
@@ -1079,6 +1114,17 @@ fn run_resume_check(
             idle.pages - idle.pages_free == idle.pages_retained,
             "hy4f-golden --resume-at {at}: idle page leak ({idle:?})"
         );
+    }
+    if dfly2 && graph_parity {
+        for rows in [1, 4] {
+            ensure!(engine.retained_graph_rows(rows).iter().all(|&(_, count)| count > 0),
+                "DFly2 parity did not retain target graphs at {rows} rows");
+        }
+    }
+    if let Some(output) = output {
+        ensure!(!parity_logits.is_empty(), "resume check did not produce logits to compare");
+        std::fs::create_dir_all(output)?;
+        std::fs::write(output.join("logits.bin"), parity_logits)?;
     }
     ensure!(verify_exact, "Hy4 forced target verify differs from serial greedy decode");
     println!("hy4f-golden --resume-at: PASS");
