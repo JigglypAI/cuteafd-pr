@@ -418,3 +418,65 @@ pub fn layer_experts(checkpoint: &Checkpoint, cfg: &Inkling2MiniConfig) -> Resul
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::families::inkling2_mini::tests::mini_test_checkpoint;
+
+    #[test]
+    fn mini_target_weights_plan_and_sources_pack_cross_pass_and_controllers_in_one_arena() -> Result<()> {
+        let (cfg, _dir, checkpoint) = mini_test_checkpoint()?;
+        let layout = MiniTargetWeights::plan(&checkpoint, &cfg)?;
+        let exec = layout.execution_arena()?;
+        assert_eq!(layout.layers, (0..24).collect::<Vec<_>>());
+        assert_eq!(layout.core_start, 6);
+        assert_eq!(layout.core_end, 18);
+        assert_eq!(exec.id(), "inkling2_mini/target/0");
+        assert!(exec.bytes() > layout.arena.bytes());
+        assert_eq!(exec.views().len(), layout.arena.views().len() + 24);
+
+        // Every planned arena view must resolve exact source slices summing to view.bytes().
+        for (name, view) in layout.arena.views() {
+            let slices = layout.sources(&checkpoint, name)?;
+            let total: usize = slices.iter().map(MiniSourceSlice::bytes).sum();
+            assert_eq!(total, view.bytes(), "view {name} source sum mismatch");
+        }
+
+        // Cross-pass queries land in exact [attn, k, v, mlp] order matching reference/model.py:178-181.
+        let row_bytes = cfg.text.hidden * 4;
+        for core_idx in 0..12 {
+            let layer = 6 + core_idx;
+            let slices = layout.sources(&checkpoint, &format!("{TEXT}layers.{layer}.cross_pass_queries"))?;
+            assert_eq!(slices.len(), 3);
+            assert_eq!(slices[0].tensor, CROSS_PASS_QUERIES);
+            assert_eq!(slices[0].rows, 2 * core_idx..2 * core_idx + 1);
+            assert_eq!(slices[0].dst_offset, 0);
+            assert_eq!(slices[1].tensor, CROSS_PASS_KV_QUERIES);
+            assert_eq!(slices[1].rows, 2 * core_idx..2 * core_idx + 2);
+            assert_eq!(slices[1].dst_offset, row_bytes);
+            assert_eq!(slices[2].tensor, CROSS_PASS_QUERIES);
+            assert_eq!(slices[2].rows, 2 * core_idx + 1..2 * core_idx + 2);
+            assert_eq!(slices[2].dst_offset, 3 * row_bytes);
+            for stream in CONTROLLER_STREAMS {
+                let fg = layout.sources(&checkpoint, &format!("{TEXT}layers.{layer}.controllers.{stream}.forget_gain_weight"))?;
+                assert_eq!(fg.len(), 2);
+                assert_eq!(fg[0].dst_offset, 0);
+                assert_eq!(fg[1].dst_offset, cfg.text.hidden * cfg.loop_cfg.gate_rank * 2);
+            }
+        }
+        // Global layers pack [q_input_norm, k_input_norm, v_input_norm] contiguously.
+        for global_layer in [5usize, 11, 17, 23] {
+            let norms = layout.sources(&checkpoint, &format!("{TEXT}layers.{global_layer}.qkv_input_norm.weight"))?;
+            assert_eq!(norms.len(), 3);
+            assert_eq!(norms[0].dst_offset, 0);
+            assert_eq!(norms[1].dst_offset, cfg.text.hidden * 2);
+            assert_eq!(norms[2].dst_offset, 2 * cfg.text.hidden * 2);
+        }
+        let experts = layer_experts(&checkpoint, &cfg)?;
+        assert_eq!(experts.len(), 24);
+        assert!(experts[..20].iter().all(|e| e.storage == ExpertStorage::Nvfp4));
+        assert!(experts[20..].iter().all(|e| e.storage == ExpertStorage::Mxfp8));
+        Ok(())
+    }
+}

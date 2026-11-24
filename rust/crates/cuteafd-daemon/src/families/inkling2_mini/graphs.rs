@@ -161,5 +161,41 @@ pub(super) fn local<'a>(
     let Some(graphs) = graphs else {
         return work();
     };
+    // The router and MXFP8 wire quantizer do not touch the optional FIR replay backing.
+    let mode = if section == Section::Routes {
+        Mode::Decode
+    } else {
+        mode
+    };
     graphs.run(Key { visit, rows, section, mode }, stream, work)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mini_graph_key_distinguishes_all_three_loop_passes_rows_sections_and_verify() {
+        // Physical core layer 6 executes across three distinct visits (6, 18, 30) with
+        // different cache slots and cross-pass controller routes; none may alias.
+        let base = Key {
+            visit: 6,
+            rows: 4,
+            section: Section::VisitAttention,
+            mode: Mode::Decode,
+        };
+        assert_eq!(
+            HashSet::from([
+                base,
+                Key { visit: 18, ..base },
+                Key { visit: 30, ..base },
+                Key { rows: 8, ..base },
+                Key { section: Section::Routes, ..base },
+                Key { section: Section::VisitFinish, ..base },
+                Key { mode: Mode::Verify, ..base },
+            ])
+            .len(),
+            7
+        );
+    }
 }

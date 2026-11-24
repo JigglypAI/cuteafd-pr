@@ -25,7 +25,7 @@ use crate::plan::{
 
 mod placement;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub struct Inkling2Mini;
 pub static INKLING2_MINI: Inkling2Mini = Inkling2Mini;

@@ -97,6 +97,19 @@ fn mini_snapshot_tensors() -> Vec<(&'static str, String, Vec<usize>)> {
     out
 }
 
+pub(crate) fn mini_test_checkpoint() -> anyhow::Result<(crate::families::inkling2_mini::Inkling2MiniConfig, tempfile::TempDir, crate::plan::Checkpoint)> {
+    let dir = tempfile::tempdir()?;
+    let raw = mini_snapshot_tensors();
+    let specs: Vec<_> = raw
+        .iter()
+        .map(|(dtype, name, shape)| t(name.clone(), dtype, shape))
+        .collect();
+    write_snapshot(dir.path(), &release_config(), &specs, None);
+    let checkpoint = crate::plan::Checkpoint::open(dir.path())?;
+    let cfg = crate::families::inkling2_mini::Inkling2MiniConfig::from_hf(&checkpoint.config)?;
+    Ok((cfg, dir, checkpoint))
+}
+
 #[test]
 fn mini_plan_detects_classifies_and_accepts_every_tensor() {
     let dir = tempfile::tempdir().unwrap();
