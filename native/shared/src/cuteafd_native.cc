@@ -2013,23 +2013,54 @@ struct GraphSource {
   std::vector<uint64_t> signature;
   ~GraphSource() { if (graph) cuteafd::diagnostic_cuda(cudaGraphDestroy(graph)); }
 };
-// Exact census signature: ordered node kinds/function identities and sorted,
-// annotated edges. Only kernels can transfer: updating every kernel parameter
-// replaces every captured pointer, with no host/allocation/memcpy state retained.
+// Exact census signature: ordered node kinds/identities and sorted, annotated
+// edges. Kernel nodes and 1D same-device D2D memcpy nodes can transfer:
+// cudaGraphExecUpdate rewrites every kernel parameter and D2D memcpy pointer
+// with no host, peer, allocation or multidimensional state retained.
 std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
   std::vector<cudaGraphNode_t> nodes(count);
   if (cuteafd::diagnostic_cuda(cudaGraphGetNodes(graph, nodes.data(), &count)) != cudaSuccess) return {};
+  int current_device = -1;
+  bool have_device = false;
   std::vector<uint64_t> signature{count};
   std::unordered_map<cudaGraphNode_t, size_t> indices;
   for (size_t n = 0; n < count; ++n) {
     cudaGraphNodeType kind;
-    if (cuteafd::diagnostic_cuda(cudaGraphNodeGetType(nodes[n], &kind)) != cudaSuccess ||
-        kind != cudaGraphNodeTypeKernel) return {};
-    CUDA_KERNEL_NODE_PARAMS params{};
-    if (cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(nodes[n]), &params) != CUDA_SUCCESS ||
-        !params.func) return {};
-    signature.push_back(static_cast<uint64_t>(kind));
-    signature.push_back(reinterpret_cast<uintptr_t>(params.func));
+    if (cuteafd::diagnostic_cuda(cudaGraphNodeGetType(nodes[n], &kind)) != cudaSuccess) return {};
+    if (kind == cudaGraphNodeTypeKernel) {
+      CUDA_KERNEL_NODE_PARAMS params{};
+      if (cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(nodes[n]), &params) != CUDA_SUCCESS ||
+          !params.func) return {};
+      signature.push_back(static_cast<uint64_t>(kind));
+      signature.push_back(reinterpret_cast<uintptr_t>(params.func));
+    } else if (kind == cudaGraphNodeTypeMemcpy) {
+      cudaMemcpy3DParms params{};
+      if (cuteafd::diagnostic_cuda(cudaGraphMemcpyNodeGetParams(nodes[n], &params)) != cudaSuccess) return {};
+      if (params.srcArray || params.dstArray ||
+          !params.srcPtr.ptr || !params.dstPtr.ptr ||
+          params.srcPtr.pitch != 0 || params.dstPtr.pitch != 0 ||
+          params.srcPos.x != 0 || params.srcPos.y != 0 || params.srcPos.z != 0 ||
+          params.dstPos.x != 0 || params.dstPos.y != 0 || params.dstPos.z != 0 ||
+          params.extent.width == 0 || params.extent.height > 1 || params.extent.depth > 1 ||
+          (params.kind != cudaMemcpyDeviceToDevice && params.kind != cudaMemcpyDefault)) return {};
+      if (!have_device) {
+        if (cuteafd::diagnostic_cuda(cudaGetDevice(&current_device)) != cudaSuccess || current_device < 0) return {};
+        have_device = true;
+      }
+      cudaPointerAttributes src_attr{}, dst_attr{};
+      if (cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&src_attr, params.srcPtr.ptr)) != cudaSuccess ||
+          cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&dst_attr, params.dstPtr.ptr)) != cudaSuccess) return {};
+      if (src_attr.type != cudaMemoryTypeDevice || dst_attr.type != cudaMemoryTypeDevice ||
+          src_attr.device != current_device || dst_attr.device != current_device) return {};
+      // Omit 1D extent.width from the signature (matching kernel nodes omitting
+      // gridDim/rows): cudaGraphExecUpdate updates 1D same-device D2D pointers
+      // and byte counts in place across different batch row counts.
+      signature.push_back(static_cast<uint64_t>(kind));
+      signature.push_back(static_cast<uint64_t>(cudaMemcpyDeviceToDevice));
+      signature.push_back(static_cast<uint64_t>(src_attr.device));
+    } else {
+      return {};
+    }
     indices[nodes[n]] = n;
   }
   size_t capacity = std::max(size_t(1), count);

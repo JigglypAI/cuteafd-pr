@@ -2853,6 +2853,101 @@ void test_cuda_graph_source_transfer_rewrites_all_kernel_pointers() {
   free_buffer(&new_input); free_buffer(&new_output);
 }
 
+void test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers() {
+  constexpr size_t count = 5120, bytes = count * sizeof(uint16_t);
+  auto old_in = device_buffer(bytes), old_mid = device_buffer(bytes);
+  auto old_staged = device_buffer(bytes), old_out = device_buffer(bytes);
+  auto new_in = device_buffer(bytes), new_mid = device_buffer(bytes);
+  auto new_staged = device_buffer(bytes), new_out = device_buffer(bytes);
+  std::vector<uint16_t> donor_vals(count, 0x3f80), target_vals(count);
+  for (size_t i = 0; i < count; ++i) target_vals[i] = static_cast<uint16_t>(0x3c00 + (i & 0x3ff));
+  copy_h2d(old_in, donor_vals);
+  copy_h2d(new_in, target_vals);
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "d2d transfer stream");
+  auto record = [&](cuteafd_device_buffer_t in, cuteafd_device_buffer_t mid,
+                    cuteafd_device_buffer_t staged, cuteafd_device_buffer_t out, size_t copy_bytes) {
+    const uint16_t* in_planes[8] = {static_cast<const uint16_t*>(in.ptr)};
+    const uint16_t* staged_planes[8] = {static_cast<const uint16_t*>(staged.ptr)};
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        in_planes, nullptr, static_cast<uint16_t*>(mid.ptr), 1, 1, stream)), "d2d transfer kernel 1");
+    require_status(cuteafd_copy_d2d_async(staged, mid, copy_bytes, stream), "d2d transfer copy");
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        staged_planes, nullptr, static_cast<uint16_t*>(out.ptr), 1, 1, stream)), "d2d transfer kernel 2");
+  };
+  record(old_in, old_mid, old_staged, old_out, bytes);
+  record(new_in, new_mid, new_staged, new_out, bytes);
+  require_cuda(cudaStreamSynchronize(stream), "d2d transfer warmup");
+  size_t nodes = 0, width = 0, words = 0;
+  int spans = 0;
+  const uint64_t* signature = nullptr;
+  void *first = nullptr, *second = nullptr, *smaller = nullptr, *h2d_src = nullptr;
+  void *donor = nullptr, *receiver = nullptr;
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d transfer first begin");
+  record(old_in, old_mid, old_staged, old_out, bytes);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words), "d2d transfer first source");
+  assert(nodes == 3 && spans == 0 && words != 0);
+  const std::vector<uint64_t> expected(signature, signature + words);
+  require_status(cuteafd_cuda_graph_source_instantiate(first, stream, &donor), "d2d transfer instantiate");
+  require_cuda(cudaStreamSynchronize(stream), "d2d transfer upload complete");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d transfer second begin");
+  record(new_in, new_mid, new_staged, new_out, bytes);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &second, &nodes, &width, &spans, &signature, &words), "d2d transfer second source");
+  assert(nodes == 3 && spans == 0 && expected == std::vector<uint64_t>(signature, signature + words));
+  int status = -1, result = -1;
+  require_status(cuteafd_cuda_graph_source_update(second, donor, &status, &result), "d2d transfer update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(second, donor, &receiver), "d2d transfer owner");
+  require_status(cuteafd_cuda_graph_upload(receiver, stream), "d2d transfer upload");
+  require_status(cuteafd_cuda_graph_source_destroy(first), "d2d transfer first destroy");
+  require_status(cuteafd_cuda_graph_source_destroy(second), "d2d transfer second destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(donor), "d2d transfer old handle destroy");
+  // Free every donor buffer before launching receiver to prove all memcpy and kernel pointers updated.
+  free_buffer(&old_in); free_buffer(&old_mid); free_buffer(&old_staged); free_buffer(&old_out);
+  require_cuda(cudaMemset(new_mid.ptr, 0, bytes), "d2d reset mid");
+  require_cuda(cudaMemset(new_staged.ptr, 0, bytes), "d2d reset staged");
+  require_cuda(cudaMemset(new_out.ptr, 0, bytes), "d2d reset out");
+  require_status(cuteafd_cuda_graph_launch(receiver, stream), "d2d transfer launch");
+  require_cuda(cudaStreamSynchronize(stream), "d2d transfer completion");
+  assert(copy_d2h<uint16_t>(new_staged, count) == target_vals);
+  assert(copy_d2h<uint16_t>(new_out, count) == target_vals);
+  // Cross-size 1D D2D donor update (shrink bytes -> bytes/2, then grow back) must match signature
+  // and preserve exact byte-identity without touching bytes past the updated copy extent.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "d2d smaller begin");
+  record(new_in, new_mid, new_staged, new_out, bytes / 2);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &smaller, &nodes, &width, &spans, &signature, &words), "d2d smaller source");
+  assert(nodes == 3 && spans == 0 && expected == std::vector<uint64_t>(signature, signature + words));
+  status = -1; result = -1;
+  require_status(cuteafd_cuda_graph_source_update(smaller, receiver, &status, &result), "d2d shrink update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  void* shrunk = nullptr;
+  require_status(cuteafd_cuda_graph_source_transfer(smaller, receiver, &shrunk), "d2d shrink transfer");
+  require_status(cuteafd_cuda_graph_upload(shrunk, stream), "d2d shrink upload");
+  require_status(cuteafd_cuda_graph_source_destroy(smaller), "d2d smaller destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(receiver), "d2d transfer receiver destroy");
+  std::vector<uint16_t> sentinel(count, 0x3e00);
+  copy_h2d(new_staged, sentinel);
+  require_status(cuteafd_cuda_graph_launch(shrunk, stream), "d2d shrink launch");
+  require_cuda(cudaStreamSynchronize(stream), "d2d shrink completion");
+  auto staged_after = copy_d2h<uint16_t>(new_staged, count);
+  for (size_t i = 0; i < count / 2; ++i) assert(staged_after[i] == target_vals[i]);
+  for (size_t i = count / 2; i < count; ++i) assert(staged_after[i] == 0x3e00);
+  require_status(cuteafd_cuda_graph_exec_destroy(shrunk), "d2d shrunk destroy");
+  // Non-D2D memcpy (H2D) must remain non-transferable.
+  void* host_pinned = nullptr;
+  require_cuda(cudaMallocHost(&host_pinned, bytes), "d2d test pinned host");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "h2d non-transferable begin");
+  require_cuda(cudaMemcpyAsync(new_mid.ptr, host_pinned, bytes, cudaMemcpyHostToDevice, stream), "h2d copy 1");
+  require_cuda(cudaMemcpyAsync(new_staged.ptr, host_pinned, bytes, cudaMemcpyHostToDevice, stream), "h2d copy 2");
+  require_cuda(cudaMemcpyAsync(new_out.ptr, host_pinned, bytes, cudaMemcpyHostToDevice, stream), "h2d copy 3");
+  require_status(cuteafd_cuda_graph_capture_source(stream, &h2d_src, &nodes, &width, &spans, &signature, &words), "h2d source");
+  assert(nodes == 3 && words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(h2d_src), "h2d source destroy");
+  require_cuda(cudaFreeHost(host_pinned), "d2d test free pinned");
+  require_cuda(cudaStreamDestroy(stream), "d2d transfer stream destroy");
+  free_buffer(&new_in); free_buffer(&new_mid); free_buffer(&new_staged); free_buffer(&new_out);
+}
+
 void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
   constexpr size_t bytes = 5120 * sizeof(uint16_t);
   auto input = device_buffer(bytes);
@@ -3320,7 +3415,8 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-transfer-only") == 0) {
     test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
-    std::cout << "test result: ok. 1 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
+    std::cout << "test result: ok. 2 passed; 0 failed\n";
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-update-probe-only") == 0) {
@@ -3332,7 +3428,8 @@ int main(int argc, char** argv) {
     test_cuda_graph_topology_chain_and_fork();
     test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
     test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
-    std::cout << "test result: ok. 4 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
+    std::cout << "test result: ok. 5 passed; 0 failed\n";
     return 0;
   }
   test_peer_copy_optional_query_failure_is_recoverable();
@@ -3386,6 +3483,7 @@ int main(int argc, char** argv) {
   test_cuda_graph_topology_chain_and_fork();
   test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
   test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
+  test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();
