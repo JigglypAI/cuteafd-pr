@@ -82,7 +82,8 @@ def main():
                           for i in range(0, cfg.num_hidden_layers, 2)})
     model, info = Inkling2LoopForConditionalGeneration.from_pretrained(
         a.snapshot, config=config, dtype=torch.float32, device_map=placement,
-        offload_folder=offload, local_files_only=True, attn_implementation="eager", output_loading_info=True)
+        offload_folder=offload, local_files_only=True, attn_implementation="eager",
+        experts_implementation="eager", output_loading_info=True)
     if any(info.get(k) for k in ("missing_keys", "mismatched_keys", "error_msgs", "conversion_errors")):
         raise ValueError(f"HF didn't load the checkpoint: {info}")
     model.eval()
