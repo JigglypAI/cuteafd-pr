@@ -233,25 +233,25 @@ mod add_tests {
 }
 
 type PeerCopyFn = unsafe extern "C" fn(*mut c_void,*const c_void,u64,*mut c_void)->i32;
-/// SM-issued peer copy, avoiding DMA queue coupling across lane-local event waits.
+/// Generic SM-issued 1D/2D device row-copy kernel (`cuteafd_peer_copy_*`), avoiding DMA queue
+/// coupling across lane-local event waits and keeping captured CUDA graphs kernel-only.
 type PeerRowsFn = unsafe extern "C" fn(*mut c_void,*const c_void,u64,u64,u64,u64,*mut c_void)->i32;
-pub struct V41PeerCopy<'a> { _library: &'a NativeLibrary, launch: PeerCopyFn, rows: PeerRowsFn }
-/// Neutral shared alias for the generic SM 1D/2D row-copy kernel (`cuteafd_peer_copy_*`),
-/// used by families to keep captured CUDA graphs kernel-only without depending on a V4.1 name.
-pub type DeviceRowCopy<'a> = V41PeerCopy<'a>;
+pub struct DeviceRowCopy<'a> { _library: &'a NativeLibrary, launch: PeerCopyFn, rows: PeerRowsFn }
+/// Compatibility alias for V4.1 and existing callers; physically identical to [`DeviceRowCopy`].
+pub type V41PeerCopy<'a> = DeviceRowCopy<'a>;
 impl NativeLibrary {
-    pub fn v41_peer_copy(&self) -> Result<V41PeerCopy<'_>> {
+    pub fn device_row_copy(&self) -> Result<DeviceRowCopy<'_>> {
         let initialize=unsafe { *self.lib.get::<unsafe extern "C" fn()->i32>(b"cuteafd_peer_copy_initialize")? };
         ensure!(unsafe { initialize() }==0,"peer copy initialization failed");
-        Ok(V41PeerCopy { _library:self,launch:unsafe { *self.lib.get(b"cuteafd_peer_copy_async")? },
+        Ok(DeviceRowCopy { _library:self,launch:unsafe { *self.lib.get(b"cuteafd_peer_copy_async")? },
             rows:unsafe { *self.lib.get(b"cuteafd_peer_copy_rows_async")? } })
     }
 
-    pub fn device_row_copy(&self) -> Result<DeviceRowCopy<'_>> {
-        self.v41_peer_copy()
+    pub fn v41_peer_copy(&self) -> Result<V41PeerCopy<'_>> {
+        self.device_row_copy()
     }
 }
-impl V41PeerCopy<'_> {
+impl DeviceRowCopy<'_> {
     /// Interleave independent BF16 gate/up planes on one serialized stream.
     /// The caller retains allocation owners until the stream drains.
     pub fn interleave_bf16(&self, destination:CuteafdDeviceBuffer,gate:CuteafdDeviceBuffer,
@@ -324,7 +324,7 @@ mod draft_failure_tests {
         let library = crate::tests::draft_failure_library()?;
         unsafe extern "C" fn launch(_: *mut c_void, _: *const c_void, _: u64, _: *mut c_void) -> i32 { 98 }
         unsafe extern "C" fn rows(_: *mut c_void, _: *const c_void, _: u64, _: u64, _: u64, _: u64, _: *mut c_void) -> i32 { 98 }
-        let copy = V41PeerCopy { _library: &library, launch, rows };
+        let copy = DeviceRowCopy { _library: &library, launch, rows };
         let b = CuteafdDeviceBuffer { ptr: std::ptr::NonNull::<u16>::dangling().as_ptr().cast(),
             bytes: 16, device_id: 0, flags: 0 };
         // SAFETY: the injected entry points do not dereference synthetic buffers.

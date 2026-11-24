@@ -25,7 +25,7 @@ pub mod exlr8;
 pub mod dense_trellis;
 pub(crate) mod l2_prefetch;
 pub mod peer_exchange;
-pub(crate) mod v41_device_ops;
+pub(crate) mod device_ops;
 pub(crate) mod v41_exl3;
 pub(crate) mod v41_exl3_wire;
 pub(crate) mod v41_experts;

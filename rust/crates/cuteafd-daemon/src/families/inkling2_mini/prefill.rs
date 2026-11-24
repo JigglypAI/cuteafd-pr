@@ -325,54 +325,24 @@ impl Stateful<'_, '_> {
                 units.len() == 1 && self.owners.len() == 1 && units[0].slot == 0,
                 "Inkling 2 Mini graphed step requires one single-slot decode/verify unit"
             );
-            let unit = &units[0];
-            let owner = &self.owners[0];
-            let uploads = &mut self.uploads[0];
-            self.io.begin(unit, owner, uploads)?;
-            let packed = build_packed_members(self.cfg, self.cache, self.placements, unit)?;
-            owner.packed_metadata(self.cache, &packed, uploads)?;
-            let rows = unit.rows.len();
-            let mode = if owner.replaying() {
-                Mode::Verify
-            } else {
-                Mode::Decode
+            let mut ops = StatefulOps {
+                kernels: self.kernels,
+                target: self.target,
+                local: self.local,
+                io: self.io,
             };
-            let has_taps = self.io.has_taps();
-            let visits = self.visits;
-            let kernels = self.kernels;
-            let cache = self.cache;
-            let target = self.target;
-            let cfg = self.cfg;
-            let local = self.local;
-            let io = &mut self.io;
-            graphs::step(self.graphs.as_deref_mut(), &owner.stream, rows, mode, has_taps, || {
-                for (visit_idx, &visit) in visits.iter().enumerate() {
-                    io.tap(visit_idx, unit, owner)?;
-                    let state = PackedVisitUnit {
-                        unit: owner,
-                        cache,
-                        cache_slot: visit.cache_slot,
-                        members: &packed,
-                    };
-                    layers::begin_visit(kernels, &state, target, cfg, visit, rows)?;
-                    let experts = local[visit.layer].as_ref();
-                    layers::prepare_routes(kernels, owner, target, experts, visit.layer, rows)?;
-                    layers::dispatch_experts(owner, experts, rows)?;
-                    layers::join_visit(kernels, &state, target, cfg, visit, rows)?;
-                }
-                Ok(())
-            })?;
-            self.io.end(unit, owner)?;
-            for member in members(unit) {
-                let placement = &mut self.placements[member.sequence];
-                ensure!(
-                    placement.state_len == member.tokens.start,
-                    "Inkling 2 Mini causal commit is out of order"
-                );
-                placement.state_len = member.tokens.end;
-                placement.len = member.tokens.end;
-            }
-            return Ok(());
+            return run_monolithic_step(
+                self.graphs.as_deref_mut(),
+                self.cfg,
+                self.visits,
+                &self.owners[0],
+                self.cache,
+                self.placements,
+                &mut self.uploads[0],
+                &units[0],
+                ops.io.has_taps(),
+                &mut ops,
+            );
         }
 
         let waves = self.owners.len();
@@ -393,6 +363,54 @@ impl Stateful<'_, '_> {
         };
         run_prefill_units(&mut prepared, units, waves)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_monolithic_step<'a, O: VisitOps<'a>>(
+    graphs: Option<&mut DecodeGraphs<'a>>,
+    cfg: &Inkling2MiniConfig,
+    visits: &[LoopVisit],
+    owner: &UnitOwner<'a>,
+    cache: &super::cache::CacheBank<'a>,
+    placements: &mut [super::cache::Placement],
+    uploads: &mut crate::shared::token_table::RetainedUploads<'a>,
+    unit: &Unit,
+    has_taps: bool,
+    ops: &mut O,
+) -> Result<()> {
+    ops.begin_io(unit, owner, uploads)?;
+    let packed = build_packed_members(cfg, cache, placements, unit)?;
+    owner.packed_metadata(cache, &packed, uploads)?;
+    let rows = unit.rows.len();
+    let mode = if owner.replaying() {
+        Mode::Verify
+    } else {
+        Mode::Decode
+    };
+    graphs::step(graphs, &owner.stream, rows, mode, has_taps, || {
+        for (visit_idx, &visit) in visits.iter().enumerate() {
+            let state = PackedVisitUnit {
+                unit: owner,
+                cache,
+                cache_slot: visit.cache_slot,
+                members: &packed,
+            };
+            ops.attention(visit_idx, visit, unit, cfg, &state)?;
+            ops.local_ffn(visit_idx, visit, unit, cfg, &state)?;
+        }
+        Ok(())
+    })?;
+    ops.end_io(unit, owner)?;
+    for member in members(unit) {
+        let placement = &mut placements[member.sequence];
+        ensure!(
+            placement.state_len == member.tokens.start,
+            "Inkling 2 Mini causal commit is out of order"
+        );
+        placement.state_len = member.tokens.end;
+        placement.len = member.tokens.end;
+    }
+    Ok(())
 }
 
 trait VisitOps<'a> {
@@ -918,6 +936,258 @@ mod tests {
         }], HeadProjection::AllHeadRows, true)?;
         assert_eq!(norm_rows(&all_actions), 8);
         assert_eq!(proj_rows(&all_actions), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn monolithic_decode_graph_records_one_kernel_only_graph_invariant_to_prompt_length() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.configure_device_flags(&library, 0)?;
+        fixture.configure_memory_usage(&library, 0, 512 << 20, 0)?;
+        let device = Device {
+            library: &library,
+            id: 0,
+        };
+        let stream = Rc::new(Stream::new(device)?);
+        let cfg = test_config()?;
+        let all_visits = cfg.visits();
+        assert_eq!(all_visits.len(), 48);
+        let cache = super::super::cache::CacheBank::new(
+            vec![stream.clone()],
+            MiniCacheLayout::with_format(&cfg, 2, 512, InklingKvCache::Fp8)?,
+            0,
+        )?;
+        let mut owner = UnitOwner::new(
+            stream.clone(),
+            MiniUnitLayout::serving_decode(&cfg, 32_768, InklingKvCache::Fp8, 2)?,
+        )?;
+        owner.decode_attention = true;
+        let mut uploads = owner.uploads(&cfg, 2)?;
+        let policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0)?;
+        let mut graphs = DecodeGraphs::new_for_test(&stream, -270_101, policy)?;
+
+        // Structural guard: decode/verify captured paths must stay kernel-only (no captured
+        // `cudaMemcpyAsync` / `cudaMemsetAsync` nodes; experts and draft taps use `DeviceRowCopy`).
+        let code_only = |src: &str| -> String {
+            src.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let experts_code = code_only(include_str!("experts.rs"));
+        assert!(
+            !experts_code.contains("copy_d2d_async")
+                && !experts_code.contains("cuda_zero_bytes_async")
+                && experts_code.contains("launch_rows"),
+            "experts.rs must use shared DeviceRowCopy::launch_rows instead of memcpy/memset inside captured graphs"
+        );
+        let taps_entry_code = code_only(
+            include_str!("draft_taps.rs")
+                .split("pub fn final_norm")
+                .next()
+                .expect("draft_taps entry section"),
+        );
+        assert!(
+            !taps_entry_code.contains("copy_d2d_2d_async")
+                && !taps_entry_code.contains("cuda_zero_bytes_async")
+                && taps_entry_code.contains("launch_rows"),
+            "draft_taps::entry must use shared DeviceRowCopy::launch_rows inside captured graphs"
+        );
+
+        struct CaptureAuditOps<'f> {
+            fixture: &'f Fixture,
+            attention_visits: usize,
+            ffn_visits: usize,
+            captured_events: String,
+            first_visit_event_len: Option<usize>,
+        }
+        impl<'a> VisitOps<'a> for CaptureAuditOps<'_> {
+            fn begin_io(
+                &mut self,
+                unit: &Unit,
+                owner: &UnitOwner<'a>,
+                uploads: &mut crate::shared::token_table::RetainedUploads<'a>,
+            ) -> Result<()> {
+                let bytes = vec![0u8; unit.rows.len() * 4];
+                // SAFETY: matches embed_unit uploading token ids before graph capture.
+                unsafe {
+                    uploads.upload(owner.buffer("first")?, &bytes, owner.stream.raw)?;
+                }
+                Ok(())
+            }
+            fn attention(
+                &mut self,
+                visit_idx: usize,
+                _visit: LoopVisit,
+                _unit: &Unit,
+                _cfg: &Inkling2MiniConfig,
+                state: &PackedVisitUnit<'_, 'a>,
+            ) -> Result<()> {
+                if visit_idx == 0 {
+                    self.first_visit_event_len = Some(self.fixture.events()?.len());
+                }
+                assert!(state.decode_attention());
+                self.attention_visits += 1;
+                Ok(())
+            }
+            fn local_ffn(
+                &mut self,
+                visit_idx: usize,
+                _visit: LoopVisit,
+                _unit: &Unit,
+                _cfg: &Inkling2MiniConfig,
+                _state: &PackedVisitUnit<'_, 'a>,
+            ) -> Result<()> {
+                self.ffn_visits += 1;
+                if visit_idx == 47 {
+                    let all = self.fixture.events()?;
+                    let start = self.first_visit_event_len.unwrap_or(all.len());
+                    self.captured_events = all[start..].to_string();
+                }
+                Ok(())
+            }
+            fn end_io(&mut self, _unit: &Unit, _owner: &UnitOwner<'a>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run_step<'a>(
+            fixture: &Fixture,
+            library: &'a cuteafd_ffi::NativeLibrary,
+            cfg: &Inkling2MiniConfig,
+            all_visits: &[LoopVisit],
+            stream: &Stream<'a>,
+            cache: &super::super::cache::CacheBank<'a>,
+            owner: &UnitOwner<'a>,
+            graphs: &mut DecodeGraphs<'a>,
+            uploads: &mut crate::shared::token_table::RetainedUploads<'a>,
+            seq_specs: &[(usize, usize, usize)], // (slot, prompt_len, rows_in_step)
+            taps: bool,
+        ) -> Result<(usize, usize, usize, usize, usize, String)> {
+            let mut placements = Vec::new();
+            let mut segments = Vec::new();
+            let mut row_cursor = 0usize;
+            for (idx, &(slot, prompt_len, step_rows)) in seq_specs.iter().enumerate() {
+                let pages = (prompt_len + step_rows).div_ceil(64);
+                let page_base = (idx * 256) as u32;
+                placements.push(super::super::cache::Placement {
+                    units: (page_base..page_base + pages as u32).collect(),
+                    slot,
+                    len: prompt_len,
+                    state_len: prompt_len,
+                    media: None,
+                });
+                segments.push(UnitSegment {
+                    sequence: idx,
+                    rows: row_cursor..row_cursor + step_rows,
+                    tokens: prompt_len..prompt_len + step_rows,
+                    prompt_end: false,
+                    snapshot: false,
+                    head: true,
+                });
+                row_cursor += step_rows;
+            }
+            let unit = Unit {
+                index: 0,
+                sequence: 0,
+                segments,
+                rows: 0..row_cursor,
+                layers: 0..48,
+                slot: 0,
+                barrier: false,
+            };
+            let before = fixture.events()?;
+            let mut ops = CaptureAuditOps {
+                fixture,
+                attention_visits: 0,
+                ffn_visits: 0,
+                captured_events: String::new(),
+                first_visit_event_len: None,
+            };
+            run_monolithic_step(
+                Some(graphs),
+                cfg,
+                all_visits,
+                owner,
+                cache,
+                &mut placements,
+                uploads,
+                &unit,
+                taps,
+                &mut ops,
+            )?;
+            stream.drain()?;
+            if graphs.needs_boundary() {
+                // SAFETY: stream drained above.
+                unsafe {
+                    crate::shared::decode_graph::device::observe_completed(library, |visit| graphs.visit(visit))?;
+                }
+                graphs.observed();
+            } else {
+                graphs.tick();
+            }
+            let after = fixture.events()?;
+            let delta = &after[before.len()..];
+            let captures = delta.chars().filter(|&c| c == 'G').count();
+            let launches = delta.chars().filter(|&c| c == 'L').count();
+            let updates = delta.chars().filter(|&c| c == 'U').count();
+            Ok((captures, launches, updates, ops.attention_visits, ops.ffn_visits, ops.captured_events))
+        }
+
+        // 1. First touch at prompt_len=64, rows=4, taps=true: runs eagerly once to warm.
+        let (c1, l1, u1, av1, fv1, _) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 64, 4)], true,
+        )?;
+        assert_eq!((c1, l1, u1, av1, fv1), (0, 0, 0, 48, 48));
+
+        // 2. Capture pass at prompt_len=64, rows=4, taps=true:
+        //    EXACTLY ONE graph recorded for all 48 visits, launched once, ZERO memcpy/memset inside capture.
+        let (c2, l2, u2, av2, fv2, captured_body) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 64, 4)], true,
+        )?;
+        assert_eq!(c2, 1, "48-visit decode step must record exactly ONE monolithic graph");
+        assert_eq!(l2, 1, "captured monolithic graph must launch once per step");
+        assert_eq!(u2, 0);
+        assert_eq!((av2, fv2), (48, 48));
+        assert!(
+            !captured_body.chars().any(|c| matches!(c, 'C' | 'H' | 'D' | 'Z')),
+            "monolithic graph capture body must be kernel-only (no memcpy/memset); saw events: {captured_body:?}"
+        );
+
+        // 3. Replay at DIFFERENT prompt length (prompt_len=257, same rows=4, taps=true):
+        //    cache HIT (0 captures, 0 updates, 1 launch, 48-visit closure not re-run).
+        let (c3, l3, u3, av3, fv3, _) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 257, 4)], true,
+        )?;
+        assert_eq!((c3, l3, u3, av3, fv3), (0, 1, 0, 0, 0), "graph key must be invariant to prompt length");
+
+        // 4. Replay across two sequences with very different prompt lengths (16_384 and 512, total rows=4):
+        //    still a cache HIT (no per-request lengths in cache key).
+        let (c4, l4, u4, av4, fv4, _) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 16_384, 3), (1, 512, 1)], true,
+        )?;
+        assert_eq!((c4, l4, u4, av4, fv4), (0, 1, 0, 0, 0), "graph key must carry no per-request prompt lengths");
+
+        // 5. Different batch row count (rows=8) or different tap flag (taps=false) does NOT alias.
+        let (c5, l5, _, av5, _, _) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 257, 8)], true,
+        )?;
+        assert_eq!((c5, l5, av5), (0, 0, 48), "distinct row count must not alias cached rows=4 graph");
+        let (c6, l6, _, av6, _, _) = run_step(
+            &fixture, &library, &cfg, &all_visits, &stream, &cache, &owner, &mut graphs, &mut uploads,
+            &[(0, 257, 4)], false,
+        )?;
+        assert_eq!((c6, l6, av6), (0, 0, 48), "distinct taps flag must not alias cached taps=true graph");
+
+        graphs.clear_drained();
         Ok(())
     }
 }

@@ -66,6 +66,30 @@ impl<'a> DecodeGraphs<'a> {
         }))
     }
 
+    #[cfg(test)]
+    pub(super) fn new_for_test(stream: &Stream<'a>, synthetic_cache_device: i32, policy: Resolved) -> Result<Self> {
+        let mut bank = GraphBank::with_family("inkling2_mini");
+        bank.attach_device_for_test(
+            synthetic_cache_device,
+            policy.bytes,
+            Site {
+                name: "inkling2_mini.step",
+                cycle: Cycle::Decode,
+                preference: Preference::Adaptive,
+                bootstrap: 2 << 20,
+                basis: Basis::Bytes,
+                spans_devices: super::graph_sites::spans("inkling2_mini.step", false),
+            },
+        )?;
+        Ok(Self {
+            bank,
+            first_touched: HashSet::new(),
+            first_touch_pending: false,
+            unsupported: HashSet::new(),
+            device: stream.device.id,
+        })
+    }
+
     pub(super) fn cycle(&mut self, cycle: Cycle) {
         self.bank.cache_cycle(cycle);
     }
