@@ -12,7 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from golden import HF, open_snapshot, start_f32
-from families.inkling2.model import head_forward, quantize_mxfp8
+from families.inkling2.model import capped_swiglu, head_forward, quantize_mxfp8
+from shape_invariant import linear as fixed_linear
 from families.inkling2_mini.model import TEXT, Experts, forward, quantize_nvfp4
 
 PROMPTS = ["Explain why the sky looks blue at midday.",
@@ -20,15 +21,44 @@ PROMPTS = ["Explain why the sky looks blue at midday.",
            "Prove that the sum of the first n positive odd integers is n squared."]
 
 
-def native_expert_control(qdq):
+def unpack_hf_expert(layer, expert):
+    from transformers.core_model_loading import Inkling2LoopDequantizeExperts, Interleave
+
+    class F32Target:
+        def get_parameter(self, _name):
+            return torch.empty((), device="meta", dtype=torch.float32)
+
+    unpack = Inkling2LoopDequantizeExperts()
+    interleave = Interleave(dim=1)
+    matrices = []
+    for prefix in ("w13", "w2"):
+        key = f"mlp.experts.{prefix}_weight"
+        terms = {"packed": layer[key][expert:expert + 1],
+                 "scale": layer[key + "_scale"][expert:expert + 1]}
+        if terms["packed"].dtype == torch.uint8:
+            terms.update(amax=layer[key + "_amax"][expert:expert + 1],
+                         denominator=layer[key + "_outer_scale_denominator"])
+        projection = unpack.convert(terms, ("packed", "scale", "amax", "denominator"), ("out",),
+                                    model=F32Target(), full_layer_name="out")
+        if prefix == "w13":
+            projection = interleave.convert(projection, ("out",), ("out",))
+        matrices.append(projection["out"][0])
+    return matrices
+
+
+def native_expert_control(qdq, layer, observe=None):
     def run(self, hidden, ids, weights):
         result = torch.zeros_like(hidden, dtype=torch.float32)
         source = qdq(hidden)
         for i in ids.unique().tolist():
             row, slot = torch.where(ids == i)
-            gate_up = F.linear(source[row], self.gate_up_proj[i].float()).to(hidden.dtype).float()
-            y = self._apply_gate(gate_up) * weights[row, slot, None]
-            down = F.linear(qdq(y.to(hidden.dtype)), self.down_proj[i].float()).to(hidden.dtype)
+            up_weight, down_weight = unpack_hf_expert(layer, i)
+            gate_up = F.linear(source[row], up_weight).to(hidden.dtype).float()
+            y = (self._apply_gate(gate_up) * weights[row, slot, None]).to(hidden.dtype)
+            down_input = qdq(y)
+            down = F.linear(down_input, down_weight).to(hidden.dtype)
+            if observe is not None:
+                observe(i, row, source[row], gate_up, y, down_input, down)
             result.index_add_(0, row, down.float())
         return result.to(hidden.dtype)
     return run
@@ -71,25 +101,39 @@ def trace_comparison(path, model, weights, cfg, ids, oracle):
     # separate a real QDQ/weight discrepancy from upstream hidden drift.
     first = weights.load_layer(0)
     input_hf = hf[0, "expert_input"][0].to(weights.device)
-    matched = Experts(first, cfg)(input_hf).cpu()
-    expert = model.model.language_model.layers[0].mlp.experts
-    if hasattr(expert, "_hf_hook"):
-        expert._hf_hook.pre_forward(expert)
-    try:
-        e = Experts(first, cfg)
-        weight_witness = {}
-        for part, hf_w in enumerate((expert.gate_up_proj[0], expert.down_proj[0])):
-            source = e.weight(part, 0)
-            if part == 0:
-                source = torch.cat((source[::2], source[1::2]), dim=0)
-            weight_witness[str(part)] = {"hf_dtype": str(hf_w.dtype),
-                "max_abs_f32": (source - hf_w.float()).abs().max().item(),
-                "max_abs_if_rounded": (source.to(hf_w.dtype) - hf_w).abs().max().item()}
-    finally:
-        if hasattr(expert, "_hf_hook"):
-            expert._hf_hook.post_forward(expert, None)
-    out = {"visits": results, "first_expert_same_input": compare(matched.float(), hf[0, "expert_output"][0].float()),
-           "first_expert_weight": weight_witness}
+    native = Experts(first, cfg)
+    matched = native(input_hf).cpu()
+    hf_layer = model.model.language_model.layers[0].mlp
+    _, gamma, indices = hf_layer.gate(input_hf)
+    stages = {}
+
+    def compare_expert(e, rows, fc1_input, fc1_output, activation, fc2_input, fc2_output):
+        w13, w2 = native.decoded[e]
+        gamma_e = gamma[rows, (indices[rows] == e).long().argmax(-1)]
+        xq = native.qdq[0](input_hf)[rows]
+        z = fixed_linear(xq, w13).to(input_hf.dtype).float()
+        y = capped_swiglu(z, gamma_e, cfg.mlp_gate_softcap, cfg.mlp_up_softcap).to(input_hf.dtype)
+        yq = native.qdq[1](y)
+        down = fixed_linear(yq, w2).to(input_hf.dtype)
+        z = torch.cat((z[:, ::2], z[:, 1::2]), -1)
+        for name, left, right in zip(("fc1_input", "fc1_output", "activation", "fc2_input", "fc2_output"),
+                                    (xq, z, y, yq, down),
+                                    (fc1_input, fc1_output, activation, fc2_input, fc2_output), strict=True):
+            stat = stages.setdefault(name, {"max_abs": 0., "different_elements": 0})
+            stat["max_abs"] = max(stat["max_abs"], (left.float() - right.float()).abs().max().item())
+            stat["different_elements"] += int((left != right).count_nonzero())
+
+    replay = native_expert_control(quantize_nvfp4, first, compare_expert)(
+        hf_layer.experts, input_hf, indices, gamma).cpu()
+    weight_witness = {}
+    for part, exact in enumerate(unpack_hf_expert(first, 0)):
+        source = native.weight(part, 0)
+        if part == 0:
+            source = torch.cat((source[::2], source[1::2]), dim=0)
+        weight_witness[str(part)] = {"native_converter_max_abs": (source - exact).abs().max().item()}
+    out = {"visits": results, "first_expert_same_input": compare(matched.float(), replay.float()),
+           "first_expert_replay_vs_trace": compare(replay.float(), hf[0, "expert_output"][0].float()),
+           "first_expert_same_input_stages": stages, "first_expert_weight": weight_witness}
     path.write_text(json.dumps(out, indent=2) + "\n")
     torch.save({"oracle": oracle, "hf": hf}, path.with_suffix(".pt"))
 
@@ -177,7 +221,8 @@ def main():
         fmt = weights.formats[TEXT + f"layers.{i}.mlp.experts.w13_weight"]
         qdq = quantize_nvfp4 if fmt == "nvfp4" else quantize_mxfp8
         expert = layer.mlp.experts
-        implementation = MethodType(native_expert_control(qdq), expert)
+        packed = {k: v for k, v in weights.load_layer(i).items() if k.startswith("mlp.experts.")}
+        implementation = MethodType(native_expert_control(qdq, packed), expert)
         if hasattr(expert, "_hf_hook"):
             expert._old_forward = implementation
         else:
@@ -195,7 +240,7 @@ def main():
                "hf_stock_cached_last": cached}
               for text, ours, adapted, raw, no_qdq, cached in zip(PROMPTS[:len(batches)], native, matched, stock, unquantized,
                                                                 cache_evidence, strict=True)]
-    result = {"comparison": "Stock HF dequantizes the experts and does not QDQ their activations; matched control replaces the expert forward with native QDQ and upcasts the head. Dense compute is BF16 with HF F32 islands.",
+    result = {"comparison": "Stock HF dequantizes the experts and does not QDQ their activations; matched control decodes original packed experts to F32 with HF's converter, applies native activation QDQ, and upcasts the head. Dense compute is BF16 with HF F32 islands.",
               "upstream": HF, "revision": a.snapshot.name, "prompts": checks,
               "passed": all(c["native_vs_hf_qdq_control"]["max_abs"] <= .25
                             and c["native_vs_hf_qdq_control"]["top1_equal"] == c["native_vs_hf_qdq_control"]["rows"]
