@@ -3679,8 +3679,8 @@ fn drafter_report_matches_the_selected_head_split() -> anyhow::Result<()> {
         if split { owners.push(owner(1, 130)); }
         let layout = report::admitted(Kind::Dflash2, dflash_placement(split), 0, &[4, 7], &plan(owners))?;
         assert_eq!(layout.placement, Some(if split { Placement::Split } else { Placement::Whole }));
-        assert_eq!(layout.ranks, if split { vec![Rank::Gpu(4), Rank::Gpu(7)] } else { vec![Rank::Gpu(4)] });
-        assert_eq!(layout.lead, Some(Rank::Gpu(4)));
+        assert_eq!(layout.ranks, if split { vec![Rank::CudaRank(4), Rank::CudaRank(7)] } else { vec![Rank::CudaRank(4)] });
+        assert_eq!(layout.lead, Some(Rank::CudaRank(4)));
     }
     Ok(())
 }

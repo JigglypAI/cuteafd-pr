@@ -525,9 +525,9 @@ function tableFor(id, comparedResult = null) {
     const drafter = report.server.drafter;
     const kind = { none: 'none', dflash2: 'DFlash2', dspark: 'dSpark', mtp: 'MTP', dfly2: 'DFly2' };
     const placement = { whole: 'whole on', split: 'split over', 'paired-block': 'paired-block over', remote: 'remote on' };
-    const rank = (r) => r.gpu != null ? `GPU${r.gpu}` : `Spark${r.spark}`;
+    const rank = (r) => r.cuda_rank != null ? `GPU rank ${r.cuda_rank}` : `Spark${r.spark}`;
     const layout = !drafter ? '' : drafter.kind === 'none' ? 'none' :
-      `${kind[drafter.kind] || drafter.kind} ${placement[drafter.placement]} ${drafter.ranks.map(rank).join('+')}`
+      `${kind[drafter.kind] || drafter.kind} ${placement[drafter.placement]} ${drafter.ranks.map(rank).join(' + ')}`
       + ` (lead ${rank(drafter.lead)}), ${drafter.arena_bytes.map(b => (b / 1e9).toFixed(2)).join(' / ')} GB`;
     return (layout ? `<p class="note">Drafter: ${fmt.esc(layout)}</p>` : '')
       + tableHtml(['tensor group', 'formats'], (c.quant || []).map((q) => [q.group, q.formats.join(' + ')]))

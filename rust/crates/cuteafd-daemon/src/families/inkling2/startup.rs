@@ -289,10 +289,8 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
                 rank.rank.rank,rank.rank.ranks,rank.rank.lead)?;
             rank.buffers.extend(projection);
         }
-        use crate::shared::draft::report::{self, Kind, Placement};
-        let lead = u8::try_from(layout.runtime.first().context("Inkling admitted draft ranks")?.rank.lead)?;
-        let placement = if layout.runtime.len() == 1 { Placement::Whole } else { Placement::Split };
-        report::publish(report::admitted(Kind::Dspark, placement, lead, &physical, &admitted.solved)?);
+        let shape = layout.runtime.first().context("Inkling admitted draft ranks")?.rank;
+        crate::shared::draft::report::publish(drafter_report(shape.ranks, shape.lead, &physical, &admitted.solved)?);
         let streams=std::iter::once(stream.clone()).chain(peer_stream.clone()).collect();
         execution.draft=Some(std::rc::Rc::new(super::draft::Binding::new(programs,streams,draft_weights,layout,
             &admitted.solved,execution.target.projection("model.llm.unembed.weight")?,
@@ -371,4 +369,22 @@ mod tests {
         assert!(source.contains("spark.start_with(options.peers, Some(membership))"));
         assert!(source.contains("target.finish(&catalog, pending)"));
     }
+}
+
+fn drafter_report(ranks: usize, lead: usize, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let placement = if ranks == 1 { Placement::Whole } else { Placement::Split };
+    report::admitted(Kind::Dspark, placement, u8::try_from(lead)?, devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn inkling_reports_recurrent_draft_rank_shape() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let admitted = plan(vec![owner(0, 2048), owner(1, 1024)]);
+    let split = drafter_report(2, 0, &[4, 6], &admitted)?;
+    assert_eq!((split.kind, split.placement, split.lead), (Kind::Dspark, Some(Placement::Split), Some(Rank::CudaRank(4))));
+    assert_eq!(split.arena_bytes, [2048, 1024]);
+    assert_eq!(drafter_report(1, 0, &[4], &admitted)?.placement, Some(Placement::Whole));
+    Ok(())
 }

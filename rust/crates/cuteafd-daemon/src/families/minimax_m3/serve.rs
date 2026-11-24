@@ -140,10 +140,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 usage_reader: worker_args.expert_usage_reader.clone(),
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
             if loaded.owners.storage.draft_prefix.is_some() {
-                use crate::shared::draft::report::{self, Kind, Placement};
                 let physical = std::iter::once(worker_args.device).chain(worker_args.split_device).collect::<Vec<_>>();
-                let lead = u8::try_from(physical.len() - 1)?;
-                report::publish(report::admitted(Kind::Dspark, Placement::Whole, lead, &physical, &loaded.admitted.solved)?);
+                crate::shared::draft::report::publish(drafter_report(&physical, &loaded.admitted.solved)?);
             }
             let served_context = usize::try_from(loaded.admitted.solved.served_context())?;
             let backend = super::backend::MiniMaxBackend::new(&loaded.owners, &cfg,
@@ -259,4 +257,22 @@ mod tests {
         })
     }
 
+}
+
+fn drafter_report(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let lead = plan.decisions.draft_home.context("MiniMax admitted draft head absent")?;
+    report::admitted(Kind::Dspark, Placement::Whole, lead, devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn minimax_reports_whole_dspark_on_the_admitted_head() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let mut admitted = plan(vec![owner(1, 4096)]);
+    admitted.decisions.draft_home = Some(1);
+    let layout = drafter_report(&[4, 7], &admitted)?;
+    assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Dspark, Some(Placement::Whole), Some(Rank::CudaRank(7))));
+    assert_eq!(layout.arena_bytes, [4096]);
+    Ok(())
 }

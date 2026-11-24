@@ -303,6 +303,15 @@ mod tests {
                 drafter: served_drafter, media: None })
             })?;
             assert_eq!(report.phase_ledger.as_ref().context("solved ledger")?.pool_policy, live.solved.pool_policy);
+            let draft_report = super::super::serve::drafter_report(&live, &[6, 4])?;
+            assert_eq!(draft_report.is_some(), drafter.is_some(), "{label}");
+            if let Some(layout) = draft_report {
+                use crate::shared::draft::report::{Kind, Placement, Rank};
+                assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Dflash2,
+                    Some(if tp2 { Placement::Split } else { Placement::Whole }), Some(Rank::CudaRank(4))), "{label}");
+                assert_eq!(layout.ranks.len(), if tp2 { 2 } else { 1 });
+            }
+
             let live = without_sampled_baseline(live.placement, arch.context_bytes);
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {

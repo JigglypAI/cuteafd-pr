@@ -248,9 +248,8 @@ impl<'a> DenseEngine<'a> {
             ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&admitted_plan))?,
             "dense Qwen admitted phase ledger");
         if let (Some(kind), true) = (draft_kind, serving.is_some()) {
-            use crate::shared::draft::report::{self, Placement};
             let physical = std::iter::once(device.id).chain(peer_programs.map(|(peer, _)| peer.id)).collect::<Vec<_>>();
-            report::publish(report::admitted(kind, Placement::Whole, 0, &physical, &admitted_plan)?);
+            crate::shared::draft::report::publish(draft_report(kind, &physical, &admitted_plan)?);
         }
         cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "qwen3_5");
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
@@ -730,4 +729,22 @@ impl Drop for DenseEngine<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.drain(), "dense Qwen execution owners");
     }
+}
+
+fn draft_report(kind: crate::shared::draft::report::Kind, devices: &[i32],
+    plan: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Placement};
+    report::admitted(kind, Placement::Whole, 0, devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn dense_qwen_draft_stays_whole_when_target_layers_split() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    for kind in [Kind::Dspark, Kind::Mtp] {
+        let layout = draft_report(kind, &[5, 4], &plan(vec![owner(0, 1024)]))?;
+        assert_eq!((layout.kind, layout.placement, layout.lead), (kind, Some(Placement::Whole), Some(Rank::CudaRank(5))));
+        assert_eq!(layout.ranks, [Rank::CudaRank(5)]);
+    }
+    Ok(())
 }

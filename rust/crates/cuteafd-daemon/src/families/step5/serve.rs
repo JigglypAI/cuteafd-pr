@@ -602,14 +602,39 @@ pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item
 
 fn mtp_report(ids: &[i32], admission: &cuteafd_loader::placement::families::step5::Admission, sequences: usize)
     -> Result<crate::shared::draft::report::DrafterLayout> {
-    use crate::shared::draft::report::{self, Kind, Placement};
     let head = admission.ownership.execution().spec().head_gpu;
-    let state = &admission.cache.ranks[usize::from(head)];
+    mtp_layout(ids, head, &admission.cache, &admission.solved, sequences)
+}
+
+fn mtp_layout(ids: &[i32], head: u8, cache: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
+    plan: &cuteafd_loader::placement::planner::ResolvedPlan, sequences: usize)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let state = &cache.ranks[usize::from(head)];
     let first = state.sliding.iter().find(|ring| ring.mtp).context("Step-5 missing admitted MTP rings")?;
-    let mut layout = report::admitted(Kind::Mtp, Placement::Whole, head, ids, &admission.solved)?;
+    let mut layout = report::admitted(Kind::Mtp, Placement::Whole, head, ids, plan)?;
     let active = (state.bytes - first.key.offset).checked_mul(sequences as u64).context("Step-5 MTP state overflow")?;
     layout.arena_bytes[0] = layout.arena_bytes[0].checked_add(active).context("Step-5 MTP report overflow")?;
     Ok(layout)
+}
+
+#[cfg(test)]
+#[test]
+fn step5_mtp_report_uses_the_predictor_head_and_cache() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    use cuteafd_loader::{plan::testing::{step5_fixture, write_snapshot}, serving_capacity::step5::Step5CacheLayout};
+    let root = tempfile::tempdir()?;
+    let (json, tensors) = step5_fixture("fp8");
+    write_snapshot(root.path(), &json, &tensors, None);
+    let cfg = Config::parse(&Checkpoint::open(root.path())?)?;
+    let cache = Step5CacheLayout::new(&cfg, 2, 8192, 3, 256, 256, Default::default())?;
+    let state = &cache.ranks[0];
+    let first = state.sliding.iter().find(|ring| ring.mtp).unwrap();
+    let layout = mtp_layout(&[4, 2], 0, &cache, &plan(vec![owner(0, 1024)]), 2)?;
+    assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Mtp, Some(Placement::Whole), Some(Rank::CudaRank(4))));
+    assert_eq!(layout.ranks, [Rank::CudaRank(4)]);
+    assert_eq!(layout.arena_bytes, [1024 + 2 * (state.bytes - first.key.offset)]);
+    Ok(())
 }
 
 fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {

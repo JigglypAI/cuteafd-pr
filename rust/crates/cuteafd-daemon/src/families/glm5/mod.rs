@@ -1844,15 +1844,14 @@ impl Opened {
         }
         engine.usage_active.set(true);
         if serving.is_some() {
-            use crate::shared::draft::report::{self, Kind, Placement};
+            use crate::shared::draft::report;
             if let Some(draft) = &engine.drafter {
-                let kind = if draft.token_only() { Kind::Dspark } else { Kind::Dflash2 };
-                let (placement, lead) = match draft {
-                    drafter::GlmDrafter::Local(_) => (Placement::Whole, 0),
-                    drafter::GlmDrafter::Remote(draft) => (Placement::Remote,
+                let remote = match draft {
+                    drafter::GlmDrafter::Local(_) => None,
+                    drafter::GlmDrafter::Remote(draft) => Some(
                         cuteafd_loader::placement::planner::CoordinatorDevices::new(&devices)?.logical_rank(draft.draft.device.id)?),
                 };
-                report::publish(report::admitted(kind, placement, lead, &devices, &admitted.solved)?);
+                report::publish(drafter_report(draft.token_only(), remote, &devices, &admitted.solved)?);
             }
         }
         let result = body(&engine, transport.as_mut(), &runtime);
@@ -2854,4 +2853,24 @@ fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_
     });
     allocator.release(placement);
     result
+}
+
+fn drafter_report(token_only: bool, remote: Option<u8>, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let kind = if token_only { Kind::Dspark } else { Kind::Dflash2 };
+    let placement = if remote.is_some() { Placement::Remote } else { Placement::Whole };
+    report::admitted(kind, placement, remote.unwrap_or(0), devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn glm_dflash_and_ml4_markov_report_their_resolved_homes() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let local = drafter_report(false, None, &[4, 2], &plan(vec![owner(0, 1024)]))?;
+    let remote = drafter_report(true, Some(1), &[4, 2], &plan(vec![owner(1, 2048)]))?;
+    assert_eq!((local.kind, local.placement, local.lead), (Kind::Dflash2, Some(Placement::Whole), Some(Rank::CudaRank(4))));
+    assert_eq!((remote.kind, remote.placement, remote.lead), (Kind::Dspark, Some(Placement::Remote), Some(Rank::CudaRank(2))));
+    assert_eq!(remote.arena_bytes, [2048]);
+    Ok(())
 }

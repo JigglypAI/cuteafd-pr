@@ -575,10 +575,7 @@ pub(crate) fn with_engine<T>(
                 graph_bootstraps: admitted.graphs.bootstraps.clone() }.register();
         }
         if !facts.draft.is_empty() {
-            use crate::shared::draft::report::{self, Kind, Placement};
-            let placement = if facts.draft_half.is_empty() { Placement::Whole } else { Placement::Split };
-            report::publish(report::from_plan(Kind::Dspark, placement, 0, &devices, &admitted.solved,
-                |owner| owner.id == "v4.tp1.0" || owner.id.starts_with("v4.tp2.draft."))?);
+            crate::shared::draft::report::publish(draft_report(!facts.draft_half.is_empty(), &devices, &admitted.solved)?);
         }
         let (placement, host_prefix, expert_usage, graphs) = (admitted.placement, admitted.host_prefix,
             admitted.expert_usage, admitted.graphs);
@@ -1434,4 +1431,25 @@ mod program_selection_tests {
             }
         }
     }
+}
+
+fn draft_report(expert_halves: bool, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let placement = if expert_halves { Placement::Split } else { Placement::Whole };
+    report::from_plan(Kind::Dspark, placement, 0, devices, plan,
+        |owner| owner.id == "v4.tp1.0" || owner.id.starts_with("v4.tp2.draft."))
+}
+
+#[cfg(test)]
+#[test]
+fn v4_dspark_report_distinguishes_expert_halves() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let admitted = plan(vec![owner(0, 512), owner(1, 256)]);
+    for (split, placement, ranks) in [(false, Placement::Whole, 1), (true, Placement::Split, 2)] {
+        let layout = draft_report(split, &[4, 2], &admitted)?;
+        assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Dspark, Some(placement), Some(Rank::CudaRank(4))));
+        assert_eq!(layout.ranks.len(), ranks);
+    }
+    Ok(())
 }

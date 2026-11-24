@@ -1256,7 +1256,7 @@ fn dfly2_report_does_not_confuse_target_head_split_with_draft_split() -> Result<
     assert_eq!(resolve_attention_placement(2, "heads")?, "heads");
     let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 1024)]))?;
     assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Whole)));
-    assert_eq!(layout.ranks, [Rank::Gpu(5)]);
+    assert_eq!(layout.ranks, [Rank::CudaRank(5)]);
     assert_eq!(layout.arena_bytes, [1024]);
     Ok(())
 }

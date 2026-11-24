@@ -622,12 +622,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // Same Ready-boundary verification as the single-rank worker: both GPUs'
     // predicted runtime bases against what their devices hold.
     if let Some(draft) = &draft {
-        use crate::shared::draft::report::{self, Kind, Placement};
         let physical = devices.map(|device| device.id);
         let lead = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?.logical_rank(draft.device.id)?;
-        // The distributed vocabulary head itself owns work on both GPUs, even
-        // when the routed expert halves are all on the lead.
-        report::publish(report::admitted(Kind::Dspark, Placement::Split, lead, &physical, &pool.solved)?);
+        crate::shared::draft::report::publish(super::drafter_report(lead, &physical, &pool.solved)?);
     }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;

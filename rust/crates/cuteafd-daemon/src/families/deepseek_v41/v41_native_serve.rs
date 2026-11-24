@@ -63,6 +63,15 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
+fn drafter_report(lead: u8, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    // A distributed terminal uses both vocabulary shards even if the routed
+    // draft experts are all on its lead.
+    let placement = if devices.len() == 1 { Placement::Whole } else { Placement::Split };
+    report::admitted(Kind::Dspark, placement, lead, devices, plan)
+}
+
 /// The served profile: the public id is `--model-id`, else the checkpoint's
 /// own id. The checkpoint is identified from its own files (hub path id,
 /// model-card base_model ancestry, or its encoding/encoding.py against the
@@ -802,8 +811,7 @@ fn worker(
             Ok(())
         }) }?;
     if draft.is_some() {
-        use crate::shared::draft::report::{self, Kind, Placement};
-        report::publish(report::admitted(Kind::Dspark, Placement::Whole, 0, &[inventory.gpus[0].device], &pool.solved)?);
+        crate::shared::draft::report::publish(drafter_report(0, &[inventory.gpus[0].device], &pool.solved)?);
     }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;

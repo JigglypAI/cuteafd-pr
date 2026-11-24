@@ -22,20 +22,36 @@ pub struct DrafterLayout {
     pub ranks: Vec<DrafterRank>,
     pub lead: Option<DrafterRank>,
     pub arena_bytes: Vec<u64>,
+    /// Physical GPU UUID keyed by process CUDA rank, when known at launch.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gpu_uuids: std::collections::BTreeMap<i32, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DrafterRank { Gpu(i32), Spark(u8) }
+pub enum DrafterRank { #[serde(rename = "cuda_rank")] CudaRank(i32), Spark(u8) }
 
 impl std::fmt::Display for DrafterRank {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Gpu(id) => write!(f, "GPU{id}"), Self::Spark(id) => write!(f, "Spark{id}") }
+        match self { Self::CudaRank(id) => write!(f, "GPU rank {id}"), Self::Spark(id) => write!(f, "Spark{id}") }
     }
 }
 
 impl DrafterLayout {
-    pub const NONE: Self = Self { kind: DrafterKind::None, placement: None, ranks: Vec::new(), lead: None, arena_bytes: Vec::new() };
+    pub const NONE: Self = Self { kind: DrafterKind::None, placement: None, ranks: Vec::new(), lead: None, arena_bytes: Vec::new(), gpu_uuids: std::collections::BTreeMap::new() };
+
+    /// The launcher lists full GPU UUIDs in CUDA ordinal order. Don't infer
+    /// UUIDs for bare ordinals or abbreviated UUIDs that cannot be verified.
+    pub fn bind_visible_gpus(&mut self, visible: &str) {
+        self.gpu_uuids = self.ranks.iter().filter_map(|rank| {
+            let DrafterRank::CudaRank(rank) = *rank else { return None; };
+            let uuid = visible.split(',').nth(usize::try_from(rank).ok()?)?.trim();
+            let groups = uuid.strip_prefix("GPU-")?.split('-').collect::<Vec<_>>();
+            (groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+                && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit())))
+                .then(|| (rank, uuid.to_owned()))
+        }).collect();
+    }
 
     pub fn label(&self) -> String {
         let kind = match self.kind {
@@ -50,7 +66,7 @@ impl DrafterLayout {
             Some(DrafterPlacement::Remote) => "remote on",
             None => return kind.into(),
         };
-        let ranks = self.ranks.iter().map(ToString::to_string).collect::<Vec<_>>().join("+");
+        let ranks = self.ranks.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ");
         let lead = self.lead.map_or_else(String::new, |rank| format!(" (lead {rank})"));
         let bytes = self.arena_bytes.iter().map(|&bytes| format!("{:.2}", bytes as f64 / 1e9)).collect::<Vec<_>>().join(" / ");
         format!("{kind} {placement} {ranks}{lead}, {bytes} GB")

@@ -4739,8 +4739,8 @@ def test_sweep_passes_refuse_nothing_to_repeat_or_out_of_range(entry, tmp_path, 
 
 
 def test_summary_flags_only_differing_resolved_drafters(tmp_path):
-    whole = dict(kind='dflash2', placement='whole', ranks=[{'gpu': 1}], lead={'gpu': 1}, arena_bytes=[10])
-    split = dict(kind='dflash2', placement='split', ranks=[{'gpu': 1}, {'gpu': 0}], lead={'gpu': 1}, arena_bytes=[6, 4])
+    whole = dict(kind='dflash2', placement='whole', ranks=[{'cuda_rank': 1}], lead={'cuda_rank': 1}, arena_bytes=[10])
+    split = dict(kind='dflash2', placement='split', ranks=[{'cuda_rank': 1}, {'cuda_rank': 0}], lead={'cuda_rank': 1}, arena_bytes=[6, 4])
     rows = [dict(card='c', arm=arm, repeat=repeat, simulated=False, status='pass', C1=10, drafter=layout)
             for repeat, layouts in enumerate([(whole, split), (split, split), (None, whole)], 1)
             for arm, layout in zip(['base', 'candidate'], layouts)]

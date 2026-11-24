@@ -13,7 +13,7 @@ pub(crate) fn admitted(kind: Kind, placement: Placement, lead: u8, devices: &[i3
 pub(crate) fn from_plan(kind: Kind, placement: Placement, lead: u8, devices: &[i32], plan: &ResolvedPlan,
     extra: impl Fn(&Allocation) -> bool) -> Result<DrafterLayout> {
     let physical = CoordinatorDevices::new(devices)?;
-    let lead_rank = Rank::Gpu(physical.physical_device(lead)?);
+    let lead_rank = Rank::CudaRank(physical.physical_device(lead)?);
     let split = matches!(placement, Placement::Split | Placement::PairedBlock);
     ensure!(!split || devices.len() == 2, "split drafter requires two admitted coordinator ranks");
     let mut ranks = Vec::new();
@@ -35,10 +35,10 @@ pub(crate) fn from_plan(kind: Kind, placement: Placement, lead: u8, devices: &[i
             });
         let bytes = owners.iter().map(|owner| Ok(owner.bytes)).chain(totals)
             .try_fold(0u64, |sum, n| sum.checked_add(n?).context("admitted drafter bytes overflow"))?;
-        ranks.push(Rank::Gpu(device));
+        ranks.push(Rank::CudaRank(device));
         arena_bytes.push(bytes);
     }
-    Ok(DrafterLayout { kind, placement: Some(placement), ranks, lead: Some(lead_rank), arena_bytes })
+    Ok(DrafterLayout { kind, placement: Some(placement), ranks, lead: Some(lead_rank), arena_bytes, gpu_uuids: Default::default() })
 }
 
 pub(crate) fn publish(layout: DrafterLayout) {
@@ -83,8 +83,8 @@ pub(crate) mod tests {
             location: arena.location, lifetime: arena.lifetime, evidence: p::GranularityEvidence::Forecast,
             backings: vec![p::GranularityBacking { backing: arena.id, requests: vec![arena.bytes] }] });
         let layout = admitted(Kind::Dflash2, Placement::Split, 1, &[5, 2], &plan)?;
-        assert_eq!(layout.ranks, [Rank::Gpu(5), Rank::Gpu(2)]);
-        assert_eq!(layout.lead, Some(Rank::Gpu(2)));
+        assert_eq!(layout.ranks, [Rank::CudaRank(5), Rank::CudaRank(2)]);
+        assert_eq!(layout.lead, Some(Rank::CudaRank(2)));
         assert_eq!(layout.arena_bytes, [4 << 20, 256]);
         Ok(())
     }

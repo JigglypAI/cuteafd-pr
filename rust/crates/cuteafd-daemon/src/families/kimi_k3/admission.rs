@@ -3419,8 +3419,8 @@ fn paired_block_report_uses_the_draft_selector_rank() -> Result<()> {
         cache_format: cuteafd_core::MlaCacheFormat::Bf16, context_window: 0, draft_kv_cache: Default::default() };
     let layout = options.layout(2, 64, 188, 1)?;
     let reported = draft_layout_report(&layout, 1, &[5, 2], &plan(vec![owner(0, 100), owner(1, 200)]))?;
-    assert_eq!((reported.kind, reported.placement, reported.lead), (Kind::Dspark, Some(Placement::PairedBlock), Some(Rank::Gpu(2))));
-    assert_eq!(reported.ranks, [Rank::Gpu(5), Rank::Gpu(2)]);
+    assert_eq!((reported.kind, reported.placement, reported.lead), (Kind::Dspark, Some(Placement::PairedBlock), Some(Rank::CudaRank(2))));
+    assert_eq!(reported.ranks, [Rank::CudaRank(5), Rank::CudaRank(2)]);
     assert_eq!(reported.arena_bytes, [100, 200]);
     Ok(())
 }
