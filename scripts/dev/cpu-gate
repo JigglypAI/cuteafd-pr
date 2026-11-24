@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, nullcontext
 import fcntl
+import importlib.util
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -182,6 +183,7 @@ CHILDREN_LOCK = threading.Lock()
 STOPPING = threading.Event()
 TERMINATED_SIGNAL = None
 GATE_LEASE_WAIT = 7200
+GATE_LEASE_POLL = 1.0
 
 
 def log(message):
@@ -604,32 +606,84 @@ def compiler_cache_receipt(env, target):
     return record
 
 
+def _load_hwlock():
+    """scripts/hw/hwlock.py's ticket queue: numbered, flocked SEQ.PID.ticket entries."""
+    spec = importlib.util.spec_from_file_location('cuteafd_hwlock', REPO / 'scripts/hw/hwlock.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HWLOCK = _load_hwlock()
+
+
+def _claim_slot(directory, slots, ahead):
+    """Flock the (ahead+1)-th free slot, leaving the first `ahead` to the older
+    waiters: (slot, handle, free slots seen), or (None, None, free) when too few
+    are free. Probes release at once, so no waiter sees a slot falsely busy."""
+    free = 0
+    for slot in range(slots):
+        lock = (directory / f'cpu-gate.{slot}.lock').open('a')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            continue
+        free += 1
+        if free > ahead:
+            return slot, lock, free
+        lock.close()
+    return None, None, free
+
+
 @contextmanager
 def gate_lease(directory=None, slots=None, timeout=GATE_LEASE_WAIT):
-    """Count whole gates, including pytest and base comparisons, on this host."""
+    """Count whole gates, including pytest and base comparisons, on this host.
+
+    First come, first served (hwlock's ticket queue): each waiter publishes a
+    flocked SEQ.PID.ticket in cpu-gate-q/ holding its PID and start time, and
+    takes a free slot only when fewer older live tickets wait than slots are
+    free, so a later waiter never overtakes an earlier one. A ticket whose flock
+    is free belongs to a dead process and is removed. The slot locks are flocks,
+    so a killed holder releases its slot; the ticket goes once the lease is
+    taken, the wait times out or the gate is stopped."""
     directory = directory or Path.home() / '.cache/cuteafd'
     slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 3)
     directory.mkdir(parents=True, exist_ok=True)
+    queue = directory / 'cpu-gate-q'
+    queue.mkdir(exist_ok=True)
     started = time.monotonic()
     log(f'waiting for gate lease ({slots} slots, timeout {timeout}s)')
-    while True:
-        for slot in range(slots):
-            lock = (directory / f'cpu-gate.{slot}.lock').open('a')
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock.close()
-                continue
-            try:
-                log(f'gate lease {slot}/{slots} acquired after {time.monotonic() - started:.1f}s')
-                yield dict(slot=slot, slots=slots, wait_s=round(time.monotonic() - started, 3))
-            finally:
-                lock.close()
-            return
-        if time.monotonic() - started >= timeout:
-            raise TimeoutError(f'no gate lease free after {timeout}s')
-        if STOPPING.wait(min(1, max(0, timeout - (time.monotonic() - started)))):
-            raise KeyboardInterrupt('terminated while waiting for gate lease')
+    lease, ticket, handle, position = None, None, None, None
+    try:
+        seq = HWLOCK._next_seq(queue)
+        ticket, handle = HWLOCK._publish(queue, seq, 'ticket', dict(pid=os.getpid(), created=time.time(),
+                                                                    host=platform.node(), argv=sys.argv[1:][:8]))
+        while True:
+            ahead = sum(1 for other, _, _ in HWLOCK._live_entries(queue, 'ticket') if other < seq)
+            slot, lease, free = _claim_slot(directory, slots, ahead)
+            if lease is not None:
+                break
+            if ahead + 1 != position:
+                position = ahead + 1
+                log(f'gate lease queue position {position} ({ahead} older waiting, {free}/{slots} slots free)')
+            if time.monotonic() - started >= timeout:
+                raise TimeoutError(f'no gate lease free after {timeout}s')
+            if STOPPING.wait(min(GATE_LEASE_POLL, max(0, timeout - (time.monotonic() - started)))):
+                raise KeyboardInterrupt('terminated while waiting for gate lease')
+    except BaseException:
+        if lease is not None:
+            lease.close()
+        raise
+    finally:
+        if ticket is not None:
+            ticket.unlink(missing_ok=True)
+            handle.close()
+    try:
+        log(f'gate lease {slot}/{slots} acquired after {time.monotonic() - started:.1f}s')
+        yield dict(slot=slot, slots=slots, ticket=seq, wait_s=round(time.monotonic() - started, 3))
+    finally:
+        lease.close()
 
 
 def validate_full_test_ids(source, root, args, env):
