@@ -880,6 +880,7 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
         let catalog = crate::read_expert_catalog_view(&selected)?;
         let model = Model::open(&checkpoint)?;
 
+        for attention in [AttentionPlacement::Context, AttentionPlacement::Heads] {
         let run_arm = |tp2_dflash: bool| -> anyhow::Result<(hy4_place::Hy4Inputs, hy4_place::AdmittedHy4)> {
             let inputs = admission::gather(&FactsRequest {
                 checkpoint: &checkpoint,
@@ -891,7 +892,7 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
                 tp2_dflash,
                 manifest_path: Some(&manifest),
                 coordinator: Coordinator::Planned { rtx_bytes: rtx_bytes.clone() },
-                attention: AttentionPlacement::Heads,
+                attention,
                 spark_ranks: 0,
                 spark_bytes: Vec::new(),
                 prefill,
@@ -924,6 +925,14 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
 
         let (_whole_in, whole) = run_arm(false)?;
         let (split_in, split) = run_arm(true)?;
+        if attention == AttentionPlacement::Context {
+            let draft = split_in.draft.as_ref().expect("split DFly2 admitted");
+            for gpu in 0..2 {
+                let ws = &draft.rank(gpu).expect("draft rank").workspace;
+                assert!(ws.view("tap_recall_peer").is_some(), "gpu{gpu} missing tap_recall_peer");
+                assert!(ws.view("verify_recall_peer").is_some(), "gpu{gpu} missing verify_recall_peer");
+            }
+        }
 
         // 1. Per-rank drafter weight, workspace, and trellis arenas admitted on both GPUs.
         let facts = &split.solved.facts;
@@ -1028,7 +1037,7 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
         let (sf0, skv0, spool) = fixed_and_kv(&split, 0);
         let (sf1, skv1, _) = fixed_and_kv(&split, 1);
         eprintln!(
-            "HY4F_BURDEN view={view}: whole(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={wpool}) -> split(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={spool})",
+            "HY4F_BURDEN view={view} attention={attention:?}: whole(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={wpool}) -> split(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={spool})",
             wf0 as f64 / (1u64 << 30) as f64,
             wf1 as f64 / (1u64 << 30) as f64,
             wkv0 as f64 / (1u64 << 30) as f64,
@@ -1040,6 +1049,7 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
         );
         assert!(sf0 < wf0, "split must reduce GPU0 fixed burden ({sf0} < {wf0})");
         assert!(spool >= wpool, "split must not reduce admitted KV pool ({spool} >= {wpool})");
+        }
     }
     Ok(())
 }
