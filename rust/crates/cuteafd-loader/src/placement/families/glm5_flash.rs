@@ -804,15 +804,17 @@ pub(crate) mod tests {
             let admitted = contract(&input).unwrap();
             assert_eq!(admitted.solved.phases,
                 planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
-            let expected = glmf_graphs::glmf_graph_reserve(ranks, input.spark_ranks > 0);
-            assert_eq!(admitted.graphs.reserves, [94 << 20, 92 << 20][..ranks]);
-            assert_eq!(admitted.graphs.charged, [190 << 20, 188 << 20][..ranks]);
-            assert_eq!(admitted.graphs.executables, expected.executables);
-            assert_eq!(admitted.graphs.bootstraps, expected.bootstraps);
-            for gpu in 0..ranks {
+            let (soft, hard): (&[u64], &[u64]) = if ranks == 1 { (&[170], &[178]) } else { (&[190, 188], &[198, 196]) };
+            for (gpu, policy) in admitted.graphs.policies.iter().enumerate() {
+                assert_eq!(policy.base_bytes, soft[gpu] << 20);
+                assert_eq!(policy.bytes, hard[gpu] << 20);
+                assert_eq!(policy.growth_headroom, Some(8 << 20));
+                let boot = glmf_graphs::bootstrap_bytes(ranks, input.spark_ranks > 0, gpu);
+                assert_eq!(admitted.graphs.bootstraps[gpu], boot);
+                assert_eq!(admitted.graphs.executables[gpu], policy.base_bytes.div_ceil(boot));
                 let owner = admitted.solved.facts.allowances.iter()
                     .find(|owner| owner.source == format!("graph reserve: glmf.graphs.{gpu}")).unwrap();
-                assert_eq!(owner.bytes, admitted.graphs.charged[gpu]);
+                assert_eq!(owner.bytes, policy.bytes);
                 // The configured budget, not a census estimate awaiting capture.
                 assert!(!owner.assumed);
                 assert_eq!(owner.location, planner::Location::coordinator(gpu as u8));
@@ -848,7 +850,7 @@ pub(crate) mod tests {
                 let graph: Vec<_> = device.reserve.iter()
                     .filter(|row| row.name == "graph reserve").collect();
                 assert_eq!(graph.len(), 1, "one canonical graph reserve row per device");
-                assert_eq!(graph[0].bytes, admitted.graphs.charged[gpu as usize]);
+                assert_eq!(graph[0].bytes, admitted.graphs.policies[gpu as usize].bytes);
                 assert!(!device.reserve.iter().any(|row| row.name != "graph reserve"
                     && (row.name.starts_with("startup graph") || row.name.contains("glmf graph"))),
                     "no family-named graph owner may follow the canonical row");
@@ -864,8 +866,8 @@ pub(crate) mod tests {
         let input = inputs(&cfg, 1, 32 << 30);
         let (placed, graphs, _) = admitted_case(&input, true, 170, true, None).unwrap();
         assert!(placed.pool_tokens < 1 << 20);
-        assert_eq!(graphs.reserves, [94 << 20]);
-        assert_eq!(graphs.charged, [190 << 20]);
+        assert_eq!(graphs.policies[0].base_bytes, 170 << 20);
+        assert_eq!(graphs.charges(), [178 << 20]);
     }
 
     #[test]

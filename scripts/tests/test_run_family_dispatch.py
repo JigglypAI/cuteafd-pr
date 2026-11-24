@@ -980,9 +980,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                   json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
                               "/drafters/nvidia.json").read_text()),
                   "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
-    if (family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER")
-            and not (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").exists()):
-        _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    if family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER"):
+        # Split DFlash admission reads the draft config and tensor headers.
+        cache = "models--incoai--GLM-5.3-Flash-DFlash2"
+        staged = hf / "hub" / cache
+        if not staged.exists():
+            source = Path(extra_env["STUB_REAL_HF_HOME"]) / "hub" / cache
+            staged.symlink_to(source.resolve(strict=True), target_is_directory=True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # Launcher tests model an idle host, independent of real API listeners.
@@ -5909,18 +5913,23 @@ def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag
     assert "CUTEAFD_GRAPH_DONOR_COLD_LAG" not in result.stderr
 
 
+@pytest.mark.parametrize("family", ["glmf", "inkling2"])
 @pytest.mark.parametrize("overrides,donate,lag", [
-    ("", True, "8"),
+    ("", False, None),
     ("GRAPH_DONOR_ALWAYS=off\n", False, None),
-    ("GRAPH_DONOR_COLD_LAG=16\n", True, "16"),
+    ("GRAPH_DONOR_ALWAYS=on\nGRAPH_DONOR_COLD_LAG=16\n", True, "16"),
 ])
-def test_inkling_graph_donors_default_to_qualified_lag(tmp_path, overrides, donate, lag):
-    config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
-    result = _family_launch_result(tmp_path, config, "test/inkling",
-        "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + overrides)
+def test_graph_donors_are_opt_in_on_exact_row_families(tmp_path, family, overrides, donate, lag):
+    if family == "inkling2":
+        config = {"model_type": "inkling2", "text_config": {"num_hidden_layers": 48}}
+        keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    else:
+        config = SPLIT_CONFIGS["glm5_flash"]
+        keys = "RTX_GPUS=2\n"
+    result = _family_launch_result(tmp_path, config, f"test/{family}", keys + overrides)
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
-        if "serve-inkling2" in line and "--snapshot" in line))
+        if f"serve-{family}" in line and "--snapshot" in line))
     assert ("--graph-donor-always" in serve) == donate
     assert ("--graph-donor-cold-lag" in serve) == (lag is not None)
     if lag is not None:
@@ -5942,18 +5951,11 @@ def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error
     assert "serve-glm --snapshot" not in result.stderr
 
 
-@pytest.mark.parametrize("extra", [
-    "GRAPH_DONOR_ALWAYS=on\n",
-    "GRAPH_DONOR_ALWAYS=off\n",
-    "GRAPH_DONOR_COLD_LAG=8\n",
-    "GRAPH_DONOR_ALWAYS=on\nGRAPH_DONOR_COLD_LAG=16\n",
-    "GRAPH_EXACT_ROWS=on\n",
-])
-def test_glmf_refuses_fixed_graph_donor_and_removed_mode_keys(tmp_path, extra):
+def test_glmf_refuses_removed_graph_mode_key(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"RTX_GPUS=2\n{extra}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", "RTX_GPUS=2\nGRAPH_EXACT_ROWS=on\n")
     assert result.returncode == 2, result.stderr
     assert "serve-glmf" not in result.stderr
 

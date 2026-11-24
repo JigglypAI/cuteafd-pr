@@ -238,10 +238,9 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert all(inventory < start < allocation for start in (
         match.start() for match in re.finditer(r"self\.admit_candidate\(", opening)))
     # Attach the admitted cache before first-use capture can run.
-    flat = " ".join(opening.split())
-    assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
-            "&admitted_graphs.bootstraps)?") in flat
     startup = opening.index("let result = with_startup_graphs(")
+    attach = opening.index("engine.configure_graph_cache(&admitted_graphs)?")
+    assert startup < attach < opening.index("|| body(&engine)")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
     assert startup < opening.index("|| body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening

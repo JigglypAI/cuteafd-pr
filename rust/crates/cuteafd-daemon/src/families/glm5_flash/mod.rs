@@ -2181,7 +2181,7 @@ impl Opened {
         // Under TP2_DFLASH auto both drafter candidates are admitted; each logs its breakdown.
         tracing::info!(target: "cuteafd::memory_policy", tp2_dflash = args.tp2_dflash, "GLM Flash admission candidate");
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5_flash");
-        tracing::info!(graph_reserve = ?admitted.graphs.charged, prewarm_shapes = 0,
+        tracing::info!(graph_reserve = ?admitted.graphs.charges(), prewarm_shapes = 0,
             phases = ?admitted.solved.phases, "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
@@ -3038,13 +3038,10 @@ impl Opened {
             engine.attach_selection_dump(dump)?;
         }
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy.is_some(), || {
-                engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves,
-                    &admitted_graphs.bootstraps)?;
-                for (rank, &charge) in admitted_graphs.charged.iter().enumerate() {
-                    let resolved = cuteafd_loader::placement::graph_reserve::current_working_set(rank,
-                        admitted_graphs.reserves[rank]).map_err(anyhow::Error::msg)?;
-                    tracing::info!(rank, reserve = charge, source = %resolved.source,
-                        soft_cap = resolved.base_bytes, soft_margin_floor = resolved.soft_margin_floor,
+                engine.configure_graph_cache(&admitted_graphs)?;
+                for (rank, resolved) in admitted_graphs.policies.iter().enumerate() {
+                    tracing::info!(rank, reserve = resolved.bytes, source = %resolved.source,
+                        soft_cap = resolved.base_bytes, growth_headroom = ?resolved.growth_headroom,
                         executables = admitted_graphs.executables[rank], prewarm_shapes = 0,
                         bootstrap = admitted_graphs.bootstraps[rank], "GLM Flash graph reserve");
                 }

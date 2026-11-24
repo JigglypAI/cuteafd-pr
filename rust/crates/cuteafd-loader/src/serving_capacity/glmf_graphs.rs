@@ -5,18 +5,23 @@ pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {
     if decode_rows <= DECODE_ROWS { decode_rows } else { (3 * sms / 4).clamp(DECODE_ROWS, decode_rows) }
 }
 
-/// Lag-8 exact-row working set measured on the GLM Flash K4-MC original max card (#2645).
-/// The rank-local sites pin only a shape used in at least half the cycles of a band;
-/// no measured shape qualified, so the entire working set is captured lazily.
-const SOFT_CAP: [u64; 2] = [94 << 20, 92 << 20];
-
-pub struct GlmfGraphReserve {
-    pub reserves: Vec<u64>,
-    pub executables: Vec<u64>,
-    pub bootstraps: Vec<u64>,
+/// Lag-8 exact-row C1 census, short and 32K, on GLM Flash K4-MC K8 compact.
+/// TP2 also matches the K4-MC original max W1 from #2645. No shape met the
+/// one-half-of-band-cycles pin bar, so all captures are lazy.
+pub fn working_set(gpus: usize, split_draft: bool, rank: usize) -> crate::placement::graph_reserve::WorkingSet {
+    use crate::placement::graph_reserve::WorkingSet;
+    let (w1_mib, step_growth) = match (gpus, split_draft, rank) {
+        (1, _, _) => (74, 8_339_064),
+        // Explicit TP2 DFlash A-on census (short and 32K C1).
+        (2, true, 0) => (94, 9_789_077),
+        (2, true, _) => (94, 9_629_699),
+        (_, _, 0) => (94, 9_755_762),
+        _ => (92, 9_566_036),
+    };
+    WorkingSet { w1: w1_mib << 20, step_growth, capture_growth: 4 << 20 }
 }
 
-pub fn glmf_graph_reserve(gpus: usize, sparks: bool) -> GlmfGraphReserve {
+pub fn bootstrap_bytes(gpus: usize, sparks: bool, rank: usize) -> u64 {
     // Initial per-executable estimates from the old traced layouts, unchanged
     // from #2645. The device controller replaces these with observed topology.
     let bootstrap: &[u64] = match (gpus, sparks) {
@@ -24,10 +29,7 @@ pub fn glmf_graph_reserve(gpus: usize, sparks: bool) -> GlmfGraphReserve {
         (2, true) => &[156_746, 154_122],
         _ => &[195_387, 186_414],
     };
-    let reserves: Vec<_> = (0..gpus).map(|rank| SOFT_CAP[rank.min(1)]).collect();
-    let bootstraps: Vec<_> = (0..gpus).map(|rank| bootstrap[rank.min(bootstrap.len() - 1)]).collect();
-    let executables = reserves.iter().zip(&bootstraps).map(|(&soft, &boot)| soft.div_ceil(boot)).collect();
-    GlmfGraphReserve { reserves, executables, bootstraps }
+    bootstrap[rank.min(bootstrap.len() - 1)]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
