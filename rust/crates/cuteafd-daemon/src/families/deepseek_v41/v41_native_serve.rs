@@ -69,7 +69,8 @@ fn drafter_report(lead: u8, devices: &[i32], plan: &cuteafd_loader::placement::p
     // A distributed terminal uses both vocabulary shards even if the routed
     // draft experts are all on its lead.
     let placement = if devices.len() == 1 { Placement::Whole } else { Placement::Split };
-    report::admitted(Kind::Dspark, placement, lead, devices, plan)
+    report::from_plan(Kind::Dspark, placement, lead, devices, plan, |owner|
+        owner.id.starts_with("v41.draft.") && owner.category == cuteafd_core::memory_layout::Category::Workspace)
 }
 
 /// The served profile: the public id is `--model-id`, else the checkpoint's
