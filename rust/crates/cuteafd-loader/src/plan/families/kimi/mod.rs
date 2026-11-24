@@ -315,9 +315,9 @@ impl Family for KimiK3 {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            128,
             15,
-            "Kimi coordinator decode programs cover 64 rows (missing kimik3/kimik31 *_m128 export)",
+            "Kimi coordinator decode programs cover at most 128 rows",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

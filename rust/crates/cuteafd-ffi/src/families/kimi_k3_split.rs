@@ -137,7 +137,8 @@ impl<'a> KimiKdaCore<'a> {
             (b.conv_state,g.conv_state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA conv slots"))?),
             (b.state,g.state_bytes(b.state_slots).map_err(|_|KimiSplitError::Invalid("KDA state slots"))?),
             (b.slots,b.rows*4),(b.first,b.rows*4),(b.output,b.rows*g.width()*2),
-            (b.replay,g.replay_bytes()),(b.scratch,self.scratch)], &[11,12,15,16,17])?;
+            (b.replay,g.replay_bytes_for(if self.decode { self.rows } else { 64 })),
+            (b.scratch,self.scratch)], &[11,12,15,16,17])?;
         // SAFETY: all operand/state/replay extents checked with disjoint writes;
         // the engine owns valid sequence metadata and graph-safe lifetimes.
         unsafe { self.program.launch(&[b.input.ptr,b.q.ptr,b.k.ptr,b.v.ptr,b.gate.ptr,w.fab.ptr,w.forget.ptr,
@@ -187,13 +188,19 @@ fn validate_kda(spec: &ProgramSpec, rows: usize, decode: bool) -> Result<(KimiKd
     let heads = g["kda_heads"].as_u64().and_then(|n| usize::try_from(n).ok())
         .ok_or(KimiSplitError::Invalid("KDA manifest heads"))?;
     let geometry = KimiKdaGeometry::new(heads).map_err(|_|KimiSplitError::Invalid("KDA manifest heads"))?;
-    if rows != if decode {64} else {4096}
+    let valid_rows = if decode { matches!(rows, 64 | 128) } else { rows == 4096 };
+    let replay_ok = if decode && rows > 64 {
+        g["replay_rows"].as_u64() == Some(rows as u64)
+    } else {
+        g["replay_rows"].is_null()
+    };
+    if !valid_rows
         || [("hidden",7168),("kda_head_dim",128),("conv_kernel",4)]
             .iter().any(|&(key,value)|g[key].as_u64()!=Some(value as u64))
         || g["gate_lower_bound"].as_f64()!=Some(-5.) || g["norm_eps"].as_f64()!=Some(1e-5)
         || g["output_gate"].as_str()!=Some("full_rank") || g["o_norm_dtype"].as_str()!=Some("float32")
         || g["output_kind"].as_str()!=Some("norm") || g["decode"].as_bool()!=Some(decode)
-        || !g["state_dtype"].is_null() || !g["state_rounding"].is_null() || !g["replay_rows"].is_null() {
+        || !g["state_dtype"].is_null() || !g["state_rounding"].is_null() || !replay_ok {
         return Err(KimiSplitError::Invalid("KDA manifest arithmetic/state"));
     }
     let base = spec.scratch.get("scratch").copied().and_then(|v|usize::try_from(v).ok())

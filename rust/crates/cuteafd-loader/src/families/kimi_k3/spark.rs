@@ -22,7 +22,11 @@ pub fn owner_bytes(world: usize, extent: OwnerExtent) -> Result<OwnerBytes> {
 
 /// Exact owners plus fixed startup reserve; the inventory adds arena-size growth.
 pub fn reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
-    let executions = super::spark_executions(waves, unit_rows)?;
+    reserve_bytes_for_rows(world, waves, unit_rows, 64)
+}
+
+pub fn reserve_bytes_for_rows(world: usize, waves: u64, unit_rows: u64, decode_rows: u64) -> Result<u64> {
+    let executions = super::spark_executions_for_rows(waves, unit_rows, decode_rows)?;
     let runtime = cuteafd_core::memory_layout::spark_runtime_bytes(Some((
         cuteafd_core::ExpertGeometry::KIMI_K3, world, executions.compiled_capacity())), 0)
         .context("Kimi Spark runtime reserve overflow")?;

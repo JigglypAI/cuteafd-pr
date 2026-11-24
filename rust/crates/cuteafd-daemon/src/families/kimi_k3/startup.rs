@@ -90,6 +90,8 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub draft: Option<super::draft::Options>,
     /// Exact speculative verify widths given startup graphs; 0 = the drafter's block.
     pub verify_rows: usize,
+    /// Maximum decode/verify batch rows admitted for this launch (64 or 128).
+    pub decode_rows: usize,
     pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
     #[cfg(test)]
     pub prove_serve_admission: bool,
@@ -174,10 +176,12 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // peer exchange, hop and Spark wave serves one unit.
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
         options.prefill_rows)?.unit_rows as usize;
+    let decode_rows = if options.decode_rows == 0 { 64 } else { options.decode_rows };
+    ensure!((1..=128).contains(&decode_rows), "Kimi decode_rows outside 1..=128");
     let native_manifest = devices[0].run(|| super::device::native_manifest(programs))?;
     let native_exports = core.native_programs(unit, RANKS, Some(&native_manifest))?;
-    let native = devices.iter().map(|&device| NativePrograms::load_resolved(device, full, programs, options.ffn_mode,
-        options.cache_format, &core, unit, RANKS, &native_exports).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+    let native = devices.iter().map(|&device| NativePrograms::load_resolved_rows(device, full, programs, options.ffn_mode,
+        options.cache_format, &core, unit, RANKS, &native_exports, decode_rows).map(Rc::new)).collect::<Result<Vec<_>>>()?;
     let native: [_; RANKS] = native.try_into().map_err(|_| anyhow::anyhow!("Kimi native physical rank inventory"))?;
     memory.sample("modules-target")?;
     ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
@@ -237,7 +241,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let mut spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
         model, spark_budget_bytes,
-        cuteafd_loader::families::kimi_k3::spark::reserve_bytes(spark_ranks, options.waves as u64, unit as u64)?)?;
+        cuteafd_loader::families::kimi_k3::spark::reserve_bytes_for_rows(spark_ranks, options.waves as u64, unit as u64, decode_rows as u64)?)?;
     spark_budget.rank_budgets = cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?;
     let rtx = if onboard.layers(routed) == Some(0) { None } else {
         let exl3 = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?;
@@ -261,7 +265,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-rtx-experts")?;
     let context_programs = devices.iter().map(|device|
         (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
-            .then(|| device.run(|| super::context::Programs::load_for_config(programs, options.cache_format, full).map(Rc::new)))
+            .then(|| device.run(|| super::context::Programs::load_for_config_rows(programs, options.cache_format, full, decode_rows).map(Rc::new)))
             .transpose()).collect::<Result<Vec<_>>>()?;
     let context_programs = context_programs.try_into()
         .map_err(|_| anyhow::anyhow!("Kimi context program rank inventory"))?;
@@ -283,8 +287,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         .collect::<Result<Vec<_>>>()?
         .try_into().map_err(|_| anyhow::anyhow!("Kimi lane physical rank inventory"))?;
     let context_layout = (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
-        .then(|| super::context::Programs::layout(programs, options.cache_format,
-            options.max_context, unit, lane_layouts[0].metadata_banks(), full)).transpose()?;
+        .then(|| super::context::Programs::layout_rows(programs, options.cache_format,
+            options.max_context, unit, lane_layouts[0].metadata_banks(), full, decode_rows)).transpose()?;
     let lane_layouts = vec![lane_layouts];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
@@ -344,7 +348,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
-        core.attention_receive_bytes(unit.min(64), RANKS)?];
+        core.attention_receive_bytes(unit.min(decode_rows), RANKS)?];
     let vision=options.media.filter(|m|m.vision!=cuteafd_loader::plan::MediaMode::Off).map(|media|->Result<_>{
         let view=checkpoint.view.as_ref().context("Kimi media selected view")?;
         let tower=cuteafd_loader::plan::Checkpoint::open_view_for_role(view,"Kimi still tower",|name|
@@ -424,6 +428,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         "Kimi admitted TP2 expert ownership");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &options.max_context.to_string());
+    cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
@@ -435,7 +440,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1,
             peer_receive[0], peer_receive[1]))?;
         let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec(),
-            unit.min(64) * plan.spec().row_bytes as usize))?;
+            unit.min(decode_rows) * plan.spec().row_bytes as usize))?;
         hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
             peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
         (Some(Rc::new(peer)), Some(hops))
@@ -498,8 +503,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         let capture_started = std::time::Instant::now();
         // Prewarm reachable decode/verify geometry only; row-window prefill
         // stays eager and unselected replayable geometry can capture lazily.
-        let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
-            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), options.slots, unit);
+        let prewarm = super::graphs::prewarm_keys_with_limit(cfg, &set.keys,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), options.slots, unit, decode_rows);
         let policies = (0..RANKS).map(|rank| {
             let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(graph_core, RANKS, rank);
             cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)

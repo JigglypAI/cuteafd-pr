@@ -220,7 +220,8 @@ impl<'a> Engine<'a> {
         let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
             .context("Kimi engine requires the immutable selected checkpoint view")?)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
-            &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
+            &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(),
+            Some(u32::try_from(programs[0].decode_rows())?),
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
@@ -377,7 +378,7 @@ impl<'a> Engine<'a> {
         Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
             vocab_size: local.config().vocab_size, max_context: self.served_context,
             // A call is the slots' units.
-            slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64) })
+            slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(local.decode_rows()) })
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -629,6 +630,21 @@ impl<'a> Engine<'a> {
         Ok(GraphWarmup { captured, before_capture })
     }
 
+    /// Capture one explicit speculative width across every physical rank without
+    /// launching, then settle device graph accounting (golden wide-batch oracle).
+    pub(crate) fn warm_explicit_verify_graphs(&self, rows: usize) -> Result<usize> {
+        let mut captured = 0;
+        {
+            let mut lanes = self.lanes.try_borrow_mut()?;
+            for local in &mut lanes.local[0] {
+                local.graph_cycle(crate::shared::decode_graph::device::Cycle::Other);
+                captured += local.warm_explicit_verify_graphs(rows)?;
+            }
+        }
+        self.graph_settle()?;
+        Ok(captured)
+    }
+
     /// Completed-step graph boundary. Every rank's step is queued and no lane is
     /// mid-segment, so each physical device is sampled once and growth charged.
     fn graph_settle(&self) -> Result<()> {
@@ -681,11 +697,11 @@ impl<'a> Engine<'a> {
         self.require_live()?;
         ensure!(self.provisional.borrow().is_none(), "Kimi pending verify must be accepted or discarded before reuse");
         let family = self.prefix_family()?;
-        let provisional = if speculative { Some(super::state::Provisional::new(sequences, self.geometry()?.slots)?) }
+        let geometry = self.geometry()?;
+        let provisional = if speculative { Some(super::state::Provisional::with_limit(sequences, geometry.slots, geometry.decode_rows)?) }
             else { None };
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
-        let geometry = self.geometry()?;
         let logit_capacity = if consume.is_some() { geometry.prefill_rows }
             else { geometry.decode_rows };
         ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= logit_capacity,
@@ -700,7 +716,7 @@ impl<'a> Engine<'a> {
             let mut lanes = self.lanes.try_borrow_mut()?;
             let cfg = lanes.local[0][self.head()].config();
             if self.execution.skip_routed_experts { cfg.prefix_geometry()?; } else { cfg.release_geometry()?; }
-            let cycle = if rows > 64 { crate::shared::decode_graph::device::Cycle::Prefill }
+            let cycle = if rows > geometry.decode_rows { crate::shared::decode_graph::device::Cycle::Prefill }
                 else if speculative { crate::shared::decode_graph::device::Cycle::Verify }
                 else { crate::shared::decode_graph::device::Cycle::Decode };
             for local in &mut lanes.local[0] { local.graph_cycle(cycle); }
@@ -709,7 +725,7 @@ impl<'a> Engine<'a> {
             }).collect::<Vec<_>>();
             // Unit calls stage all metadata banks before the pipeline; a single
             // pass stages its whole step (at most one unit) here.
-            let unit_call = !speculative && sequences.len() == 1 && rows > 64;
+            let unit_call = !speculative && sequences.len() == 1 && rows > geometry.decode_rows;
             if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
@@ -942,7 +958,8 @@ impl<'a> Engine<'a> {
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
                 "Kimi forward token/sequence lane count");
             let rows = tokens.iter().map(Vec::len).collect::<Vec<_>>();
-            let unit_call = tokens.len() == 1 && sequences[0].len() == 1 && rows[0] > 64;
+            let decode_rows = lanes.local[0][0].decode_rows();
+            let unit_call = tokens.len() == 1 && sequences[0].len() == 1 && rows[0] > decode_rows;
             for (lane, ids) in tokens.iter().enumerate() {
                 ensure!(!ids.is_empty(), "Kimi forward has an empty lane");
                 for local in &mut lanes.local[lane] {

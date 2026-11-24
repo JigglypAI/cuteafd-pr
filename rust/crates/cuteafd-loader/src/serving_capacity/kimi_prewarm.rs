@@ -100,13 +100,10 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
 pub fn kimi_layout(core: KimiCoreFormat, ranks: usize) -> &'static KimiPrewarmLayout {
     let list = kimi_prewarm_list();
     list.layouts.iter().find(|layout| layout.core == core && layout.ranks == ranks)
-        .unwrap_or_else(|| {
-            tracing::warn!(?core, ranks, "Kimi graph prewarm trace missing for core/layout; using bootstrap startup set");
-            kimi_bootstrap_layout(core)
-        })
+        .unwrap_or_else(|| kimi_bootstrap_layout(core, ranks))
 }
 
-fn kimi_bootstrap_layout(core: KimiCoreFormat) -> &'static KimiPrewarmLayout {
+fn kimi_bootstrap_layout(core: KimiCoreFormat, ranks: usize) -> &'static KimiPrewarmLayout {
     static BF16: OnceLock<KimiPrewarmLayout> = OnceLock::new();
     static K6: OnceLock<KimiPrewarmLayout> = OnceLock::new();
     static TRELLIS: OnceLock<KimiPrewarmLayout> = OnceLock::new();
@@ -117,16 +114,19 @@ fn kimi_bootstrap_layout(core: KimiCoreFormat) -> &'static KimiPrewarmLayout {
     let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6, KimiCoreFormat::Trellis => &TRELLIS,
         KimiCoreFormat::McOriginal => &ORIGINAL, KimiCoreFormat::McK6 => &MC_K6,
         KimiCoreFormat::McK8 => &MC_K8, KimiCoreFormat::McFp8 => &MC_FP8 };
-    bootstrap.get_or_init(|| KimiPrewarmLayout {
-        core,
-        ranks: 0,
-        layout: "bootstrap startup set (untraced)".into(),
-        reserve_base_bytes: vec![],
-        reserve_extra_bytes: 2 << 20,
-        entries: [1, 4, 16, 64].into_iter().map(|rows|
-            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, capture_bytes: vec![] })
-            .chain((2..=64).map(|rows|
-                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, capture_bytes: vec![] })).collect(),
+    bootstrap.get_or_init(|| {
+        tracing::warn!(?core, ranks, "Kimi graph prewarm trace missing for core/layout; using bootstrap startup set");
+        KimiPrewarmLayout {
+            core,
+            ranks: 0,
+            layout: "bootstrap startup set (untraced)".into(),
+            reserve_base_bytes: vec![],
+            reserve_extra_bytes: 2 << 20,
+            entries: [1, 4, 16, 64].into_iter().map(|rows|
+                KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, capture_bytes: vec![] })
+                .chain((2..=64).map(|rows|
+                    KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, capture_bytes: vec![] })).collect(),
+        }
     })
 }
 
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn bootstrap_only_contains_replayable_rows() {
-        let layout = kimi_bootstrap_layout(KimiCoreFormat::Bf16);
+        let layout = kimi_bootstrap_layout(KimiCoreFormat::Bf16, 1);
         for entry in &layout.entries {
             assert!((1..=64).contains(&entry.rows));
         }

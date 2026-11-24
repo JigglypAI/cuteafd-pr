@@ -698,7 +698,7 @@ mod tests {
                 pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {
                     snapshot: args.draft.clone().context("native packing gate requires --draft")?,
-                    fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, context_window: args.draft_length.draft_context_window, draft_kv_cache: args.draft_kv_cache }), verify_rows: 0, prefix: Some(&args.prefix),
+                    fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, context_window: args.draft_length.draft_context_window, draft_kv_cache: args.draft_kv_cache }), verify_rows: 0, decode_rows: 64, prefix: Some(&args.prefix),
                 prove_serve_admission: false })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;

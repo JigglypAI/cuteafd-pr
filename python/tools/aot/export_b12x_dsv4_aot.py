@@ -1365,6 +1365,32 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out.extend(kimi_shared_programs())
     out.extend(mla_draft_programs(decode_rows, max_context))
     out.extend(mla_draft_fp8_weight_programs(64))
+    # Additive 128-row decode/verify stems appended after existing m64/m4096 exports.
+    if decode_rows < 128:
+        wide = 128
+        out.append((f"kda_commit_m{wide}", "kda_commit", {"replay_rows": wide},
+                    lambda r=wide: glmf.compile_glmf_kda_commit_aot(g, replay_rows=r)))
+        kda_params = {"max_rows": wide, "output_kind": "norm", "decode": True, "bf16_wide": False}
+        out.append((f"kda_m{wide}", "kda", kda_params,
+                    lambda kw=kda_params: glmf.compile_glmf_kda_aot(g, **kw)))
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache)
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{wide}", "mla_producer",
+                            {"max_rows": wide, "heads": heads, "kv_cache": cache},
+                            lambda r=wide, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{wide}", "mla_output", {"max_rows": wide, "heads": heads},
+                                lambda r=wide, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+                for mode in ("decode", "verify"):
+                    out.append((f"dense_mla_{mode}{suffix}{cache_suffix}_m{wide}", "dense_mla",
+                                {"mode": mode, "max_rows": wide, "heads": heads, "kv_cache": cache},
+                                lambda m=mode, r=wide, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                                    g, max_rows=r, max_context=max_context, mode=m)))
+        out.extend(item for item in kimi_context_programs(wide, max_context)
+                   if item[1] == "mla_partial")
     return out
 
 
@@ -1433,6 +1459,41 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                         row_bytes=rb, page_rows=PAGE_ROWS)))
     out.extend(causal_mla_draft_programs(64, max_context))
     out.extend(mla_draft_fp8_weight_programs(64, causal=True))
+    # Additive 128-row decode/verify stems appended after existing m64/m4096 exports.
+    if decode_rows < 128:
+        wide = 128
+        out.append((f"kda_commit_m{wide}", "kda_commit", {"replay_rows": wide},
+                    lambda r=wide: glmf.compile_glmf_kda_commit_aot(g, replay_rows=r)))
+        kda_params = {"max_rows": wide, "output_kind": "norm", "decode": True, "bf16_wide": False}
+        out.append((f"kda_m{wide}", "kda", kda_params,
+                    lambda kw=kda_params: glmf.compile_glmf_kda_aot(g, **kw)))
+        out.append((f"index_producer_m{wide}", "index_producer", {"max_rows": wide},
+                    lambda r=wide: kimi_dsa.compile_kimi_index_producer_aot(index, max_rows=r)))
+        for stem, compile_topk in (("index_topk", kimi_dsa.compile_kimi_index_topk_aot),
+                                   ("scored_index_topk", kimi_dsa.compile_kimi_context_index_topk_aot)):
+            params = {"max_rows": wide, "max_pages": pages, "mode": "decode"}
+            out.append((f"{stem}_decode_m{wide}", stem, params,
+                        lambda fn=compile_topk, kw=params: selector(fn, kw)))
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache, norm_eps=1e-5)
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                params = {"max_rows": wide, "heads": heads, "kv_cache": cache}
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{wide}", "mla_producer", params,
+                            lambda r=wide, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                out.append((f"sparse_mla{suffix}{cache_suffix}_m{wide}", "sparse_mla", params,
+                            lambda r=wide, g=mla: kimi_dsa.compile_kimi_sparse_mla_aot(
+                                g, max_rows=r, row_chunk_size=index.sparse_mla_row_chunk_size)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{wide}", "mla_output", params,
+                                lambda r=wide, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+                if heads == 96:
+                    for begin in (0, 48):
+                        out.append((f"sparse_mla_partial{cache_suffix}_h{begin}_m{wide}", "sparse_mla_partial",
+                                    {**params, "head_begin": begin, "head_count": 48},
+                                    lambda r=wide, g=mla, b=begin: kimi_dsa.compile_kimi_sparse_mla_partial_aot(
+                                        g, max_rows=r, head_begin=b, row_chunk_size=index.sparse_mla_row_chunk_size)))
     return out
 
 

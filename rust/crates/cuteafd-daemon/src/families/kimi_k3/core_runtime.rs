@@ -108,8 +108,15 @@ impl<'a> CorePrograms<'a> {
     pub(crate) fn load_for_ranks(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
         inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize,
         cache_format:cuteafd_core::MlaCacheFormat,ranks:usize)->Result<Option<Self>> {
+        Self::load_for_ranks_rows(programs, cfg, inventory, rows, cache_format, ranks, 64)
+    }
+
+    pub(crate) fn load_for_ranks_rows(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
+        inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize,
+        cache_format:cuteafd_core::MlaCacheFormat,ranks:usize,decode_rows:usize)->Result<Option<Self>> {
         use cuteafd_loader::placement::{LayerMode,FfnMode};
         ensure!(matches!(ranks,1|2),"Kimi K6 physical rank count");
+        let decode_cap = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
         inventory.validate_runtime_groups(cfg)?;
         if !inventory.has_split_core() {return Ok(None);}
         let mut projections=BTreeMap::new();
@@ -182,12 +189,12 @@ impl<'a> CorePrograms<'a> {
         if let Some(head) = &fp8_head { native_scratch = native_scratch.max(head.scratch_bytes()?); }
         let dense_situ = inventory.has_dense_fp8_ffn().then(|| KimiSitu::load(programs, cfg.dense_intermediate / ranks)).transpose()?;
         let heads=cfg.kda_heads/ranks;
-        let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
+        let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m{decode_cap}"),decode_cap,true)?,
             KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
         let mut mla=BTreeMap::new();
         let k31 = cfg.dsa.is_some();
         let prefix = if k31 { "kimik31_" } else { "" };
-        for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
+        for heads in [48,96] {for stride in [576,640] {for capacity in [decode_cap,4096] {
             let names=[format!("{prefix}mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
                 format!("{prefix}mla_query_h{heads}_m{capacity}"),format!("{prefix}mla_gate_output_h{heads}_m{capacity}")];
             let load = if k31 { KimiMlaSplit::load_k31 } else { KimiMlaSplit::load };
