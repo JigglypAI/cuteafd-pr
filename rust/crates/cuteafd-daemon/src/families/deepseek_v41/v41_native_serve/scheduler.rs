@@ -939,11 +939,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
-        let mut loads = crate::shared::serve::lanes::rebalance(&mut active, lanes,
+        // Queued prompts keep the lane they were announced on and decode there.
+        let mut loads = admission_loads(&mut active, lanes,
+            prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Queued prompts keep the lane they were announced on and decode there.
-        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
         // Admit available work at a completed boundary (both lanes drained):
         // admitted prompts join the decode-share queue holding their slots.
         let mut intake = receive.len().max(1);
@@ -2062,6 +2062,19 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
     result
 }
 
+/// Lane loads at a drained admission boundary: rebalance the active cohort
+/// with the queued prompts (`queued`, the lane each is pinned to) already
+/// counted. Counting them after balancing could move a member into a lane its
+/// queued prompts then fill past `lane_capacity`; admission passes
+/// `check_lane`, but the lane guard sheds the excess member mid-stream with
+/// "decode lane request capacity exhausted" (found by JigglypAI, #2661).
+fn admission_loads<T>(active: &mut [T], lanes: u8, queued: impl IntoIterator<Item = usize>,
+    lane: impl Fn(&T) -> Option<usize>, set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    let mut reserved = [0usize; 2];
+    for index in queued { reserved[index] += 1; }
+    crate::shared::serve::lanes::rebalance(active, lanes, reserved, lane, set_lane)
+}
+
 /// Members one decode lane holds: the request slots split across `lanes`
 /// lanes, capped by the per-lane member limit (`V41_MAX_LANE_MEMBERS`).
 pub(super) fn lane_capacity(slots: usize, lanes: usize) -> usize {
@@ -2839,6 +2852,29 @@ mod sampling_tests {
     use super::*;
     use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
 
+    /// 29 active on lane 0, 31 on lane 1 and 3 prompts queued on lane 0. Balancing
+    /// before counting the queued prompts gave [30, 30] + 3 = [33, 30], one past
+    /// the 32-member lane, and the lane guard shed a live stream (#2661).
+    #[test]
+    fn admission_loads_count_queued_prompts_before_rebalancing() {
+        let mut active: Vec<Option<usize>> = std::iter::repeat_n(Some(0), 29)
+            .chain(std::iter::repeat_n(Some(1), 31)).chain(std::iter::repeat_n(None, 4)).collect();
+        let capacity = lane_capacity(active.len(), 2);
+        assert_eq!(capacity, 32);
+        let loads = admission_loads(&mut active, 2, [0, 0, 0], |entry| *entry, |entry, lane| *entry = Some(lane));
+        assert_eq!(loads, [32, 31]);
+        assert!(loads.iter().all(|&load| load <= capacity), "{loads:?} exceeds {capacity}");
+        assert_eq!(active.iter().flatten().filter(|&&lane| lane == 0).count(), 29, "no member moved");
+        // Lane 0 heavy only through queued prompts: active members move off it.
+        let mut active: Vec<Option<usize>> = std::iter::repeat_n(Some(0), 20)
+            .chain(std::iter::repeat_n(Some(1), 10)).collect();
+        assert_eq!(admission_loads(&mut active, 2, [0; 12], |entry| *entry, |entry, lane| *entry = Some(lane)), [21, 21]);
+        // One lane: everything lands on lane zero.
+        let mut active = vec![Some(1), None, Some(0)];
+        assert_eq!(admission_loads(&mut active, 1, [0], |entry| *entry, |entry, lane| *entry = Some(lane)), [3, 0]);
+        assert_eq!(active, [Some(0), None, Some(0)]);
+    }
+
     #[test]
     fn startup_queue_validation_precedes_readiness() {
         use crate::shared::prefill_share::DecodeShareArgs;
@@ -2913,7 +2949,7 @@ mod sampling_tests {
         // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
         // Queued prompts decode on the lane they were announced on (review A4).
-        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        assert!(serve.contains("prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),"));
         assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
         let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
