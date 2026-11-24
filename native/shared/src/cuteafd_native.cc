@@ -2480,8 +2480,14 @@ extern "C" cuteafd_status_t cuteafd_copy_h2d_batch_async(
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
                 "batched H2D copy requires a non-default CUDA stream");
   }
-  std::vector<void*> destination_ptrs;
-  destination_ptrs.reserve(count);
+  constexpr size_t kStackCopies = 12;
+  std::array<void*, kStackCopies> small;
+  std::vector<void*> large;
+  void** destination_ptrs = small.data();
+  if (count > small.size()) {
+    large.resize(count);
+    destination_ptrs = large.data();
+  }
   for (size_t index = 0; index < count; ++index) {
     if (bytes[index] == 0) {
       return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
@@ -2495,7 +2501,7 @@ extern "C" cuteafd_status_t cuteafd_copy_h2d_batch_async(
       return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
                   "batched H2D copy exceeds a destination device buffer");
     }
-    destination_ptrs.push_back(dsts[index].ptr);
+    destination_ptrs[index] = dsts[index].ptr;
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
 #if CUDART_VERSION >= 12080
@@ -2503,7 +2509,7 @@ extern "C" cuteafd_status_t cuteafd_copy_h2d_batch_async(
   attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
   size_t attributes_index = 0;
   cudaError_t err = cudaMemcpyBatchAsync(
-      destination_ptrs.data(), srcs, bytes, count, &attributes, &attributes_index, 1,
+      destination_ptrs, srcs, bytes, count, &attributes, &attributes_index, 1,
       reinterpret_cast<cudaStream_t>(cuda_stream));
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_COPY_FAILED, "cudaMemcpyBatchAsync host-to-device failed",
