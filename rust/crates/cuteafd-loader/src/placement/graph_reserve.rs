@@ -7,11 +7,6 @@ pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
     let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
     (list.reserve_base_bytes, list.reserve_extra_bytes)
 }
-/// Qwen 3.8 Flash Next's per-device prewarm base plus extra, by resolved capture shape.
-pub fn qwen_default(shape: crate::serving_capacity::qwen_graphs::QwenGraphShapeKey, rank: usize)
-    -> Option<(u64, u64)> {
-    crate::serving_capacity::qwen_graphs::qwen_reserve(shape, rank)
-}
 /// Each layout rank charges only its trace-qualified identities and one tail.
 /// An unmeasured layout has no borrowed inventory; explicit policy still works.
 pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {

@@ -15,7 +15,7 @@ use crate::placement::planner::{
 };
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{
-    qwen_admission, qwen_reserve, QwenAdmission, QwenAdmissionInputs, QwenGraphShapeKey,
+    qwen_admission, qwen_resolve_reserve, QwenAdmission, QwenAdmissionInputs, QwenGraphShapeKey,
     QWEN_DECODE_ROWS, QWEN_UNIT_ROWS,
 };
 use crate::serving_capacity::Exl3Epilogue;
@@ -197,15 +197,12 @@ fn allowance(source: &str, location: Location, bytes: u64, lifetime: PlanLifetim
             source: source.to_string(), assumed: false }) }
 }
 
-/// The graph reserve as one named owner, charged before KV sizing: the measured
-/// bootstrap high-water plus one in-flight capture's headroom, which
-/// `GPU_GRAPH_RESERVE` overrides per device.
+/// The graph reserve as one named owner, charged before KV sizing: the exact-row
+/// W1 soft cap plus `2x` largest-capture hard margin, which `GPU_GRAPH_RESERVE`
+/// overrides per device.
 fn graph_reserve_owner(shape: QwenGraphShapeKey, rank: usize, location: Location,
     maximum: u64) -> Result<Component, Refusal> {
-    let (base, extra) = qwen_reserve(shape, rank)
-        .ok_or_else(|| Refusal::InvalidFact(format!("Qwen {shape:?} graph reserve has no rank {rank}")))?;
-    let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
-        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    let reserve = qwen_resolve_reserve(shape, rank).map_err(Refusal::InvalidFact)?;
     Ok(allowance(&crate::placement::graph_reserve::source(&format!("qwen4.graphs.{rank}")),
         location, reserve.bytes, PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, maximum))
 }
@@ -1859,8 +1856,7 @@ mod tests {
             expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
             assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
                 .map(|item| item.bytes).sum::<u64>(), expected);
-            let (base, extra) = qwen_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
-            let reserve = crate::placement::graph_reserve::current(0, false, base, extra).unwrap();
+            let reserve = qwen_resolve_reserve(QwenGraphShapeKey::Single0Spark, 0).unwrap();
             assert_eq!(planned.items[0].iter().filter(|item| item.group == "graph reserve: qwen4.graphs.0")
                 .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserve.bytes]);
 
@@ -2217,14 +2213,10 @@ mod tests {
         drop(lazy);
         let serving = build();
         let placement = dual_placement(&serving).unwrap();
-        let (base, extra) = (qwen_reserve(QwenGraphShapeKey::Dual0Spark, 0).unwrap(),
-            qwen_reserve(QwenGraphShapeKey::Dual0Spark, 1).unwrap());
-        let reserves: Vec<_> = [base, extra].iter().enumerate()
-            .map(|(gpu, &(base, extra))| crate::placement::graph_reserve::current(gpu, false, base, extra)
-                .unwrap().bytes).collect();
-        // Each rank's traced prewarm list is independent (rank 1's dual_0spark
-        // base is the larger of the two), so the plan must charge each device
-        // its own reserve rather than a shared value.
+        let reserves: Vec<_> = (0..2)
+            .map(|gpu| qwen_resolve_reserve(QwenGraphShapeKey::Dual0Spark, gpu).unwrap().bytes).collect();
+        // Rank 0 (25 segments, largest capture 2 MiB -> 112+4 = 116 MiB) and
+        // rank 1 (24 segments, largest capture 4 MiB -> 112+8 = 120 MiB) carry independent reserves.
         assert_ne!(reserves[0], reserves[1]);
         for gpu in 0..2 {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.group == format!("graph reserve: qwen4.graphs.{gpu}"))

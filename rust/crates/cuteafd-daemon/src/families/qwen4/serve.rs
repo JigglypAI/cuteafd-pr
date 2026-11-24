@@ -219,10 +219,10 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         engine.warm_decode_graphs(max_sequences, !matches!(draft, Drafts::None))?;
         crate::shared::memory_report::log("qwen4/graphs");
         if let Ok(path) = std::env::var("CUTEAFD_QWEN4_PADDING_TOKENS") {
-            let bytes = std::fs::read(&path).with_context(|| format!("Qwen padding tokens {path}"))?;
-            anyhow::ensure!(bytes.len() % 4 == 0, "Qwen padding token file is not U32-aligned");
+            let bytes = std::fs::read(&path).with_context(|| format!("Qwen graph parity tokens {path}"))?;
+            anyhow::ensure!(bytes.len() % 4 == 0, "Qwen graph parity token file is not U32-aligned");
             let tokens: Vec<_> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-            engine.check_decode_padding(&tokens)?;
+            engine.check_decode_graphs(&tokens)?;
         }
         scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences, draft, length, eos,
             decode_share, &prefix, loop_abort, args.token_io.token_select, &mut media, preparer.as_deref(), || {
@@ -260,32 +260,6 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     Ok((family, cache))
 }
 
-
-#[cfg(test)]
-mod scheduler_tests {
-
-    #[test]
-    fn shared_copy_trim_preserves_qwen_native_launch_limits() {
-        for sequences in 1..=16 {
-            for extra in 0..=64-sequences {
-                let original: Vec<Vec<u32>> = (0..sequences).map(|i| {
-                    (0..=extra / sequences + usize::from(i < extra % sequences))
-                        .map(|j| (i * 100 + j) as u32).collect()
-                }).collect();
-                let real = original.iter().map(Vec::len).sum::<usize>();
-                let limit = super::super::engine::copy_row_limit(real, sequences);
-                let mut trimmed = original.clone();
-                crate::shared::qwen::scheduler::trim_copy_rows(&mut trimmed, limit);
-                assert_eq!(trimmed.iter().map(Vec::len).sum::<usize>(), limit);
-                for (before, after) in original.iter().zip(&trimmed) {
-                    assert!(!after.is_empty());
-                    assert_eq!(after, &before[..after.len()]);
-                }
-            }
-        }
-    }
-
-}
 
 struct Qwen4Backend<'e, 'a> {
     engine: &'e Qwen4Engine<'a>,
@@ -395,11 +369,8 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device_ungraphed(sequences, speculative)
     }
-    fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize {
-        self.engine.verify_bucket_rows(rows, speculative, diagnostic)
-    }
-    fn verify_explore_bucket(&self, rows: usize, diagnostic: bool) -> Option<usize> {
-        Some(self.engine.verify_bucket_rows(rows, true, diagnostic))
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize {
+        rows
     }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         self.engine.verify_attention_trace(contexts, rows)

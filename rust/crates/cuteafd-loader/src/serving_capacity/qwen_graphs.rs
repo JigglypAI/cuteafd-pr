@@ -1,68 +1,27 @@
-//! Qwen 3.8 Flash Next's decode graph shapes and bootstrap prewarm: the one
-//! definition the engine's warm-up captures and admission (runtime and
-//! planner) reserves. Each shape is a (rows, speculative, table geometry)
-//! step; every shape is captured once per layer segment plus the head.
-//!
-//! The checked-in list in `qwen_prewarm.json` is the provisional prewarm and
-//! reserve until a `GRAPH_TRACE` at each card layout replaces it; the runtime
-//! filters it against the shapes this launch may actually capture.
+//! Qwen 3.8 Flash Next's exact-row decode graph geometry and working-set
+//! reserve: every decode and verify step captures lazily on first use at its
+//! exact live row count (`1..=QWEN_DECODE_ROWS`) on `qwen4.segment` (`Scope::Local`),
+//! with empty startup prewarm and the shared default donor rule.
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 
 /// Rows of the decode-shaped programs (`_m64`).
 pub const QWEN_DECODE_ROWS: usize = 64;
-/// Plain decode row buckets.
-pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16, 24, 32, 64];
-/// Speculative verify row buckets.
-pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
+/// Narrowest decode page-table stride, in 64-row KV pages (4,096 tokens):
+/// short sequences up to 4,096 tokens share one table stride instead of
+/// recapturing full-attention graphs as sequences cross 256/512/1024/2048 tokens.
+pub const QWEN_MIN_PAGE_STRIDE: usize = 64;
 /// Tokens per allocation unit (four 64-row record pages) and pages per unit.
 pub const QWEN_UNIT_ROWS: usize = 256;
 pub const QWEN_UNIT_PAGES: usize = 4;
-/// Measured driver bytes of one startup graph executable, rounded up: the
-/// 1-RTX min config (`qwen38-exl3-min`, EXL3 K4.25 PLE FP8, MTP depth 3)
-/// captured 33,418 executables (682 shapes x 49 segments) for 5,102,370,816 B
-/// on SM120 PRO, 2026-11-08 — 152,683.31 B each, charged as the next byte. The
-/// capture measures allocatable memory before and after the whole loop, so it
-/// absorbs the modules and stream slabs that capturing the set creates
-/// (pinned-host page tables are charged as their own owner); multiplying it by
-/// the exact executable count is the whole charge, with no margin.
+/// Measured driver bytes of one graph executable, rounded up: the 1-RTX min
+/// config (`qwen38-exl3-min`, EXL3 K4.25 PLE FP8, MTP depth 3) captured 33,418
+/// executables for 5,102,370,816 B on SM120 PRO (152,683.31 B each). The device
+/// cache replaces this initial bootstrap estimate with observed topology growth.
 pub const QWEN_GRAPH_BYTES_PER_GRAPH: u64 = 152_684;
 
-/// One captured decode step: its row bucket, speculation, and table geometry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QwenGraphShape {
-    pub rows: usize,
-    pub spec: bool,
-    pub long: bool,
-    pub pool_width: usize,
-    pub page_stride: usize,
-    pub pool_stride: usize,
-}
-
-impl QwenGraphShape {
-    /// Full-attention capture geometry; GDN and head keys normalize further.
-    pub fn capture_shape(self) -> Self {
-        Self { pool_width: 0, pool_stride: if self.long { self.pool_stride } else { 0 }, ..self }
-    }
-
-    pub fn geometry(&self) -> QwenGraphGeometry {
-        QwenGraphGeometry { pool_width: self.pool_width, page_stride: self.page_stride, pool_stride: self.pool_stride, long: self.long }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QwenPrewarmEntry {
-    #[serde(flatten)]
-    pub shape: QwenGraphShape,
-    /// Hold this shape resident across eviction pressure (trace-chosen).
-    pub pin: bool,
-}
-
 /// The resolved capture shape: how many devices own layers, and whether Sparks
-/// are attached. A 0-Spark card captures no onboarding graphs and a TP1 card
-/// captures no TP2 peer segments, so the four shapes capture different sets;
-/// each has its own prewarm and reserve, and an untraced shape uses the
-/// bootstrap set rather than borrowing another shape's list.
+/// are attached. Routed experts run outside `qwen4.segment` replay, so 0-Spark
+/// and Spark layouts share the same rank-local segment topology per owner count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QwenGraphShapeKey {
     #[serde(rename = "single_0spark")] Single0Spark,
@@ -84,176 +43,79 @@ impl QwenGraphShapeKey {
     pub fn owners(self) -> usize { if self.is_dual() { 2 } else { 1 } }
     pub fn sparks(self) -> bool { matches!(self, Self::SingleSparks | Self::DualSparks) }
     fn is_dual(self) -> bool { matches!(self, Self::Dual0Spark | Self::DualSparks) }
-    fn index(self) -> usize {
-        match self { Self::Single0Spark => 0, Self::SingleSparks => 1, Self::Dual0Spark => 2, Self::DualSparks => 3 }
+}
+
+/// Exact-row working-set soft cap and hard margin per rank (bytes), following
+/// the shared W1 soft-cap rule (pending `work/graph-soft-cap-rule` landing in
+/// `graph_reserve.rs`):
+/// - `soft = ceil_2MiB(max(1.2 * W1, W1 + 100 MB, W1 + 2 * step))`
+/// - `margin = ceil_2MiB(max(2 * largest_single_capture_growth, 2 MiB))`
+/// - `hard = soft + margin`, `spanning = 0` (`qwen4.segment` is `Scope::Local`).
+///
+/// Calibrated from the donor-off census (`GPU_GRAPH_RESERVE=4GiB`, shared
+/// default donor rule, `baseline + spec_lossless_set + 32K context_load + C1..C16`):
+/// - `qwen38-exl3-min` (1 RTX, 49 segments):
+///   * Full live shape set high-water: 392.00 MiB (411,041,792 B; 2,756 execs, 46,128 nodes).
+///   * W1 (`rows <= 4`, short + long): 29.72 MiB (208 execs, 3,540 nodes);
+///     step growth `G = 6.97 MiB`; `W1 + 100 MB = 125.09 MiB` -> `soft = 126 MiB`.
+///   * `largest_bytes = 4.00 MiB` (`2x = 8.00 MiB`) -> `margin = 8 MiB`, `hard = 134 MiB`.
+/// - `qwen38-exl3-2rtx` (2 RTX; rank 0 = 25 segments, rank 1 = 24 segments):
+///   * Full live shape set high-water: 206.00 / 198.00 MiB (216,006,656 / 207,618,048 B;
+///     1,456 / 1,398 execs, 24,260 / 23,448 nodes).
+///   * W1 (`rows <= 4`, short + long): 15.07 / 14.52 MiB (106 / 102 execs, 1,796 / 1,740 nodes);
+///     step growth `G = 3.54 / 3.44 MiB`; `W1 + 100 MB = 110.44 / 109.88 MiB` -> `soft = 112 / 112 MiB`.
+///   * `largest_bytes = 2.00 / 4.00 MiB` (`2x = 4.00 / 8.00 MiB`) ->
+///     `margin = 4 / 8 MiB`, `hard = 116 / 120 MiB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenGraphBudget {
+    pub soft_cap: u64,
+    pub margin: u64,
+}
+
+const SINGLE_BUDGET: QwenGraphBudget = QwenGraphBudget { soft_cap: 126 << 20, margin: 8 << 20 };
+const DUAL_BUDGET: [QwenGraphBudget; 2] = [
+    QwenGraphBudget { soft_cap: 112 << 20, margin: 4 << 20 },
+    QwenGraphBudget { soft_cap: 112 << 20, margin: 8 << 20 },
+];
+
+/// The exact-row W1 soft cap and 2x-capture hard margin of `rank` on `key` (bytes).
+pub fn qwen_graph_budget(key: QwenGraphShapeKey, rank: usize) -> Option<QwenGraphBudget> {
+    if rank >= key.owners() { return None; }
+    if key.is_dual() { Some(DUAL_BUDGET[rank]) } else { Some(SINGLE_BUDGET) }
+}
+
+/// Resolve Qwen4's per-rank reserve through `graph_reserve::current_working_set`,
+/// applying the W1 soft cap and `2x` largest-capture hard margin until the shared
+/// `work/graph-soft-cap-rule` resolver lands.
+pub fn qwen_resolve_reserve(key: QwenGraphShapeKey, rank: usize)
+    -> Result<crate::placement::graph_reserve::Resolved, String> {
+    const CHUNK: u64 = 2 << 20;
+    let budget = qwen_graph_budget(key, rank)
+        .ok_or_else(|| format!("Qwen {key:?} graph reserve has no rank {rank}"))?;
+    let mut resolved = crate::placement::graph_reserve::current_working_set(rank, budget.soft_cap)
+        .map_err(|error| error.to_string())?;
+    if resolved.source == "user total" {
+        let margin = if resolved.bytes <= CHUNK {
+            resolved.bytes / 2
+        } else {
+            budget.margin.min(resolved.bytes.saturating_sub(CHUNK))
+        };
+        resolved.soft_margin_floor = margin;
+        resolved.base_bytes = resolved.bytes.saturating_sub(margin);
+    } else {
+        resolved.base_bytes = budget.soft_cap;
+        resolved.extra_bytes = budget.margin;
+        resolved.effective_extra_bytes = budget.margin;
+        resolved.soft_margin_floor = budget.margin;
+        resolved.bytes = budget.soft_cap + budget.margin;
     }
-}
-
-/// A `GRAPH_TRACE` run's captured set for one shape.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QwenTrace {
-    /// Host, card, model and date the trace ran.
-    pub provenance: String,
-    pub entries: Vec<QwenPrewarmEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct QwenShapePrewarm {
-    pub shape: QwenGraphShapeKey,
-    /// Per-device prewarm arena: the selected shapes' measured capture bytes,
-    /// summed and rounded once to the 2 MiB chunk. Never the trace's charged
-    /// high-water.
-    pub reserve_base_bytes: Vec<u64>,
-    /// Per-device capture headroom, a fixed 2 MiB; the shared graph reserve
-    /// extra adds room for runtime captures.
-    pub reserve_extra_bytes: Vec<u64>,
-    /// The shape's own trace; `None` until one runs, which falls back to the
-    /// bootstrap startup set with a warning.
-    pub trace: Option<QwenTrace>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct QwenBootstrap {
-    pub entries: Vec<QwenPrewarmEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct QwenPrewarmList {
-    pub schema_version: u32,
-    pub family: String,
-    /// Where the reserves and entries came from (measurement or trace).
-    pub provenance: String,
-    /// Every shape's provisional prewarm before its own trace.
-    pub bootstrap: QwenBootstrap,
-    pub shapes: Vec<QwenShapePrewarm>,
-}
-
-pub fn qwen_prewarm_list() -> &'static QwenPrewarmList {
-    static LIST: OnceLock<QwenPrewarmList> = OnceLock::new();
-    LIST.get_or_init(|| {
-        let list: QwenPrewarmList = serde_json::from_str(include_str!("qwen_prewarm.json"))
-            .expect("qwen_prewarm.json is well formed");
-        assert_eq!(list.schema_version, 1, "qwen prewarm schema");
-        assert_eq!(list.family, "qwen4", "qwen prewarm family");
-        assert!(!list.bootstrap.entries.is_empty(), "qwen prewarm bootstrap entries");
-        for key in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks,
-            QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
-            let rows = list.shapes.iter().filter(|prewarm| prewarm.shape == key).count();
-            assert_eq!(rows, 1, "qwen prewarm shape {key:?} appears once");
-        }
-        for prewarm in &list.shapes {
-            assert_eq!(prewarm.reserve_base_bytes.len(), prewarm.shape.owners(), "qwen prewarm reserve ranks");
-            assert_eq!(prewarm.reserve_extra_bytes.len(), prewarm.shape.owners(), "qwen prewarm reserve ranks");
-        }
-        list
-    })
-}
-
-pub fn qwen_shape_prewarm(key: QwenGraphShapeKey) -> &'static QwenShapePrewarm {
-    qwen_prewarm_list().shapes.iter().find(|prewarm| prewarm.shape == key)
-        .expect("qwen prewarm shape")
-}
-
-/// The reserve of `rank` on `key`: base + extra capture headroom.
-pub fn qwen_reserve(key: QwenGraphShapeKey, rank: usize) -> Option<(u64, u64)> {
-    let prewarm = qwen_shape_prewarm(key);
-    Some((*prewarm.reserve_base_bytes.get(rank)?, *prewarm.reserve_extra_bytes.get(rank)?))
-}
-
-/// The prewarm of `key`, filtered to the shapes this launch can capture: an
-/// entry whose geometry or bucket is outside the allowed set is dropped (a
-/// narrower context prewarms a subset; a wider one captures the rest lazily).
-/// An untraced shape uses the bootstrap startup set and says so once.
-pub fn qwen_prewarm_shapes(key: QwenGraphShapeKey, context: usize, pages: usize, dense: usize,
-    sequences: usize, speculation: bool) -> Vec<QwenGraphShape> {
-    use std::sync::Once;
-    static WARNED: [Once; 4] = [Once::new(), Once::new(), Once::new(), Once::new()];
-    let prewarm = qwen_shape_prewarm(key);
-    if prewarm.trace.is_none() {
-        WARNED[key.index()].call_once(|| {
-            tracing::warn!(shape = ?key,
-                "qwen4 has no graph trace for this shape; prewarming the bootstrap startup set");
-        });
-    }
-    let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries, |trace| &trace.entries);
-    let allowed: std::collections::HashSet<_> = qwen_serving_graph_shapes(context, pages, dense, sequences, speculation)
-        .into_iter().map(|(rows, spec, geometry)| QwenGraphShape { rows, spec,
-            long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-            pool_stride: geometry.pool_stride }.capture_shape()).collect();
-    let pins = qwen_prewarm_pinned(key);
-    let mut seen = std::collections::HashSet::new();
-    let mut shapes: Vec<_> = entries.iter().map(|entry| entry.shape.capture_shape())
-        .filter(|shape| allowed.contains(shape) && seen.insert(*shape)).collect();
-    // A pinned old geometry pins its capture-equivalent normalized identity.
-    shapes.sort_by_key(|shape| !pins.contains(shape));
-    shapes
-}
-
-/// The shapes `key` prewarms that pin their cache entry.
-pub fn qwen_prewarm_pinned(key: QwenGraphShapeKey) -> Vec<QwenGraphShape> {
-    let prewarm = qwen_shape_prewarm(key);
-    let entries = prewarm.trace.as_ref().map_or(&qwen_prewarm_list().bootstrap.entries, |trace| &trace.entries);
-    let mut seen = std::collections::HashSet::new();
-    entries.iter().filter(|entry| entry.pin).map(|entry| entry.shape.capture_shape())
-        .filter(|shape| seen.insert(*shape)).collect()
-}
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct QwenGraphGeometry {
-    pub pool_width: usize,
-    pub page_stride: usize,
-    pub pool_stride: usize,
-    pub long: bool,
-}
-
-/// The decode row bucket of `rows` live rows.
-pub fn qwen_decode_bucket(rows: usize, spec: bool) -> usize {
-    let buckets = if spec { QWEN_SPEC_BUCKETS } else { QWEN_PLAIN_BUCKETS };
-    buckets.iter().copied().find(|&bucket| rows <= bucket).unwrap_or(rows)
+    Ok(resolved)
 }
 
 /// Preserve the established short-context allocation buckets, but do not key a
 /// long decode by unused pages reserved beyond its live power-of-two bucket.
 pub fn decode_allocation_units(allocated: usize, live_tokens: usize, unit: usize) -> usize {
     allocated.min(live_tokens.max(131_072).div_ceil(unit).next_power_of_two())
-}
-
-/// Every table geometry a decode step over `pages` record pages can take for
-/// sequences up to `context` tokens, short (at most `dense`) and long.
-pub fn qwen_graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<QwenGraphGeometry> {
-    let pools = pages / QWEN_UNIT_PAGES;
-    let mut geometries = Vec::new();
-    for units in 1..=context.div_ceil(QWEN_UNIT_ROWS).min(pools) {
-        let capacity = (units * QWEN_UNIT_ROWS).min(context);
-        let mut width = 1;
-        while width / 2 * QWEN_UNIT_ROWS < capacity {
-            let low = if width == 1 { 1 } else { width / 2 * QWEN_UNIT_ROWS + 1 };
-            let high = (width * QWEN_UNIT_ROWS).min(capacity);
-            for long in [false, true] {
-                if (!long && low <= high.min(dense)) || (long && low.max(dense + 1) <= high) {
-                    let live_units = decode_allocation_units(units, high, QWEN_UNIT_ROWS);
-                    let pool_stride = live_units.next_power_of_two().min(pools);
-                    let page_stride = (live_units * QWEN_UNIT_PAGES).next_power_of_two().min(pages);
-                    let geometry = QwenGraphGeometry { pool_width: width.min(pool_stride), page_stride, pool_stride, long };
-                    if !geometries.contains(&geometry) { geometries.push(geometry); }
-                }
-            }
-            width *= 2;
-        }
-    }
-    geometries
-}
-
-/// Every serving shape: each geometry x the plain buckets up to `sequences`
-/// and, with speculation, every verify bucket.
-pub fn qwen_serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
-    -> Vec<(usize, bool, QwenGraphGeometry)> {
-    let plain = qwen_decode_bucket(sequences, false);
-    qwen_graph_geometries(context, pages, dense).into_iter().flat_map(|geometry| {
-        QWEN_PLAIN_BUCKETS.iter().copied().filter(move |&rows| rows <= plain).map(move |rows| (rows, false, geometry))
-            .chain(QWEN_SPEC_BUCKETS.iter().copied().filter(move |_| speculation).map(move |rows| (rows, true, geometry)))
-    }).collect()
 }
 
 /// Record pages of a pool of `pool_tokens` tokens.
@@ -290,51 +152,19 @@ mod owner_graph_tests {
     }
 
     #[test]
-    fn qwen_prewarm_is_the_measured_startup_set() {
-        use super::*;
-        let shapes = qwen_serving_graph_shapes(262_144, 8192, 2051, 16, true);
-        assert_eq!(shapes.len(), 682);
-        let entries = &qwen_prewarm_list().bootstrap.entries;
-        assert_eq!(entries.len(), shapes.len());
-        for (entry, shape) in entries.iter().zip(&shapes) {
-            assert_eq!((entry.shape.rows, entry.shape.spec, entry.shape.geometry()), *shape);
-            assert!(!entry.pin, "the bootstrap prewarm pins nothing");
-        }
-        for key in [QwenGraphShapeKey::SingleSparks, QwenGraphShapeKey::DualSparks] {
-            // Untraced: every shape falls back to the bootstrap set, never another shape's list.
-            assert!(qwen_shape_prewarm(key).trace.is_none(), "{key:?}");
-            assert_eq!(qwen_prewarm_shapes(key, 262_144, 8192, 2051, 16, true).len(), 187, "{key:?}");
-            assert_eq!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 16, true).len(), 88, "{key:?}");
-            assert!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 1, false).len() < 253, "{key:?}");
-            assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
-        }
-        // Traced shapes install their own measured list; every entry must stay
-        // reachable at the card it was traced on (the trace cards' pool pages),
-        // so prewarm never silently drops a measured shape.
-        for (key, pages) in [(QwenGraphShapeKey::Single0Spark, 10_744),
-            (QwenGraphShapeKey::Dual0Spark, 32_768)] {
-            let prewarm = qwen_shape_prewarm(key);
-            let trace = prewarm.trace.as_ref().expect("traced shape");
-            let retained = qwen_prewarm_shapes(key, 262_144, pages, 2051, 16, true);
-            assert_eq!(retained.len(), if key == QwenGraphShapeKey::Single0Spark { 13 } else { 15 });
-            for entry in &trace.entries {
-                assert!(retained.contains(&entry.shape.capture_shape()), "{key:?}: {entry:?}");
-            }
-            assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
-        }
+    fn qwen_exact_row_soft_caps_cover_every_resolved_shape() {
         assert_eq!(QwenGraphShapeKey::resolve(1, false), QwenGraphShapeKey::Single0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(1, true), QwenGraphShapeKey::SingleSparks);
         assert_eq!(QwenGraphShapeKey::resolve(2, false), QwenGraphShapeKey::Dual0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(2, true), QwenGraphShapeKey::DualSparks);
-        for (key, rank0, rank1) in [
-            (QwenGraphShapeKey::Single0Spark, (109_051_904, 2_097_152), None),
-            (QwenGraphShapeKey::SingleSparks, (5_102_370_816, 2_097_152), None),
-            (QwenGraphShapeKey::Dual0Spark, (67_108_864, 2_097_152), Some((73_400_320, 2_097_152))),
-            (QwenGraphShapeKey::DualSparks, (2_707_423_232, 2_097_152), Some((2_604_662_784, 2_097_152))),
-        ] {
-            assert_eq!(qwen_reserve(key, 0), Some(rank0), "{key:?}");
-            assert_eq!(qwen_reserve(key, 1), rank1, "{key:?}");
-            assert_eq!(qwen_reserve(key, 2), None, "{key:?}");
+        for key in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks] {
+            assert_eq!(qwen_graph_budget(key, 0), Some(SINGLE_BUDGET), "{key:?}");
+            assert_eq!(qwen_graph_budget(key, 1), None, "{key:?}");
+        }
+        for key in [QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
+            assert_eq!(qwen_graph_budget(key, 0), Some(DUAL_BUDGET[0]), "{key:?}");
+            assert_eq!(qwen_graph_budget(key, 1), Some(DUAL_BUDGET[1]), "{key:?}");
+            assert_eq!(qwen_graph_budget(key, 2), None, "{key:?}");
         }
     }
 
