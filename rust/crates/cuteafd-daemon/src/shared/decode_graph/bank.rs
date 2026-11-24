@@ -125,6 +125,19 @@ impl CaptureTicket {
                     tracing::error!(%error, "invalidating rejected donor");
                 } }) {
                 self.updated = true;
+                // Upload outside the device cache mutex on the launch stream so
+                // the first launch after refresh is a normal async enqueue,
+                // matching the instantiate path below.
+                drop(cache);
+                // SAFETY: `exec` is exclusively owned by this ticket and `stream`
+                // is the caller's launch stream.
+                if let Err(error) = unsafe { library.cuda_graph_upload(exec as *mut _, stream) } {
+                    // SAFETY: `exec` has never been committed or launched; destroy
+                    // it so the transferred executable does not leak while
+                    // capture_result/Drop removes this ticket's cache metadata.
+                    let _ = unsafe { library.cuda_graph_exec_destroy(exec as *mut _) };
+                    return Err(error);
+                }
                 return Ok((exec as *mut _, source.nodes, source.width, source.spans_devices, inspection_error));
             }
             match cache.fallback_update(self.id) {
@@ -496,6 +509,22 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 }
 
+impl<K: Hash + Eq + Clone + std::fmt::Debug, P> GraphBank<K, super::GraphOwner<'_, P>> {
+    /// Asynchronously pre-uploads a resident graph for `key` on `stream`.
+    /// Native skips the driver call if the handle is already uploaded on `stream`.
+    ///
+    /// # Safety
+    /// `stream` is a live CUDA stream (or null for stream 0) on this bank's device.
+    #[allow(dead_code)]
+    pub unsafe fn prefetch_upload(&self, library: &cuteafd_ffi::NativeLibrary,
+        key: &K, stream: *mut std::ffi::c_void) -> anyhow::Result<bool> {
+        let Some(owner) = self.get(key) else { return Ok(false); };
+        // SAFETY: `owner.raw` is a live resident handle owned by this bank.
+        unsafe { library.cuda_graph_upload(owner.raw, stream)?; }
+        Ok(true)
+    }
+}
+
 impl<K, E> Drop for GraphBank<K, E> {
     fn drop(&mut self) {
         if let Some(binding) = &mut self.device {
@@ -558,6 +587,107 @@ mod device_tests {
         assert_eq!(snapshot.charged, 10);
         assert_eq!(snapshot.live_bytes, 10);
         assert_eq!(snapshot.cycles[&Cycle::Decode].updates_soft, 1);
+        drop(receiver);
+        Ok(())
+    }
+
+    #[test]
+    fn source_capture_and_donor_update_upload_on_stream_before_launch() -> anyhow::Result<()> {
+        use super::super::GraphOwner;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 0, 128 << 20, 0)?;
+        let mut donor = GraphBank::new();
+        let mut receiver = GraphBank::new();
+        for bank in [&mut donor, &mut receiver] {
+            bank.attach_device_for_test(-164_408, 100, site())?;
+        }
+        donor.cache_lane_owner(1);
+        receiver.cache_lane_owner(0);
+        let stream_a = 0x1000usize as *mut std::ffi::c_void;
+        let stream_b = 0x2000usize as *mut std::ffi::c_void;
+
+        // 1. Fresh capture/instantiate uploads on stream_a before launch.
+        let mut ticket = donor.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: CPU fixture records no device work or captured allocations.
+        let source = unsafe { library.cuda_graph_capture_source(stream_a)? };
+        let (raw, nodes, width, spans, _) = ticket.complete_source(&library, source, stream_a)?;
+        assert_eq!(fixture.events()?, "Gu", "fresh instantiate must upload before launch");
+        // SAFETY: fixture graph has no device operands.
+        let owner = unsafe { GraphOwner::new(&library, 0, raw, ())? };
+        donor.cache_commit(1, owner, ticket, nodes as u64, width, spans);
+        donor.cache_measured(10);
+        // SAFETY: fixture submits no device work.
+        unsafe { library.cuda_graph_launch(raw, stream_a)?; }
+        assert_eq!(fixture.events()?, "GuL");
+
+        // 2. Donor update uploads on stream_b inside complete_source, before launch.
+        let cache = donor.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().advance_for_update_fixture(1, 2);
+        cache.lock().unwrap().set_soft_limit_for_fixture(10);
+        let mut ticket = receiver.cache_ticket(&2, false, None).expect("soft-cap update admitted");
+        // SAFETY: CPU fixture records no device work.
+        let source = unsafe { library.cuda_graph_capture_source(stream_b)? };
+        let (new, nodes, width, spans, _) = ticket.complete_source(&library, source, stream_b)?;
+        assert_eq!(fixture.events()?, "GuLUu",
+            "donor update must issue cudaGraphUpload on launch stream before first launch");
+        // SAFETY: stale donor handle must reject upload; receiver commits and launches.
+        unsafe { assert!(library.cuda_graph_upload(raw, stream_b).is_err()); }
+        let owner = unsafe { GraphOwner::new(&library, 0, new, ())? };
+        receiver.cache_commit(2, owner, ticket, nodes as u64, width, spans);
+        // SAFETY: prefetch on same stream is idempotent; prefetch on a new stream uploads ahead of launch.
+        unsafe {
+            assert!(receiver.prefetch_upload(&library, &2, stream_b)?);
+            assert_eq!(fixture.events()?, "GuLUu", "redundant prefetch on same stream must be a no-op");
+            library.cuda_graph_launch(new, stream_b)?;
+            assert_eq!(fixture.events()?, "GuLUuL");
+            assert!(receiver.prefetch_upload(&library, &2, stream_a)?);
+            assert_eq!(fixture.events()?, "GuLUuLu", "prefetch on another stream uploads ahead of launch");
+            library.cuda_graph_launch(new, stream_a)?;
+            assert_eq!(fixture.events()?, "GuLUuLuL");
+        }
+        drop(donor);
+        drop(receiver);
+        Ok(())
+    }
+
+    #[test]
+    fn donor_update_upload_failure_destroys_exec_and_cleans_cache() -> anyhow::Result<()> {
+        use super::super::GraphOwner;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 0, 128 << 20, 0)?;
+        let mut donor = GraphBank::new();
+        let mut receiver = GraphBank::new();
+        for bank in [&mut donor, &mut receiver] {
+            bank.attach_device_for_test(-164_409, 100, site())?;
+        }
+        donor.cache_lane_owner(1);
+        receiver.cache_lane_owner(0);
+        let mut ticket = donor.cache_ticket(&1, false, None).unwrap();
+        // SAFETY: CPU fixture records no device work.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (raw, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        // SAFETY: fixture graph has no device operands.
+        let owner = unsafe { GraphOwner::new(&library, 0, raw, ())? };
+        donor.cache_commit(1, owner, ticket, nodes as u64, width, spans);
+        donor.cache_measured(10);
+        let cache = donor.device.as_ref().unwrap().cache.clone();
+        cache.lock().unwrap().advance_for_update_fixture(1, 2);
+        cache.lock().unwrap().set_soft_limit_for_fixture(10);
+
+        let mut ticket = receiver.cache_ticket(&2, false, None).expect("soft-cap update admitted");
+        // SAFETY: CPU fixture records no device work.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        fixture.configure_capture(&library, 12)?;
+        let completed = ticket.complete_source(&library, source, std::ptr::null_mut());
+        assert!(ticket.capture_result(completed).is_err());
+        fixture.configure_capture(&library, 0)?;
+        assert_eq!(fixture.events()?, "GuUg",
+            "failed upload after donor transfer must destroy the transferred executable");
+        let snapshot = super::super::device::snapshots().into_iter().find(|row| row.device == -164_409).unwrap();
+        assert_eq!(snapshot.pools.live_execs, 0, "failed upload must remove transferred cache entry");
+        drop(donor);
         drop(receiver);
         Ok(())
     }

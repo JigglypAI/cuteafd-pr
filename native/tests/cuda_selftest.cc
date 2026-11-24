@@ -2831,6 +2831,8 @@ void test_cuda_graph_source_transfer_rewrites_all_kernel_pointers() {
   require_status(cuteafd_cuda_graph_source_update(second, donor, &status, &result), "transfer update");
   assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
   require_status(cuteafd_cuda_graph_source_transfer(second, donor, &receiver), "transfer owner");
+  assert(cuteafd_cuda_graph_upload(donor, stream) != CUTEAFD_STATUS_OK);
+  require_status(cuteafd_cuda_graph_upload(receiver, stream), "transfer upload");
   require_status(cuteafd_cuda_graph_source_destroy(first), "transfer first destroy");
   require_status(cuteafd_cuda_graph_source_destroy(second), "transfer second destroy");
   require_status(cuteafd_cuda_graph_exec_destroy(donor), "transfer old handle destroy");

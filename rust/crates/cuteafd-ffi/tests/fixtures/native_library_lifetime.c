@@ -561,7 +561,7 @@ static int hc_is_recording(void *stream) {
 }
 static int capture_status;
 void fixture_configure_capture(int status) { capture_status = status; }
-struct graph_exec { int device; size_t bytes; int invalid; uint64_t launches; };
+struct graph_exec { int device; size_t bytes; int invalid; uint64_t launches; int uploaded; void *uploaded_stream; };
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     if (hc_is_recording(stream)) hc_recording = 0;
     if (capture_status) return capture_status;
@@ -570,6 +570,8 @@ int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     graph->device = current_device;
     graph->invalid = 0;
     graph->launches = 0;
+    graph->uploaded = 0;
+    graph->uploaded_stream = NULL;
     graph->bytes = graph_bytes;
     memory_used[current_device] += graph_bytes;
     *out = graph;
@@ -607,10 +609,20 @@ int cuteafd_cuda_graph_capture_source(void *stream, void **out, size_t *nodes,
 }
 int cuteafd_cuda_graph_source_instantiate(void *source, void *stream, void **exec) {
     if (!source) return 1;
-    return cuteafd_cuda_graph_end_capture(stream, exec);
+    int status = cuteafd_cuda_graph_end_capture(stream, exec);
+    if (!status) {
+        struct graph_exec *graph = *exec;
+        graph->uploaded = 1;
+        graph->uploaded_stream = stream;
+        event('u');
+    }
+    return status;
 }
 int cuteafd_cuda_graph_source_update(void *source, void *exec, int *status, int *result) {
     if (!source || !exec) return 1;
+    struct graph_exec *graph = exec;
+    graph->uploaded = 0;
+    graph->uploaded_stream = NULL;
     *status = 0; *result = 0; event('U'); return 0;
 }
 int cuteafd_cuda_graph_source_transfer(void *source, void *donor, void **out) {
@@ -621,8 +633,20 @@ int cuteafd_cuda_graph_source_transfer(void *source, void *donor, void **out) {
     if (!next) return 1;
     *next = *old;
     next->launches = 0;
+    next->uploaded = 0;
+    next->uploaded_stream = NULL;
     old->invalid = 1;
     *out = next;
+    return 0;
+}
+int cuteafd_cuda_graph_upload(void *handle, void *stream) {
+    struct graph_exec *graph = handle;
+    if (!graph || graph->invalid || graph->device != current_device) return 1;
+    if (capture_status == 12) return 1;
+    if (graph->uploaded && graph->uploaded_stream == stream) return 0;
+    graph->uploaded = 1;
+    graph->uploaded_stream = stream;
+    event('u');
     return 0;
 }
 int cuteafd_cuda_graph_exec_invalidate(void *donor) {

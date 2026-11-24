@@ -75,6 +75,22 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         let owner = self.bank.get(&(layer, rows))?;
         std::ptr::eq(owner.pins, weights).then_some((owner.raw, rows))
     }
+    /// Asynchronously pre-uploads the likely-next layer graph `(layer + 1, rows)`
+    /// on `stream` if it is resident with matching weights. Idempotent in native
+    /// when already uploaded on `stream`.
+    ///
+    /// # Safety
+    /// `stream` is a live CUDA stream (or null for stream 0) on this bank's device.
+    #[allow(dead_code)]
+    pub unsafe fn prefetch_next(&self, layer: usize, weights: &W, rows: u32,
+        stream: *mut c_void) -> Result<bool> {
+        let next = layer + 1;
+        if next >= 40 { return Ok(false); }
+        let Some((raw, _)) = self.get_shape(next, weights, rows) else { return Ok(false); };
+        // SAFETY: `raw` is a live resident handle owned by this bank.
+        unsafe { self.library.cuda_graph_upload(raw, stream)?; }
+        Ok(true)
+    }
     /// # Safety
     /// Every launch of this layer's graph completed on every consumer stream.
     pub unsafe fn remove(&mut self, layer: usize) -> Result<()> {
