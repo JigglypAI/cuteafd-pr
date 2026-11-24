@@ -31,7 +31,7 @@ impl Panel for ConfigurationPanel {
     fn estimate_s(&self, _rates: &Rates, _info: &ServerInfo) -> f64 { 0.2 }
     fn run(&self, ctx: &Ctx<'_>) -> anyhow::Result<Value> {
         Ok(json!({"model": ctx.info.model, "family": ctx.info.family, "revision": ctx.info.revision,
-            "configuration": ctx.info.configuration, "build": ctx.info.build}))
+            "configuration": ctx.info.configuration, "drafter": ctx.info.drafter, "build": ctx.info.build}))
     }
 }
 

@@ -565,6 +565,10 @@ fn with_backend<T>(args: &ServeArgs,
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
+    if mtp.is_some() {
+        crate::shared::draft::report::publish(mtp_layout(&ids, u8::try_from(head_rank)?,
+            &admission.cache, &admission.solved, inputs.sequences)?);
+    }
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     let backend = backend.with_vision(crate::shared::vision::perception::Binding::new(&args.snapshot,
         cuteafd_loader::media::ImageFamily::Step5, media.preparer.is_some(), cfg.vocab as u32)?);
@@ -595,6 +599,18 @@ pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item
         .context("Step-5 sampled owner overflow")?;
     ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
     total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
+}
+
+fn mtp_layout(ids: &[i32], head: u8, cache: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
+    plan: &cuteafd_loader::placement::planner::ResolvedPlan, sequences: usize)
+    -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let state = &cache.ranks[usize::from(head)];
+    let first = state.sliding.iter().find(|ring| ring.mtp).context("Step-5 missing admitted MTP rings")?;
+    let mut layout = report::admitted(Kind::Mtp, Placement::Whole, head, ids, plan)?;
+    let active = (state.bytes - first.key.offset).checked_mul(sequences as u64).context("Step-5 MTP state overflow")?;
+    layout.arena_bytes[0] = layout.arena_bytes[0].checked_add(active).context("Step-5 MTP report overflow")?;
+    Ok(layout)
 }
 
 fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {
@@ -1600,4 +1616,23 @@ mod session_ownership_tests {
         working.spark_layers.push(90);
         assert!(opens_expert_sessions(&working));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn step5_mtp_report_uses_the_predictor_head_and_cache() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    use cuteafd_loader::{plan::testing::{step5_fixture, write_snapshot}, serving_capacity::step5::Step5CacheLayout};
+    let root = tempfile::tempdir()?;
+    let (json, tensors) = step5_fixture("fp8");
+    write_snapshot(root.path(), &json, &tensors, None);
+    let cfg = Config::parse(&Checkpoint::open(root.path())?)?;
+    let cache = Step5CacheLayout::new(&cfg, 2, 8192, 3, 256, 256, Default::default())?;
+    let state = &cache.ranks[0];
+    let first = state.sliding.iter().find(|ring| ring.mtp).unwrap();
+    let layout = mtp_layout(&[4, 2], 0, &cache, &plan(vec![owner(0, 1024)]), 2)?;
+    assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Mtp, Some(Placement::Whole), Some(Rank::CudaRank(4))));
+    assert_eq!(layout.ranks, [Rank::CudaRank(4)]);
+    assert_eq!(layout.arena_bytes, [1024 + 2 * (state.bytes - first.key.offset)]);
+    Ok(())
 }

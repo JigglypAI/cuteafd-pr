@@ -1240,6 +1240,13 @@ mod admission_tests {
             let memory = vec![(80usize << 30, 96usize << 30); ranks];
             let moved = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, Some(&draft))?;
             assert_eq!(draft::home(&moved.placement), Some(home));
+            let ids = &[7, 3][..ranks];
+            let report = super::super::drafter_report(home, ids, &moved.solved)?;
+            use crate::shared::draft::report::{Kind, Placement, Rank};
+            assert_eq!((report.kind, report.placement, report.lead), (Kind::Dspark,
+                Some(if ranks == 1 { Placement::Whole } else { Placement::Split }), Some(Rank::CudaRank(ids[usize::from(home)]))));
+            assert_eq!(report.arena_bytes.len(), ranks);
+            assert!(report.arena_bytes.iter().all(|&bytes| bytes >= 64 << 20));
             assert_eq!(moved.placement.items[home as usize].iter()
                 .filter(|item| item.group == "dSpark experts").map(|item| item.bytes).sum::<u64>(), draft.resident);
             assert_eq!(moved.placement.items[home as usize].iter()

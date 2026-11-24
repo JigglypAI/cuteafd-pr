@@ -1476,6 +1476,26 @@ impl Opened {
             }
             engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
             if let Some(drafter) = &engine.drafter { drafter.prepare_workspace()?; }
+            if serving.is_some() {
+                use crate::shared::draft::report::{self, Kind};
+                let physical = std::iter::once(args.device).chain(peer_stream.map(|(id, _)| id)).collect::<Vec<_>>();
+                let draft_split = engine.drafter.as_ref().map(|draft| draft.is_split());
+                if let Some(mut layout) = drafter_report(draft_split, engine.mtp.is_some(), &physical, &preflight.solved)? {
+                    if layout.kind == Kind::Mtp {
+                        use cuteafd_loader::serving_capacity::{mimo_cache_geometry, MIMO_RING_ROWS};
+                        use cuteafd_loader::placement::planner::independent_backing_slack;
+                        let target = mimo_cache_geometry(&self.cfg, layers, physical.len(), args.kv_formats(), 0)?.ranks[0];
+                        let full = mimo_cache_geometry(&self.cfg, layers, physical.len(), args.kv_formats(), args.mtp)?.ranks[0];
+                        let stage = args.rings as u64 * MIMO_RING_ROWS
+                            * self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding, args.kv_formats()) as u64;
+                        let history = args.rings as u64 * MIMO_RING_ROWS * self.cfg.hidden as u64 * 2;
+                        let tail = independent_backing_slack(std::iter::repeat_n(stage, args.mtp).chain([history]))?;
+                        layout.arena_bytes[0] += (full.active_state_per_sequence_bytes - target.active_state_per_sequence_bytes)
+                            * args.rings as u64 + full.fixed_state_bytes - target.fixed_state_bytes + tail;
+                    }
+                    report::publish(layout);
+                }
+            }
             body(&engine, preflight.host_config)
         })();
         let submission_failed = engine.submission_failed();
@@ -2484,5 +2504,30 @@ fn greedy_digest(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine
         count as f64 / cycles as f64, all_drafts.len(), 1e3 * draft_s / cycles as f64,
         count as f64 / started.elapsed().as_secs_f64());
     allocator.release(placement);
+    Ok(())
+}
+
+fn drafter_report(dflash_split: Option<bool>, mtp: bool, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+    -> Result<Option<crate::shared::draft::report::DrafterLayout>> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let (kind, placement) = match dflash_split {
+        Some(true) => (Kind::Dflash2, Placement::Split),
+        Some(false) => (Kind::Dflash2, Placement::Whole),
+        None if mtp => (Kind::Mtp, Placement::Whole),
+        None => return Ok(None),
+    };
+    Ok(Some(report::from_plan(kind, placement, 0, devices, plan, |owner| owner.group == "draft.fp8_scratch")?))
+}
+
+#[cfg(test)]
+#[test]
+fn mimo_report_matches_bound_dflash_and_native_mtp() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let admitted = plan(vec![owner(0, 600), owner(1, 400)]);
+    let split = drafter_report(Some(true), false, &[3, 6], &admitted)?.unwrap();
+    let mtp = drafter_report(None, true, &[3, 6], &admitted)?.unwrap();
+    assert_eq!((split.kind, split.placement, split.ranks), (Kind::Dflash2, Some(Placement::Split), vec![Rank::CudaRank(3), Rank::CudaRank(6)]));
+    assert_eq!((mtp.kind, mtp.placement, mtp.arena_bytes), (Kind::Mtp, Some(Placement::Whole), vec![600]));
+    assert!(drafter_report(None, false, &[3, 6], &admitted)?.is_none());
     Ok(())
 }

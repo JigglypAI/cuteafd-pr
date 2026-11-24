@@ -97,6 +97,9 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+        if mtp {
+            crate::shared::draft::report::publish(admission::mtp_report(&devices.map(|device| device.id), &solved, &[])?);
+        }
         admission::publish_reconciliation(args, &inventory.gpus, &solved, sparks)?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();

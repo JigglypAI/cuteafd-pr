@@ -13,6 +13,7 @@ pub(crate) mod history;
 pub(crate) mod length;
 pub(crate) mod remote;
 pub(crate) mod remote_dflash;
+pub(crate) mod report;
 pub(crate) mod timing;
 
 /// Explicit device timing profiles.

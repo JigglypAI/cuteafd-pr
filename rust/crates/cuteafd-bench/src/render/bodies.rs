@@ -322,6 +322,9 @@ impl<'a> View<'a> {
             y += chips(doc, t, 120.0, y, w - 120.0, &items, t.series[0]) + 6.0;
         }
         y += row(doc, t, 0.0, y, w, "Speculator", &c.speculator_label());
+        if let Some(drafter) = &s.drafter {
+            y += row(doc, t, 0.0, y, w, "Drafter", &drafter.label());
+        }
         y += row(doc, t, 0.0, y, w, "Thinking", c.thinking_label());
         y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity_line());
         if let Some(layout) = &c.layout {
