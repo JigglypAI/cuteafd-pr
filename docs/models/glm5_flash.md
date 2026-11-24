@@ -1,5 +1,10 @@
 # GLM 5.3 Flash
 
+Both MC checkpoints use K8 compact for v7 Release smoke. The two-RTX, zero-
+Spark cards are the bases for original, K6 compact and FP8 compact
+comparisons. The v6 EXLR8 card is retired; the checkpoint and configs remain
+supported.
+
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
 the pool then grows into remaining admitted memory, within native encoding
@@ -62,9 +67,8 @@ router, embedding or routed expert is converted by core selection.
 `fp8-compact` converts the selected target-owned original attention, dense/shared FFN
 and vocabulary-head matrices to block FP8. It leaves native keep tensors,
 routers, embeddings, the vision tower and routed experts unchanged.
-Max K8/K6/FP8 comparisons are supplementary to the original-view card.
-The original max baseline still uses FP8-QK MLA attention and must be
-re-run when BF16 attention lands (#2146).
+The v6 original max comparison used FP8-QK MLA attention. The v7 study
+compares every view with the same attention settings as the K8 base.
 
 ## Engineering summary
 

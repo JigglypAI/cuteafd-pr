@@ -141,14 +141,13 @@ def test_glm_ring_expectation_requires_preserved_observer(entry, tmp_path):
 
 
 def test_dense_candidate_cards_are_zero_spark_and_do_not_change_release_matrix():
-    kit = ROOT / 'scripts/bench/kits/gate'
     names = ['qwen35-9b-bf16-min', 'qwen38-27b-bf16-min']
-    dense = cards.load_cards(kit, names)
+    dense = json.loads((ROOT / 'scripts/tests/fixtures/matrix-dense-qwen.json').read_text())['entries']
     assert [card['name'] for card in dense] == names
-    assert [cards.config(card['config'])['MODEL_ID'] for card in dense] == [
+    assert [cards.config(ROOT / 'scripts/bench/kits/gate' / card['config'])['MODEL_ID'] for card in dense] == [
         'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.8-27B']
     for card in dense:
-        values = cards.config(card['config'])
+        values = cards.config(ROOT / 'scripts/bench/kits/gate' / card['config'])
         assert card['family'] == 'qwen3_5' and card['sparks'] == [] and card['gpus'] == [1]
         assert values['SPARK_COUNT'] == '0' and values['EXPERT_BACKEND'] == 'local'
         assert values['CONCURRENCY'] == '8' and values['POOL_TOKENS'] == 'auto'
@@ -1629,25 +1628,6 @@ def test_gate_muse_mc_cards_are_separate_from_legacy_support(size, count):
         assert values['MAX_CONTEXT_TOKENS'] == 'auto'
 
 
-def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
-    kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]
-    values = {**cards.config(ROOT / card['config']), **card['set']}
-    assert card['family'] == 'glm5' and card['gpus'] == [0]
-    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
-    assert values['RTX_GPUS'] == '1' and values['COORDINATOR_GPUS'] == '0'
-    assert values['SPARK_COUNT'] == '4' and values['EXLR8_MANIFEST'] == 'up1'
-    assert values['MODEL_ID'] == 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
-    assert values['POOL_TOKENS'] == 'auto' and 'RTX_EXPERT_LAYERS' not in values
-    for rank, host in enumerate(card['sparks']):
-        assert values[f'SPARK_{rank}_HOST'] == host
-        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
-    entries = [entry for matrix in kit.glob('matrix-*.json')
-               for entry in json.loads(matrix.read_text())['entries']]
-    for key in ('ADDR', 'EXPERT_PORT'):
-        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
-
-
 @pytest.mark.parametrize('size,gpus,count', [('min', [1], 4), ('max', [0, 1], 6)])
 def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, count):
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'glm53-mc-original-{size}'])[0]
@@ -1659,9 +1639,9 @@ def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, cou
     assert card['gpus'] == gpus and card['sparks'] == list(cards.HOSTS[:count])
 
 
-def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
-    kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['v41-flash-sim5090'])[0]
+def test_archived_v41_sim5090_matches_pinned_tp4_reproduction():
+    entries = json.loads((ROOT / 'scripts/tests/fixtures/retired-gate-cards.json').read_text())['entries']
+    card = next(e for e in entries if e['name'] == 'v41-flash-sim5090')
     values = {**cards.config(ROOT / card['config']), **card['set']}
     assert card['gpus'] == [0]
     assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
@@ -1676,7 +1656,6 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
     assert 'PREFILL_BATCH_TOKENS' not in values and 'PREFILL_ROWS' not in values
     assert [values[f'SPARK_{rank}_HOST'] for rank in range(4)] == card['sparks']
-    entries = json.loads((kit / 'matrix-gate.json').read_text())['entries']
     for key in ('ADDR', 'EXPERT_PORT'):
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
 
@@ -1685,7 +1664,7 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     # A card pinned to GPU0 (GPU1 held by another session) stages its WIP build
     # container on GPU0 too; without the key the default stays GPU1.
     kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['v41-flash-min'])[0]
+    card = cards.load_cards(kit, ['v4-pro-exl3-max'])[0]
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     arms = cards.arms_from(['base=x:a'])
     for sub in ('gpu0', 'pair', 'default', 'bad'):
@@ -2013,10 +1992,10 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-strided-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
-    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-strided-min', '--matrix', '--arm', 'c=x:s',
             '--state', str(tmp_path / 'state')]
     with pytest.raises(ValueError) as caught:
         _run_main(monkeypatch, argv, slot=_slot_with_roles(roles, verified, error=error))
@@ -2028,17 +2007,17 @@ def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, mo
     assert not list((tmp_path / 'state').glob('*/exit'))
     # A slot that attests tp3 with verified symbols launches.
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_slot_with_roles(['tp3']))
-    assert rc == 0 and launched == ['v41-flash-min/c']
+    assert rc == 0 and launched == ['v41-flash-strided-min/c']
 
 
 def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatch):
     gate = ROOT / 'scripts/bench/kits/gate'
     state = tmp_path / 'state'
-    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s', '--state', str(state),
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-strided-min', '--matrix', '--arm', 'c=x:s', '--state', str(state),
             '--preflight-only']
     rc, launched = _run_main(monkeypatch, argv, slot=_slot_with_roles(['tp2', 'tp3', 'tp6']))
     assert rc == 0 and launched == []
-    job = json.loads((state / 'v41-flash-min-c-r1' / 'job.json').read_text())
+    job = json.loads((state / 'v41-flash-strided-min-c-r1' / 'job.json').read_text())
     assert job['needs']['tp_role'] == 'tp3'
     hook = job['entry']['prelaunch']['argv']
     # At grant the slot no longer attests tp3 (rebuilt or swapped): refused.
@@ -4600,8 +4579,8 @@ def test_summary_lists_graph_captures_per_timed_band(tmp_path):
     cards.write_summary(tmp_path, rows, {'candidate': {}})
     text = (tmp_path / 'summary.md').read_text()
     assert '## Graph Captures Per Timed Band' in text
-    assert '| c | candidate | 1 | levels C1 | 0 | 0 | 0 | 0 | yes |' in text
-    assert '| c | candidate | 1 | levels C16 | 2 | 1 | 3 | 1 | NO |' in text
+    assert '| c | candidate | 1 | 1 | levels C1 | 0 | 0 | 0 | 0 | yes |' in text
+    assert '| c | candidate | 1 | 1 | levels C16 | 2 | 1 | 3 | 1 | NO |' in text
     assert 'unavailable: no start sample' in text
     assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['graph_bands'] == bands
 
@@ -4623,5 +4602,140 @@ def test_summary_lists_context_load_bands_with_thermals_and_eager_sites(entry, t
     assert row['graph_bands'] == bands and 'context_graph_bands' not in row
     cards.write_summary(tmp_path, [{**row, 'card': 'c', 'arm': 'candidate', 'repeat': 1, 'status': 'pass'}], {'candidate': {}})
     text = (tmp_path / 'summary.md').read_text()
-    assert ('| c | candidate | 1 | context 32768 C8 | 0 | 0 | 4 | 4 | yes | 2.5 | 0.5 | 2400 | 81 | 6 '
+    assert ('| c | candidate | 1 | 1 | context 32768 C8 | 0 | 0 | 4 | 4 | yes | 2.5 | 0.5 | 2400 | 81 | 6 '
             '| v41.exchange* 3, v41.decode 1 |') in text
+
+
+def _band(name, captures, thermal=None, sites=()):
+    return dict(band=name, available=True, captures=captures, device_captures=captures, misses=captures,
+                eager_runs=0, zero_captures=captures == 0, thermal=thermal, sites=list(sites))
+
+
+def _sweep_pass(number, tok_s, captures):
+    """One pass of a fixture sweep.json, as smoke's Sweep::from_passes labels it."""
+    return {'pass': number, 'points': [{'c': 1, 'phase': 'levels', 'aggregate_tok_s': tok_s, 'graph': {'captures': captures}}],
+            'thermal': {'decode': {'seconds': 10.0}},
+            'graph_bands': [{**_band('levels C1', captures), 'pass': number}]}
+
+
+def test_sweep_passes_keep_every_band_and_headline_the_final_pass(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'levels': [1], 'sweep_passes': 2}, tmp_path)
+    assert job['entry']['sweep_passes'] == 2
+    sweep_dir = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name']
+    sweep_dir.mkdir(parents=True)
+    first, final = _sweep_pass(1, 50.0, 7), _sweep_pass(2, 55.0, 0)
+    (sweep_dir / 'sweep.json').write_text(json.dumps({**final, 'passes': [first, final]}))
+    row = cards.summarize_job(job, 0)
+    assert row['sweep C1'] == 55.0 and row['headline_pass'] == 2, 'headline speed is the final pass'
+    assert [p['pass'] for p in row['passes']] == [1, 2] and {p['passes'] for p in row['passes']} == {2}
+    assert row['passes'][0]['sweep']['points'][0]['aggregate_tok_s'] == 50.0
+    assert row['passes'][0]['sweep']['thermal'] == {'decode': {'seconds': 10.0}}
+    assert [(b['pass'], b['captures']) for b in row['graph_bands']] == [(1, 7), (2, 0)]
+    assert row['status'] == 'pass', row.get('error')
+    cards.write_summary(tmp_path, [{**row, 'card': 'c', 'arm': 'candidate', 'repeat': 1}], {'candidate': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'Headline speed is the final same-server pass (pass 2 of each launch)' in text
+    assert '| Card | Arm | Repeat | Pass | Band |' in text
+    assert '| c | candidate | 1 | 1 | levels C1 | 7 | 7 | 7 | 0 | NO |' in text
+    assert '| c | candidate | 1 | 2 | levels C1 | 0 | 0 | 0 | 0 | yes |' in text
+    summary = json.loads((tmp_path / 'summary.json').read_text())
+    assert [(p['pass'], p['headline'], [b['captures'] for b in p['graph_bands']]) for p in summary['passes']] == \
+        [(1, False, [7]), (2, True, [0])]
+    assert summary['rows'][0]['passes'][1]['sweep']['graph_bands'][0]['pass'] == 2
+
+
+def test_sweep_passes_keep_context_load_points_and_thermals_per_pass(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:context_load', 'sweep_passes': 2}, tmp_path)
+    reports = Path(job['state']) / 'reports' / 'context'
+    reports.mkdir(parents=True)
+    hot = dict(seconds=20.0, power_cap_s=2.5, thermal_slowdown_s=0.0, busy_sm_clock_mhz=2400.0,
+               max_temperature_c=81.0, min_tlimit_headroom_c=6.0, gpus=[])
+    records = [{'points': [{'context': 32768, 'c': 8, 'status': 'ok', 'aggregate_tok_s': rate}], 'thermal': {'seconds': 30.0},
+                'graph_bands': [_band('context 32768 C8', captures, hot, [dict(site='v41.decode', eager_runs=2)] if captures else [])]}
+               for rate, captures in ((100.0, 5), (120.0, 0))]
+    (reports / 'report.json').write_text(json.dumps({'status': 'done', 'panels': [{'id': 'context_load', 'passes': records}]}))
+    row = cards.summarize_job(job, 0)
+    assert [p['context_load']['points'][0]['aggregate_tok_s'] for p in row['passes']] == [100.0, 120.0]
+    assert [p['context_load']['thermal'] for p in row['passes']] == [{'seconds': 30.0}] * 2
+    assert [(b['pass'], b['captures']) for b in row['graph_bands']] == [(1, 5), (2, 0)]
+    assert row['status'] == 'pass', row.get('error')
+    cards.write_summary(tmp_path, [{**row, 'card': 'c', 'arm': 'a', 'repeat': 1}], {'a': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert '| c | a | 1 | 1 | context 32768 C8 | 5 | 5 | 5 | 0 | NO | 2.5 | 0 | 2400 | 81 | 6 |' in text
+    assert '| c | a | 1 | 2 | context 32768 C8 | 0 | 0 | 0 | 0 | yes | 2.5 |' in text
+
+
+def test_sweep_passes_fail_when_the_runner_recorded_fewer_passes(entry, tmp_path):
+    """An older smoke binary ignores sweep_passes and records one pass: that is a measurement failure."""
+    job = make({**entry, 'profile': 'panels:', 'levels': [1], 'sweep_passes': 3}, tmp_path)
+    sweep_dir = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name']
+    sweep_dir.mkdir(parents=True)
+    (sweep_dir / 'sweep.json').write_text(json.dumps(_sweep_pass(1, 50.0, 0) | {'pass': None}))
+    row = cards.summarize_job(job, 0)
+    assert row['status'] == 'failed' and row['failure_kind'] == 'measurement'
+    assert 'sweep_passes=3 but sweep recorded 1 pass' in row['error']
+    assert 'passes' not in row
+
+
+def test_single_pass_rows_record_no_pass_list(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'levels': [1]}, tmp_path)
+    assert 'sweep_passes' not in job['entry'], 'default 1 leaves the smoke entry unchanged'
+    sweep_dir = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name']
+    sweep_dir.mkdir(parents=True)
+    (sweep_dir / 'sweep.json').write_text(json.dumps({'points': [{'c': 1, 'phase': 'levels', 'aggregate_tok_s': 50.0}],
+                                                     'graph_bands': [_band('levels C1', 0)]}))
+    row = cards.summarize_job(job, 0)
+    assert 'passes' not in row and 'headline_pass' not in row and row['status'] == 'pass'
+    cards.write_summary(tmp_path, [{**row, 'card': 'c', 'arm': 'a', 'repeat': 1}], {'a': {}})
+    assert 'passes' not in json.loads((tmp_path / 'summary.json').read_text())
+    assert 'Headline speed is the final' not in (tmp_path / 'summary.md').read_text()
+
+
+def test_pass_snapshots_pair_sweep_and_context_passes():
+    assert cards.pass_snapshots(None, []) == []
+    assert cards.pass_snapshots({'points': []}, [{'points': []}]) == [], 'one pass records no list'
+    sweep = {'passes': [_sweep_pass(1, 1.0, 1), _sweep_pass(2, 2.0, 0)]}
+    context = [{'points': [], 'graph_bands': [_band('context 8192 C1', 1)]}, {'points': [], 'graph_bands': []}]
+    snapshots = cards.pass_snapshots(sweep, context)
+    assert [(s['pass'], s['passes']) for s in snapshots] == [(1, 2), (2, 2)]
+    assert snapshots[0]['context_load']['graph_bands'][0] == {**_band('context 8192 C1', 1), 'pass': 1}
+    assert snapshots[1]['sweep']['points'][0]['aggregate_tok_s'] == 2.0
+
+
+def test_sweep_passes_reuse_one_server_per_job(entry, tmp_path, monkeypatch, capsys):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'none', '--levels', '1,16', '--sweep-passes', '2', '--dry-run'])
+    assert cards.main() == 0
+    out = capsys.readouterr().out
+    jobs = json.loads((state / 'plan.json').read_text())['jobs']
+    assert len(jobs) == 1, 'two passes are one job, not a second launch'
+    matrix = json.loads((Path(jobs[0]['state']) / 'matrix.json').read_text())
+    assert len(matrix['entries']) == 1 and matrix['entries'][0]['sweep_passes'] == 2
+    assert out.count('bench smoke') == 1, 'one smoke run, so one server launch'
+    assert '# sweep_passes=2: one server launch' in out
+    single = cards.job_max_run({'entry': {**matrix['entries'][0], 'sweep_passes': 1}})
+    assert cards.job_max_run({'entry': matrix['entries'][0]}) - single == int(matrix['entries'][0].get('run_timeout_s', 900))
+
+
+def test_sweep_passes_reach_context_load_panels(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'bench_panels', lambda binary=None: {'context_load', 'concurrency'})
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'context_load', '--sweep-passes', '3', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['sweep_passes'] == 3
+
+
+@pytest.mark.parametrize('extra', [['--levels', '1', '--sweep-passes', '0'], ['--levels', '1', '--sweep-passes', '21'],
+                                   ['--panels', 'baseline', '--sweep-passes', '2']])
+def test_sweep_passes_refuse_nothing_to_repeat_or_out_of_range(entry, tmp_path, monkeypatch, extra):
+    kit = _kit(tmp_path, entry)
+    monkeypatch.setattr(cards, 'bench_panels', lambda binary=None: {'context_load'})
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(tmp_path / 'state'), *extra, '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()

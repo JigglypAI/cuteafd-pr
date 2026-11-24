@@ -132,7 +132,7 @@ New measured retirements are `v41-flash-reference-tp4`,
 `v41-flash-max-nvfp4-reply` variants are also removed from the runnable v5
 matrix; they have no published report to pin as a measured retired card.
 Neither Step-5 FP8 nor Step-5 NVFP4 is scheduled. The v4 matrix remains the
-historical recipe; new release launches use the v5 matrix.
+historical recipe; new release launches use the v7 matrix.
 
 <!-- reports:begin -->
 
@@ -420,7 +420,7 @@ historical recipe; new release launches use the v5 matrix.
 - 2026-10-02 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-4spark/report.svg) · ⚠ quality gate failed
 - 2026-10-02 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build v0.1.0 · [report](glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark/report.svg)
 
-## inkling2
+## Inkling 2 Small
 
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k6-compact-max/report.svg)
@@ -498,7 +498,7 @@ historical recipe; new release launches use the v5 matrix.
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
 
-## minimax_m3
+## MiniMax M3.1 Flash
 
 - 2026-11-19 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 2× RTX PRO 6000 @ gpu-powerd 425/425 W + 6× DGX Spark · build v6.0.0-rc1 · [report](minimax_m3/2026-11-19-smoke-minimax-m3-1-flash-2rtx-6spark-minimax-m31-flash-max/report.svg)
 - 2026-11-19 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark · build v6.0.0-rc1 · [report](minimax_m3/2026-11-19-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-m31-flash-min/report.svg)

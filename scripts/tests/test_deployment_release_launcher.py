@@ -10,7 +10,9 @@ import pytest
 from v41_launch_capture import ROOT, capture, parse_run, namespace_launch_contract
 
 MATRIX = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
-ENTRIES = MATRIX["entries"]
+# Keep testing the retired layouts' launch contracts without making them live smoke cards.
+ARCHIVED = json.loads((ROOT / "scripts/tests/fixtures/retired-release-example-cards.json").read_text())
+ENTRIES = MATRIX["entries"] + ARCHIVED["entries"]
 FIXTURES = Path(__file__).parent / "fixtures/deployment-launch"
 BASELINE_CAPTURES = {
     "glm53-exl3-k6core-min": "glm53-exl3-min",
