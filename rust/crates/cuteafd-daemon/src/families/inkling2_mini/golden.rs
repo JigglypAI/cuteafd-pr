@@ -69,13 +69,13 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || run(args)).await?
 }
 
-fn read_logits(library: &cuteafd_ffi::NativeLibrary, logits: &DeviceLogits) -> Result<Vec<f32>> {
+fn read_logits(library: &cuteafd_ffi::NativeLibrary, device_id: i32, logits: &DeviceLogits) -> Result<Vec<f32>> {
     let count = logits.rows * logits.vocab;
     let mut bytes = vec![0u8; count * 4];
     let buf = cuteafd_ffi::CuteafdDeviceBuffer {
         ptr: logits.ptr as *mut libc::c_void,
         bytes: bytes.len(),
-        device_id: 0,
+        device_id,
         flags: 0,
     };
     library.copy_d2h(&mut bytes, buf)?;
@@ -185,9 +185,10 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         }];
     }
     let mut placements = [placement.clone()];
-    let mut copy_lib = &*library;
+    let copy_lib = &*library;
+    let device_id = args.device;
     execution.prefill(&mut placements, &[&tokens[..rows]], &units, &mut |_seq, at_1based, logits| {
-        let tile = read_logits(copy_lib, &logits)?;
+        let tile = read_logits(copy_lib, device_id, &logits)?;
         let row0 = at_1based - 1;
         values[row0 * vocab..(row0 + logits.rows) * vocab].copy_from_slice(&tile);
         Ok(())
@@ -241,6 +242,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             let mut pos = prefix_len;
             while pos < prefix_len + tail_len {
                 let step = w.min(prefix_len + tail_len - pos);
+                p.len = pos;
                 let dec_u = Unit {
                     index: 0,
                     sequence: 0,
@@ -260,7 +262,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                 let mut ps = [p];
                 let logits = execution.decode_eager(&mut ps, &[&tokens[pos..pos + step]], &dec_u)?;
                 p = ps[0].clone();
-                let tile = read_logits(&library, &logits)?;
+                let tile = read_logits(&library, device_id, &logits)?;
                 collected.extend(tile.into_iter().map(f32::to_bits));
                 pos += step;
             }
@@ -326,6 +328,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                             head: true,
                         }],
                     };
+                    p.len = prefix_len;
                     let mut ps = [p];
                     let logits = if graphed {
                         execution.decode(&mut ps, &[&tokens[prefix_len..prefix_len + 1]], &dec_u)?
@@ -333,7 +336,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                         execution.decode_eager(&mut ps, &[&tokens[prefix_len..prefix_len + 1]], &dec_u)?
                     };
                     if rep == 2 {
-                        *out = read_logits(&library, &logits)?.into_iter().map(f32::to_bits).collect();
+                        *out = read_logits(&library, device_id, &logits)?.into_iter().map(f32::to_bits).collect();
                     }
                 }
             }

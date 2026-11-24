@@ -25,7 +25,7 @@ encoding limits. See [memory policy](../options.md#memory-and-pools).
   - **48 contiguous FP32 short-convolution lag slots** (width `6656 = 2304 + 2304 + 1024 + 1024`, 3 lags per slot).
 - **Attention:** GQA 24/8 × 128 (`H=2304`, group size 3), relative-position bias (`d_rel=16`,
   local window 1024, global extent 1024), per-token per-head attention sinks, sigmoid output gate,
-  Q/K L2 clip (`2.207`), R L2 clip (`4.0`), global log-scaling (`floor=8192`, `alpha=0.141`),
+  Q/K L2 clip (`22.627 = 2*sqrt(128)`), R L2 clip (`8.0`), global log-scaling (`floor=8192`, `alpha=0.1`),
   and short causal K/V convolutions (static on local layers; static + dynamic per-token taps on global layers).
 - **MoE:** 128 routed experts, top-8, intermediate 1152, no shared expert; sigmoid + F32 bias
   selection, log-sigmoid softmax weights × `8.0`, interleaved `w13` gate/up with SiTU softcaps
