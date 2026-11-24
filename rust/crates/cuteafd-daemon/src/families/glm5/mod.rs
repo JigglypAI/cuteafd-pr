@@ -974,14 +974,22 @@ impl Opened {
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
         }
         // The bundled mtp_dspark drafts its whole block (anchor-as-first).
-        let ml4_draft = args.dspark.then(|| cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
-            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, args.max_context,
-            self.library.sm_count()? as usize)).transpose()?;
+        let ml4_draft = if args.dspark {
+            let slots = args.draft_context_slots.unwrap_or(20.max(args.draft_sequences));
+            let sms = self.library.sm_count()? as usize;
+            Some(if args.tp2_dflash {
+                Ml4DraftLayout::Tp2(Box::new(cuteafd_loader::placement::families::glm5::ml4_tp2_draft_layouts(
+                    &args.snapshot, slots, args.draft_sequences, args.max_context, sms)?))
+            } else {
+                Ml4DraftLayout::Whole(cuteafd_loader::placement::families::glm5::ml4_draft_layout(
+                    &args.snapshot, slots, args.draft_sequences, args.max_context, sms)?)
+            })
+        } else { None };
         if ml4_draft.is_some() {
             cuteafd_ffi::mla_draft::Ml4ContextProjection::validate(&programs)?;
         }
         let draft_width = provisional_drafter.as_ref().map(|cfg| cfg.drafts())
-            .or(ml4_draft.as_ref().map(|layout| layout.capacity().block_rows / layout.capacity().max_batch_sequences));
+            .or(ml4_draft.as_ref().map(|layout| layout.lead().capacity().block_rows / layout.lead().capacity().max_batch_sequences));
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
             engine::DECODE_ROWS, draft_width, args.attention_plan_rows)?;
         let legacy_manifest = args.manifest.with_file_name("DSV4_PROGRAMS.json");
@@ -1026,8 +1034,8 @@ impl Opened {
             None => None,
         };
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        ensure!(!args.tp2_dflash || (split_device.is_some() && args.draft.is_some()),
-            "TP2 DFlash requires --split-device and a GQA DFlash2 drafter (--draft)");
+        ensure!(!args.tp2_dflash || (split_device.is_some() && (args.draft.is_some() || args.dspark)),
+            "TP2 DFlash requires --split-device and a DFlash2 (--draft) or ML4 mtp_dspark (--dspark) drafter");
         cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
         self.startup_probe(&devices, "glm/streams-before-programs", None, false)?;
         use cuteafd_loader::families::glm5::DensePrograms;
@@ -1133,7 +1141,8 @@ impl Opened {
             Ok(scratch)
         };
         let draft_facts = match (&ml4_draft, args.draft.as_deref(), &provisional_drafter) {
-            (Some(layout), _, _) => DraftFacts::ml4(layout)?,
+            (Some(Ml4DraftLayout::Whole(layout)), _, _) => DraftFacts::ml4(layout)?,
+            (Some(Ml4DraftLayout::Tp2(layouts)), _, _) => DraftFacts::ml4_tp2(layouts)?,
             (None, Some(snapshot), Some(draft)) => {
                 let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8);
                 let capacity = cuteafd_loader::families::glm5::draft_representation::GlmDraftCapacity::new(
@@ -1164,7 +1173,7 @@ impl Opened {
                     let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
                     args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")?
                 }),
-                (None, Some(layout)) => Some(layout.capacity().block_rows),
+                (None, Some(layout)) => Some(layout.lead().capacity().block_rows),
                 (None, None) => None,
             };
             Ok(Some(cuteafd_loader::families::glm5::core::CoreCharges::from_package(&self.cfg,
@@ -1255,7 +1264,7 @@ impl Opened {
         let source = local.as_ref().map(|local| LocalPhysicalSource::read(&self.cfg, &self.catalog, local,
             &physical, metadata.as_ref())).transpose()?;
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-        let mark_bytes = ml4_draft.as_ref().map(glm::draft_window_mark_bytes).transpose()?.unwrap_or(0);
+        let mark_bytes = ml4_draft.as_ref().map(|layout| glm::draft_window_mark_bytes(layout.lead())).transpose()?.unwrap_or(0);
         let host_config = if devices.len() == 2 && attention == cuteafd_loader::placement::AttentionPlacement::Heads { None }
             else { serving.map(|(prefix, concurrency)| prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
                 page_rows: 64, pages: pool.maximum_tokens() as usize / 64,
@@ -1402,7 +1411,7 @@ impl Opened {
                 Some(_) => {
                     let (device, stream) = peer_stream.context("admitted remote drafter needs the second GPU")?;
                     let rows = match (&ml4_draft, &provisional_drafter) {
-                        (Some(layout), _) => layout.capacity().block_rows,
+                        (Some(layout), _) => layout.lead().capacity().block_rows,
                         (None, Some(draft)) => args.draft_sequences.checked_mul(draft.block).context("GLM draft rows")?,
                         (None, None) => anyhow::bail!("admitted remote drafter without a drafter"),
                     };
@@ -1927,6 +1936,19 @@ impl Opened {
 }
 
 
+/// Admitted Mistral Large 4 bundled mtp_dspark layout: whole (64 heads on one GPU)
+/// or TP2 (32 heads and half dense FFN per GPU over the shared peer exchange).
+enum Ml4DraftLayout {
+    Whole(cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout),
+    Tp2(Box<[cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout; 2]>),
+}
+
+impl Ml4DraftLayout {
+    fn lead(&self) -> &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout {
+        match self { Self::Whole(layout) => layout, Self::Tp2(layouts) => &layouts[0] }
+    }
+}
+
 /// The drafter's admitted home: beside the target (GPU0), GPU1 through the
 /// shared device-driven bridge, or tensor-parallel across both target GPUs over
 /// the shared target peer exchange.
@@ -1937,17 +1959,55 @@ pub(crate) enum DraftHome<'a> {
 }
 
 impl Opened {
+    fn ml4_draft_source(&self, name: &str, shape: &[usize])
+        -> Result<crate::shared::experts::rtx::dense::Rect> {
+        let tensor = self.catalog.tensor(name)?;
+        let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("mtp_dspark source extent overflow")?;
+        ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape
+            && tensor.metadata.byte_length == bytes as u64,
+            "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
+        let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+        ensure!(rows > 0 && bytes > 0 && bytes % rows == 0, "{name}: invalid drafter rows");
+        Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: self.catalog.snapshot().join(&tensor.shard),
+            base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
+    }
+
     /// The admitted drafter: single-GPU (GPU0 or GPU1 via bridge), or TP2 split
     /// across both target GPUs on the shared `PeerExchange`.
     #[allow(clippy::too_many_arguments)]
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
-        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        ml4_draft: &Option<Ml4DraftLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
         home: &DraftHome<'s>, head: &weights::GlmHead<'_>) -> Result<Option<drafter::GlmDrafter<'s>>> {
         let target_projection = dflash::TargetProjection::from_bf16(matches!(head, weights::GlmHead::Bf16(_)));
         if let DraftHome::Tp2(exchange) = home {
-            let snapshot = args.draft.as_deref().context("TP2 DFlash requires --draft")?;
+            if let Some(Ml4DraftLayout::Tp2(layouts)) = ml4_draft {
+                let started = Instant::now();
+                let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
+                let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
+                let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
+                let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4_tp2(&dspark, ml4)?;
+                let devices = [args.device, exchange.device(1)];
+                let arenas: std::collections::BTreeMap<_, _> = devices.iter().enumerate().map(|(rank, &id)| {
+                    let device = crate::shared::memory::device::Device { library: &self.library, id };
+                    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                        format!("glm/draft/{rank}"), layouts[rank].immutable_arena_requests())?;
+                    Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                        device, layout, cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?))
+                }).collect::<Result<_>>()?;
+                let source = |name: &str, shape: &[usize]| self.ml4_draft_source(name, shape);
+                let drafter = dflash::DflashDrafter::load_ml4_tp2_with(&self.library, programs, target_projection,
+                    native, ml4, ml4.logit_softcap as f32, (**layouts).clone(), &source, exchange.clone(),
+                    |id, name, bytes| {
+                        arenas.get(&id).context("ML4 TP2 draft arena absent for device")?.view(name, bytes)
+                    })?;
+                if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                    tp2_dflash = true, "mtp_dspark TP2 drafter resident");
+                return Ok(Some(drafter::GlmDrafter::Local(drafter)));
+            }
+            let snapshot = args.draft.as_deref().context("TP2 DFlash requires --draft or --dspark")?;
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
@@ -2019,7 +2079,7 @@ impl Opened {
     fn load_common_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
         target_projection: dflash::TargetProjection,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
-        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        ml4_draft: &Option<Ml4DraftLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
         -> Result<Option<dflash::DflashDrafter<'s>>> {
         Ok(if let Some(snapshot) = &args.draft {
@@ -2056,24 +2116,14 @@ impl Opened {
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
                 draft_head = "tensor", "DFlash2 drafter resident");
             Some(drafter)
-        } else if let Some(layout) = ml4_draft.clone() {
+        } else if let Some(Ml4DraftLayout::Whole(layout)) = ml4_draft {
+            let layout = layout.clone();
             let started = Instant::now();
             let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
             let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
             let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
             let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
-            let catalog = &self.catalog;
-            let source = |name: &str, shape: &[usize]| -> Result<crate::shared::experts::rtx::dense::Rect> {
-                let tensor = catalog.tensor(name)?;
-                let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)).context("mtp_dspark source extent overflow")?;
-                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape
-                    && tensor.metadata.byte_length == bytes as u64,
-                    "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
-                let rows = if shape.len() >= 2 { shape[0] } else { 1 };
-                ensure!(rows > 0 && bytes > 0 && bytes % rows == 0, "{name}: invalid drafter rows");
-                Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
-                    base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
-            };
+            let source = |name: &str, shape: &[usize]| self.ml4_draft_source(name, shape);
             let device = crate::shared::memory::device::Device { library: &self.library,
                 id: self.library.cuda_get_device()? };
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
@@ -2098,7 +2148,7 @@ impl Opened {
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
-        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        ml4_draft: &Option<Ml4DraftLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome<'s>,
         shared_plans: Vec<crate::shared::experts::exlr8::NativePlan>, peer_routers: Option<std::ops::Range<usize>>)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),

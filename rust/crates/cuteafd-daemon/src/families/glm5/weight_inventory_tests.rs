@@ -365,6 +365,18 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
         eprintln!("ARENA_CHARGE ML4-bundled-draft home={home} old={old} logical={logical} B={} tail={tail} new={} delta={} old_rounding=no",
             arena.bytes(), arena.bytes() as u64 + tail, arena.bytes() as u64 + tail - old);
     }
+    let tp2_layouts = cuteafd_loader::placement::families::glm5::ml4_tp2_draft_layouts(&snapshot, 20, 16, 16384, 188)?;
+    let tp2_facts = DraftFacts::ml4_tp2(&tp2_layouts)?;
+    let tp2_components = tp2_facts.tp2_components(1)?;
+    for (rank, rank_layout) in tp2_layouts.iter().enumerate() {
+        let id = format!("glm/draft/{rank}");
+        let rank_arena = WeightArenaLayout::new(id.clone(), rank_layout.immutable_arena_requests())?;
+        let rank_logical = rank_layout.owners().iter().map(|o| o.resident_weights.0).sum::<u64>();
+        let tail = arena_charge(&tp2_components, &id, Location::coordinator(rank as u8),
+            rank_arena.bytes() as u64, rank_logical, MemoryKind::DrafterWeights)?;
+        eprintln!("ARENA_CHARGE ML4-tp2-draft rank={rank} logical={rank_logical} B={} tail={tail} new={}",
+            rank_arena.bytes(), rank_arena.bytes() as u64 + tail);
+    }
     Ok(())
 }
 

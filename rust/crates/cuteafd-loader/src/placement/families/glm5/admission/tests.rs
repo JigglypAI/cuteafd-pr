@@ -377,6 +377,49 @@ fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
 }
 
 #[test]
+fn ml4_tp2_draft_facts_split_arenas_charge_standalone_tails_and_omit_bridge() {
+    use crate::formats::{block_dspark::DsparkRotaryPlan, dflash::MlaDflashConfig, mla::MlaGeometry};
+    use crate::families::glm5::draft_representation::GlmDraftCapacity;
+    let cfg = MlaDflashConfig { hidden_stream: Default::default(), mla: MlaGeometry { hidden: 6144, heads: 32, q_rank: 0,
+        kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 12288, eps: 1e-5,
+        block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1, 18, 36, 54, 71],
+        vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+        rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+        kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2, markov_rank: 512 };
+    let cap = GlmDraftCapacity::new(20, 16, 3).unwrap();
+    let layouts = [
+        cfg.ml4_tp2_runtime_layout(0, cap, 1 << 20, 1 << 20, 188, cuteafd_core::MlaCacheFormat::Fp8).unwrap(),
+        cfg.ml4_tp2_runtime_layout(1, cap, 1 << 20, 1 << 20, 188, cuteafd_core::MlaCacheFormat::Fp8).unwrap(),
+    ];
+    let facts = DraftFacts::ml4_tp2(&layouts).unwrap().with_window_marks(16 * 1024 * 1024);
+    assert!(facts.is_tp2());
+    assert!(facts.homes(2).is_empty());
+    assert!(facts.bridge().is_empty());
+    assert_eq!(facts.tp2_arenas.len(), 2);
+    assert!(facts.tp2_arenas[0].0.view("markov_norms").is_some());
+    assert!(facts.tp2_arenas[1].0.view("markov_norms").is_none());
+    let components = facts.tp2_components(64).unwrap();
+    for rank in 0..2u8 {
+        let id = format!("glm/draft/{rank}");
+        let roots = components.iter().filter_map(|c| match &c.kind {
+            ComponentKind::Allocation { template, .. } if template.id == id => Some(template), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].location, Location::coordinator(rank));
+        assert_eq!(roots[0].bytes, facts.tp2_arenas[rank as usize].0.bytes() as u64);
+    }
+    assert!(components.iter().any(|c| matches!(&c.kind,
+        ComponentKind::Allocation { template, .. } if template.id == "glm.draft.window_marks"
+            && template.location == Location::coordinator(0))));
+    assert!(components.iter().any(|c| matches!(&c.kind,
+        ComponentKind::Allocation { template, .. } if template.id == "glm.draft.reduced"
+            && template.location == Location::coordinator(0))));
+    assert!(components.iter().any(|c| matches!(&c.kind,
+        ComponentKind::Allocation { template, .. } if template.id == "glm.draft.peer.reduced"
+            && template.location == Location::coordinator(1))));
+}
+
+#[test]
 fn tp2_gqa_draft_splits_arenas_charges_standalone_tails_and_balances_embedding() {
     use crate::families::glm5::{
         draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout},

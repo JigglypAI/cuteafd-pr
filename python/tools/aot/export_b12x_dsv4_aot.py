@@ -270,7 +270,7 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144, 7168, 8192):
         result.setdefault((h, h // 4), []).append("dflash-convolution")
         result.setdefault((h, 256), []).append("dflash-selector")
-    for h, inter in ((7168, 14336), (6144, 24576)):
+    for h, inter in ((7168, 14336), (6144, 24576), (6144, 12288)):
         result.setdefault((h, 2 * inter), []).append("mla-dflash/ml4-ffn")
         result.setdefault((inter, h), []).append("mla-dflash/ml4-ffn")
     for h in (2048, 4096, 5120, 6144):
@@ -1397,20 +1397,22 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(rope_g, max_rows=rows, max_pages=index_pages,
                                                                           mode=mode)),
         ]
-    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
-    draft = ml4.ML4_DRAFT
-    out += [
-        # Restore chunking must not change the context FC's reduction order.
-        ("draft_context_fc", "bf16_projection", {"width": 5 * g.hidden, "outputs": g.hidden, "max_rows": 2048},
-         lambda: compile_bf16_projection_aot(width=5 * g.hidden, outputs=g.hidden)),
-        ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
-         lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
-        ("draft_attention_m64", "mla_draft_attention",
-         {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
-         lambda: ml4.compile_draft_attention_aot(draft, max_rows=64, max_context=max_context)),
-        ("draft_output_m64", "mla_draft_output", {"max_rows": 64},
-         lambda: ml4.compile_draft_output_aot(draft, max_rows=64)),
-    ]
+    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks),
+    # whole (64 heads, ml4_draft_*) and two-GPU head-split (32 heads/rank, ml4_draft2_*).
+    for prefix, draft in (("draft", ml4.ML4_DRAFT), ("draft2", ml4.ML4_DRAFT_TP2)):
+        if prefix == "draft":
+            # Restore chunking must not change the context FC's reduction order.
+            out.append(("draft_context_fc", "bf16_projection", {"width": 5 * g.hidden, "outputs": g.hidden, "max_rows": 2048},
+                        lambda: compile_bf16_projection_aot(width=5 * g.hidden, outputs=g.hidden)))
+        out += [
+            (f"{prefix}_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
+             lambda d=draft: ml4.compile_draft_producer_aot(d, max_rows=64)),
+            (f"{prefix}_attention_m64", "mla_draft_attention",
+             {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
+             lambda d=draft: ml4.compile_draft_attention_aot(d, max_rows=64, max_context=max_context)),
+            (f"{prefix}_output_m64", "mla_draft_output", {"max_rows": 64},
+             lambda d=draft: ml4.compile_draft_output_aot(d, max_rows=64)),
+        ]
     return out
 
 

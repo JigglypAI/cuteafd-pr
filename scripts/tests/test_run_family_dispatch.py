@@ -5670,16 +5670,25 @@ def test_glm5_tp2_dflash_and_ml4_dspark_dispatch(tmp_path):
         bad = _family_launch_result(tmp_path / f"glm5-bad-{idx}", glm5_cfg, "test/glm53", bad_keys + "VISION=off\nAUDIO=off\n")
         assert bad.returncode == 2, bad.stderr
         assert expected_err in bad.stderr
-    # ML4 (mistral_large4) ships bundled dspark, never defaults TP2_DFLASH on, and refuses TP2_DFLASH=on.
+    # ML4 (mistral_large4) ships bundled dspark: TP2_DFLASH defaults on on 2 RTX, honors explicit off, refuses 1 RTX.
     ml4_cfg = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
                "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
     ml4_ok = _family_launch_result(tmp_path / "ml4-ok", ml4_cfg, "test/ml4",
         "RTX_GPUS=2\nSPECULATOR=dspark\nVISION=off\nAUDIO=off\n")
     assert ml4_ok.returncode == 0, ml4_ok.stderr
     ml4_serve = next(line for line in ml4_ok.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line)
-    assert "--tp2-dflash false" in ml4_serve and "--dspark" in ml4_serve
+    ml4_plans = [line for line in ml4_ok.stderr.splitlines() if "cuteafd plan " in line and "--resolve-settings-only" not in line]
+    assert "--tp2-dflash true" in ml4_serve and "--dspark" in ml4_serve
+    assert ml4_plans and all("--tp2-dflash true" in line for line in ml4_plans), ml4_plans
+    ml4_off = _family_launch_result(tmp_path / "ml4-off", ml4_cfg, "test/ml4",
+        "RTX_GPUS=2\nSPECULATOR=dspark\nTP2_DFLASH=off\nVISION=off\nAUDIO=off\n")
+    assert ml4_off.returncode == 0, ml4_off.stderr
+    ml4_off_serve = next(line for line in ml4_off.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line)
+    ml4_off_plans = [line for line in ml4_off.stderr.splitlines() if "cuteafd plan " in line and "--resolve-settings-only" not in line]
+    assert "--tp2-dflash false" in ml4_off_serve and "--dspark" in ml4_off_serve
+    assert ml4_off_plans and all("--tp2-dflash false" in line for line in ml4_off_plans), ml4_off_plans
     ml4_bad = _family_launch_result(tmp_path / "ml4-bad", ml4_cfg, "test/ml4",
-        "RTX_GPUS=2\nSPECULATOR=dspark\nTP2_DFLASH=on\nVISION=off\nAUDIO=off\n")
+        "RTX_GPUS=1\nSPECULATOR=dspark\nTP2_DFLASH=on\nVISION=off\nAUDIO=off\n")
     assert ml4_bad.returncode == 2, ml4_bad.stderr
     assert "TP2_DFLASH requires" in ml4_bad.stderr
 

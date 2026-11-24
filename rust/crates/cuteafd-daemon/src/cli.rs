@@ -43,8 +43,8 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         return Ok(());
     }
     let (enabled, family, split, draft) = match command {
-        Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
-        Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
+        Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
@@ -1027,14 +1027,19 @@ mod tests {
                 }
             }
         }
-        // Bundled ML4 --dspark without --draft must never default-enable TP2 DFlash.
-        let argv = ["cuteafd", "serve-glm", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--split-device", "1", "--dspark"];
-        let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
-        let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
-        super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
-        let super::Commands::ServeGlm(args) = cli.command else { panic!("expected ServeGlm"); };
-        assert!(!args.engine.tp2_dflash);
+        // Bundled ML4 --dspark defaults TP2 on when split is active, preserves explicit false, and stays off on 1 GPU.
+        for (split, explicit, expected) in [
+            (false, None, false), (true, None, true), (true, Some("false"), false), (true, Some("true"), true),
+        ] {
+            let mut argv = vec!["cuteafd", "serve-glm", "--snapshot", "/model", "--native-lib", "/native.so", "--dspark"];
+            if split { argv.extend(["--split-device", "1"]); }
+            if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
+            let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+            let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+            super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
+            let super::Commands::ServeGlm(args) = cli.command else { panic!("expected ServeGlm"); };
+            assert_eq!(args.engine.tp2_dflash, expected, "dspark split={split} explicit={explicit:?}");
+        }
     }
 
     #[test]
