@@ -405,6 +405,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     let prefill = args.prefill()?;
     cuteafd_bench::context::ResolvedSettings::prefill(prefill)
         .value("decode-rows", decode_rows)
+        .value("dfly2", args.dfly2 == Some(true))
         .value("attention-placement", resolved_attention)
         .publish();
 
@@ -917,6 +918,7 @@ mod tests {
             assert_eq!(decode_rows, 32);
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("decode-rows", decode_rows)
+                .value("dfly2", args.dfly2 == Some(true))
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)
