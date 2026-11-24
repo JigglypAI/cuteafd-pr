@@ -566,7 +566,8 @@ fn with_backend<T>(args: &ServeArgs,
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     if mtp.is_some() {
-        crate::shared::draft::report::publish(mtp_report(&ids, &admission, inputs.sequences)?);
+        crate::shared::draft::report::publish(mtp_layout(&ids, u8::try_from(head_rank)?,
+            &admission.cache, &admission.solved, inputs.sequences)?);
     }
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     let backend = backend.with_vision(crate::shared::vision::perception::Binding::new(&args.snapshot,
@@ -598,12 +599,6 @@ pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item
         .context("Step-5 sampled owner overflow")?;
     ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
     total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
-}
-
-fn mtp_report(ids: &[i32], admission: &cuteafd_loader::placement::families::step5::Admission, sequences: usize)
-    -> Result<crate::shared::draft::report::DrafterLayout> {
-    let head = admission.ownership.execution().spec().head_gpu;
-    mtp_layout(ids, head, &admission.cache, &admission.solved, sequences)
 }
 
 fn mtp_layout(ids: &[i32], head: u8, cache: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
