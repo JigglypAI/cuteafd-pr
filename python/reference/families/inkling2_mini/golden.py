@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Score the pinned Inkling 2 Mini text panel with native W4A4/W8A8 F32 math."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "python/reference"))
+
+import numpy as np
+import torch
+
+from families.inkling2.golden import configure_f32, digest
+from families.inkling2.model import head_forward
+from families.inkling2_mini.model import CHECKPOINT, REVISION, TEXT, Config, Weights, forward
+from fidelity_windows import finish_golden, load_set, verify_snapshot, write_scored_logits
+from shape_invariant import ROWS, qualify
+
+PINS = {
+    "config.json": "a7a349601f0984c4abf999c480ef775d8567d21f5f84b4e8a3e035b44f288dc2",
+    "hf_quant_config.json": "7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143",
+    "model.safetensors.index.json": "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838",
+}
+HF = {"repository": "https://github.com/huggingface/transformers", "revision": "89c632fd826f68ecadd176320e9b2c070918f4f2",
+      "version": "5.24.0"}
+ROOT_ARITHMETIC = {
+    "source": "Independent PyTorch F32 oracle; Inkling 2 Mini checkpoint and Transformers 5.24.0 fixed-loop semantics",
+    "arithmetic": "Checkpoint BF16 and F32 tensors cast exactly to F32 for computation. Native NVFP4 weights and per-token fouroversix_mae activation QDQ; native MXFP8 weights and group32 MXFP8 activation QDQ. Each logical loop visit has distinct causal state. No MTP or vision.",
+}
+
+
+def expected_source_identity(runtime):
+    if runtime:
+        raise ValueError("Mini reference has no dynamic model dependencies")
+    return {"transformers": HF, "snapshot": PINS,
+            "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
+            "reference_runner_sha256": digest(__file__),
+            "inkling_primitives_sha256": digest(ROOT / "python/reference/families/inkling2/model.py"),
+            "shape_invariant_sha256": digest(ROOT / "python/reference/shape_invariant.py")}
+
+
+def open_snapshot(snapshot, device):
+    if snapshot.name != REVISION or any(digest(snapshot / name) != expected for name, expected in PINS.items()):
+        raise ValueError("not the pinned official Inkling 2 Mini snapshot")
+    cfg = Config.from_dict(json.loads((snapshot / "config.json").read_bytes()))
+    return cfg, Weights(snapshot, cfg, device)
+
+
+def start_f32():
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    cfg = configure_f32()
+    return {key: cfg[key] for key in ("matmul_precision", "torch_matmul_tf32", "cudnn_tf32", "deterministic_algorithms")}
+
+
+@torch.inference_mode()
+def execute(a):
+    started = time.monotonic()
+    arithmetic = start_f32()
+    cfg, weights = open_snapshot(a.snapshot, a.device)
+    if a.check_only:
+        print(f"verified {len(weights.formats)} packed Mini expert projections; {len(weights.contracts)} physical layers")
+        return
+    manifest = load_set(a.windows)
+    if manifest["checkpoint"] != CHECKPOINT or any(w.get("media") for w in manifest["windows"]):
+        raise ValueError("Mini golden accepts only its text panel")
+    if any(t >= cfg.unpadded_vocab_size for w in manifest["windows"] for t in w["tokens"]):
+        raise ValueError("panel token exceeds the unpadded vocabulary")
+    snapshot = verify_snapshot(manifest, a.snapshot)
+    a.out.mkdir(parents=True, exist_ok=True)
+    proof = qualify(a, manifest, execute)
+    windows = manifest["windows"]
+    hidden = forward(weights, cfg, [torch.tensor(w["tokens"], device=a.device) for w in windows])
+    head = weights.tensor(TEXT + "unembed.weight").float()
+    weights.close()
+    entries = []
+    for window, state in zip(windows, hidden, strict=True):
+        start, end = window["score_from"], len(window["tokens"])
+        logits = np.empty((end - start, cfg.unpadded_vocab_size), dtype="<f4")
+        for first in range(start, end, ROWS):
+            last = min(first + ROWS, end)
+            logits[first-start:last-start] = head_forward(state[first-1:last-1], head, cfg).cpu().numpy()
+        entries.append(write_scored_logits(a.out, window, logits))
+    rows = sum(entry["scored_tokens"] for entry in entries)
+    platform = ({"capability": list(torch.cuda.get_device_capability(a.device)),
+                 "gpu": torch.cuda.get_device_name(a.device), "cuda": torch.version.cuda}
+                if torch.device(a.device).type == "cuda" else {"device": "cpu"})
+    evidence = {"official_forward": json.loads(a.hf_evidence.read_text())} if a.hf_evidence else {}
+    finish_golden(a.out, manifest, entries, snapshot_identity=snapshot,
+                  source_pin=expected_source_identity({}), source_identity_provider="families.inkling2_mini.golden",
+                  harness_commit=os.environ.get("CUTEAFD_REFERENCE_COMMIT", ""), **evidence,
+                  nll=sum(e["nll"] * e["scored_tokens"] for e in entries) / rows, scored_tokens=rows,
+                  seconds=time.monotonic() - started, platform=platform, torch=torch.__version__,
+                  tokenizers=importlib.metadata.version("tokenizers"), transformers="not used in reference forward",
+                  attention="eager", mtp=False, use_cache=False, prefix_qualification=proof, fixed_rows=ROWS,
+                  arithmetic=arithmetic, root_arithmetic=ROOT_ARITHMETIC)
+    print(f"Mini reference complete: {rows} scored rows in {time.monotonic()-started:.1f}s", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--windows", type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--hf-evidence", type=Path)
+    parser.add_argument("--check-only", action="store_true")
+    args = parser.parse_args()
+    if not args.check_only and (args.windows is None or args.out is None):
+        parser.error("--windows and --out are required for scoring")
+    execute(args)
+
+
+if __name__ == "__main__":
+    main()
