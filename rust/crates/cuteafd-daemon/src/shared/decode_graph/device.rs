@@ -396,7 +396,7 @@ pub(crate) struct NativePools {
     pub unknown_execs: u64,
 }
 
-const GRAPH_CHUNK: u64 = 2 << 20;
+use cuteafd_loader::placement::graph_reserve::{GRAPH_CHUNK, capture_growth_headroom};
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub(crate) struct SoftState {
@@ -560,14 +560,7 @@ pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement:
         .ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     anyhow::ensure!(cache.reserve == policy.bytes, "graph reserve policy disagrees with admission on device {device}");
-    if policy.soft_margin_floor > 0 {
-        let floor = policy.soft_margin_floor.min(cache.reserve.saturating_sub(cache.soft.granule));
-        if floor > cache.soft.margin {
-            cache.soft.margin = floor;
-            cache.soft.limit = cache.reserve.saturating_sub(cache.soft.margin);
-        }
-    }
-    cache.reserve_policy = Some(policy);
+    cache.apply_reserve_policy(policy);
     Ok(())
 }
 
@@ -2132,21 +2125,34 @@ impl DeviceCache {
         self.soft.fits(native.live_nodes.saturating_add(uncredited).saturating_add(incoming_nodes))
     }
 
+    fn apply_reserve_policy(&mut self, policy: cuteafd_loader::placement::graph_reserve::Resolved) {
+        if let Some(headroom) = policy.growth_headroom {
+            self.soft.margin = self.soft.margin.max(headroom);
+            self.soft.limit = self.reserve - self.soft.margin;
+        }
+        self.reserve_policy = Some(policy);
+    }
+
     fn apply_soft_pressure(&mut self, growth: u64, completed: Option<u64>) {
         if self.charged >= self.reserve { return }
         let native = self.native_pools();
         if self.soft.measured_bytes.is_none() {
-            let policy_floor = self.reserve_policy.map_or(0, |policy| policy.soft_margin_floor)
-                .min(self.reserve.saturating_sub(self.soft.granule));
-            let requested = self.soft.margin.max(policy_floor)
-                .max(growth.saturating_mul(2).div_ceil(self.soft.granule).saturating_mul(self.soft.granule));
-            let maximum = (self.reserve / 2).max(policy_floor);
+            let requested = self.soft.margin.max(capture_growth_headroom(growth, self.soft.granule));
+            let maximum = self.reserve / 2;
             if requested > maximum && !self.margin_clamp_warned {
                 tracing::warn!(device = self.device, hard = self.reserve, requested_margin = requested,
                     clamped_margin = maximum, "graph margin clamped to preserve half the reserve as soft capacity");
                 self.margin_clamp_warned = true;
             }
-            self.soft.margin = requested.min(maximum);
+            let margin = requested.min(maximum);
+            if let Some(policy) = self.reserve_policy.filter(|p| p.growth_headroom.is_some()) {
+                if margin > self.soft.margin {
+                    tracing::warn!(device = self.device, growth, census_soft = policy.base_bytes,
+                        previous_soft = self.soft.limit, soft = self.reserve - margin,
+                        "observed graph growth moved soft cap below the census target");
+                }
+            }
+            self.soft.margin = margin;
             self.soft.limit = self.reserve.saturating_sub(self.soft.margin);
             if self.charged < self.soft.limit || native.live_nodes == 0 || self.unmeasured { return }
             let pinned_nodes = self.records.values().filter(|r| r.pinned || r.spans_devices)
@@ -2890,31 +2896,20 @@ mod tests {
     }
 
     #[test]
-    fn working_set_reserve_policy_reconciles_soft_margin_and_2x_growth() {
-        let policy = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, 0, 94 << 20).unwrap();
-        assert_eq!(policy.bytes, 190 << 20);
-        assert_eq!(policy.soft_margin_floor, 96 << 20);
+    fn working_set_reserve_seeds_adaptive_headroom() {
+        use cuteafd_loader::placement::graph_reserve::{WorkingSet, resolve_working_set};
+        let policy = resolve_working_set(None, None, None, 0, WorkingSet {
+            w1: 94 << 20, step_growth: 10 << 20, capture_growth: 4 << 20,
+        }).unwrap();
         let mut cache = DeviceCache::new(-1089, policy.bytes);
-        let floor = policy.soft_margin_floor.min(cache.reserve.saturating_sub(cache.soft.granule));
-        cache.soft.margin = cache.soft.margin.max(floor);
-        cache.soft.limit = cache.reserve.saturating_sub(cache.soft.margin);
-        cache.reserve_policy = Some(policy);
-        assert_eq!(cache.soft.limit, 94 << 20, "soft limit lands directly at measured lag-8 working set");
-        // Small capture growth keeps the 100 MB (96 MiB) policy margin floor without reserve/2 clamp shrinking it.
+        cache.apply_reserve_policy(policy);
+        assert_eq!(cache.soft.margin, 8 << 20);
+        assert_eq!(cache.soft.limit, 190 << 20);
         cache.apply_soft_pressure(2 << 20, None);
-        assert_eq!(cache.soft.margin, 96 << 20);
-        assert_eq!(cache.soft.limit, 94 << 20);
-        // Large capture growth (> margin / 2) still grows margin via 2x growth, clamped to reserve/2 (or floor).
-        let big_policy = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, 0, 600 << 20).unwrap();
-        let mut big = DeviceCache::new(-1090, big_policy.bytes);
-        big.soft.margin = big_policy.soft_margin_floor;
-        big.soft.limit = big.reserve.saturating_sub(big.soft.margin);
-        big.reserve_policy = Some(big_policy);
-        assert_eq!(big.soft.margin, 120 << 20);
-        assert_eq!(big.soft.limit, 600 << 20);
-        big.apply_soft_pressure(80 << 20, None);
-        assert_eq!(big.soft.margin, 160 << 20, "2x measured growth dominates when larger than 20% floor");
-        assert_eq!(big.soft.limit, 560 << 20);
+        assert_eq!(cache.soft.limit, 190 << 20, "smaller growth must not undo the census seed");
+        cache.apply_soft_pressure((4 << 20) + 1, None);
+        assert_eq!(cache.soft.margin, 10 << 20, "larger growth still adjusts adaptive headroom");
+        assert_eq!(cache.soft.limit, 188 << 20);
     }
 
     #[test]

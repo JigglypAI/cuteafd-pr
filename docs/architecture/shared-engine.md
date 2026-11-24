@@ -653,6 +653,14 @@ SM120 experiment retained 224 MiB after destroying 1024 48-node executables,
 synchronizing and calling `cudaDeviceGraphMemTrim`; same- and different-shape
 recapture reused it with zero growth (#2154). There is no drain/trim reset path.
 
+For GLM Flash and measured Spark-free Hy4-flash DFly2, the checkout census
+sets the initial soft cap from the C1 working set plus the largest of 20% of
+that set, 100 MB, or twice the largest decode-step capture growth, rounded up
+to 2 MiB. The admitted hard reserve adds the margin computed from the largest
+individual capture; a user total replaces the hard reserve. These layouts seed
+the runtime margin from the same single-capture census and log if larger live
+growth moves the soft cap below its initial target.
+
 Before the first soft crossing, the margin is twice the largest measured
 single-capture growth, rounded once up to 2 MiB with a one-chunk minimum, then
 clamped to at most half the hard reserve. The clamp emits one warning and keeps

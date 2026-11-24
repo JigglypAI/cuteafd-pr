@@ -1746,16 +1746,17 @@ impl<'a> GlmfEngine<'a> {
 
     /// Attach the admitted rank-local sites before any first-use capture. No
     /// observed shape used at least half the cycles of a band, so none pin.
-    pub fn configure_graph_cache(&self, charged: &[u64], bases: &[u64], bootstraps: &[u64]) -> Result<()> {
+    pub fn configure_graph_cache(&self, graphs: &cuteafd_loader::placement::families::glm5_flash::admission::GlmfGraphs)
+        -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
         if !self.use_graphs || self.layer_execution.is_some() { return Ok(()); }
         for rank in 0..self.ranks() {
             let device = if rank == 0 { self.device } else { self.peer()?.device };
             let site = Site { name: "glm5_flash.decode_local", cycle: Cycle::Decode,
-                preference: Preference::Adaptive, bootstrap: bootstraps[rank],
+                preference: Preference::Adaptive, bootstrap: graphs.bootstraps[rank],
                 basis: Basis::Bytes, spans_devices: false };
-            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], site)?;
-            let policy = cuteafd_loader::placement::graph_reserve::current_working_set(rank, bases[rank])?;
+            let policy = graphs.policies[rank];
+            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, policy.bytes, site)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
             drop(self.decode_workspace_of(rank)?);
         }

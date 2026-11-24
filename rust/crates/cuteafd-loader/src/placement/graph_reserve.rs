@@ -30,14 +30,14 @@ pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") |
 const FAMILY: &str = "family default";
 const USER: &str = "user override";
 const DEFAULT_EXTRA: u64 = 500_000_000;
-const GRAPH_CHUNK: u64 = 2 << 20;
-/// Minimum soft-to-hard safety margin for working-set-sized reserves (100 MB).
-pub const WORKING_SET_MARGIN_MIN_BYTES: u64 = 100_000_000;
+pub const GRAPH_CHUNK: u64 = 2 << 20;
+const WORKING_SET_SLACK_MIN_BYTES: u128 = 100_000_000;
 
-fn is_zero(value: &u64) -> bool { *value == 0 }
-
-fn packed_chunk(bytes: u64) -> u64 {
-    bytes.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK)
+/// One chunk or twice the largest single capture, rounded up once. The caller
+/// clamps the result to half the hard reserve.
+pub fn capture_growth_headroom(growth: u64, chunk: u64) -> u64 {
+    let chunk = u128::from(chunk);
+    u64::try_from((2 * u128::from(growth)).div_ceil(chunk).max(1) * chunk).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -56,6 +56,8 @@ pub enum Error {
     Environment { key: &'static str },
     #[error("GPU_GRAPH_RESERVE is a user total and conflicts with {key}")]
     Conflict { key: &'static str },
+    #[error("{key} is not supported with working-set graph sizing; use GPU_GRAPH_RESERVE for the total")]
+    WorkingSetExtra { key: &'static str },
 }
 
 /// The admission charge and the exact inputs that produced it. `extra_bytes` is
@@ -73,11 +75,9 @@ pub struct Resolved {
     pub cap_bytes: Option<u64>,
     pub cap_source: &'static str,
     pub effective_extra_bytes: u64,
-    /// Optional minimum soft-to-hard margin (bytes) when the reserve was sized
-    /// from a lag-measured working set (`soft = reserve - margin`, `margin = max(20% soft, 100 MB, 2x growth)`).
-    /// Zero for legacy prewarm-plus-extra reserves (keeps existing `SoftState` behavior untouched).
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub soft_margin_floor: u64,
+    /// Census seed for the runtime's adaptive margin; absent for prewarm reserves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growth_headroom: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +145,7 @@ pub fn resolve_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text
     if selected.is_some() || spark {
         return Ok(Resolved { bytes: base_bytes, source: if selected.is_some() { "user total" } else { FAMILY },
             base_bytes, base_source, extra_bytes: 0, extra_source: "not applicable", cap_bytes: None,
-            cap_source: "not applicable", effective_extra_bytes: 0, soft_margin_floor: 0 });
+            cap_source: "not applicable", effective_extra_bytes: 0, growth_headroom: None });
     }
     let extra_bytes = extra.unwrap_or(Value::Bytes(DEFAULT_EXTRA))
         .bytes("GPU_GRAPH_RESERVE_EXTRA", base_bytes)?;
@@ -159,48 +159,57 @@ pub fn resolve_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text
     Ok(Resolved { bytes, source: "family default with extra",
         base_bytes, base_source, extra_bytes, extra_source: if extra.is_some() { USER } else { FAMILY },
         cap_bytes, cap_source: if cap.is_some() { USER } else { FAMILY }, effective_extra_bytes,
-        soft_margin_floor: 0 })
+        growth_headroom: None })
 }
 
-/// Resolve a working-set-sized reserve: `soft = soft_cap`, `margin = max(20% of soft, 100 MB)`
-/// rounded up to 2 MiB (`GRAPH_CHUNK`), and `reserve = soft + margin` (no +500 MB default extra).
-/// `GPU_GRAPH_RESERVE` user totals override `reserve` while keeping the `max(reserve/6, 100 MB)`
-/// margin floor clamped so `soft = reserve - margin` stays positive.
-pub fn resolve_working_set(text: Option<&str>, rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSet {
+    pub w1: u64,
+    pub step_growth: u64,
+    pub capture_growth: u64,
+}
+
+/// Start donor pressure at `W1 + max(20% of W1, 100 MB, 2x step growth)`, rounded
+/// up to 2 MiB. Charge that soft cap plus the single-capture growth headroom.
+pub fn resolve_working_set(text: Option<&str>, extra_text: Option<&str>, cap_text: Option<&str>,
+    rank: usize, measured: WorkingSet) -> Result<Resolved, Error> {
     let key = "GPU_GRAPH_RESERVE";
     let selected = select(text, rank, false, key, false)?;
+    for (key, text) in [("GPU_GRAPH_RESERVE_EXTRA", extra_text), ("GPU_GRAPH_RESERVE_EXTRA_CAP", cap_text)] {
+        if select(text, rank, false, key, true)?.is_some() {
+            return Err(Error::WorkingSetExtra { key });
+        }
+    }
+    let headroom = capture_growth_headroom(measured.capture_growth, GRAPH_CHUNK);
     if let Some(value) = selected {
         let bytes = value.bytes(key, 0)?;
-        let margin = if bytes <= GRAPH_CHUNK {
-            bytes / 2
-        } else {
-            let floor = packed_chunk((bytes / 6).max(WORKING_SET_MARGIN_MIN_BYTES));
-            floor.min(bytes.saturating_sub(GRAPH_CHUNK))
-        };
+        let margin = headroom.min(bytes / 2);
         return Ok(Resolved {
-            bytes, source: "user total", base_bytes: bytes.saturating_sub(margin),
+            bytes, source: "user total", base_bytes: bytes - margin,
             base_source: USER, extra_bytes: 0, extra_source: "not applicable",
             cap_bytes: None, cap_source: "not applicable", effective_extra_bytes: 0,
-            soft_margin_floor: margin,
+            growth_headroom: Some(margin),
         });
     }
-    let soft = packed_chunk(soft_cap);
-    let margin = packed_chunk((soft / 5).max(WORKING_SET_MARGIN_MIN_BYTES));
+    let w1 = u128::from(measured.w1);
+    let chunk = u128::from(GRAPH_CHUNK);
+    let slack = w1.div_ceil(5).max(WORKING_SET_SLACK_MIN_BYTES).max(2 * u128::from(measured.step_growth));
+    let soft = u64::try_from((w1 + slack).div_ceil(chunk) * chunk).map_err(|_| Error::Overflow { key })?;
+    // Margin <= hard/2 is equivalent to margin <= soft, before adding it.
+    let margin = headroom.min(soft);
     let bytes = soft.checked_add(margin).ok_or(Error::Overflow { key })?;
     Ok(Resolved {
         bytes, source: "working-set reserve", base_bytes: soft, base_source: FAMILY,
-        extra_bytes: margin, extra_source: FAMILY, cap_bytes: None, cap_source: FAMILY,
-        effective_extra_bytes: margin, soft_margin_floor: margin,
+        extra_bytes: headroom, extra_source: FAMILY, cap_bytes: Some(bytes / 2), cap_source: FAMILY,
+        effective_extra_bytes: margin, growth_headroom: Some(margin),
     })
 }
 
-pub fn current_working_set(rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
-    let text = match std::env::var("CUTEAFD_GPU_GRAPH_RESERVE") {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(Error::Environment { key: "GPU_GRAPH_RESERVE" }),
-    }?;
-    resolve_working_set(text.as_deref(), rank, soft_cap)
+pub fn current_working_set(rank: usize, measured: WorkingSet) -> Result<Resolved, Error> {
+    let text = read("GPU_GRAPH_RESERVE")?;
+    let extra = read("GPU_GRAPH_RESERVE_EXTRA")?;
+    let cap = read("GPU_GRAPH_RESERVE_EXTRA_CAP")?;
+    resolve_working_set(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, measured)
 }
 
 pub fn resolve(text: Option<&str>, rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
@@ -214,29 +223,18 @@ pub fn physical_floor(text: Option<&str>, rank: usize, memory_padding: u64) -> R
 }
 
 pub fn current(rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
-    current_with_step_margin(rank, spark, base, tail, None)
+    let text = read(if spark { "SPARK_GRAPH_RESERVE" } else { "GPU_GRAPH_RESERVE" })?;
+    let extra = if spark { None } else { read("GPU_GRAPH_RESERVE_EXTRA")? };
+    let cap = if spark { None } else { read("GPU_GRAPH_RESERVE_EXTRA_CAP")? };
+    resolve_with_extra(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, spark, base, tail)
 }
 
-/// Use the observed working set as the soft cap, with one step of headroom.
-/// Explicit reserve, extra and cap values retain the shared override semantics.
-pub fn current_with_step_margin(rank: usize, spark: bool, base: u64, tail: u64,
-    step_margin: Option<u64>) -> Result<Resolved, Error> {
-    let read = |key: &'static str| match std::env::var(key) {
+fn read(key: &'static str) -> Result<Option<String>, Error> {
+    match std::env::var(format!("CUTEAFD_{key}")) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(_) => Err(Error::Environment { key }),
-    };
-    let text = read(if spark { "CUTEAFD_SPARK_GRAPH_RESERVE" } else { "CUTEAFD_GPU_GRAPH_RESERVE" })?;
-    let extra = if spark { None } else { read("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")? };
-    let cap = if spark { None } else { read("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP")? };
-    if let Some(margin) = step_margin.filter(|_| !spark && text.is_none() && extra.is_none() && cap.is_none()) {
-        let bytes = base.checked_add(margin).ok_or(Error::Overflow { key: "GPU_GRAPH_RESERVE" })?;
-        return Ok(Resolved { bytes, source: "C1 working set plus one step", base_bytes: base,
-            base_source: FAMILY, extra_bytes: margin, extra_source: FAMILY,
-            cap_bytes: None, cap_source: "not applicable", effective_extra_bytes: margin,
-            soft_margin_floor: margin });
     }
-    resolve_with_extra(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, spark, base, tail)
 }
 
 /// Select whole prewarm entries against every device's base. The caller supplies
@@ -372,21 +370,35 @@ mod tests {
     }
 
     #[test]
-    fn working_set_reserve_uses_twenty_percent_or_100mb_floor() {
-        // Below 500 MB soft cap: 100 MB floor rounded to 2 MiB (96 MiB = 100,663,296 B).
-        let small = resolve_working_set(None, 0, 94 << 20).unwrap();
-        assert_eq!(small.base_bytes, 94 << 20);
-        assert_eq!(small.soft_margin_floor, 96 << 20);
-        assert_eq!(small.bytes, 190 << 20);
-        // Above 500 MB soft cap: 20% dominates the 100 MB floor.
-        let large = resolve_working_set(None, 0, 600 << 20).unwrap();
-        assert_eq!(large.base_bytes, 600 << 20);
-        assert_eq!(large.soft_margin_floor, 120 << 20);
-        assert_eq!(large.bytes, 720 << 20);
-        // User GPU_GRAPH_RESERVE override sets total while retaining the floor.
-        let user = resolve_working_set(Some("256MiB"), 0, 94 << 20).unwrap();
-        assert_eq!(user.bytes, 256 << 20);
-        assert_eq!(user.soft_margin_floor, 96 << 20);
-        assert_eq!(user.base_bytes, 160 << 20);
+    fn working_set_soft_cap_uses_maximum_of_three_branches() {
+        for (w1, step_growth, soft) in [(94, 10, 190), (600, 10, 720), (200, 70, 340)] {
+            let policy = resolve_working_set(None, None, None, 0, WorkingSet {
+                w1: w1 << 20, step_growth: step_growth << 20, capture_growth: (4 << 20) + 1,
+            }).unwrap();
+            assert_eq!(policy.base_bytes, soft << 20);
+            assert_eq!(policy.growth_headroom, Some(10 << 20));
+            assert_eq!(policy.bytes, (soft + 10) << 20);
+        }
+        let tiny_growth = WorkingSet { w1: 94 << 20, step_growth: 0, capture_growth: 0 };
+        let policy = resolve_working_set(None, None, None, 0, tiny_growth).unwrap();
+        assert_eq!(policy.bytes, 192 << 20);
+        assert_eq!(policy.growth_headroom, Some(GRAPH_CHUNK));
+        let overflow = WorkingSet { w1: u64::MAX, ..tiny_growth };
+        assert!(matches!(resolve_working_set(None, None, None, 0, overflow), Err(Error::Overflow { .. })));
+    }
+
+    #[test]
+    fn working_set_user_total_subtracts_census_headroom_clamped_to_half() {
+        let measured = WorkingSet { w1: 94 << 20, step_growth: 10 << 20, capture_growth: 4 << 20 };
+        for (rank, hard, soft, headroom) in [(0, 256, 248, 8), (1, 4, 2, 2), (2, 0, 0, 0), (3, 198, 190, 8)] {
+            let user = resolve_working_set(Some("gpu0=256MiB,gpu1=4MiB,gpu2=0"), None, None, rank, measured).unwrap();
+            assert_eq!((user.bytes, user.base_bytes, user.growth_headroom), (hard << 20, soft << 20, Some(headroom << 20)));
+        }
+        for (extra, cap, key) in [(Some("10MB"), None, "GPU_GRAPH_RESERVE_EXTRA"),
+            (None, Some("10%"), "GPU_GRAPH_RESERVE_EXTRA_CAP")] {
+            assert_eq!(resolve_working_set(None, extra, cap, 0, measured), Err(Error::WorkingSetExtra { key }));
+            assert_eq!(resolve_working_set(Some("256MiB"), extra, cap, 0, measured), Err(Error::WorkingSetExtra { key }));
+        }
+        assert!(resolve_working_set(None, Some("gpu1=1MB"), None, 0, measured).is_ok());
     }
 }

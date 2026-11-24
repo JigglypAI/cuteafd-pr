@@ -333,6 +333,7 @@ pub struct PreparedGlmf<'a> {
     pub request: p::Request,
     counts: Vec<usize>,
     arena: Vec<Vec<u64>>,
+    graphs: GlmfGraphs,
     native_load: Option<NativeLoad>,
     mount_load: Option<crate::shared::dense_read::MountLoad>,
     encoders: Vec<crate::plan::encoder::EncoderPlacement>,
@@ -355,26 +356,30 @@ fn invalid(error: impl std::fmt::Display) -> p::Refusal {
 /// The exact-row working-set reserve admitted once per GPU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlmfGraphs {
-    pub reserves: Vec<u64>,
+    pub policies: Vec<crate::placement::graph_reserve::Resolved>,
     pub executables: Vec<u64>,
-    pub charged: Vec<u64>,
     pub bootstraps: Vec<u64>,
 }
 
-fn graph_reserve(i: &GlmfInputs<'_>) -> glmf_graphs::GlmfGraphReserve {
-    glmf_graphs::glmf_graph_reserve(i.gpus.len(), i.spark_ranks > 0)
+impl GlmfGraphs {
+    pub fn charges(&self) -> Vec<u64> {
+        self.policies.iter().map(|policy| policy.bytes).collect()
+    }
 }
 
-fn resolve_graph_rank(gpu: usize, graphs: &glmf_graphs::GlmfGraphReserve)
-    -> Result<crate::placement::graph_reserve::Resolved, p::Refusal> {
-    crate::placement::graph_reserve::current_working_set(gpu, graphs.reserves[gpu])
-        .map_err(|error| p::Refusal::InvalidFact(error.to_string()))
+fn graph_reserve(i: &GlmfInputs<'_>, split_draft: bool) -> Result<GlmfGraphs, p::Refusal> {
+    let gpus = i.gpus.len();
+    let policies: Vec<_> = (0..gpus).map(|gpu| {
+        crate::placement::graph_reserve::current_working_set(gpu, glmf_graphs::working_set(gpus, split_draft, gpu))
+            .map_err(invalid)
+    }).collect::<Result<_, _>>()?;
+    let bootstraps: Vec<_> = (0..gpus).map(|gpu| glmf_graphs::bootstrap_bytes(gpus, i.spark_ranks > 0, gpu)).collect();
+    let executables = policies.iter().zip(&bootstraps).map(|(policy, &boot)| policy.base_bytes.div_ceil(boot)).collect();
+    Ok(GlmfGraphs { policies, executables, bootstraps })
 }
 
-fn graph_components(graphs: &glmf_graphs::GlmfGraphReserve, maximum: u64)
-    -> Result<Vec<p::Component>, p::Refusal> {
-    (0..graphs.reserves.len()).map(|gpu| {
-        let resolved = resolve_graph_rank(gpu, graphs)?;
+fn graph_components(graphs: &GlmfGraphs, maximum: u64) -> Result<Vec<p::Component>, p::Refusal> {
+    graphs.policies.iter().enumerate().map(|(gpu, resolved)| {
         let id = format!("glmf.graphs.{gpu}");
         let mut component = p::serving::startup_graph_component(&id, p::Location::coordinator(gpu as u8),
             crate::placement::GraphRank::estimated(graphs.executables[gpu], resolved.bytes), maximum)?;
@@ -1040,7 +1045,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     // The graph reserve is one fixed per-device owner, charged once here (before
     // the pool is solved), and independent of the onboarding choice.
-    contract.components.extend(graph_components(&graph_reserve(i), maximum)?);
+    let graphs = graph_reserve(i, !process.draft_tp2.is_empty())?;
+    contract.components.extend(graph_components(&graphs, maximum)?);
     let (rtx_blas, spark_blas): (Vec<_>, Vec<_>) = blas.into_iter()
         .partition(|owner| matches!(owner.location.device, p::Device::Coordinator(_)));
     contract.components.extend(p::serving::blas_components("sm_120", &rtx_blas, maximum, contract.phase_order)?);
@@ -1065,7 +1071,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         prefill: p::Pin::Exact(prefill), operation: p::Operation::Serving,
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
-    Ok(PreparedGlmf { pool, started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena,
+    Ok(PreparedGlmf { pool, started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, graphs,
         native_load: process.native_load, mount_load: process.mount_load, encoders: process.encoders })
 }
 
@@ -1084,19 +1090,13 @@ impl PreparedGlmf<'_> {
         let option = self.counts.iter().position(|&n| n == count).ok_or_else(|| invalid("unprepared onboarding count"))?;
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         // The working-set reserve does not depend on the solved KV pool.
-        let prepared = graph_reserve(i);
-        let mut charged = Vec::with_capacity(i.gpus.len());
-        for gpu in 0..i.gpus.len() {
-            let id = format!("glmf.graphs.{gpu}");
-            let resolved = resolve_graph_rank(gpu, &prepared)?;
-            let source = crate::placement::graph_reserve::source(&id);
+        let graphs = self.graphs;
+        for (gpu, policy) in graphs.policies.iter().enumerate() {
+            let source = crate::placement::graph_reserve::source(&format!("glmf.graphs.{gpu}"));
             let owner = solved.facts.allowances.iter().find(|owner| owner.source == source)
                 .ok_or_else(|| invalid("missing admitted graph reserve owner"))?;
-            if resolved.bytes != owner.bytes { return Err(invalid("solved graph reserve differs from the charge")); }
-            charged.push(resolved.bytes);
+            if policy.bytes != owner.bytes { return Err(invalid("solved graph reserve differs from the charge")); }
         }
-        let graphs = GlmfGraphs { reserves: prepared.reserves, executables: prepared.executables,
-            charged, bootstraps: prepared.bootstraps };
         let modes = &solved.decisions.attention;
         let layers = modes.iter().enumerate().map(|(layer, &mode)| LayerAssignment { mode,
             experts: if i.cfg.dense[layer] { ExpertHome::Dense }
@@ -1129,7 +1129,7 @@ impl PreparedGlmf<'_> {
         }
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
-            graph_reserve = ?graphs.charged,
+            graph_reserve = ?graphs.charges(),
             "Flash recipe preparation, search and exact reconciliation completed");
         Ok(AdmittedGlmf { placement, graphs, working, solved,
             native_load: self.native_load, mount_load: self.mount_load, encoder })
@@ -1352,7 +1352,13 @@ mod tests {
             process.draft(snapshot.path(), representation, 2, true)?;
             let layouts = process.draft_tp2.clone();
             let arenas = process.draft_arenas.clone();
-            let facts = prepare(&input, 188, true, process)?.admit()?.solved.facts;
+            let admitted = prepare(&input, 188, true, process)?.admit()?;
+            assert_eq!(admitted.graphs.charges(), [198 << 20; 2]);
+            for policy in &admitted.graphs.policies {
+                assert_eq!(policy.base_bytes, 190 << 20);
+                assert_eq!(policy.growth_headroom, Some(8 << 20));
+            }
+            let facts = admitted.solved.facts;
             for rank in 0..2 {
                 let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
                 let location = p::Location::coordinator(rank as u8);

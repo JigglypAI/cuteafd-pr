@@ -127,23 +127,27 @@ pub fn reserve(layout: Option<Hy4GraphLayout>, rank: usize) -> (u64, u64) {
         .map_or((0, 0), |data| (data.reserve_base_bytes, data.reserve_extra_bytes))
 }
 
-/// Two donor-off, no-prewarm C1 passes (short and 32K). W1 uses the
-/// larger of charged and settled physical bytes. Margin rounds up the
-/// trace-priced maximum draft + verify step plus 8 MiB (at least 2x growth).
-pub fn draft_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<(u64, u64)> {
-    let (working, margin) = match (layout, rank) {
-        (Some(Hy4GraphLayout::Exl3Min), 0) => (86, 30),
-        (Some(Hy4GraphLayout::Exl3Max), 0) => (120, 32),
-        (Some(Hy4GraphLayout::Exl3Max), 1) => (118, 30),
+/// Two donor-off, no-prewarm C1 passes (short and 32K). W1 uses the larger
+/// of charged and settled physical bytes. Step growth is the trace-priced
+/// draft + verify bundle; capture growth is the largest single capture in
+/// those C1 traces, not the sum across the bundle.
+pub fn draft_working_set(layout: Option<Hy4GraphLayout>, rank: usize)
+    -> Option<crate::placement::graph_reserve::WorkingSet> {
+    let (w1, step_growth, capture_growth) = match (layout, rank) {
+        (Some(Hy4GraphLayout::Exl3Min), 0) => (86, 22, 4),
+        (Some(Hy4GraphLayout::Exl3Max), 0) => (120, 24, 2),
+        (Some(Hy4GraphLayout::Exl3Max), 1) => (118, 22, 2),
         _ => return None,
     };
-    Some((working << 20, margin << 20))
+    Some(crate::placement::graph_reserve::WorkingSet {
+        w1: w1 << 20, step_growth: step_growth << 20, capture_growth: capture_growth << 20,
+    })
 }
 
 pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize, dfly2: bool)
     -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
-    if let Some((w1, margin)) = dfly2.then(|| draft_working_set(layout, rank)).flatten() {
-        return crate::placement::graph_reserve::current_with_step_margin(rank, false, w1, 0, Some(margin));
+    if let Some(measured) = dfly2.then(|| draft_working_set(layout, rank)).flatten() {
+        return crate::placement::graph_reserve::current_working_set(rank, measured);
     }
     let (base, tail) = reserve(layout, rank);
     crate::placement::graph_reserve::current(rank, false, base, tail)
@@ -215,14 +219,23 @@ mod tests {
 
     #[test]
     fn draft_working_sets_are_rank_local_and_do_not_cover_spark_layouts() {
-        let mib = 1 << 20;
         let min = Some(Hy4GraphLayout::Exl3Min);
         let max = Some(Hy4GraphLayout::Exl3Max);
-        assert_eq!(draft_working_set(min, 0), Some((86 * mib, 30 * mib)));
+        for (layout, rank, w1, step, capture, soft, hard) in [
+            (min, 0, 86, 22, 4, 182, 190),
+            (max, 0, 120, 24, 2, 216, 220),
+            (max, 1, 118, 22, 2, 214, 218),
+        ] {
+            let measured = draft_working_set(layout, rank).unwrap();
+            assert_eq!((measured.w1, measured.step_growth, measured.capture_growth), (w1 << 20, step << 20, capture << 20));
+            let policy = reserve_policy(layout, rank, true).unwrap();
+            assert_eq!((policy.base_bytes, policy.bytes), (soft << 20, hard << 20));
+            assert_eq!(policy.growth_headroom, Some((2 * capture) << 20));
+        }
         assert_eq!(draft_working_set(min, 1), None);
-        assert_eq!(draft_working_set(max, 0), Some((120 * mib, 32 * mib)));
-        assert_eq!(draft_working_set(max, 1), Some((118 * mib, 30 * mib)));
         assert_eq!(draft_working_set(Some(Hy4GraphLayout::Exl3MinSpark), 0), None);
+        assert!(reserve_policy(min, 0, false).unwrap().growth_headroom.is_none());
+        assert_eq!(reserve_policy(Some(Hy4GraphLayout::Exl3MinSpark), 0, true).unwrap().bytes, 0);
     }
 
     #[test]

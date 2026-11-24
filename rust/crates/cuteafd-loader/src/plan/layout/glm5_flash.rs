@@ -454,7 +454,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selected.solved));
         report.host_budget_bytes = quota;
         notes.push(format!("exact-row graph reserve by GPU: {:?} bytes (lazy capture)",
-            selected.graphs.charged));
+            selected.graphs.charges()));
         let (placed, working) = (selected.placement, selected.working);
         let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
         if replicas > 0 {

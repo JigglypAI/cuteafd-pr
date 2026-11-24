@@ -466,7 +466,8 @@ def test_optional_levers_are_default_off_and_documented():
 def test_glmf_documents_lazy_exact_rows_and_working_set_reserve():
     text = DOC.read_text()
     assert "GLM Flash uses exact live-row keys" in text
-    assert "working-set soft caps are 94/92 MiB" in text
+    assert "`max(1.2 × W1, W1 + 100 MB, W1 + 2 × step)`" in text
+    assert "twice the largest measured single-capture growth" in text
 
 
 def test_minimax_bundled_dspark_is_a_family_default_not_an_optional_lever():
