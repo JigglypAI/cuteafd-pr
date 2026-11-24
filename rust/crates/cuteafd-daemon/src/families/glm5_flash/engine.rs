@@ -1503,8 +1503,6 @@ pub(crate) struct Fp8Prefill {
 }
 
 use cuteafd_loader::serving_capacity::glmf_graphs::{GraphGeometry, decode_strides};
-#[cfg(test)]
-use cuteafd_loader::serving_capacity::glmf_graphs::MIN_PAGE_STRIDE;
 
 fn check_decode_slots(sequences: impl IntoIterator<Item = i32>) -> Result<()> {
     let mut slots = std::collections::HashSet::new();
@@ -5487,7 +5485,8 @@ mod wide_decode_tests {
 
 #[cfg(test)]
 mod graph_key_tests {
-    use super::{decode_strides, glmf_table_pages, GraphKey, StepTables, MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
+    use super::{decode_strides, glmf_table_pages, GraphKey, StepTables, UNIT_PAGES, UNIT_ROWS};
+    use cuteafd_loader::serving_capacity::glmf_graphs::MIN_PAGE_STRIDE;
 
     fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
         StepTables { decode: true, long, pool_width, page_stride, pool_stride, spec: true, ..Default::default() }
