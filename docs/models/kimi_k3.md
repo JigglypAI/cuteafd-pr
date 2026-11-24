@@ -1,5 +1,9 @@
 # Kimi K3
 
+The v7 card set keeps K3 Core-K6 on 2 RTX + 6 Sparks. K3.1 MC uses K8
+compact on both its one- and two-RTX cards (6 Sparks each); original, K6
+compact and FP8 compact are compared on the two-RTX layout.
+
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
 the pool then grows into remaining admitted memory, within native encoding

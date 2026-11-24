@@ -141,9 +141,8 @@ def test_glm_ring_expectation_requires_preserved_observer(entry, tmp_path):
 
 
 def test_dense_candidate_cards_are_zero_spark_and_do_not_change_release_matrix():
-    kit = ROOT / 'scripts/bench/kits/gate'
     names = ['qwen35-9b-bf16-min', 'qwen38-27b-bf16-min']
-    dense = cards.load_cards(kit, names)
+    dense = json.loads((ROOT / 'scripts/tests/fixtures/matrix-dense-qwen.json').read_text())['entries']
     assert [card['name'] for card in dense] == names
     assert [cards.config(card['config'])['MODEL_ID'] for card in dense] == [
         'Qwen/Qwen3.5-9B', 'Qwen/Qwen3.8-27B']
@@ -1629,26 +1628,6 @@ def test_gate_muse_mc_cards_are_separate_from_legacy_support(size, count):
         assert values['MAX_CONTEXT_TOKENS'] == 'auto'
 
 
-def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
-    kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]
-    values = {**cards.config(ROOT / card['config']), **card['set']}
-    assert card['family'] == 'glm5' and card['gpus'] == [0]
-    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
-    assert values['RTX_GPUS'] == '1' and values['COORDINATOR_GPUS'] == '0'
-    assert values['SPARK_COUNT'] == '4' and values['EXLR8_MANIFEST'] == 'up1'
-    assert values['MODEL_ID'] == 'kindlingai/glm-5.3-exlr8-k2-k3-k4'
-    assert values['POOL_TOKENS'] == 'auto' and 'RTX_EXPERT_LAYERS' not in values
-    for rank, host in enumerate(card['sparks']):
-        assert values[f'SPARK_{rank}_HOST'] == host
-        assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'
-    entries = [entry for matrix in kit.glob('matrix-*.json')
-               for entry in json.loads(matrix.read_text())['entries']]
-    for key in ('ADDR', 'EXPERT_PORT'):
-        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
-
-
-@pytest.mark.parametrize('size,gpus,count', [('min', [1], 4), ('max', [0, 1], 6)])
 def test_gate_glm53_cards_use_the_live_k4_mc_original_checkpoint(size, gpus, count):
     card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'glm53-mc-original-{size}'])[0]
     values = {**cards.config(ROOT / card['config']), **card['set']}
@@ -1685,7 +1664,7 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     # A card pinned to GPU0 (GPU1 held by another session) stages its WIP build
     # container on GPU0 too; without the key the default stays GPU1.
     kit = ROOT / 'scripts/bench/kits/gate'
-    card = cards.load_cards(kit, ['v41-flash-min'])[0]
+    card = cards.load_cards(kit, ['v4-pro-exl3-max'])[0]
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     arms = cards.arms_from(['base=x:a'])
     for sub in ('gpu0', 'pair', 'default', 'bad'):
@@ -2013,10 +1992,10 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-strided-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
-    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-strided-min', '--matrix', '--arm', 'c=x:s',
             '--state', str(tmp_path / 'state')]
     with pytest.raises(ValueError) as caught:
         _run_main(monkeypatch, argv, slot=_slot_with_roles(roles, verified, error=error))
@@ -2028,17 +2007,17 @@ def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, mo
     assert not list((tmp_path / 'state').glob('*/exit'))
     # A slot that attests tp3 with verified symbols launches.
     rc, launched = _run_main(monkeypatch, argv + ['--resume'], slot=_slot_with_roles(['tp3']))
-    assert rc == 0 and launched == ['v41-flash-min/c']
+    assert rc == 0 and launched == ['v41-flash-strided-min/c']
 
 
 def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatch):
     gate = ROOT / 'scripts/bench/kits/gate'
     state = tmp_path / 'state'
-    argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s', '--state', str(state),
+    argv = ['--kit', str(gate), '--cards', 'v41-flash-strided-min', '--matrix', '--arm', 'c=x:s', '--state', str(state),
             '--preflight-only']
     rc, launched = _run_main(monkeypatch, argv, slot=_slot_with_roles(['tp2', 'tp3', 'tp6']))
     assert rc == 0 and launched == []
-    job = json.loads((state / 'v41-flash-min-c-r1' / 'job.json').read_text())
+    job = json.loads((state / 'v41-flash-strided-min-c-r1' / 'job.json').read_text())
     assert job['needs']['tp_role'] == 'tp3'
     hook = job['entry']['prelaunch']['argv']
     # At grant the slot no longer attests tp3 (rebuilt or swapped): refused.

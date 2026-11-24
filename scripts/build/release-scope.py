@@ -42,7 +42,8 @@ PREVIOUS_RELEASE_FLOOR = {
         }.items() for count in counts
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
-DEFAULT_MATRIX = 'scripts/bench/release-smoke-v6.json'
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v7.json'
+V6_MATRIX = 'scripts/bench/release-smoke-v6.json'
 # WIP scope switches with no release key: release images always build V4.1 and vision.
 WIP_ONLY = {'V41_AOT', 'VISION_ATTENTION_AOT'}
 
@@ -97,15 +98,23 @@ def entries_for(repo, matrix, scope):
     payload = json.loads(matrix.read_text())
     defaults = payload.get('defaults', {})
     entries = []
-    for raw in payload['entries']:
-        entry = {**defaults, **raw}
-        entry['set'] = {**defaults.get('set', {}), **raw.get('set', {})}
-        entries.append(entry)
+    def effective(raw, defaults):
+        return {**defaults, **raw, 'set': {**defaults.get('set', {}), **raw.get('set', {})}}
+
+    entries = [effective(raw, defaults) for raw in payload['entries']]
     if not entries or len({e['name'] for e in entries}) != len(entries):
         raise ValueError('release matrix must contain nonempty, uniquely named entries')
     if scope == 'explicit':
         return []
     if scope == 'all':
+        # Card retirement does not drop previously released programs. Preserve
+        # the v6 export recipes for retired checkpoints in complete releases.
+        floor = matrix.with_name(Path(V6_MATRIX).name)
+        if matrix.name == Path(DEFAULT_MATRIX).name and floor.is_file():
+            old = json.loads(floor.read_text())
+            retired = {entry['name'] for entry in payload.get('retired', [])}
+            entries += [effective(raw, old.get('defaults', {})) for raw in old['entries']
+                        if raw['name'] in retired]
         return entries
     selectors = scope.split(',')
     selected = []
@@ -492,14 +501,17 @@ def revision_requirements(repo, revision):
     policy_path = 'scripts/build/spark-package-ranges.json'
     policy = json.loads(subprocess.check_output(
         ['git', '-C', str(repo), 'show', f'{revision}:{policy_path}']))
+    matrices = [path for path in (DEFAULT_MATRIX, V6_MATRIX) if subprocess.run(
+        ['git', '-C', str(repo), 'cat-file', '-e', f'{revision}:{path}'], capture_output=True).returncode == 0]
+    require(matrices, 'build revision is missing its shipping matrix')
     archive = subprocess.check_output(['git', '-C', str(repo), 'archive', revision, '--',
-                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX,
+                                       'scripts/lib', 'examples/configs', 'cuteafd.config', *matrices,
                                        *policy['shared_inputs']])
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
             tree.extractall(root, filter='data')
-        return requirements(root, root / DEFAULT_MATRIX, 'all')
+        return requirements(root, root / matrices[0], 'all')
 
 
 def main():

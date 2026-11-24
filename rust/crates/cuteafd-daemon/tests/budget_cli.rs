@@ -1249,7 +1249,8 @@ fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<Str
 
 fn live_release_entries(root: &std::path::Path, matrix: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
-    for cell in matrix["cells"].as_array().unwrap() {
+    let supplemental = matrix["supplemental"].as_array().into_iter().flatten();
+    for cell in matrix["cells"].as_array().unwrap().iter().chain(supplemental) {
         for column in ["1rtx", "2rtx"] {
             let card = &cell[column];
             if card["status"] != "current" { continue; }

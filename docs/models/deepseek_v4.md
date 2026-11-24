@@ -1,5 +1,9 @@
 # DeepSeek V4 (Flash / Pro)
 
+The v7 release keeps the V4 Pro EXL3 K2 card and retires the V4 Flash 0731
+card. The Flash checkpoint, example configs and historical measurements
+remain available.
+
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
 the pool then grows into remaining admitted memory, within native encoding
