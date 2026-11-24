@@ -76,6 +76,21 @@ impl NativeLibrary {
         self.status_to_result("invalidate graph executable", status)
     }
 
+    /// Asynchronously uploads an executable on `stream` so its next launch
+    /// does not pay an implicit first-launch upload stall on the host.
+    ///
+    /// # Safety
+    /// `exec` is a live executable owned on the current executor thread and
+    /// `stream` is a live CUDA stream (or null for stream 0) on the same device.
+    pub unsafe fn cuda_graph_upload(&self, exec: *mut c_void, stream: *mut c_void) -> Result<()> {
+        type Upload = unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuteafdStatus;
+        // SAFETY: fixed ABI owned by the retained native module.
+        let upload = unsafe { self.lib.get::<Upload>(b"cuteafd_cuda_graph_upload")? };
+        // SAFETY: native validates tagged handles without dereferencing stale ones.
+        let status = unsafe { upload(exec, stream) };
+        self.status_to_result("cuteafd_cuda_graph_upload", status)
+    }
+
 }
 
 impl GraphSource<'_> {
@@ -173,10 +188,14 @@ mod tests {
         assert_eq!(counts.sample(receiver as usize), 0);
         // SAFETY: fixture handles are valid; donor must reject, receiver survives.
         unsafe {
+            assert!(library.cuda_graph_upload(donor, std::ptr::null_mut()).is_err());
             assert!(library.cuda_graph_launch(donor, std::ptr::null_mut()).is_err());
             library.cuda_graph_exec_destroy(donor)?;
+            library.cuda_graph_upload(receiver, std::ptr::null_mut())?;
+            library.cuda_graph_upload(receiver, std::ptr::null_mut())?;
             library.cuda_graph_launch(receiver, std::ptr::null_mut())?;
         }
+        assert_eq!(fixture.events()?, "GuLUguL");
         assert_eq!(counts.sample(receiver as usize), 1);
         assert_eq!(before, library.cuda_memory_info()?);
         // SAFETY: receiver exclusively owns the still-live executable.

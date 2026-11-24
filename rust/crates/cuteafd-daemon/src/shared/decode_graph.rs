@@ -134,6 +134,19 @@ pub(crate) unsafe fn launch(library: &cuteafd_ffi::NativeLibrary,
     unsafe { library.cuda_graph_launch(graph, stream) }
 }
 
+/// Asynchronously uploads an executable on `stream` ahead of its next launch.
+///
+/// # Safety
+/// The executable comes from an attached bank owned on the current executor
+/// thread, and `stream` is a live CUDA stream (or null for stream 0) on the
+/// same device.
+#[allow(dead_code)]
+pub(crate) unsafe fn upload(library: &cuteafd_ffi::NativeLibrary,
+    graph: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> anyhow::Result<()> {
+    // SAFETY: forwarded executable and stream ownership contract.
+    unsafe { library.cuda_graph_upload(graph, stream) }
+}
+
 pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {
     if let Err(error) = result {
         tracing::error!(%error, site, "graph storage drain failed; aborting before storage release");
