@@ -3552,11 +3552,20 @@ impl NativeLibrary {
                 )?;
             }
         }
-        let source_ptrs = srcs
-            .iter()
-            .map(|source| source.ptr.cast_const())
-            .collect::<Vec<_>>();
+        const STACK_COPIES: usize = 12;
+        let mut small = [std::ptr::null(); STACK_COPIES];
+        let large;
+        let source_ptrs = if srcs.len() <= small.len() {
+            for (ptr, source) in small.iter_mut().zip(srcs) {
+                *ptr = source.ptr.cast_const();
+            }
+            &small[..srcs.len()]
+        } else {
+            large = srcs.iter().map(|source| source.ptr.cast_const()).collect::<Vec<_>>();
+            &large
+        };
         let copy_fn: CopyH2DBatchAsyncFn = self.cuteafd_copy_h2d_batch_async()?;
+        // SAFETY: caller retains the backing bytes; the native call borrows these arrays only here.
         let status = unsafe {
             copy_fn(
                 dsts.as_ptr(),

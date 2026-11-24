@@ -147,6 +147,35 @@ fn staging_census_getters_preserve_absence_backing_and_native_history() -> Resul
     Ok(())
 }
 
+#[test]
+fn host_copy_batch_preserves_order_at_stack_boundary() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    let input: Vec<u8> = (1..=13).collect();
+    let mut source = library.alloc_host_buffer(input.len(), memory_ledger::TEST)?;
+    let mut target = library.alloc_device_buffer(input.len(), memory_ledger::TEST)?;
+    // SAFETY: the fixture allocated a live pinned region of input.len() bytes.
+    unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), source.ptr.cast(), input.len()); }
+    for count in [1, 12, 13] {
+        let srcs: Vec<_> = (0..count).map(|i| CuteafdHostBuffer {
+            ptr: source.ptr.wrapping_byte_add(count - i - 1), bytes: 1, ..source
+        }).collect();
+        let dsts: Vec<_> = (0..count).map(|i| CuteafdDeviceBuffer {
+            ptr: target.ptr.wrapping_byte_add(i), bytes: 1, ..target
+        }).collect();
+        // SAFETY: the fake copies synchronously using exclusively owned, disjoint views.
+        unsafe { library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &vec![1; count], 1usize as *mut c_void)?; }
+        let mut actual = vec![0; count];
+        library.copy_d2h(&mut actual, target)?;
+        assert!(actual.iter().copied().eq(input[..count].iter().rev().copied()));
+    }
+    library.free_device_buffer(&mut target)?;
+    library.free_host_buffer(&mut source)?;
+    Ok(())
+}
+
 /// #2544: a reservation-only upload into an unreserved destination is refused
 /// with the typed error before any event, staging or copy; after the startup
 /// reservation it uploads into exactly the reserved staging, never a new one.
