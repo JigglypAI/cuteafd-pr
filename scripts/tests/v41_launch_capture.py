@@ -149,7 +149,9 @@ if tool == "docker":
                 sys.exit("deepseek_v41 supports DECODE_ROWS up to 256")
             if family == "glm5_flash" and decode_rows > (128 if int(value("--rtx", "1")) == 1 else 64):
                 sys.exit("glm5_flash missing wide decode programs")
-            if family not in ("deepseek_v41", "glm5_flash") and decode_rows > 64:
+            if family == "minimax_m3" and decode_rows > 128:
+                sys.exit("minimax_m3 supports DECODE_ROWS up to 128")
+            if family not in ("deepseek_v41", "glm5_flash", "minimax_m3") and decode_rows > 64:
                 sys.exit("unsupported DECODE_ROWS for " + family)
             response["decode_rows"] = decode_rows
             tp = int(ranks)

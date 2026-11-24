@@ -1189,7 +1189,9 @@ if family == "glm5_flash" and gpus == 2 and decode_rows > 64:
     sys.exit("glm5_flash on 2 RTX GPUs supports DECODE_ROWS up to 64 (missing glmf2_*_m128)")
 if family == "glm5_flash" and decode_rows > 128:
     sys.exit("glm5_flash on 1 RTX GPU supports DECODE_ROWS up to 128 (missing glmf_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash") and decode_rows > 64:
+if family == "minimax_m3" and decode_rows > 128:
+    sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes, decode_rows=decode_rows)

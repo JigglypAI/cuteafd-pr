@@ -79,19 +79,31 @@ pub(crate) struct Kernels<'a> {
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, false, false)
+        Self::bind_role(device, programs, manifest, cfg, weights, rows.min(64), rows, context, false, false)
+    }
+    pub fn bind_for_decode(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, decode_rows: u32, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, decode_rows, rows, context, false, false)
     }
     pub fn bind_split(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true, false)
+        Self::bind_role(device, programs, manifest, cfg, weights, rows.min(64), rows, context, true, false)
+    }
+    pub fn bind_split_for_decode(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, decode_rows: u32, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, decode_rows, rows, context, true, false)
     }
     pub fn bind_heads(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
         cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32) -> Result<Self> {
-        Self::bind_role(device, programs, manifest, cfg, weights, rows, context, true, true)
+        Self::bind_role(device, programs, manifest, cfg, weights, rows.min(64), rows, context, true, true)
+    }
+    pub fn bind_heads_for_decode(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, decode_rows: u32, rows: u32, context: u32) -> Result<Self> {
+        Self::bind_role(device, programs, manifest, cfg, weights, decode_rows, rows, context, true, true)
     }
     pub fn has_router(&self) -> bool { self.router.is_some() }
     fn bind_role(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
-        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, rows: u32, context: u32, split: bool, heads: bool) -> Result<Self> {
+        cfg: &MiniMaxM3Config, weights: &CoordinatorWeights, decode_rows: u32, rows: u32, context: u32, split: bool, heads: bool) -> Result<Self> {
         UnitLayout::new(cfg, rows)?;
         let (_, forward) = if heads { ForwardPrograms::resolve_heads(manifest, rows)? }
             else { ForwardPrograms::resolve(manifest, rows)? };
@@ -107,8 +119,8 @@ impl<'a> Kernels<'a> {
         }
         let dense = dense::NativePrograms::bind(device, programs, weights, manifest, rows)?;
         let attention = (!weights.layers.is_empty()).then(||
-            if heads { attention::Kernels::bind_heads(device, programs, manifest, cfg, rows, context, attention::HeadLayout::Narrow) }
-            else { attention::Kernels::bind(device, programs, manifest, cfg, rows, context) }).transpose()?;
+            if heads { attention::Kernels::bind_heads_for_decode(device, programs, manifest, cfg, decode_rows, rows, context, attention::HeadLayout::Narrow) }
+            else { attention::Kernels::bind_for_decode(device, programs, manifest, cfg, decode_rows, rows, context) }).transpose()?;
         device.run(|| Ok(Self { device, dense, attention,
             norm: forward::ForwardProducer::bind(programs, forward::Kind::ResidualNorm)?,
             router: (!split || weights.rank == 0).then(||
@@ -256,7 +268,7 @@ impl<'a> UnitOwner<'a> {
     }
     pub fn new_decode(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
         weights: &CoordinatorWeights, rows: u32) -> Result<Self> {
-        ensure!(rows <= 64, "MiniMax decode owner exceeds native row capacity");
+        ensure!(rows <= 128, "MiniMax decode owner exceeds native row capacity");
         Self::for_mode(kernels, stream, cfg, weights, rows, false)
     }
     fn for_mode(kernels: &Kernels<'a>, stream: Rc<Stream<'a>>, cfg: &MiniMaxM3Config,
@@ -280,7 +292,7 @@ impl<'a> UnitOwner<'a> {
         receive_routes: bool) -> Result<Self> {
         ensure!(stream.device.id == kernels.device.id
             && std::ptr::eq(stream.device.library, kernels.device.library), "MiniMax split stream differs");
-        ensure!(prefill || rows <= 64, "MiniMax split decode rows exceed native capacity");
+        ensure!(prefill || rows <= 128, "MiniMax split decode rows exceed native capacity");
         let partial = PartialFfnLayout::new(cfg, weights.rank as u8, rows)?;
         let mut buffers = partial.buffers();
         if !weights.layers.is_empty() { buffers.extend(AttentionLayout::new(cfg, rows)?.buffers()); }
@@ -311,7 +323,7 @@ impl<'a> UnitOwner<'a> {
         weights: &CoordinatorWeights, rows: u32, prefill: bool) -> Result<Self> {
         ensure!(kernels.heads && stream.device.id == kernels.device.id
             && std::ptr::eq(stream.device.library, kernels.device.library), "MiniMax Heads stream/role differs");
-        ensure!(prefill || rows <= 64, "MiniMax Heads decode exceeds capacity");
+        ensure!(prefill || rows <= 128, "MiniMax Heads decode exceeds capacity");
         let layout = HeadsLayout::new(cfg, weights.rank as u8, rows)?;
         let planes = layout.buffers().into_iter().map(|(name, bytes)| Ok((name.into(),
             Rc::new(Allocation::new(kernels.device, usize::try_from(bytes)?, Tag::workspace("minimax/unit"))?))))

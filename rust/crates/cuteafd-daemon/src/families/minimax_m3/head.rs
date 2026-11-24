@@ -162,9 +162,9 @@ impl<'a> Head<'a> {
     /// `consume` finishes reading each tile before the next overwrites logits.
     pub fn project_spans(&self, weights: &TargetWeights<'_>, residual: Buffer, rows: usize,
         consume: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>) -> Result<()> {
-        ensure!(self.rows <= 64 && rows > 0 && residual.device_id == self.stream.device.id
+        ensure!(self.rows <= 128 && rows > 0 && residual.device_id == self.stream.device.id
             && rows.checked_mul(6144 * 4).is_some_and(|bytes| bytes <= residual.bytes),
-            "MiniMax serving head must use an admitted <=64-row owner and bounded residual");
+            "MiniMax serving head must use an admitted <=128-row owner and bounded residual");
         for span in crate::shared::probe::head_spans(rows, self.rows)? {
             let input = super::cache::view(residual, span.start * 6144 * 4, span.len() * 6144 * 4)?;
             consume(span.start, self.project_device(weights, input, span.len())?)?;

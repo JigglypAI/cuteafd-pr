@@ -27,6 +27,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "fp32", value_parser = ["bf16", "fp32"])] pub split_wire: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
+    /// Per-lane decode/verify row budget (`DECODE_ROWS`: auto=64, up to 128).
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long)] pub model_id: Option<String>,
     /// Bundled native DSpark; --dspark=false disables it.
@@ -75,6 +78,16 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelProfile, NativeRequest};
     use std::sync::Mutex;
     cuteafd_core::concurrency::validate("minimax_m3", u64::from(args.max_sequences))?;
+    let decode_rows = cuteafd_loader::plan::resolve_decode_rows(
+        "minimax_m3",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(),
+            concurrency: u64::from(args.max_sequences),
+            decode_lanes: 1,
+            rtx_gpus: 1 + usize::from(args.split_device.is_some()),
+            draft_length: args.draft_length.draft_length.map(|n| n as u32),
+        },
+    ).map_err(|error| anyhow::anyhow!("{error}"))?;
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu)
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "MiniMax serving requires admitted GPU embedding and device selection");
@@ -83,6 +96,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         supports_thinking_off: Some(false), ..Default::default()
     });
     cuteafd_bench::context::ResolvedSettings::default().value("max-sequences", args.max_sequences)
+        .value("decode-rows", decode_rows)
         .value("prefill-packing", format!("{:?}", args.prefill_packing).to_lowercase())
         .value("draft-mode", if args.dspark { "adaptive" } else { "no speculation" })
         .value("dspark",args.dspark).value("expert-usage", args.expert_usage).publish();
@@ -133,6 +147,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     _ => super::dense::PartialPrecision::DEFAULT,
                 },
                 prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
+                decode_rows,
                 sequences: concurrency as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0),
                 onboard: worker_args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
@@ -248,6 +263,7 @@ mod tests {
             args.prefill()?;
             cuteafd_bench::context::ResolvedSettings::default().value("max-context-tokens", 131072)
                 .value("pool-tokens", 2097152).value("rtx-expert-layers", 0)
+                .value("decode-rows", 64)
                 .value("attention-placement", "heads").publish();
             Ok(())
         })

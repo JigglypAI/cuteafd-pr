@@ -898,7 +898,7 @@ mod tests {
         let mut capacity = RequestCapacity::new(16, 32)?;
         capacity.decode = UnitMetadata::new(16)?;
         assert!(Metadata::new_decode(Rc::clone(&stream), capacity).is_err());
-        capacity.decode = UnitMetadata::for_requests(65, 65)?;
+        capacity.decode = UnitMetadata::for_requests(129, 129)?;
         assert!(Metadata::new_decode(Rc::clone(&stream), capacity).is_err());
         capacity = RequestCapacity::new(64, 32)?;
         capacity.prefill = UnitMetadata::for_requests(32, 16)?;
