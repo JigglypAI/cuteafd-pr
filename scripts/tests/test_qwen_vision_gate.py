@@ -467,7 +467,7 @@ def test_qwen_prewarm_drains_at_pass_boundaries_without_serving_reachability():
         check(engine + "\nfn serving_step() { self.warm_decode_graphs(1, false); }\n")
 
 
-@pytest.mark.parametrize("family", ["qwen4", "mimo_v2", "glm5_flash", "glm5"])
+@pytest.mark.parametrize("family", ["qwen4", "mimo_v2", "glm5_flash", "glm5", "mistral_large4"])
 @pytest.mark.parametrize("vision", ["off", "auto", "rtx", "spark:1"])
 @pytest.mark.parametrize("quota", ["", "2621440"])
 def test_media_cache_flag_only_reaches_enabled_vision(family, vision, quota):
@@ -476,12 +476,14 @@ def test_media_cache_flag_only_reaches_enabled_vision(family, vision, quota):
     block = launcher[start:launcher.index('if [[ $family == mimo_v2 ]]; then', start)]
     program = '''
 family=$1; vision=$2; quota=$3
+checkpoint_family=$family
+[[ "$family" != mistral_large4 ]] || family=glm5
 get() { printf '%s' "$quota"; }
 family_args=()
 ''' + block + '\nif ((${#family_args[@]})); then printf "%s\\n" "${family_args[@]}"; fi\n'
     result = subprocess.run(["bash", "-c", program, "test", family, vision, quota],
                             check=True, capture_output=True, text=True)
-    expected = ["--media-cache-bytes", quota] if family in ("qwen4", "mimo_v2", "glm5_flash") and vision != "off" and quota else []
+    expected = ["--media-cache-bytes", quota] if family in ("qwen4", "mimo_v2", "glm5_flash", "mistral_large4") and vision != "off" and quota else []
     assert result.stdout.splitlines() == expected
 
 

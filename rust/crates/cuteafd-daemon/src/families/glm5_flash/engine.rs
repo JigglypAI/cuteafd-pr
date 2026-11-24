@@ -4667,15 +4667,6 @@ impl<'a> GlmfEngine<'a> {
                 }
             });
             if rank == 0 { self.timed("glm_mla_prefill (native)", launch)? } else { launch()? }
-            if rank == 0 && crate::families::glm5::engine::mla_prefill_check() {
-                // SAFETY: as above; the check synchronizes the stream.
-                let (stats, bf16) = unsafe {
-                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, cache, w.indices.buffer.ptr,
-                        w.lengths.buffer.ptr, tables.positions.len(), heads, SPARSE_TOPK, RECORD_BYTES,
-                        scale * std::f32::consts::LOG2_E, self.stream)
-                }?;
-                crate::families::glm5::engine::print_mla_check(index, &stats, bf16);
-            }
         } else {
             let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
             let prefill_scalars = [rows];

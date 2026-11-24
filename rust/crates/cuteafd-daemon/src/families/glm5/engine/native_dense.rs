@@ -468,7 +468,7 @@ impl<'a> GlmEngine<'a> {
         } else {
             let fp8 = [("x", normed.ptr), ("w_iq_fp8", layer.ptr("w_iq_fp8")?),
                 ("w_iq_scale", layer.ptr("w_iq_scale")?), ("out", iq.ptr), ("scratch", w.scratch.buffer.ptr)];
-            self.run_on(rank, &format!("ml4_index_q_{cap}"), &fp8, &self.projection_scalars(row, cap))?;
+            self.run_on(rank, &format!("ml4_index_q_{cap}"), &fp8, &self.projection_scalars(row, cap, "index"))?;
         }
         self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", iq.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),

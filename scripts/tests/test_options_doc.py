@@ -403,8 +403,9 @@ def test_optional_levers_are_default_off_and_documented():
     seen = set()
     for lever in LEVERS:
         for key in lever["keys"]:
-            assert key not in seen, f"duplicate lever row for {key}"
-            seen.add(key)
+            for family in lever["families"]:
+                assert (key, family) not in seen, f"duplicate lever row for {key} on {family}"
+                seen.add((key, family))
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
@@ -591,6 +592,18 @@ def test_attention_precision_is_shared_and_has_no_legacy_alias():
             if row[0] == "`ATTENTION_PRECISION`"]
     assert len(rows) == 1
     assert rows[0][1:3] == ["`bf16`", "`bf16`, `fp8`"]
+
+
+@pytest.mark.parametrize("checkpoint_family", ["glm5", "mistral_large4"])
+def test_serve_glm_standard_option_contract(checkpoint_family):
+    result = run_bash(f"_family_allowed_keys glm5 {checkpoint_family}")
+    assert result.returncode == 0, result.stderr
+    keys = set(result.stdout.split())
+    assert {"FP8_PREFILL", "DECODE_GRAPHS", "HTTP_QUEUE_DEPTH", "HTTP_QUEUE_WAIT_MS", "MEDIA_CACHE_BYTES",
+            "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS"} <= keys
+    assert not {"CHAT_TEMPLATE_FROM", "EXPERT_INPUT", "RTX_EXPERT_PEER",
+                "PREFILL_BATCH_TOKENS", "TP2_DFLASH"} & keys
+
 
 
 def test_v41_public_id_and_option_limits_are_documented():

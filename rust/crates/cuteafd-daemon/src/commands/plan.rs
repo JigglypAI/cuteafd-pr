@@ -124,6 +124,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 draft_context_slots: args.draft_context_slots,
                 mimo_decode_graphs: args.mimo_decode_graphs == "on",
                 step5_decode_graphs: args.step5_decode_graphs == "on",
+                glm_decode_graphs: args.glm_decode_graphs == "on",
                 physical_sms: args.physical_sms,
                 mimo_draft_bf16: args.mimo_draft_bf16,
                 mimo_expert_manifest: args.mimo_expert_manifest.clone(),
@@ -396,18 +397,31 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
             && matches!(get("SPECULATOR_FP8").map(String::as_str), None | Some("auto" | "off")),
             "Inkling SPECULATOR_FP8 must be auto or off (checkpoint-native drafter)");
     }
+    let glm = matches!(family, "glm5" | "mistral_large4");
+    if glm {
+        anyhow::ensure!(get("PREFILL_BATCH_TOKENS").is_none(), "unused configuration key: PREFILL_BATCH_TOKENS");
+        if !args.explicit_settings.contains("glm_decode_graphs") {
+            if let Some(value) = get("DECODE_GRAPHS") {
+                anyhow::ensure!(matches!(value.as_str(), "on" | "off"), "DECODE_GRAPHS must be on or off");
+                args.glm_decode_graphs = value.clone();
+            }
+        }
+        if let Some(value) = get("MEDIA_CACHE_BYTES").filter(|_| args.media_cache_bytes.is_none()) {
+            args.media_cache_bytes = Some(crate::shared::prefix::parse_bytes(value).map_err(anyhow::Error::msg)?);
+        }
+    }
     if !args.explicit_settings.contains("prefill_rows") {
         if family == "qwen3_5" { args.prefill_rows = 4096; }
         else {
             let value = match family {
                 "step5" | "deepseek_v41" => get("PREFILL_BATCH_TOKENS"),
-                "mimo_v2" | "kimi_k3" | "muse_spark" | "minimax_m3" => get("PREFILL_ROWS"),
+                "mimo_v2" | "kimi_k3" | "muse_spark" | "minimax_m3" | "glm5" | "mistral_large4" => get("PREFILL_ROWS"),
                 _ => get("PREFILL_ROWS").or_else(|| get("PREFILL_BATCH_TOKENS")),
             };
             if let Some(value) = value { args.prefill_rows = value.parse().context("family prefill rows")?; }
         }
     }
-    if family == "glm5" && !args.explicit_settings.contains("prefill_span_rows") {
+    if glm && !args.explicit_settings.contains("prefill_span_rows") {
         if let Some(value) = get("PREFILL_SPAN_ROWS") { args.prefill_span_rows = value.parse().context("PREFILL_SPAN_ROWS")?; }
     }
     if family == "mimo_v2" {
@@ -2146,6 +2160,7 @@ mod tests {
             draft_context_slots: None,
             mimo_decode_graphs: "on".into(),
             step5_decode_graphs: "on".into(),
+            glm_decode_graphs: "on".into(),
             physical_sms: None,
             mimo_draft_bf16: false,
             glm5_draft_bf16: false,
@@ -2729,7 +2744,7 @@ mod tests {
             if matches!(family, "glm5" | "glm5_flash" | "deepseek_v4" | "deepseek_v41" | "minimax_m3" | "mistral_large4") {
                 ignored.extend([("KV_CACHE", "int8"), ("SPECULATOR_DEPTH", "not-a-depth")]);
             }
-            if family != "glm5" { ignored.push(("PREFILL_SPAN_ROWS", "not-rows")); }
+            if !matches!(family, "glm5" | "mistral_large4") { ignored.push(("PREFILL_SPAN_ROWS", "not-rows")); }
             for (key, value) in ignored {
                 let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/unused", "--layout"]).unwrap();
                 let crate::cli::Commands::Plan(mut baseline) = cli.command else { panic!("plan") };
@@ -2743,7 +2758,15 @@ mod tests {
             let mut cases = common.to_vec();
             if matches!(family, "step5" | "deepseek_v41") { cases.push(("PREFILL_BATCH_TOKENS", "1024", "--prefill-rows", "1024")); }
             else if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
-            if family == "glm5" { cases.push(("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096")); }
+            if matches!(family, "glm5" | "mistral_large4") {
+                cases.extend([("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096"),
+                    ("DECODE_GRAPHS", "off", "--glm-decode-graphs", "off"),
+                    ("MEDIA_CACHE_BYTES", "256MiB", "--media-cache-bytes", "256MiB")]);
+                let mut request = args(std::path::Path::new("/model"), 4, false);
+                let cfg = [("PREFILL_BATCH_TOKENS".into(), "1024".into())].into_iter().collect();
+                let error = resolve_family_config(&mut request, family, &cfg).unwrap_err();
+                assert!(error.to_string().contains("PREFILL_BATCH_TOKENS"));
+            }
             if family == "mimo_v2" { for value in ["int8", "bf16"] { cases.push(("KV_CACHE", value, "--mimo-kv-cache", value)); } }
             else if matches!(family, "qwen4" | "qwen3_5" | "kimi_k3" | "step5" | "muse_spark") {
                 cases.push(("KV_CACHE", "bf16", "--kv-cache", "bf16"));

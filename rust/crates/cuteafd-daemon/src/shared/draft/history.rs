@@ -396,7 +396,7 @@ mod tests {
     fn every_family_feeds_its_round_time_to_the_policy() {
         for (family, source, call) in [
             ("shared scheduler", include_str!("../qwen/scheduler.rs"), "round_us: cycle.elapsed().as_micros() as u64"),
-            ("GLM 5.3", include_str!("../../families/glm5/serve.rs"), "round_us: (1e3 * verify_ms) as u64"),
+            ("GLM 5.3", include_str!("../../families/glm5/serve.rs"), "policy.observe_timed(&outcomes, Some(history::RoundTiming::since("),
             ("GLM Flash", include_str!("../../families/glm5_flash/serve.rs"), "policy.observe_timed(&outcomes, Some(history::RoundTiming::since("),
             ("MiMo", include_str!("../../families/mimo_v2/serve.rs"), "policy.observe_timed(&outcomes, Some(history::RoundTiming::since("),
             ("DeepSeek V4", include_str!("../../families/deepseek_v4/serve.rs"), "round_us: round_started.elapsed().as_micros() as u64"),

@@ -648,6 +648,9 @@ impl DraftFacts {
         if bytes > 0 {
             self.owners.push(Allocation::buffer("glm.draft.window_marks", Location::coordinator(0), bytes,
                 Lifetime::TARGET, cuteafd_core::memory_layout::Category::Prefix, "GLM draft window marks"));
+            self.owners.push(Allocation::buffer("glm.draft.window_mark_header", Location::PINNED,
+                super::DRAFT_MARK_HEADER as u64, Lifetime::TARGET,
+                cuteafd_core::memory_layout::Category::Prefix, "GLM draft mark pinned staging"));
         }
         self
     }
@@ -711,6 +714,7 @@ impl DraftFacts {
 /// Topology, programs and the host availability sample are resolved before this
 /// assembler runs; none of them may be changed by a failed allocation.
 pub struct ProductionInput<'a> {
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub cfg: &'a GlmDsaConfig,
     pub layers: usize,
@@ -1081,7 +1085,7 @@ impl<'a> ProductionInput<'a> {
                 else if count < routed { self.spark_ranks } else { 0 };
             recipe.graphs.push(Case { when, value: StartupGraphs::with_family(
                 GlmPrewarmFamily::of(&self.cfg.variant), self.context,
-                self.attention, self.gpus, &layers, return_ranks)? });
+                self.attention, self.gpus, &layers, return_ranks)?.with_decode_graphs(self.decode_graphs) });
             local.insert(count, inventory);
         }
         if self.skip_routed_experts {
@@ -1345,31 +1349,6 @@ fn graph_row(fingerprint: &str, keys: usize, rank: usize) -> GraphRow {
                     identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
                         native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
                         gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } } };
-        }
-        // A census run is how an unmeasured fingerprint gets its row: it needs
-        // *some* charge to be admitted, and the live capture replaces it through
-        // `reconcile_startup_graphs` before Ready. Charge the largest measured
-        // row for the same declared count (or 2 MiB per executable when there is
-        // none), never a proportional scale, and say so loudly.
-        //
-        // The pool is sized from this placeholder, so a live capture above it is
-        // resident over the admitted ledger. Reconcile reports that budget gap
-        // and serving continues (#1605): the KV pool is allocated before capture
-        // (`GlmEngine::new`) and the captured graphs bake in its pointers, so it
-        // can be neither shrunk in place nor reallocated. The census row itself
-        // is still the measurement; the row's bytes do not depend on headroom.
-        if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1") {
-            let bytes = MEASURED_GLM_GRAPHS.iter().filter(|row| row.keys == keys)
-                .map(|row| row.bytes).max()
-                .unwrap_or_else(|| keys as u64 * (2 << 20));
-            tracing::warn!(fingerprint, keys, bytes,
-                "GLM startup graph fingerprint has no measured row; this census run charges the largest \
-                 measured row for {keys} keys until the live capture reconciles it");
-            return GraphRow { bytes, basis: Basis::Estimated, warning: None,
-                figure: MemoryFigure { attribution: FigureAttribution::Estimated {
-                        derivation: "unmeasured declared fingerprint; census run placeholder, reconciled from the live capture" },
-                    ..measured(bytes, "", "unmeasured fingerprint; census run", "census",
-                        "census run placeholder; reconciled from the live capture") } };
         }
     }
     // #1605: an unmeasured fingerprint is served, never refused. Charge the
@@ -1723,6 +1702,7 @@ fn ordinary_heap_subset(component: &Component) -> bool {
 /// post-Ready reserve.
 #[derive(Debug, Clone)]
 pub struct StartupGraphs {
+    enabled: bool,
     family: GlmPrewarmFamily,
     context: u64,
     shapes: u64,
@@ -1770,7 +1750,7 @@ impl StartupGraphs {
                 "GLM startup graphs are admitted on estimated rows (#1605); no census covers this declared set: {}",
                 estimated.join("; ")));
         }
-        Ok(Self { family, context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
+        Ok(Self { enabled: true, family, context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
             declared, fingerprints, ranks, figures })
     }
 
@@ -1789,11 +1769,25 @@ impl StartupGraphs {
         crate::placement::graph_reserve::glm_default(self.family, self.ranks.len())
     }
 
+    fn with_decode_graphs(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn reserve_policy(&self, rank: usize) -> Result<crate::placement::graph_reserve::Resolved, Refusal> {
+        use crate::placement::graph_reserve;
+        let (base, tail) = self.default_reserve();
+        (if self.enabled { graph_reserve::current(rank, false, base, tail) } else {
+            graph_reserve::resolve(Some("0"), rank, false, base, tail).map(|mut policy| {
+                policy.source = "DECODE_GRAPHS=off";
+                policy.base_source = policy.source;
+                policy
+            })
+        }).map_err(|error| Refusal::InvalidFact(error.to_string()))
+    }
+
     pub fn reserves(&self) -> Result<Vec<u64>, Refusal> {
-        let (base, extra) = self.default_reserve();
-        self.ranks.iter().enumerate().map(|(rank, _)| crate::placement::graph_reserve::current(
-            rank, false, base, extra)
-            .map(|reserve| reserve.bytes).map_err(|error| Refusal::InvalidFact(error.to_string()))).collect()
+        (0..self.ranks.len()).map(|rank| self.reserve_policy(rank).map(|policy| policy.bytes)).collect()
     }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
