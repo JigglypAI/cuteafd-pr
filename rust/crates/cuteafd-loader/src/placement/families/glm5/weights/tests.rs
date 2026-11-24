@@ -428,6 +428,26 @@ fn kv_b_and_rows_admit_one_pinned_mount_owner() {
 }
 
 #[test]
+fn fused_glm_groups_diagnose_mixed_storage_before_loading() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    for (tensor, group, program) in [
+        ("model.layers.0.self_attn.kv_b_proj.weight", "attention", "glm_producer"),
+        ("model.layers.0.mlp.down_proj.weight", "FFN", "glm_ffn_i"),
+    ] {
+        let mut tensors = tensors.clone();
+        tensors.retain(|t| t.0 != format!("{tensor}_scale_inv"));
+        tensors.iter_mut().find(|t| t.0 == tensor).unwrap().1 = "BF16";
+        let root = tempfile::tempdir()?;
+        write_snapshot(root.path(), &config, &tensors, None);
+        let checkpoint = Checkpoint::open(root.path())?;
+        let error = WeightInventory::from_checkpoint(&checkpoint, 2, 2, None,
+            true, false, EmbeddingHome::Device(0)).unwrap_err().to_string();
+        assert!(error.contains(tensor) && error.contains(group) && error.contains(program), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
 fn bf16_kv_b_loading_refuses_bad_geometry() {
     let (config, mut tensors) = core_checkpoint(256, true);
     tensors.iter_mut().find(|t| t.0 == "model.layers.0.self_attn.kv_b_proj.weight")

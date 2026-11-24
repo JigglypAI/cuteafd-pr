@@ -474,33 +474,25 @@ impl<'a> GlmLoader<'a> {
     fn with_fp8<T>(&self, names: &[String], body: impl FnOnce(&[u8], Vec<f32>, usize, usize) -> Result<T>)
         -> Result<T> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
-        // BF16 parts need room for their padded rows while they quantize in place.
-        let total: u64 = names.iter().map(|n| self.catalog.tensor(n).map(|t| t.metadata.byte_length))
-            .sum::<Result<u64>>()? + 128 * 8192 * 2;
-        crate::shared::memory::staging::with_staging(total as usize, |values| {
+        let total = names.iter().try_fold(0usize, |bytes, name| {
+            bytes.checked_add(usize::try_from(self.catalog.tensor(name)?.metadata.byte_length)?)
+                .context("FP8 staging extent overflow")
+        })?;
+        crate::shared::memory::staging::with_staging(total, |values| {
             let mut grid = Vec::new();
             let (mut rows, mut cols, mut at) = (0usize, None, 0usize);
             for (i, name) in names.iter().enumerate() {
                 let (length, dtype, shape) = self.read_into(name, values, at)?;
-                ensure!(shape.len() == 2 && matches!(dtype, DType::F8E4M3 | DType::Bf16),
-                    "{name}: the glm programs take this weight as FP8 (or BF16 quantized at load), found {dtype:?} {shape:?}");
+                ensure!(shape.len() == 2 && dtype == DType::F8E4M3,
+                    "{name}: expected a native FP8 matrix, found {dtype:?} {shape:?}");
                 ensure!(cols.is_none_or(|c| c == shape[1]), "{names:?} do not share columns");
                 ensure!(i + 1 == names.len() || shape[0] % 128 == 0,
                     "{names:?}: only the last concatenated weight may end inside a 128-row block");
                 cols = Some(shape[1]);
                 let (n, k) = (shape[0], shape[1]);
                 let block_rows = n.div_ceil(128);
-                if dtype == DType::Bf16 {
-                    // An unquantized weight of a ModelOpt release (nvidia/GLM-5.3-NVFP4 keeps
-                    // attention and the shared experts BF16): 128x128 E4M3 blocks at load,
-                    // power-of-two scales (the glmf rule), rows padded to whole blocks.
-                    let mut padded = values[at..at + length].to_vec();
-                    padded.resize(block_rows * 128 * k * 2, 0);
-                    let (q, scales) = crate::families::glm5_flash::fp8::quantize(&padded, block_rows * 128, k,
-                        crate::families::glm5_flash::fp8::Layout::Block, crate::shared::fp8_linear::Fp8Scales::Pow2);
-                    values[at..at + n * k].copy_from_slice(&q[..n * k]);
-                    grid.extend(scales);
-                } else if self.catalog.tensor(&landing::block_grid(self.catalog, name)).is_ok() {
+                ensure!(length == n * k, "{name}: invalid E4M3 extent");
+                if self.catalog.tensor(&landing::block_grid(self.catalog, name)).is_ok() {
                     let (scale, scale_dtype, scale_shape) = self.raw(&landing::block_grid(self.catalog, name))?;
                     ensure!(scale_dtype == DType::F32 && scale_shape == [block_rows, k.div_ceil(128)],
                         "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
@@ -518,7 +510,6 @@ impl<'a> GlmLoader<'a> {
                 at += n * k;
                 rows += n;
             }
-            // The E4M3 bytes only (BF16 parts left their staging tail unused).
             body(&values[..at], grid, rows, cols.context("no FP8 rows")?)
         })
     }
@@ -692,9 +683,8 @@ impl<'a> GlmLoader<'a> {
         out.into_iter().map(|slot| slot.context("no FP8 parts")).collect()
     }
 
-    /// One FP8 weight sliced by columns over `ranks`: the whole E4M3 weight goes up
-    /// once to rank 0 and each rank's columns are a pitched device copy from it
-    /// (over peer memory for rank 1); the grid's column blocks are sliced on the host.
+    /// One FP8 weight sliced by columns, either with its native scale grid
+    /// or with the calibrated per-tensor scale broadcast over its blocks.
     fn fp8_cols(&self, key: &str, name: &str, ranks: usize) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if self.native_fp8(&[name.to_string()])? {
@@ -707,35 +697,17 @@ impl<'a> GlmLoader<'a> {
                 self.on_rank(rank, |_| Ok((self.landed(fp8_operand_names(key).0, &[values], values_bytes)?, self.landed(fp8_operand_names(key).1, &[grid], grid_bytes)?)))
             }).collect();
         }
-        let (whole, grid, rows, cols) = self.with_fp8(&[name.to_string()], |values, grid, rows, cols| {
-            ensure!(rows % 128 == 0 && cols % (128 * ranks) == 0,
-                "{name}: [{rows}, {cols}] does not split into whole 128-K blocks over {ranks} GPUs");
-            Ok((GlmLoader { arenas: None, ..self.clone() }.upload("transient.values", values)?, grid, rows, cols))
-        })?;
-        let width = cols / ranks;
-        let grid_bytes = f32_bytes(&grid);
-        let out = (0..ranks).map(|rank| {
-            let part = slice_2d(&grid_bytes, rows / 128, cols / 128, 4, Axis::Cols, rank, ranks);
-            self.on_rank(rank, |stream| {
-                let values = self.allocate(fp8_operand_names(key).0, rows * width)?;
-                let source = CuteafdDeviceBuffer {
-                    // SAFETY: column block `rank` of every row lies inside the whole weight.
-                    ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * width) }.cast(),
-                    bytes: whole.buffer.bytes - rank * width,
-                    ..whole.buffer
-                };
-                // SAFETY: both buffers are live and sized for these pitched spans; peer access
-                // to rank 0 is enabled on every rank (the split setup); drained below, before
-                // `whole` drops.
-                unsafe {
-                    self.library.copy_d2d_2d_async(values.buffer, width, source, cols, width, rows, stream)?;
-                    self.library.cuda_stream_synchronize(stream)?;
-                }
-                Ok((values, self.upload(fp8_operand_names(key).1, &part)?))
-            })
-        }).collect();
-        drop(whole);
-        out
+        let (rows, cols) = landing::geometry(self.catalog, name)?;
+        ensure!(rows % 128 == 0 && cols % (128 * ranks) == 0,
+            "{name}: [{rows}, {cols}] does not split into whole 128-K blocks over {ranks} GPUs");
+        let (scalar, dtype, _) = self.raw(&format!("{name}_scale"))?;
+        ensure!(dtype == DType::F32 && scalar.len() == 4, "{name}: expected one FP32 weight scale");
+        let grid = scalar.repeat(rows / 128 * (cols / ranks / 128));
+        (0..ranks).map(|rank| {
+            let (land, bytes) = landing::col_share(self.catalog, name, ranks, rank)?;
+            self.on_rank(rank, |_| Ok((self.landed(fp8_operand_names(key).0, &[land], bytes)?,
+                self.upload(fp8_operand_names(key).1, &grid)?)))
+        }).collect()
     }
 
     /// Every rank's copy of a small operand read once.

@@ -481,7 +481,9 @@ impl WeightInventory {
             let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
                 .filter(|op| cfg.stem(layer, *op).is_some()).all(staged);
             crate::families::glm5::core::validate_attention_format(&cfg, layer, &core)?;
-            let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
+            let bf16 = core_attention || crate::families::glm5::core::fused_bf16(
+                "attention", "glm_producer / glm_o", &attention, native_bf16,
+                |name| Ok(headers.get(name)?.dtype.clone()))?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
             let native_layouts = core.layer_native(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
@@ -671,7 +673,9 @@ impl WeightInventory {
                 let group = if dense { "dense" } else { "shared_expert" };
                 if (dense || !native_shared) && core.get_weight(&names[0]).is_none()
                     && !core.native.contains_key(names[0].strip_suffix(".weight").unwrap()) {
-                    let shared_bf16 = native_bf16 && headers.all_bf16(&names)?;
+                    let shared_bf16 = crate::families::glm5::core::fused_bf16(
+                        "FFN", "glm_ffn_i*", &names, native_bf16,
+                        |name| Ok(headers.get(name)?.dtype.clone()))?;
                     headers.projection(
                         &mut out,
                         rank,
@@ -1071,10 +1075,7 @@ impl Headers<'_> {
                     "GLM FP8 split cuts a 128-element block {name}"
                 );
             }
-            if *dtype == DType::Bf16 {
-                native = false;
-                continue;
-            }
+            ensure!(*dtype == DType::F8E4M3, "{name}: expected native FP8 projection");
             if let Some(grid) = self.block_grid(name) {
                 ensure!(
                     grid.dtype == DType::F32
@@ -1099,7 +1100,7 @@ impl Headers<'_> {
             .map(|shape| product(&[shape[0].div_ceil(128), shape[1].div_ceil(128), 4]))
             .collect::<Result<Vec<_>>>()?)?
             / ranks as u64;
-        // fp8_split's converted row buffers and fp8_cols's value buffer are exact
+        // Non-block FP8 split row buffers and fp8_cols's value buffer are exact
         // requests; landing and ordinary uploads retain their 256-byte floor.
         let floor_values = ranks == 1 || native;
         let floor_grids = ranks == 1 || native || input_split;
