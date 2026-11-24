@@ -24,6 +24,94 @@ pub(crate) trait UnitIo<'a> {
     }
 }
 
+/// Selects which rows inside `member.head` segments are projected through the vocabulary head.
+/// Drafter final-norm taps (when `draft.is_some()`) always normalize all rows of the unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadProjection {
+    /// Project every row of every `member.head` segment (decode, verify, golden).
+    AllHeadRows,
+    /// Project only the final 1 row of each `member.head` segment (serving prefill & packed prefill).
+    MemberLastRow,
+    /// Project only rows whose 1-based token position is `>= first_position` (serving prefill scoring).
+    FromPosition(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadEmit {
+    member_index: usize,
+    rows: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndSpanAction {
+    /// Rows to run through `MiniHead::normalize` (full 64-row span when drafter is active or
+    /// all rows are projected; narrowed to the exact projected slice otherwise).
+    normalize: std::ops::Range<usize>,
+    /// Whether to write `normalize` output into `draft.taps().final_norm`.
+    tap_final_norm: bool,
+    /// Exact row slices inside `normalize` to project through the vocabulary unembed head.
+    projections: Vec<HeadEmit>,
+}
+
+fn plan_end_actions(
+    unit_rows: usize,
+    members: &[UnitSegment],
+    projection: HeadProjection,
+    has_draft: bool,
+) -> Result<Vec<EndSpanAction>> {
+    let any_head = members.iter().any(|m| m.head);
+    if !any_head && !has_draft {
+        return Ok(Vec::new());
+    }
+    let mut actions = Vec::new();
+    for span in crate::shared::probe::head_spans(unit_rows, 64)? {
+        let mut projections = Vec::new();
+        for (member_index, member) in members.iter().enumerate() {
+            if !member.head || member.rows.is_empty() {
+                continue;
+            }
+            let target_rows = match projection {
+                HeadProjection::AllHeadRows => member.rows.clone(),
+                HeadProjection::MemberLastRow => (member.rows.end - 1)..member.rows.end,
+                HeadProjection::FromPosition(first_pos) => {
+                    let member_first_pos = member.tokens.start + 1;
+                    let skip = first_pos.saturating_sub(member_first_pos);
+                    let start = member.rows.start.saturating_add(skip);
+                    if start >= member.rows.end {
+                        continue;
+                    }
+                    start..member.rows.end
+                }
+            };
+            let first = span.start.max(target_rows.start);
+            let end = span.end.min(target_rows.end);
+            if first < end {
+                projections.push(HeadEmit {
+                    member_index,
+                    rows: first..end,
+                });
+            }
+        }
+        if has_draft {
+            actions.push(EndSpanAction {
+                normalize: span,
+                tap_final_norm: true,
+                projections,
+            });
+        } else if !projections.is_empty() {
+            // Without a drafter, normalize only the minimal bounding slice of rows that will be projected.
+            let min_start = projections.iter().map(|p| p.rows.start).min().unwrap();
+            let max_end = projections.iter().map(|p| p.rows.end).max().unwrap();
+            actions.push(EndSpanAction {
+                normalize: min_start..max_end,
+                tap_final_norm: false,
+                projections,
+            });
+        }
+    }
+    Ok(actions)
+}
+
 pub(crate) struct TokenIo<'s, 'a> {
     pub kernels: &'s MiniKernels<'a>,
     pub head: &'s super::head::MiniHead<'a>,
@@ -34,6 +122,7 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub starts: &'s [usize],
     pub slots: &'s [usize],
     pub retained_rows: bool,
+    pub head_projection: HeadProjection,
     pub draft: Option<&'s super::draft::Binding<'a>>,
     pub publish_draft: bool,
     pub media: &'s [Option<cuteafd_engine::media::RequestMedia>],
@@ -74,8 +163,8 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
 
     fn end(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()> {
         let members = members(unit);
-        let head = members.iter().any(|m| m.head);
-        if !head && self.draft.is_none() {
+        let actions = plan_end_actions(unit.rows.len(), &members, self.head_projection, self.draft.is_some())?;
+        if actions.is_empty() && !(self.publish_draft && self.draft.is_some()) {
             return Ok(());
         }
         let sequence = *self
@@ -84,53 +173,84 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
             .context("Inkling 2 Mini head sequence slot absent")?;
         let final_candidates = self.cfg.text.residual_blocks() + 1; // 5
         let final_slot = self.cfg.cache_slot(self.cfg.text.layers - 1, 0);
-        for span in crate::shared::probe::head_spans(unit.rows.len(), 64)? {
-            let state = owner.segment(self.cache, sequence, final_slot, span.clone())?;
-            let output_row = if self.retained_rows { span.start } else { 0 };
-            let logits = if head {
-                Some(self.head.project_at(
-                    self.kernels,
-                    &state,
+        for action in actions {
+            let state = owner.segment(self.cache, sequence, final_slot, action.normalize.clone())?;
+            self.head
+                .normalize(self.kernels, &state, self.target, action.normalize.len(), final_candidates)?;
+            if action.tap_final_norm {
+                if let Some(draft) = self.draft {
+                    draft.taps(self.retained_rows, unit.slot)?.final_norm(
+                        self.head.normalized(action.normalize.len())?,
+                        action.normalize.start,
+                        action.normalize.len(),
+                    )?;
+                }
+            }
+            if action.projections.is_empty() {
+                continue;
+            }
+            // Fast path: when projections contiguously cover the entire normalized slice
+            // (decode, verify, golden, or single-row last-token prefill), project in one GEMM.
+            let full_contiguous = action.projections.first().unwrap().rows.start == action.normalize.start
+                && action.projections.last().unwrap().rows.end == action.normalize.end
+                && action
+                    .projections
+                    .windows(2)
+                    .all(|pair| pair[0].rows.end == pair[1].rows.start);
+            if full_contiguous {
+                let output_row = if self.retained_rows {
+                    action.normalize.start
+                } else {
+                    0
+                };
+                let logits = self.head.project_normalized(
                     self.target,
                     self.cfg,
-                    span.len(),
-                    final_candidates,
+                    0,
+                    action.normalize.len(),
                     output_row,
-                )?)
-            } else {
-                self.head
-                    .normalize(self.kernels, &state, self.target, span.len(), final_candidates)?;
-                None
-            };
-            if let Some(draft) = self.draft {
-                draft.taps(self.retained_rows, unit.slot)?.final_norm(
-                    self.head.normalized(span.len())?,
-                    span.start,
-                    span.len(),
                 )?;
-            }
-            let Some(logits) = logits else {
-                continue;
-            };
-            for member in members.iter().filter(|m| m.head) {
-                let first = span.start.max(member.rows.start);
-                let end = span.end.min(member.rows.end);
-                if first >= end {
-                    continue;
+                for emit in &action.projections {
+                    let member = &members[emit.member_index];
+                    let offset = (emit.rows.start - action.normalize.start) * self.cfg.text.unpadded_vocab_size * 4;
+                    (self.on_logits)(
+                        member.sequence,
+                        member.tokens.start + emit.rows.start - member.rows.start + 1,
+                        crate::shared::token_io::DeviceLogits {
+                            ptr: logits.ptr.wrapping_byte_add(offset),
+                            rows: emit.rows.len(),
+                            vocab: self.cfg.text.unpadded_vocab_size,
+                            stride: self.cfg.text.unpadded_vocab_size,
+                            stream: owner.stream.raw,
+                            greedy: None,
+                        },
+                    )?;
                 }
-                let offset = (first - span.start) * self.cfg.text.unpadded_vocab_size * 4;
-                (self.on_logits)(
-                    member.sequence,
-                    member.tokens.start + first - member.rows.start + 1,
-                    crate::shared::token_io::DeviceLogits {
-                        ptr: logits.ptr.wrapping_byte_add(offset),
-                        rows: end - first,
-                        vocab: self.cfg.text.unpadded_vocab_size,
-                        stride: self.cfg.text.unpadded_vocab_size,
-                        stream: owner.stream.raw,
-                        greedy: None,
-                    },
-                )?;
+            } else {
+                for emit in &action.projections {
+                    let member = &members[emit.member_index];
+                    let norm_offset = emit.rows.start - action.normalize.start;
+                    let output_row = if self.retained_rows { emit.rows.start } else { 0 };
+                    let logits = self.head.project_normalized(
+                        self.target,
+                        self.cfg,
+                        norm_offset,
+                        emit.rows.len(),
+                        output_row,
+                    )?;
+                    (self.on_logits)(
+                        member.sequence,
+                        member.tokens.start + emit.rows.start - member.rows.start + 1,
+                        crate::shared::token_io::DeviceLogits {
+                            ptr: logits.ptr,
+                            rows: emit.rows.len(),
+                            vocab: self.cfg.text.unpadded_vocab_size,
+                            stride: self.cfg.text.unpadded_vocab_size,
+                            stream: owner.stream.raw,
+                            greedy: None,
+                        },
+                    )?;
+                }
             }
         }
         if self.publish_draft {
@@ -668,6 +788,107 @@ mod tests {
         assert_eq!(full_1, 2);
         assert_eq!(full_48, 2);
         assert_eq!(full_48, full_1, "full unit H2D copies must stay bounded and independent of 48 visits");
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_head_projects_only_last_row_while_normalizing_all_rows_for_drafter() -> Result<()> {
+        // Two 4096-row units covering an 8192-token prompt: unit 0 has head=false, unit 1 has head=true.
+        let unit0 = [UnitSegment {
+            sequence: 0,
+            rows: 0..4096,
+            tokens: 0..4096,
+            prompt_end: false,
+            snapshot: false,
+            head: false,
+        }];
+        let unit1 = [UnitSegment {
+            sequence: 0,
+            rows: 0..4096,
+            tokens: 4096..8192,
+            prompt_end: true,
+            snapshot: false,
+            head: true,
+        }];
+
+        // Without drafter: unit 0 does zero work; unit 1 normalizes & projects only the final row (4095..4096).
+        let u0_off = plan_end_actions(4096, &unit0, HeadProjection::MemberLastRow, false)?;
+        let u1_off = plan_end_actions(4096, &unit1, HeadProjection::MemberLastRow, false)?;
+        assert!(u0_off.is_empty());
+        assert_eq!(u1_off.len(), 1);
+        assert_eq!(u1_off[0].normalize, 4095..4096);
+        assert!(!u1_off[0].tap_final_norm);
+        assert_eq!(u1_off[0].projections, vec![HeadEmit { member_index: 0, rows: 4095..4096 }]);
+
+        // With drafter (`dspark`): EVERY row of BOTH units (8192 total) is normalized & tapped for
+        // `draft.taps().final_norm`, while ONLY the single final row (4095..4096 of unit 1) is projected!
+        let u0_draft = plan_end_actions(4096, &unit0, HeadProjection::MemberLastRow, true)?;
+        let u1_draft = plan_end_actions(4096, &unit1, HeadProjection::MemberLastRow, true)?;
+        let norm_rows = |actions: &[EndSpanAction]| -> usize { actions.iter().map(|a| a.normalize.len()).sum() };
+        let tap_rows = |actions: &[EndSpanAction]| -> usize {
+            actions.iter().filter(|a| a.tap_final_norm).map(|a| a.normalize.len()).sum()
+        };
+        let proj_rows = |actions: &[EndSpanAction]| -> usize {
+            actions
+                .iter()
+                .flat_map(|a| a.projections.iter())
+                .map(|p| p.rows.len())
+                .sum()
+        };
+        assert_eq!(u0_draft.len(), 64);
+        assert_eq!(u1_draft.len(), 64);
+        assert_eq!(norm_rows(&u0_draft) + norm_rows(&u1_draft), 8192);
+        assert_eq!(tap_rows(&u0_draft) + tap_rows(&u1_draft), 8192);
+        assert_eq!(proj_rows(&u0_draft), 0);
+        assert_eq!(proj_rows(&u1_draft), 1);
+        assert_eq!(
+            u1_draft.last().unwrap().projections,
+            vec![HeadEmit { member_index: 0, rows: 4095..4096 }]
+        );
+
+        // Packed multi-member prefill with drafter: all 100 rows normalized & tapped, only the 2 member last rows projected.
+        let packed = [
+            UnitSegment {
+                sequence: 0,
+                rows: 0..20,
+                tokens: 0..20,
+                prompt_end: true,
+                snapshot: false,
+                head: true,
+            },
+            UnitSegment {
+                sequence: 1,
+                rows: 20..100,
+                tokens: 0..80,
+                prompt_end: true,
+                snapshot: false,
+                head: true,
+            },
+        ];
+        let packed_actions = plan_end_actions(100, &packed, HeadProjection::MemberLastRow, true)?;
+        assert_eq!(norm_rows(&packed_actions), 100);
+        assert_eq!(tap_rows(&packed_actions), 100);
+        assert_eq!(proj_rows(&packed_actions), 2);
+        assert_eq!(packed_actions[0].projections, vec![HeadEmit { member_index: 0, rows: 19..20 }]);
+        assert_eq!(packed_actions[1].projections, vec![HeadEmit { member_index: 1, rows: 99..100 }]);
+
+        // Scoring suffix (`FromPosition`) projects only positions >= first_pos while normalizing all rows for drafter.
+        let score_actions = plan_end_actions(4096, &unit1, HeadProjection::FromPosition(8180), true)?;
+        assert_eq!(norm_rows(&score_actions), 4096);
+        assert_eq!(tap_rows(&score_actions), 4096);
+        assert_eq!(proj_rows(&score_actions), 13); // 1-based positions 8180..=8192 -> rows 4083..4096
+
+        // Decode / golden (`AllHeadRows`) still projects all rows.
+        let all_actions = plan_end_actions(8, &[UnitSegment {
+            sequence: 0,
+            rows: 0..8,
+            tokens: 100..108,
+            prompt_end: false,
+            snapshot: false,
+            head: true,
+        }], HeadProjection::AllHeadRows, true)?;
+        assert_eq!(norm_rows(&all_actions), 8);
+        assert_eq!(proj_rows(&all_actions), 8);
         Ok(())
     }
 }

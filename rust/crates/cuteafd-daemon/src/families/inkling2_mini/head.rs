@@ -239,25 +239,28 @@ impl<'a> MiniHead<'a> {
         super::cache::view(self.normalized.buffer, 0, rows * HIDDEN * 2)
     }
 
-    pub fn project_at(
+    pub fn project_normalized(
         &self,
-        k: &MiniKernels<'a>,
-        owner: &impl UnitBuffers<'a>,
         target: &MiniTargetWeights<'a>,
         cfg: &Inkling2MiniConfig,
+        normalized_row_offset: usize,
         rows: usize,
-        candidates: usize,
         output_row: usize,
     ) -> Result<Buffer> {
         let t = &cfg.text;
         ensure!(
             rows > 0
-                && output_row.checked_add(rows).is_some_and(|end| end <= self.rows)
-                && owner.stream().raw == self.stream.raw
-                && owner.stream().device.id == self.stream.device.id,
-            "Inkling 2 Mini head rows/stream differ from admitted owner"
+                && normalized_row_offset
+                    .checked_add(rows)
+                    .is_some_and(|end| end <= self.rows)
+                && output_row.checked_add(rows).is_some_and(|end| end <= self.rows),
+            "Inkling 2 Mini normalized projection rows exceed head owner"
         );
-        self.normalize(k, owner, target, rows, candidates)?;
+        let input = super::cache::view(
+            self.normalized.buffer,
+            normalized_row_offset * HIDDEN * 2,
+            rows * HIDDEN * 2,
+        )?;
         let logits = super::cache::view(
             self.logits.buffer,
             output_row * t.unpadded_vocab_size * 4,
@@ -269,7 +272,7 @@ impl<'a> MiniHead<'a> {
             target_head::launch(
                 TargetHead::configured(),
                 &self.bf16_head.0,
-                self.normalized.buffer.ptr,
+                input.ptr,
                 weight.ptr,
                 logits.ptr.cast(),
                 rows,
@@ -285,6 +288,27 @@ impl<'a> MiniHead<'a> {
             )?;
         }
         Ok(logits)
+    }
+
+    pub fn project_at(
+        &self,
+        k: &MiniKernels<'a>,
+        owner: &impl UnitBuffers<'a>,
+        target: &MiniTargetWeights<'a>,
+        cfg: &Inkling2MiniConfig,
+        rows: usize,
+        candidates: usize,
+        output_row: usize,
+    ) -> Result<Buffer> {
+        ensure!(
+            rows > 0
+                && output_row.checked_add(rows).is_some_and(|end| end <= self.rows)
+                && owner.stream().raw == self.stream.raw
+                && owner.stream().device.id == self.stream.device.id,
+            "Inkling 2 Mini head rows/stream differ from admitted owner"
+        );
+        self.normalize(k, owner, target, rows, candidates)?;
+        self.project_normalized(target, cfg, 0, rows, output_row)
     }
 }
 

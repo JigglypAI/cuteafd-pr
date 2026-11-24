@@ -160,29 +160,40 @@ impl<'a> MiniBackend<'a> {
         &self,
         placement: &mut Placement,
         tokens: &[u32],
-        heads: bool,
+        head_projection: Option<super::prefill::HeadProjection>,
         pool: &RefPagePool,
         callback: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>,
     ) -> Result<()> {
         self.check(placement, tokens, pool)?;
         let start = placement.len;
+        let end = start + tokens.len();
         let visits = self.execution.borrow().cfg.total_visits();
         let mut units = sequence_units(tokens.len(), self.unit_rows, self.waves, visits)?;
         for unit in &mut units {
             unit.rows = unit.rows.start + start..unit.rows.end + start;
+            let unit_head = match head_projection {
+                None => false,
+                Some(super::prefill::HeadProjection::AllHeadRows) => true,
+                Some(super::prefill::HeadProjection::MemberLastRow) => unit.rows.end == end,
+                Some(super::prefill::HeadProjection::FromPosition(first_pos)) => unit.rows.end >= first_pos,
+            };
             unit.segments = vec![UnitSegment {
                 sequence: 0,
                 rows: 0..unit.rows.len(),
                 tokens: unit.rows.clone(),
-                prompt_end: unit.rows.end == start + tokens.len(),
+                prompt_end: unit.rows.end == end,
                 snapshot: false,
-                head: heads,
+                head: unit_head,
             }];
         }
         let mut next = [placement.clone()];
-        self.execution
-            .borrow_mut()
-            .prefill(&mut next, &[tokens], &units, callback)?;
+        self.execution.borrow_mut().prefill(
+            &mut next,
+            &[tokens],
+            &units,
+            head_projection.unwrap_or(super::prefill::HeadProjection::AllHeadRows),
+            callback,
+        )?;
         *placement = next.into_iter().next().unwrap();
         Ok(())
     }
@@ -460,7 +471,8 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
     ) -> Result<Option<DeviceLogits>> {
         ensure!(rows <= 1, "Mini prefill head retains one row; scoring streams tiles");
         let mut last = None;
-        self.append(placement, tokens, rows > 0, pool, &mut |_, _, logits| {
+        let projection = (rows > 0).then_some(super::prefill::HeadProjection::MemberLastRow);
+        self.append(placement, tokens, projection, pool, &mut |_, _, logits| {
             let offset = (logits.rows - 1) * logits.stride * 4;
             last = Some(DeviceLogits {
                 ptr: logits.ptr.wrapping_byte_add(offset),
@@ -491,7 +503,8 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
             consumer: probe,
             position,
         };
-        self.append(placement, tokens, rows > 0, pool, &mut |_, at, logits| {
+        let projection = (rows > 0).then_some(super::prefill::HeadProjection::FromPosition(first));
+        self.append(placement, tokens, projection, pool, &mut |_, at, logits| {
             let end = at.checked_add(logits.rows).context("Mini score tile overflow")?;
             if end > first {
                 let skip = first.saturating_sub(at);
@@ -566,9 +579,12 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
                 .collect(),
         };
         let mut last: Vec<Option<Result<()>>> = (0..sequences.len()).map(|_| None).collect();
-        self.execution
-            .borrow_mut()
-            .prefill(&mut placements, &sources, &[unit], &mut |member, position, logits| {
+        self.execution.borrow_mut().prefill(
+            &mut placements,
+            &sources,
+            &[unit],
+            super::prefill::HeadProjection::MemberLastRow,
+            &mut |member, position, logits| {
                 if position + logits.rows == chunks[member].0 + chunks[member].1 + 1 {
                     let offset = (logits.rows - 1) * logits.stride * 4;
                     let logits = DeviceLogits {

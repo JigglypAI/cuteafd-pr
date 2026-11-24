@@ -6,7 +6,7 @@ use super::{
     head::MiniHead,
     layers::MiniKernels,
     owners::RequestOwners,
-    prefill::{Stateful, TokenIo},
+    prefill::{HeadProjection, Stateful, TokenIo},
     weights::MiniTargetWeights,
 };
 use crate::shared::{decode_graph::device::Cycle, prefill_pipeline::Unit, token_io::DeviceLogits};
@@ -83,6 +83,7 @@ impl<'a> Execution<'a> {
         placements: &mut [Placement],
         tokens: &[&[u32]],
         units: &[Unit],
+        head_projection: HeadProjection,
         on_logits: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>,
     ) -> Result<()> {
         ensure!(
@@ -103,6 +104,7 @@ impl<'a> Execution<'a> {
                 starts: &starts,
                 slots: &slots,
                 retained_rows: false,
+                head_projection,
                 draft: self.draft.as_deref(),
                 publish_draft: true,
                 media: &media,
@@ -199,6 +201,7 @@ impl<'a> Execution<'a> {
                 starts: &starts,
                 slots: &slots,
                 retained_rows: true,
+                head_projection: HeadProjection::AllHeadRows,
                 draft: self.draft.as_deref(),
                 publish_draft: false,
                 media: &media,

@@ -187,7 +187,12 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     let mut placements = [placement.clone()];
     let copy_lib = &*library;
     let device_id = args.device;
-    execution.prefill(&mut placements, &[&tokens[..rows]], &units, &mut |_seq, at_1based, logits| {
+    execution.prefill(
+        &mut placements,
+        &[&tokens[..rows]],
+        &units,
+        super::prefill::HeadProjection::AllHeadRows,
+        &mut |_seq, at_1based, logits| {
         let tile = read_logits(copy_lib, device_id, &logits)?;
         let row0 = at_1based - 1;
         values[row0 * vocab..(row0 + logits.rows) * vocab].copy_from_slice(&tile);
@@ -235,7 +240,13 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                 }],
             };
             let mut ps = [p];
-            execution.prefill(&mut ps, &[&tokens[..prefix_len]], &[pre_u], &mut |_, _, _| Ok(()))?;
+            execution.prefill(
+                &mut ps,
+                &[&tokens[..prefix_len]],
+                &[pre_u],
+                super::prefill::HeadProjection::AllHeadRows,
+                &mut |_, _, _| Ok(()),
+            )?;
             p = ps[0].clone();
             let mut collected = Vec::<u32>::new();
             let mut pos = prefix_len;
@@ -308,7 +319,13 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                         }],
                     };
                     let mut ps = [p];
-                    execution.prefill(&mut ps, &[&tokens[..prefix_len]], &[pre_u], &mut |_, _, _| Ok(()))?;
+                    execution.prefill(
+                &mut ps,
+                &[&tokens[..prefix_len]],
+                &[pre_u],
+                super::prefill::HeadProjection::AllHeadRows,
+                &mut |_, _, _| Ok(()),
+            )?;
                     p = ps[0].clone();
                     let dec_u = Unit {
                         index: 0,
