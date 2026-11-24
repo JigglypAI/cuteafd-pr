@@ -1,5 +1,6 @@
 """CPU-only coverage of the shared vision module registry and owner lifetime."""
 import importlib.util
+import re
 import json
 from pathlib import Path
 import shutil
@@ -300,6 +301,17 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
         assert ("vision_vendor_rotary_raster_t1" in names) == (kind=="kimi")
         assert "vision_rotary_raster_t1" not in names
         assert not any("cu130" in name for name in names)
+    # Every tower group links into one native library: export names must be
+    # disjoint across groups (Hy4's patch-16 raster once collided with Kimi's patch-14).
+    groups={kind:set(module.names(kind)) for kind in ("kimi","minimax","hy4f")}
+    for a in groups:
+        for b in groups:
+            assert a>=b or not groups[a]&groups[b], f"{a}/{b} share exports {sorted(groups[a]&groups[b])}"
+    hy4=(ROOT / "native/shared/cuda/vision_hy4.cuh").read_text()
+    # Literal names (or the literal prefix of a composed one) must resolve to a Hy4 export.
+    launched=set(re.findall(r'generic_program\(o,"(vision_\w+)"',hy4))
+    assert "vision_patches_raster_p16_t1" in launched
+    assert all(any(name==prefix or name.startswith(prefix) for name in groups["hy4f"]) for prefix in launched), launched
     native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
     assert "if(s.tower)return false" in native
     assert "return vision_required_impl(s,out,valid_tower);" in native

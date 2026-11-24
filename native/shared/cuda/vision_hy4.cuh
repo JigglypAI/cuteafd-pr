@@ -82,7 +82,7 @@ int encode_hy4_batch(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float*
     int64_t patch=0,pixel=0;
     for(int image=0;image<images;++image) {
       const int gh=grids[2*image],gw=grids[2*image+1];
-      HY4_RUN(generic_program(o,"vision_patches_raster_t1",{b.rgb+pixel,b.lut,b.patches+patch*HY4_PATCH_WIDTH},
+      HY4_RUN(generic_program(o,"vision_patches_raster_p16_t1",{b.rgb+pixel,b.lut,b.patches+patch*HY4_PATCH_WIDTH},
         {uint64_t(gh*16),uint64_t(gw*16)}));
       patch+=int64_t(gh)*gw;pixel+=int64_t(gh)*gw*16*16*3;
     }
