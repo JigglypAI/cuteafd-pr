@@ -214,6 +214,13 @@ pub fn physical_floor(text: Option<&str>, rank: usize, memory_padding: u64) -> R
 }
 
 pub fn current(rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
+    current_with_step_margin(rank, spark, base, tail, None)
+}
+
+/// Use the observed working set as the soft cap, with one step of headroom.
+/// Explicit reserve, extra and cap values retain the shared override semantics.
+pub fn current_with_step_margin(rank: usize, spark: bool, base: u64, tail: u64,
+    step_margin: Option<u64>) -> Result<Resolved, Error> {
     let read = |key: &'static str| match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -222,6 +229,13 @@ pub fn current(rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolve
     let text = read(if spark { "CUTEAFD_SPARK_GRAPH_RESERVE" } else { "CUTEAFD_GPU_GRAPH_RESERVE" })?;
     let extra = if spark { None } else { read("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")? };
     let cap = if spark { None } else { read("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP")? };
+    if let Some(margin) = step_margin.filter(|_| !spark && text.is_none() && extra.is_none() && cap.is_none()) {
+        let bytes = base.checked_add(margin).ok_or(Error::Overflow { key: "GPU_GRAPH_RESERVE" })?;
+        return Ok(Resolved { bytes, source: "C1 working set plus one step", base_bytes: base,
+            base_source: FAMILY, extra_bytes: margin, extra_source: FAMILY,
+            cap_bytes: None, cap_source: "not applicable", effective_extra_bytes: margin,
+            soft_margin_floor: margin });
+    }
     resolve_with_extra(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, spark, base, tail)
 }
 

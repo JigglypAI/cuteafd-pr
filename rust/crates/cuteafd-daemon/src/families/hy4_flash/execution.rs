@@ -1705,7 +1705,7 @@ impl<'a> Hy4Engine<'a> {
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
     ) -> Result<()> {
         for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank, layout, self.decode_rows)?;
+            r.graphs.attach(r.device.library, r.device.id, rank, layout, self.decode_rows, self.draft.is_some())?;
         }
         self.graphs_enabled.set(true);
         Ok(())
