@@ -24,7 +24,7 @@ use cuteafd_loader::{
         families::hy4_flash::{self as hy4_place, AdmittedHy4, Hy4Inputs},
         planner::{
             ComponentKind, CoordinatorDevices, Lifetime, Location, Operation, PrefillShape,
-            Receipt, Recipe, ResolvedPlan,
+            Phase, Receipt, Recipe, ResolvedPlan,
         },
         ArchContext, AttentionPlacement, Onboard,
     },
@@ -305,7 +305,7 @@ fn reconcile_runtime_inventory(
         .facts
         .allocations
         .iter()
-        .filter(|a| a.view.is_none() && selected(&a.id))
+        .filter(|a| a.view.is_none() && selected(&a.id) && a.lifetime.contains(Phase::Ready, contract.phase_order))
         .map(|a| (a.id.as_str(), a))
         .collect();
 

@@ -385,8 +385,11 @@ impl<'a> Drafter<'a> {
         for (name, allocation) in &self.weights {
             allocation.inventory(weights, name)?;
         }
-        // Native projection operands may live only in `linear`; the arena
-        // registers their aliases on allocation, and all views share its backing.
+        for (stem, (allocation, _)) in &self.linear {
+            allocation.payload.inventory(weights, &format!("{stem}.trellis"))?;
+            allocation.suh.inventory(weights, &format!("{stem}.suh"))?;
+            allocation.svh.inventory(weights, &format!("{stem}.svh"))?;
+        }
         for (name, allocation) in &self.workspace {
             allocation.inventory(retained, name)?;
         }
