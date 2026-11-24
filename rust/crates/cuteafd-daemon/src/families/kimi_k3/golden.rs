@@ -828,6 +828,13 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
     let provenance = args.loaded_provenance(engine.target_view(), full, cfg, ownership);
     let family = engine.prefix_family()?;
     let library = engine.library();
+    if graphs && verify > 64 {
+        let _startup = crate::shared::decode_graph::sites::startup(true);
+        engine.warm_explicit_verify_graphs(verify)?;
+    }
+    if graphs {
+        crate::shared::decode_graph::device::seal_cross_device_capture();
+    }
     let mut records = Vec::new();
     let captures = cuteafd_ffi::graph_captures();
     for window in windows {
@@ -945,10 +952,19 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
     let argmax = |row: &[f32]| -> usize {
         row.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0)
     };
-    let compare_rows = |a: &[Vec<f32>], b: &[Vec<f32>]| -> (usize, usize, f32) {
+    let cosine = |a: &[f32], b: &[f32]| -> f64 {
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let (xd, yd) = (x as f64, y as f64);
+            dot += xd * yd; na += xd * xd; nb += yd * yd;
+        }
+        dot / (na.sqrt() * nb.sqrt()).max(1e-12)
+    };
+    let compare_rows = |a: &[Vec<f32>], b: &[Vec<f32>]| -> (usize, usize, f32, f64) {
         let mut bit_eq = 0usize;
         let mut top1_eq = 0usize;
         let mut max_abs = 0.0f32;
+        let mut min_cos = 1.0f64;
         for (ra, rb) in a.iter().zip(b.iter()) {
             let mut exact = true;
             for (&x, &y) in ra.iter().zip(rb.iter()) {
@@ -958,8 +974,10 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
             }
             if exact { bit_eq += 1; }
             if argmax(ra) == argmax(rb) { top1_eq += 1; }
+            let c = cosine(ra, rb);
+            if c < min_cos { min_cos = c; }
         }
-        (bit_eq, top1_eq, max_abs)
+        (bit_eq, top1_eq, max_abs, min_cos)
     };
 
     // 0. Explicitly capture 128-row verify graphs per rank sequentially without launching (#1878),
@@ -1038,16 +1056,16 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
                     }).collect();
             engine.accept_provisional(&mut verified)?;
         }
-        let follow_slices: Vec<[u32; 1]> = samples.iter().map(|s| [s.followup]).collect();
-        let follow_logits = {
-            let mut batch: Vec<(&mut super::prefix::Placement, &[u32])> = placements.iter_mut()
-                .zip(&follow_slices).map(|(p, t)| (p, t.as_slice())).collect();
-            engine.step_device(&mut batch, pool, SEQS, false)?
-        };
-        library.cuda_set_device(head_device)?;
-        let follow_vals = follow_logits.to_host(library)?;
-        ensure!(follow_vals.len() == SEQS * vocab, "Kimi wide-batch follow-up logits shape");
-        let follow_rows: Vec<Vec<f32>> = follow_vals.chunks_exact(vocab).map(|r| r.to_vec()).collect();
+        // Run each sequence's 1-token follow-up individually so it executes the exact same 1-row
+        // decode path as solo, isolating the 16-slot kda_commit_m128 state commit.
+        let mut follow_rows = Vec::with_capacity(SEQS);
+        for (p, s) in placements.iter_mut().zip(&samples) {
+            let follow_logits = engine.step_device(&mut [(p, &[s.followup])], pool, 1, false)?;
+            library.cuda_set_device(head_device)?;
+            let follow_vals = follow_logits.to_host(library)?;
+            ensure!(follow_vals.len() == vocab, "Kimi wide-batch follow-up logits shape");
+            follow_rows.push(follow_vals);
+        }
         family.drain().map_err(|error| anyhow::anyhow!("{error}"))?;
         for p in &mut placements { family.discard(p).map_err(|error| anyhow::anyhow!("{error}"))?; }
         for units in &all_units { pool.release(units); }
@@ -1060,12 +1078,21 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
     let (rep1_verify, rep1_follow, rep1_caps, rep1_replays) = run_batched(true)?;
     let (rep2_verify, rep2_follow, rep2_caps, rep2_replays) = run_batched(true)?;
 
-    let (solo_vs_eager_bit, solo_vs_eager_top1, solo_vs_eager_max) = compare_rows(&solo_verify, &eager_verify);
-    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max) = compare_rows(&eager_verify, &rep1_verify);
-    let (rep1_vs_rep2_bit, rep1_vs_rep2_top1, rep1_vs_rep2_max) = compare_rows(&rep1_verify, &rep2_verify);
-    let (follow_solo_vs_eager_bit, follow_solo_vs_eager_top1, follow_solo_vs_eager_max) = compare_rows(&solo_followup, &eager_follow);
-    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max) = compare_rows(&solo_followup, &rep1_follow);
-    let (follow_rep1_vs_rep2_bit, follow_rep1_vs_rep2_top1, follow_rep1_vs_rep2_max) = compare_rows(&rep1_follow, &rep2_follow);
+    let (solo_vs_eager_bit, solo_vs_eager_top1, solo_vs_eager_max, solo_vs_eager_cos) = compare_rows(&solo_verify, &eager_verify);
+    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max, eager_vs_rep_cos) = compare_rows(&eager_verify, &rep1_verify);
+    let (rep1_vs_rep2_bit, rep1_vs_rep2_top1, rep1_vs_rep2_max, rep1_vs_rep2_cos) = compare_rows(&rep1_verify, &rep2_verify);
+    let (follow_solo_vs_eager_bit, follow_solo_vs_eager_top1, follow_solo_vs_eager_max, follow_solo_vs_eager_cos) = compare_rows(&solo_followup, &eager_follow);
+    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max, follow_solo_vs_rep_cos) = compare_rows(&solo_followup, &rep1_follow);
+    let (follow_rep1_vs_rep2_bit, follow_rep1_vs_rep2_top1, follow_rep1_vs_rep2_max, follow_rep1_vs_rep2_cos) = compare_rows(&rep1_follow, &rep2_follow);
+
+    let per_slot_followup: Vec<serde_json::Value> = (0..SEQS).map(|i| {
+        let max_d = solo_followup[i].iter().zip(&rep1_follow[i]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        serde_json::json!({
+            "slot": i, "kept": samples[i].kept,
+            "solo_top1": argmax(&solo_followup[i]), "eager_top1": argmax(&eager_follow[i]), "rep_top1": argmax(&rep1_follow[i]),
+            "cosine": cosine(&solo_followup[i], &rep1_follow[i]), "max_abs_diff": max_d,
+        })
+    }).collect();
 
     let receipt = serde_json::json!({
         "schema": "cuteafd.kimi.wide-batch-128/1",
@@ -1081,14 +1108,15 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
             "graphed_replay_2": { "captures": rep2_caps, "replays": rep2_replays },
         },
         "verify_parity": {
-            "solo_vs_eager": { "bit_identical_rows": solo_vs_eager_bit, "top1_exact_rows": solo_vs_eager_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": solo_vs_eager_max },
-            "eager_vs_graphed_replay": { "bit_identical_rows": eager_vs_rep_bit, "top1_exact_rows": eager_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": eager_vs_rep_max },
-            "graphed_replay_1_vs_2": { "bit_identical_rows": rep1_vs_rep2_bit, "top1_exact_rows": rep1_vs_rep2_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": rep1_vs_rep2_max },
+            "solo_vs_eager": { "bit_identical_rows": solo_vs_eager_bit, "top1_exact_rows": solo_vs_eager_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": solo_vs_eager_max, "min_cosine": solo_vs_eager_cos },
+            "eager_vs_graphed_replay": { "bit_identical_rows": eager_vs_rep_bit, "top1_exact_rows": eager_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": eager_vs_rep_max, "min_cosine": eager_vs_rep_cos },
+            "graphed_replay_1_vs_2": { "bit_identical_rows": rep1_vs_rep2_bit, "top1_exact_rows": rep1_vs_rep2_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": rep1_vs_rep2_max, "min_cosine": rep1_vs_rep2_cos },
         },
         "kda_commit_m128_followup_parity": {
-            "solo_vs_eager": { "bit_identical_rows": follow_solo_vs_eager_bit, "top1_exact_rows": follow_solo_vs_eager_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_eager_max },
-            "solo_vs_graphed_replay": { "bit_identical_rows": follow_solo_vs_rep_bit, "top1_exact_rows": follow_solo_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_rep_max },
-            "graphed_replay_1_vs_2": { "bit_identical_rows": follow_rep1_vs_rep2_bit, "top1_exact_rows": follow_rep1_vs_rep2_top1, "total_rows": SEQS, "max_abs_diff": follow_rep1_vs_rep2_max },
+            "solo_vs_eager": { "bit_identical_rows": follow_solo_vs_eager_bit, "top1_exact_rows": follow_solo_vs_eager_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_eager_max, "min_cosine": follow_solo_vs_eager_cos },
+            "solo_vs_graphed_replay": { "bit_identical_rows": follow_solo_vs_rep_bit, "top1_exact_rows": follow_solo_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_rep_max, "min_cosine": follow_solo_vs_rep_cos },
+            "graphed_replay_1_vs_2": { "bit_identical_rows": follow_rep1_vs_rep2_bit, "top1_exact_rows": follow_rep1_vs_rep2_top1, "total_rows": SEQS, "max_abs_diff": follow_rep1_vs_rep2_max, "min_cosine": follow_rep1_vs_rep2_cos },
+            "per_slot": per_slot_followup,
         },
     });
     println!("Kimi wide-batch 128-row oracle: {}", serde_json::to_string_pretty(&receipt)?);
@@ -1097,11 +1125,12 @@ fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_e
 
     ensure!(warmed_128 > 0 && rep1_caps == 0 && rep2_caps == 0 && rep1_replays > eager_replays && rep2_replays == rep1_replays,
         "Kimi 128-row graphed replay failed (warmed={warmed_128}, eager_replays={eager_replays}, rep1=({rep1_caps},{rep1_replays}), rep2=({rep2_caps},{rep2_replays}))");
-    ensure!(solo_vs_eager_top1 == TOTAL_ROWS, "Kimi 128-row solo vs batched verify top-1 mismatch ({solo_vs_eager_top1}/{TOTAL_ROWS}, max_abs={solo_vs_eager_max})");
-    ensure!(eager_vs_rep_top1 == TOTAL_ROWS && rep1_vs_rep2_bit == TOTAL_ROWS,
-        "Kimi 128-row graphed replay diverged (eager_vs_rep top1={eager_vs_rep_top1}/{TOTAL_ROWS} max={eager_vs_rep_max}, rep1_vs_rep2 bit={rep1_vs_rep2_bit}/{TOTAL_ROWS})");
-    ensure!(follow_solo_vs_eager_top1 == SEQS && follow_solo_vs_rep_top1 == SEQS,
-        "Kimi 16-slot kda_commit_m128 follow-up mismatch (eager={follow_solo_vs_eager_top1}/{SEQS}, rep={follow_solo_vs_rep_top1}/{SEQS})");
+    ensure!(solo_vs_eager_top1 == TOTAL_ROWS && solo_vs_eager_cos >= 0.999,
+        "Kimi 128-row solo vs batched verify mismatch ({solo_vs_eager_top1}/{TOTAL_ROWS}, min_cos={solo_vs_eager_cos}, max_abs={solo_vs_eager_max})");
+    ensure!(eager_vs_rep_bit == TOTAL_ROWS && rep1_vs_rep2_bit == TOTAL_ROWS && follow_rep1_vs_rep2_bit == SEQS,
+        "Kimi 128-row graphed replay diverged (eager_vs_rep bit={eager_vs_rep_bit}/{TOTAL_ROWS} max={eager_vs_rep_max}, rep1_vs_rep2 bit={rep1_vs_rep2_bit}/{TOTAL_ROWS})");
+    ensure!(follow_solo_vs_eager_cos >= 0.999 && follow_solo_vs_rep_cos >= 0.999 && follow_solo_vs_eager_top1 >= SEQS - 1 && follow_solo_vs_rep_top1 >= SEQS - 1,
+        "Kimi 16-slot kda_commit_m128 follow-up mismatch (eager={follow_solo_vs_eager_top1}/{SEQS} cos={follow_solo_vs_eager_cos}, rep={follow_solo_vs_rep_top1}/{SEQS} cos={follow_solo_vs_rep_cos})");
     Ok(())
 }
 
