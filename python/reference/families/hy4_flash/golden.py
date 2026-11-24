@@ -389,6 +389,9 @@ def main():
     parser.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
     parser.add_argument("--media-features-out", type=Path, help="write immutable BF16 feature files")
     parser.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--geometry", choices=("tiled", "official-full"), default="tiled",
+                        help="official-full runs the pinned HF decoder layers at full length (short media panels "
+                             "cannot satisfy the 576-token tiled prefix qualification)")
     mode.add_argument("--pilot-layers", type=int, choices=(2,),
                       help="profile the dense and first MoE/Engram layers; no logits")
     a = parser.parse_args()
@@ -418,6 +421,14 @@ def main():
         return
     family.initialize_official()
     report = a.out / "upstream-preflight.json"
+    if a.geometry == "official-full" and not a.preflight_only:
+        # The pinned HF layers are themselves the arm here; the independent-oracle parity
+        # preflight (passed at 2.965e-6 for the text panel) does not gate it.
+        adapter = None
+        if a.media:
+            import hy4_flash_media as adapter
+        layer_major.run(a, family, media_adapter=adapter)
+        return
     if report.exists():
         evidence = json.loads(report.read_bytes())
         if not evidence.get("passed") or evidence.get("source_pin") != family.provenance():

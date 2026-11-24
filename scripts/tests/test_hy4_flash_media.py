@@ -210,3 +210,20 @@ def test_tiny_tower_matches_shapes_and_newline_column(monkeypatch):
     serving = vision.encode(weights, pixels, grid, mode="serving").output.float()
     f32 = vision.encode(weights, pixels, grid, mode="f32").output
     assert torch.nn.functional.cosine_similarity(serving.flatten(), f32.flatten(), dim=0) > 0.99
+
+
+@pytest.mark.container_torch
+def test_inject_replaces_rows_before_stream_expansion():
+    torch = pytest.importorskip("torch")
+    w = window()
+    span = w["media"][0]
+    flat = torch.randn(len(w["tokens"]), media.WIDTH)
+    original = flat.clone()
+    feature = torch.randn(span["len"], media.WIDTH)
+    out = media.inject_embeddings(flat, w, {span["key"]: feature})
+    assert out.shape == (len(w["tokens"]), 4, media.WIDTH)
+    rows = slice(span["start"], span["start"] + span["len"])
+    assert torch.equal(out[rows], feature[:, None].expand(-1, 4, -1))
+    assert torch.equal(out[:span["start"]], original[:span["start"], None].expand(-1, 4, -1))
+    with pytest.raises(ValueError):
+        media.inject_embeddings(torch.randn(len(w["tokens"]), media.WIDTH), w, {span["key"]: feature[:-1]})
