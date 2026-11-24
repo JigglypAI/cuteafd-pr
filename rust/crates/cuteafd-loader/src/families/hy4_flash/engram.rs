@@ -588,7 +588,7 @@ impl Hy4EngramLookahead {
             .into_iter()
             .map(|table| table as Arc<dyn LookaheadTable>)
             .collect();
-        let planner = Lookahead::new("hy4_engram", lookahead_tables)?;
+        let planner = Lookahead::new("hy4_engram", lookahead_tables, 1)?;
         Ok(Self { planner, hashers })
     }
 
@@ -629,7 +629,7 @@ impl Hy4EngramLookahead {
             }
         }
         if per_layer.iter().any(|rows| !rows.is_empty()) {
-            self.planner.decode(per_layer);
+            self.planner.decode(0, per_layer);
         }
         Ok(())
     }

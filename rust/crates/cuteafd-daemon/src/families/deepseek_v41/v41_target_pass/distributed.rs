@@ -1332,7 +1332,7 @@ mod tests {
             &std::path::Path::new(&snapshot).join("tokenizer.json"),
         )?;
         let pipeline =
-            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(unit_rows as usize, 2)?, 0)? };
+            unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, cuteafd_loader::EngramStagingShape::new(unit_rows as usize, 2, 1)?, 0)? };
         let pages = if packed_check { BackboneCache::pages_for_context(2, 1024)? } else { [4, 4, 4, 8] };
         let mut requests = Requests::new_distributed(
             &lib,

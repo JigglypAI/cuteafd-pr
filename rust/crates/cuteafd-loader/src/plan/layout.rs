@@ -1811,7 +1811,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
 
     if family == "deepseek_v41" {
         let shape = crate::EngramStagingShape::new(usize::try_from(unit_rows)?,
-            usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?)?;
+            usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?, options.decode_lanes)?;
         push(Category::Staging, "v41/engram-prefill", "pinned payload + pageable sort tuples",
             shape.host_resident_bytes() as u64, Basis::Formula);
         push(Category::Staging, "v41/engram-decode", "pinned payload + pageable sort tuples",

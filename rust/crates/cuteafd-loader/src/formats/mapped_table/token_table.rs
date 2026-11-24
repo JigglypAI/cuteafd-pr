@@ -156,7 +156,7 @@ impl<H: FnMut(&[u32], &mut Vec<u64>) -> Result<()> + Send + 'static> RowSource f
 pub struct TokenTableLookahead { table: Arc<TokenTable>, planner: Lookahead }
 impl TokenTableLookahead {
     pub fn new(name: &str, table: Arc<TokenTable>) -> Result<Self> {
-        let planner = Lookahead::new(name, vec![Arc::clone(&table) as Arc<dyn LookaheadTable>])
+        let planner = Lookahead::new(name, vec![Arc::clone(&table) as Arc<dyn LookaheadTable>], 1)
             .context("starting a token-table look-ahead")?;
         Ok(Self { table, planner })
     }
@@ -166,7 +166,7 @@ impl TokenTableLookahead {
         self.planner.start(tag, start, source, units)
     }
     /// Read a decode round's rows into the decode share now. Never blocks.
-    pub fn decode(&self, rows: Vec<u64>) { if !rows.is_empty() { self.planner.decode(vec![rows]); } }
+    pub fn decode(&self, rows: Vec<u64>) { if !rows.is_empty() { self.planner.decode(0, vec![rows]); } }
 }
 
 #[cfg(test)]

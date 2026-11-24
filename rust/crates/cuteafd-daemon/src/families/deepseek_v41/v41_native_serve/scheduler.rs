@@ -2108,11 +2108,11 @@ fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, pro
 
 /// Start the proposal's Engram row reads the moment drafts exist, before
 /// length selection and verify (rows of a trimmed proposal are a subset).
-pub(super) fn prefetch_drafts(requests: &Requests<'_>, active: &[Option<Active<'_>>], members: &[usize],
+pub(super) fn prefetch_drafts(lane: usize, requests: &Requests<'_>, active: &[Option<Active<'_>>], members: &[usize],
     inputs: &[Vec<u32>]) {
     let proposals: Vec<_> = members.iter().zip(inputs)
         .map(|(&slot, input)| (active[slot].as_ref().unwrap().lease, input.as_slice())).collect();
-    requests.prefetch_drafts(&proposals);
+    requests.prefetch_drafts(lane, &proposals);
 }
 
 fn validate_proposals(active: &[Option<Active<'_>>], members: &[usize], inputs: &[Vec<u32>]) -> Result<()> {
@@ -2159,7 +2159,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     }).collect::<Result<Vec<_>>>()?;
     let draft_start = Instant::now();
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
-    prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
+    prefetch_drafts(lane, requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
         match draft.propose(lane, &seeds) {
             Ok(inputs) => inputs,
@@ -2170,7 +2170,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     validate_proposals(active, members, &inputs)?;
     if let Some(draft) = draft.as_deref_mut() { shape_inputs(draft, active, members, &mut inputs); }
-    prefetch_drafts(requests, active, members, &inputs);
+    prefetch_drafts(lane, requests, active, members, &inputs);
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();

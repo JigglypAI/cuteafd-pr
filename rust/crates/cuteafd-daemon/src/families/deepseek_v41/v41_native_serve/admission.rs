@@ -656,7 +656,7 @@ pub(super) fn resolve_with_owners(
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let host = admission::HostFacts::prepare(&config,
         &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
-        prefill, ranks, args.peers.len(), context, args.concurrency as u64,
+        prefill, args.decode_lanes, ranks, args.peers.len(), context, args.concurrency as u64,
         args.dspark, match args.prefix.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
             crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
         args.prefix.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0,

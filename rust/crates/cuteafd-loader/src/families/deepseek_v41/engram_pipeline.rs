@@ -229,7 +229,7 @@ impl EngramPipeline {
             table.set_cache_shares(shape.cache_shares())?;
         }
         let tables = tables.map(Arc::new);
-        let lookahead = crate::EngramLookahead::new(tables.clone())?;
+        let lookahead = crate::EngramLookahead::new(tables.clone(), shape.decode_lanes())?;
         Ok(Self {
             identity: Arc::new(()),
             tables,
@@ -273,7 +273,7 @@ impl EngramPipeline {
     }
     /// Read a decode round's proposed rows (anchor and drafts, per request from
     /// its committed history) into the row caches as soon as the drafter emits them.
-    pub fn prefetch_drafts(&self, requests: &[(&EngramHistory, &[u32])]) -> Result<()> {
+    pub fn prefetch_drafts(&self, lane: usize, requests: &[(&EngramHistory, &[u32])]) -> Result<()> {
         let mut rows = [Vec::new(), Vec::new()];
         for &(history, tokens) in requests {
             if tokens.is_empty() { continue; }
@@ -281,7 +281,7 @@ impl EngramPipeline {
             let batch = history.prepare(history.position(), &compressed, compressed.len())?;
             for (layer, rows) in rows.iter_mut().enumerate() { rows.extend(batch.prefetch_rows(layer)?); }
         }
-        if !rows[0].is_empty() { self.lookahead.decode(rows); }
+        if !rows[0].is_empty() { self.lookahead.decode(lane, rows); }
         Ok(())
     }
     pub fn new_history(&self) -> Result<EngramHistory> {

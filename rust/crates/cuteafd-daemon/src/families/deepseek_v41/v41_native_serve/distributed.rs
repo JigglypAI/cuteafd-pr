@@ -541,7 +541,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         cache_bytes=?pool.cache_bytes,reservation_bytes=?pool.reservation_bytes,snapshot_slots,snapshot_bytes,
         rtx_expert_layers=expert_layers,"dual RTX cache reservation after fixed allocations");
     let cache_bytes: [usize;2]=pool.cache_bytes.clone().try_into().map_err(|_|anyhow::anyhow!("dual cache budgets"))?;
-    let pipeline = super::engram_pipeline(&lib, &catalog, &args, capacity as usize, slots, &pool)?;
+    let pipeline = super::engram_pipeline(&lib, &catalog, &args, &pool)?;
     let mut requests = if args.tp2_attention {
         Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };

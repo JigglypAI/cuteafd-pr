@@ -518,7 +518,7 @@ mod tests {
         };
         let table = std::sync::Arc::new(cuteafd_loader::EngramTable::new(map(&weights, 256)?, map(&scales, 8)?)?);
         let gatherer = cuteafd_loader::EngramGatherer::new_pinned(lib,
-            cuteafd_loader::EngramStagingShape::new(rows, k)?)?;
+            cuteafd_loader::EngramStagingShape::new(rows, k, 1)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
         let mut leases = Vec::new();
         for _ in 0..k {

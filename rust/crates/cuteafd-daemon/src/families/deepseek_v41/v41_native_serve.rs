@@ -312,17 +312,16 @@ fn spark_transport(
 /// Background page-cache warm readers for `--engram-warm`.
 const ENGRAM_WARM_READERS: usize = 8;
 
-/// The Engram pipeline both V4.1 layouts serve: host staging for `slots`
-/// prefill units of `rows` and the decode lanes (admitted against host
+/// The Engram pipeline both V4.1 layouts serve: host staging for
+/// the prefill units and the decode lanes (admitted against host
 /// memory), the admitted scale or whole-table preload and, with
 /// `--engram-warm`, a background page-cache warm that starts once the API
 /// reports ready (and skips preloaded tables).
 fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Catalog,
-    args: &crate::cli::NativeServeArgs, rows: usize, slots: usize, admitted: &admission::Admitted) -> Result<cuteafd_loader::EngramPipeline> {
+    args: &crate::cli::NativeServeArgs, admitted: &admission::Admitted) -> Result<cuteafd_loader::EngramPipeline> {
     let map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
-    let shape = cuteafd_loader::EngramStagingShape::new(rows, slots)?;
     // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
-    let mut pipeline = unsafe { cuteafd_loader::EngramPipeline::new_admitted(lib, catalog, map, shape,
+    let mut pipeline = unsafe { cuteafd_loader::EngramPipeline::new_admitted(lib, catalog, map, admitted.host.engram_shape,
         admitted.host.mapped.clone())? };
     cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
     if args.engram_warm {
@@ -469,7 +468,7 @@ fn worker(
     );
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
     let attention_plan = attention_plan(&args)?;
-    let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
+    let pipeline = engram_pipeline(&lib, &catalog, &args, &pool)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load_in(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024, arena))
         .into_iter()

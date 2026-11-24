@@ -5608,9 +5608,9 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         let pinned = input.plan_spark_count(&two(96, waves, 0), 6, Some(4)).unwrap();
         assert!(pinned.executable(), "{}", render(&pinned));
         assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves), (Some(rows), Some(waves)), "{}", render(&pinned));
-        crate::EngramStagingShape::new(rows as usize, waves as usize).unwrap();
+        crate::EngramStagingShape::new(rows as usize, waves as usize, pinned.decode_lanes).unwrap();
     }
-    let shape = crate::EngramStagingShape::new(2752, 3).unwrap();
+    let shape = crate::EngramStagingShape::new(2752, 3, auto.decode_lanes).unwrap();
     let host = auto.host_ledger.as_ref().expect("V4.1 host owners");
     for (group, bytes) in [
         ("v41/engram-prefill", shape.host_resident_bytes()),
