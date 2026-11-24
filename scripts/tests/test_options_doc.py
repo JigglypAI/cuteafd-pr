@@ -392,8 +392,9 @@ def test_optional_levers_are_default_off_and_documented():
     seen = set()
     for lever in LEVERS:
         for key in lever["keys"]:
-            assert key not in seen, f"duplicate lever row for {key}"
-            seen.add(key)
+            for family in lever["families"]:
+                assert (key, family) not in seen, f"duplicate lever row for {key} on {family}"
+                seen.add((key, family))
             assert key in MATRIX, f"lever {key} is absent from the family support table"
             assert key in DEFAULTS, f"lever {key} has no documented default"
             default = DEFAULTS[key]
