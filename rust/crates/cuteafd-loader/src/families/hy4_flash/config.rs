@@ -457,6 +457,10 @@ impl Hy4FlashConfig {
 }
 
 impl Hy4DflyConfig {
+    pub fn bundled(root: &Value) -> bool {
+        root["dfly_num_hidden_layers"].as_u64() == Some(5)
+    }
+
     /// The block contains the uncached bonus token followed by mask slots.
     pub fn block_rows(&self) -> usize {
         self.num_speculative_tokens + 1

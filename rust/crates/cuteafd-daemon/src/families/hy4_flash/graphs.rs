@@ -83,10 +83,11 @@ impl<'a> Hy4Graphs<'a> {
         rank: usize,
         layout: Option<Hy4GraphLayout>,
         max_rows: usize,
+        dfly2: bool,
     ) -> Result<()> {
-        let (base, tail) = hy4_graphs::reserve(layout, rank);
-        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
-        self.pins = hy4_graphs::selected_rows(layout, max_rows)?
+        let policy = hy4_graphs::reserve_policy(layout, rank, dfly2)?;
+        let warm_layout = if dfly2 && hy4_graphs::draft_working_set(layout, rank).is_some() { None } else { layout };
+        self.pins = hy4_graphs::selected_rows(warm_layout, max_rows)?
             .into_iter()
             .filter_map(|(rows, pin)| pin.then_some(rows))
             .collect();
@@ -105,7 +106,7 @@ impl<'a> Hy4Graphs<'a> {
         )?;
         device::set_reserve_policy(device, policy)?;
         self.device = device;
-        if hy4_graphs::prewarm(layout).is_none() {
+        if policy.base_bytes == 0 && hy4_graphs::prewarm(layout).is_none() {
             tracing::warn!(
                 ?layout,
                 rank,

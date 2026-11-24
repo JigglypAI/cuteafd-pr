@@ -1056,6 +1056,10 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let default = match family {
         "minimax_m3" | "inkling2" => "dspark",
+        "hy4_flash" if args.spark_ranks.unwrap_or(args.available_sparks) == 0
+            && (args.speculator == "auto" || args.include_speculator)
+            && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
+                &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
