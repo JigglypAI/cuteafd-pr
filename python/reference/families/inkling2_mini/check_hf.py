@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from types import MethodType
 
@@ -68,6 +69,8 @@ def main():
     # Use HF's built-in mixed-expert converters, not the unrelated generic
     # ModelOpt NVFP4 loader indicated by the legacy compatibility marker.
     del config.quantization_config
+    # Async copying eagerly materializes every large expert before conversion.
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
     model, info = Inkling2LoopForConditionalGeneration.from_pretrained(
         a.snapshot, config=config, dtype=torch.float32, device_map={"": a.device},
         local_files_only=True, attn_implementation="eager", output_loading_info=True)
