@@ -104,12 +104,20 @@ async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
 }
 
 /// Balance a drained request cohort across `lanes` (one or two) before
-/// admission. Preserve the first survivor migration and lane-zero tie break;
+/// admission, accounting for queued prompts whose lanes are already pinned
+/// (`reserved`). Preserve the first survivor migration and lane-zero tie break;
 /// one lane holds the whole cohort on lane zero. Call only after every lane
 /// releases its outstanding device and transport work.
-pub(crate) fn rebalance<T>(entries: &mut [T], lanes: u8, lane: impl Fn(&T) -> Option<usize>,
-    set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
-    let mut loads = [0usize; 2];
+///
+/// Without `reserved`, rebalancing the active cohort alone can migrate an
+/// active member into a lane that already has queued prefill prompts pinned to
+/// it, pushing `active[lane] + prefills[lane]` past the per-lane member limit
+/// and tripping `check_lane` ("decode lane request capacity exhausted")
+/// mid-stream. Counting the pinned prompts first keeps the post-admission load
+/// within capacity.
+pub(crate) fn rebalance_with_reserved<T>(entries: &mut [T], lanes: u8, reserved: [usize; 2],
+    lane: impl Fn(&T) -> Option<usize>, set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    let mut loads = reserved;
     for entry in entries.iter_mut() {
         let Some(mut index) = lane(entry) else { continue };
         if lanes < 2 && index != 0 { set_lane(entry, 0); index = 0; }
@@ -123,6 +131,15 @@ pub(crate) fn rebalance<T>(entries: &mut [T], lanes: u8, lane: impl Fn(&T) -> Op
         loads[1 - heavy] += 1;
     }
     loads
+}
+
+/// Balance a drained request cohort across `lanes` (one or two) before
+/// admission. Preserve the first survivor migration and lane-zero tie break;
+/// one lane holds the whole cohort on lane zero. Call only after every lane
+/// releases its outstanding device and transport work.
+pub(crate) fn rebalance<T>(entries: &mut [T], lanes: u8, lane: impl Fn(&T) -> Option<usize>,
+    set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    rebalance_with_reserved(entries, lanes, [0; 2], lane, set_lane)
 }
 
 impl LaneLease<'_> {
@@ -324,5 +341,54 @@ mod tests {
         let mut late = Fake { fail_publish: true, ..Fake::default() };
         assert_eq!(block_on(commit(&mut late)).unwrap_err().to_string(), "publish failed");
         assert_eq!(late.log, ["begin", "publish", "abort"]);
+    }
+
+    /// Reproduces the live `decode lane request capacity exhausted` failure:
+    /// with 29 active on lane 0, 31 active on lane 1, and 3 queued prefills
+    /// pinned to lane 0 (`total = [32, 31]`), `rebalance` alone migrated a
+    /// member from lane 1 to lane 0 and pushed lane 0's total to 33, past the
+    /// per-lane member limit.
+    #[test]
+    fn rebalance_with_reserved_never_exceeds_lane_capacity_when_prefills_are_queued() {
+        let capacity = cuteafd_core::V41_MAX_LANE_MEMBERS;
+        assert_eq!(capacity, 32, "the scenario below is written for a 32-member lane");
+        let mut active: Vec<Option<usize>> = (0..29).map(|_| Some(0))
+            .chain((0..31).map(|_| Some(1)))
+            .chain(std::iter::repeat_n(None, 4))
+            .collect();
+        let reserved = [3usize, 0];
+        let loads = rebalance_with_reserved(&mut active, 2, reserved, |entry| *entry,
+            |entry, index| *entry = Some(index));
+        assert_eq!(loads, [32, 31]);
+        assert!(loads[0] <= capacity && loads[1] <= capacity,
+            "must not exceed per-lane capacity {capacity}: {loads:?}");
+        // When lane 0 retires down to 27 active + 3 reserved = 30 vs lane 1's 32,
+        // rebalancing moves 1 active member from lane 1 to lane 0 -> [31, 31].
+        let mut skewed: Vec<Option<usize>> = (0..27).map(|_| Some(0))
+            .chain((0..32).map(|_| Some(1)))
+            .chain(std::iter::repeat_n(None, 5))
+            .collect();
+        let loads2 = rebalance_with_reserved(&mut skewed, 2, [3, 0], |entry| *entry,
+            |entry, index| *entry = Some(index));
+        assert_eq!(loads2, [31, 31]);
+        // And when lane 0 is heavy only because of reserved prefills
+        // ([20 active + 12 reserved] vs [10, 0]), active members migrate from
+        // lane 0 to lane 1 to restore balance ([21, 21]).
+        let mut prefill_heavy: Vec<Option<usize>> = (0..20).map(|_| Some(0))
+            .chain((0..10).map(|_| Some(1)))
+            .collect();
+        let loads3 = rebalance_with_reserved(&mut prefill_heavy, 2, [12, 0], |entry| *entry,
+            |entry, index| *entry = Some(index));
+        assert_eq!(loads3, [21, 21]);
+        // Positive control: with nothing reserved the wrapper is the old
+        // behaviour, and a single lane still collapses onto lane zero.
+        let mut plain: Vec<Option<usize>> = (0..29).map(|_| Some(0))
+            .chain((0..31).map(|_| Some(1)))
+            .collect();
+        assert_eq!(rebalance(&mut plain, 2, |entry| *entry, |entry, index| *entry = Some(index)), [30, 30]);
+        let mut one: Vec<Option<usize>> = vec![Some(1), None, Some(0), Some(1)];
+        assert_eq!(rebalance_with_reserved(&mut one, 1, [0; 2], |entry| *entry,
+            |entry, index| *entry = Some(index)), [3, 0]);
+        assert_eq!(one, [Some(0), None, Some(0), Some(0)]);
     }
 }

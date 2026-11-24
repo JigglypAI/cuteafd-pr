@@ -939,11 +939,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // Their units are free for admission and the reservation round only once reclaimed.
         prefixes.reclaim(requests, draft.as_deref_mut())?;
-        let mut loads = crate::shared::serve::lanes::rebalance(&mut active, lanes,
+        // Queued prompts keep the lane they were announced on and decode there.
+        // Count them BEFORE rebalancing the active cohort so migration never
+        // pushes `active[lane] + prefills[lane]` past the per-lane member limit
+        // when those prefills admit.
+        let mut reserved = [0usize; 2];
+        for waiting in prefills.iter().filter_map(|queued| queued.request()) { reserved[waiting.ticket.lane()] += 1; }
+        let mut loads = crate::shared::serve::lanes::rebalance_with_reserved(&mut active, lanes, reserved,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Queued prompts keep the lane they were announced on and decode there.
-        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
         // Admit available work at a completed boundary (both lanes drained):
         // admitted prompts join the decode-share queue holding their slots.
         let mut intake = receive.len().max(1);
@@ -2912,8 +2916,10 @@ mod sampling_tests {
         assert_eq!(code.matches("pack_waiting::<P>(").count(), 1);
         // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
-        // Queued prompts decode on the lane they were announced on (review A4).
-        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        // Queued prompts decode on the lane they were announced on (review A4),
+        // and their count is reserved before the active cohort is rebalanced.
+        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { reserved[waiting.ticket.lane()] += 1; }"));
+        assert!(serve.contains("rebalance_with_reserved(&mut active, lanes, reserved,"));
         assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
         let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
