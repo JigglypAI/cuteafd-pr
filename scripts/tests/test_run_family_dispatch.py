@@ -980,9 +980,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                   json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
                               "/drafters/nvidia.json").read_text()),
                   "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
-    if (family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER")
-            and not (hf / "hub/models--incoai--GLM-5.3-Flash-DFlash2").exists()):
-        _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    if family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER"):
+        # Split DFlash admission reads the draft config and tensor headers.
+        cache = "models--incoai--GLM-5.3-Flash-DFlash2"
+        staged = hf / "hub" / cache
+        if not staged.exists():
+            source = Path(extra_env["STUB_REAL_HF_HOME"]) / "hub" / cache
+            staged.symlink_to(source.resolve(strict=True), target_is_directory=True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     # Launcher tests model an idle host, independent of real API listeners.
