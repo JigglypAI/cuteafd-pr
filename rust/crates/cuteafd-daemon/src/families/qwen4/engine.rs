@@ -1389,6 +1389,17 @@ impl<'a> Qwen4Engine<'a> {
         self.drain_state()
     }
 
+    /// Enable lazy graph capture/replay in golden wide-batch verification without
+    /// running the startup prewarm pass over unrelated narrow shapes.
+    pub(super) fn enable_lazy_graphs_for_golden(&self) -> Result<()> {
+        if !self.use_graphs { return Ok(()); }
+        ensure!(self.graph_capture.get(), "Qwen graphs must be configured before enabling lazy capture");
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
+        }
+        self.graph_warmed.set(true);
+        Ok(())
+    }
     /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
     /// Called only for the opt-in per-cycle trace, after the device work completes.
     pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
