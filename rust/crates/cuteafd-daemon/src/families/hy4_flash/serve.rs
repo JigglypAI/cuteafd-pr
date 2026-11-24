@@ -213,10 +213,7 @@ fn publish_provenance(
         args.peers.len(),
     );
     let graph_policies: Vec<_> = (0..runtime.gpus.len())
-        .map(|gpu| {
-            cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy(
-                graph_layout, gpu, args.dfly2 == Some(true))
-        })
+        .map(|gpu| cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
         "memory_reconciliation_provenance": {
@@ -297,6 +294,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.wave.")
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
+            || id.starts_with("hy4_flash.peer.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4_flash/dfly2/") && id != cuteafd_loader::families::hy4_flash::draft::ARENA_ID)
     };
@@ -788,10 +786,6 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .publish();
 
             let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
-            if worker_args.dfly2 != Some(true)
-                || cuteafd_loader::serving_capacity::hy4_graphs::draft_working_set(graph_layout, 0).is_none() {
-                backend.warm_decode_graphs(graph_layout)?;
-            }
             backend.enable_expert_usage();
             let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
                 cuteafd_engine::media::EmbeddingCache::new(0),

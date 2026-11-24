@@ -198,40 +198,8 @@ impl<'a> Hy4Backend<'a> {
         check_writable(placement, tokens.len(), self.context, pool)
     }
 
-    /// Prewarm traced decode row geometries on disposable startup state before readiness.
-    /// Rank-local sites skip startup prewarm when `GRAPH_PREWARM=off` (`--graph-no-prewarm`)
-    /// and capture lazily on first use.
     pub(crate) fn enable_expert_usage(&self) {
         self.engine.borrow_mut().enable_expert_usage();
-    }
-
-    pub(crate) fn warm_decode_graphs(
-        &self,
-        layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
-    ) -> Result<()> {
-        let selected = cuteafd_loader::serving_capacity::hy4_graphs::selected_rows(
-            layout,
-            self.decode_rows.min(self.context),
-        )?;
-        if selected.is_empty() {
-            return Ok(());
-        }
-        let Some(_startup) = crate::shared::decode_graph::sites::startup(
-            super::graph_sites::spans("hy4_flash.section", false),
-        ) else {
-            return Ok(());
-        };
-        let mut engine = self.engine.borrow_mut();
-        let warm_long = engine.max_pages >= 33 && engine.max_context > 2048;
-        let warm_pos = if warm_long { 2048 } else { 0 };
-        engine.warming_graphs(|engine| {
-            for &(rows, _) in &selected {
-                engine.warm_row_shape(rows, warm_pos)?;
-            }
-            Ok(())
-        })?;
-        tracing::info!(?layout, rows = ?selected, warm_long, "Hy4-flash graph prewarm completed on scratch state");
-        Ok(())
     }
 
     fn decode(
