@@ -225,7 +225,7 @@ pub struct GlmfInputs<'a> {
     pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
-
+}
 
 /// One drafter's exact device request lists on each candidate GPU: the resident
 /// owners (rings, taps, context update, workspace) and the linear/attention scratch.
