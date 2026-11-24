@@ -1045,23 +1045,23 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// The capture-pass boundary of one submitted step: every owner's launches
-    /// are drained, each physical device's graph growth is measured once, and
-    /// executables the policy retired are destroyed. Without pending work the
-    /// banks only flush their hit clocks.
+    /// The capture-pass boundary of one submitted step: when pending
+    /// measurement or victim state needs a quiescent device, drain every
+    /// owner's stream first; then always advance the shared device cycle via
+    /// `observe_completed` so cold-donor aging and persistent victim
+    /// retirement run on every completed step without extra CUDA queries or
+    /// stream syncs on ordinary replay steps.
     fn graph_completed(&self) -> Result<()> {
-        let needs_boundary = self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary());
-        if !needs_boundary {
-            for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_tick(); }
-            return Ok(());
+        if self.graphs.borrow().is_empty() { return Ok(()); }
+        if self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary()) {
+            // A capture's growth is only observable once every owner's stream has
+            // completed its queued launches: this is the step boundary.
+            self.drain_state()?;
         }
-        // A capture's growth is only observable once every owner's stream has
-        // completed its queued launches: this is the step boundary.
-        self.drain_state()?;
         // SAFETY: Qwen graph owners pin only borrowed, persistent engine storage
         // (weights, KV/state pools, workspaces and their owner streams); the
         // GraphExec owns no allocation its segments captured, so destroying an
-        // executable needs no lane drain.
+        // executable or advancing the serial cycle needs no lane drain.
         unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| self.visit_graphs(visit)) }
             .context("Qwen graph boundary observation")
     }
@@ -3961,6 +3961,20 @@ mod gather_recovery_tests {
             "w.terminal_valid.set(false)", "self.graph_completed()"];
         let at: Vec<_> = order.iter().map(|needle| cancel.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "cancellation order {at:?}");
+    }
+
+    #[test]
+    fn qwen_graph_completed_always_advances_serial_cycle() {
+        let source = include_str!("engine.rs");
+        let body = source.split("\n#[cfg(test)]\nmod gather_recovery_tests").next().unwrap();
+        let completed = body.split("    fn graph_completed(").nth(1).unwrap()
+            .split("    /// Attribute the whole step's replay work").next().unwrap();
+        assert!(completed.contains("observe_completed("),
+            "graph_completed must advance the device serial cycle on every step so cold donors age");
+        assert!(!completed.contains("cache_tick()"),
+            "graph_completed must not return early on !needs_boundary with cache_tick()");
+        assert!(completed.find("self.drain_state()?").unwrap()
+            < completed.find("observe_completed(").unwrap());
     }
 }
 
