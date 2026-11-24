@@ -2289,47 +2289,6 @@ static cuteafd_status_t end_capture_retained(void* cuda_stream,
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_cuda_graph_upload(void* cuda_graph_exec, void* cuda_stream) {
-  if (cuda_graph_exec == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec is null");
-  }
-#if CUTEAFD_NATIVE_ENABLE_CUDA
-  auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
-  const bool tagged = (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) != 0;
-  if (tagged) {
-    std::lock_guard<std::mutex> guard(graph_handles_mutex);
-    const auto found = graph_handles.find(cuda_graph_exec);
-    if (found == graph_handles.end() || !found->second->exec)
-      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
-    if (!graph_executor(*found->second))
-      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph upload must run on its owning executor thread");
-    if (found->second->uploaded && found->second->uploaded_stream == cuda_stream) {
-      return ok();
-    }
-    target = found->second->exec;
-  }
-  const cudaError_t err = cuteafd::diagnostic_cuda(
-      cudaGraphUpload(target, reinterpret_cast<cudaStream_t>(cuda_stream)));
-  if (err != cudaSuccess) {
-    return fail_cuda(err == cudaErrorMemoryAllocation ? CUTEAFD_STATUS_ALLOCATION_FAILED
-                                                      : CUTEAFD_STATUS_INTERNAL_ERROR,
-                     "cudaGraphUpload failed", err);
-  }
-  if (tagged) {
-    std::lock_guard<std::mutex> guard(graph_handles_mutex);
-    const auto found = graph_handles.find(cuda_graph_exec);
-    if (found != graph_handles.end() && found->second->exec == target) {
-      found->second->uploaded = true;
-      found->second->uploaded_stream = cuda_stream;
-    }
-  }
-  return ok();
-#else
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA graph upload is unavailable in this build");
-#endif
-}
-
 extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream) {
   if (cuda_graph_exec == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec is null");
@@ -2375,6 +2334,47 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch_count(void* exec, uint64_t
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "graph launch count unavailable");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_upload(void* cuda_graph_exec, void* cuda_stream) {
+  if (cuda_graph_exec == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
+  const bool tagged = (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) != 0;
+  if (tagged) {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto found = graph_handles.find(cuda_graph_exec);
+    if (found == graph_handles.end() || !found->second->exec)
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
+    if (!graph_executor(*found->second))
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph upload must run on its owning executor thread");
+    if (found->second->uploaded && found->second->uploaded_stream == cuda_stream) {
+      return ok();
+    }
+    target = found->second->exec;
+  }
+  const cudaError_t err = cuteafd::diagnostic_cuda(
+      cudaGraphUpload(target, reinterpret_cast<cudaStream_t>(cuda_stream)));
+  if (err != cudaSuccess) {
+    return fail_cuda(err == cudaErrorMemoryAllocation ? CUTEAFD_STATUS_ALLOCATION_FAILED
+                                                      : CUTEAFD_STATUS_INTERNAL_ERROR,
+                     "cudaGraphUpload failed", err);
+  }
+  if (tagged) {
+    std::lock_guard<std::mutex> guard(graph_handles_mutex);
+    const auto found = graph_handles.find(cuda_graph_exec);
+    if (found != graph_handles.end() && found->second->exec == target) {
+      found->second->uploaded = true;
+      found->second->uploaded_stream = cuda_stream;
+    }
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+              "CUDA graph upload is unavailable in this build");
 #endif
 }
 
