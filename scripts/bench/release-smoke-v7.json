@@ -1004,6 +1004,27 @@
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4"
       }
+    },
+    {
+      "name": "inkling2-mini-1x-rtx",
+      "family": "inkling2_mini",
+      "config": "examples/configs/inkling2-mini-1x-rtx.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "ADDR": "0.0.0.0:8846",
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "0",
+        "MODEL_ID": "thinkingmachines/Inkling-2-Mini",
+        "MODEL_REVISION": "7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "dspark",
+        "VISION": "auto",
+        "AUDIO": "off"
+      }
     }
   ],
   "retired": [

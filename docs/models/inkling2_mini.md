@@ -58,7 +58,32 @@ The engine matches the checkpoint's `hf_quant_config.json` parameter groups and 
 - **Experts:** native NVFP4 W4A4 (`fouroversix_mae` with exact `div.rn`, bit-exact against oracle
   commit `6bcb2a8da0`/`ece18287ff`) and native MXFP8 W8A8 with IEEE F32 math, BF16 FC1 and SiTU
   epilogues, F32 expert combine, BF16 output.
+  - **NVFP4 epilogue scale (exact vendor association):**
+    `r = rcp_rn(1536.0 * denom)` (hoisted once per CTA via IEEE `div.rn.f32(1.0, 1536.0 * denom)`),
+    `factor = (x_amax * w_amax) * r` (literal multiply order per row, no compiler reassociation),
+    `out = bf16(acc * factor)` — matching pinned vendor vLLM (`WoosukKwon/vllm @ d664cd1e` /
+    `vllm-project/vllm @ a0c1f162`, `ops/moe.py:347-353` and `ops/activation.py:155-171`) and
+    SGLang (`sgl-project/sglang @ ec5e7ff5`, `ops/inkling2/moe.py:147-150` and `nvfp4.py:256-257`).
 - **Head:** BF16 stored `unembed.weight` × F32 projection and logits, F32 softcap `30.0`.
+
+## Measured SM120 MoE Row Curves
+
+Isolated SM120 (RTX PRO 6000, `capacity=4096`, `--graph --check --check-prefix-rows 16`, TP1) kernel
+row curves — strictly monotonic in `us/row`, zero `>10%` jumps, and `prefix_comparison.bitwise_equal=true`
+(`rows=16`, `differing_rows=0`, `max_abs_diff=0.0`) on every wide shape (`17..4096`):
+
+| rows | NVFP4 W4A4 (`bf16`) us | us/row | GB/s | TFLOPS | MXFP8 W8A8 (`wire`) us | us/row | GB/s | TFLOPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 40.96 | 40.960 | 874.8 | 3.1 | 55.30 | 55.296 | 1188.0 | 2.3 |
+| 8 | 172.03 | 21.504 | 1352.2 | 5.9 | 276.48 | 34.560 | 1542.5 | 3.7 |
+| 16 | 266.24 | 16.640 | 1419.5 | 7.7 | 440.32 | 27.520 | 1573.5 | 4.6 |
+| 17 | 264.16 | 15.539 | 1438.0 | 8.2 | 432.16 | 25.421 | 1611.5 | 5.0 |
+| 64 | 390.14 | 6.096 | 1452.3 | 20.9 | 656.42 | 10.256 | 1582.5 | 12.4 |
+| 256 | 413.70 | 1.616 | 1385.8 | 78.8 | 675.84 | 2.640 | 1555.2 | 48.3 |
+| 1024 | 494.59 | 0.483 | 1159.2 | 263.8 | 717.82 | 0.701 | 1464.2 | 181.7 |
+| 2048 | 751.62 | 0.367 | 762.8 | 347.1 | 978.98 | 0.478 | 1073.6 | 266.5 |
+| 2752 | 831.49 | 0.302 | 689.5 | 421.7 | 1183.71 | 0.430 | 887.9 | 296.2 |
+| 4096 | 1163.26 | 0.284 | 492.8 | 448.6 | 1626.14 | 0.397 | 646.4 | 320.9 |
 
 ## Checkpoints
 

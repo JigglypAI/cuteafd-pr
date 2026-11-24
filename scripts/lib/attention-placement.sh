@@ -31,7 +31,7 @@ release_check_attention_placement() {
     *:step5) release_die "Step-5 has no context/layers attention executor: SWA splits heads and CSA uses whole owners" ;;
     *:muse_spark) release_die "Muse has no context/layers attention executor: native attention splits heads" ;;
     *:inkling2) release_die "inkling2 supports heads attention only; context and layers are not implemented" ;;
-    *:inkling2_mini) release_die "inkling2_mini is TP1-only (heads); context and layers are not implemented" ;;
+    *:inkling2_mini) release_die "inkling2_mini attention placement is TP1-only (heads); context and layers are not implemented" ;;
     layers:hy4_flash) release_die "hy4_flash supports context (2-GPU default) or explicit heads attention; layers is not implemented" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|context:hy4_flash|layers:qwen4|layers:qwen3_5) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.

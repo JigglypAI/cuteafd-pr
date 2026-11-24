@@ -816,7 +816,9 @@ def test_v7_release_cards_match_live_and_retired_inventory():
         cards.add(identity)
     kept = {(e["family"], _effective(e, v6)["MODEL_ID"], len(e["gpus"]), len(e["sparks"]))
             for e in v6["entries"] if e["name"] not in V7_RETIREMENTS}
-    assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)}
+    assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)} | {
+        ("inkling2_mini", "thinkingmachines/Inkling-2-Mini", 1, 0),
+    }
     primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
                        for g in (1, 2) if row[f"{g}rtx"]["status"] != "na"}

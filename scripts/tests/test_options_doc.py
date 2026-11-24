@@ -32,6 +32,7 @@ FAMILIES = {
     "Step-5": "step5",
     "Muse": "muse_spark",
     "Inkling": "inkling2",
+    "Inkling Mini": "inkling2_mini",
     "Hy4-flash": "hy4_flash",
     "MiniMax": "minimax_m3",
 }
@@ -230,7 +231,7 @@ def test_tp2_dflash_default_table_matches_supported_families():
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
-    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "hy4_flash", "minimax_m3"}
+    bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "inkling2_mini", "hy4_flash", "minimax_m3"}
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
@@ -500,7 +501,7 @@ def test_embedding_value_support_and_expert_usage_adapters():
     text = DOC.read_text()
     section = text.split("Token embedding placement (`EMBEDDING`", 1)[1].split("Speculator", 1)[0]
     host = next(line for line in section.splitlines() if line.startswith("| `host` |"))
-    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 6
+    assert [cell.strip() for cell in host.split("|")[2:-1]] == ["✓"] * 7 + ["✗"] * 7
     assert {family for family in COLUMNS if MATRIX["EXPERT_USAGE"][family]} == {
         "V4.1", "V4", "GLM 5.3 / ML4", "MiMo", "Kimi K3", "Hy4-flash", "MiniMax"}
 
@@ -533,6 +534,7 @@ def test_muse_target_kv_precision_is_opt_in_and_draft_is_independent():
 def test_inkling_global_kv_precision_defaults_fp8_and_accepts_bf16():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     assert "KV_CACHE" in family_keys("inkling2")
+    assert "KV_CACHE" in family_keys("inkling2_mini")
     assert 'inkling_kv="$(get KV_CACHE fp8)"' in launcher
     assert 'family_args+=(--kv-cache "$inkling_kv")' in launcher
     assert 'plan_draft_args+=(--kv-cache "$inkling_kv")' in launcher
@@ -575,7 +577,7 @@ def test_every_family_accepts_the_shared_draft_policy_key():
         assert removed not in MATRIX and removed not in launcher
     assert all(MATRIX["DRAFT_POLICY"].values())
     for family in ("deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5",
-                   "muse_spark", "minimax_m3", "inkling2", "hy4_flash"):
+                   "muse_spark", "minimax_m3", "inkling2", "inkling2_mini", "hy4_flash"):
         assert "DRAFT_POLICY" in family_keys(family), family
 
 

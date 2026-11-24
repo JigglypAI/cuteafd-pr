@@ -182,6 +182,18 @@
       }
     },
     {
+      "family": "inkling2_mini",
+      "checkpoint": "thinkingmachines/Inkling-2-Mini",
+      "1rtx": {
+        "status": "pending",
+        "reason": "Pending Inkling 2 Mini 1x RTX qualification card (#2701)"
+      },
+      "2rtx": {
+        "status": "na",
+        "reason": "TP1 only (1x RTX, 0 Sparks)"
+      }
+    },
+    {
       "family": "hy4_flash",
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "1rtx": {
