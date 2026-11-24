@@ -127,13 +127,15 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
         }
         Ok(())
     };
-    for name in ["kimik3_kda_commit", "kimik3_kda_m64", "kimik3_kda_m4096",
-        "kda_commit_h96", "kda_fused_h96_m64", "kda_fused_h96_m4096", "kda_output_h96"] {
+    for name in ["kimik3_kda_commit", "kimik3_kda_commit_m128",
+        "kimik3_kda_m64", "kimik3_kda_m128", "kimik3_kda_m4096",
+        "kda_commit_h96", "kda_commit_h96_m128",
+        "kda_fused_h96_m64", "kda_fused_h96_m128", "kda_fused_h96_m4096", "kda_output_h96"] {
         add(name.into(), SequenceLocal)?;
     }
     for heads in [48, 96] {
         let suffix = if heads == 48 { "" } else { "_h96" };
-        for capacity in [64, 4096] {
+        for capacity in [64, 128, 4096] {
             add(format!("kimik3_mla_output{suffix}_m{capacity}"), SequenceLocal)?;
             add(format!("kda_core_h{heads}_m{capacity}"), SequenceLocal)?;
             add(format!("mla_query_h{heads}_m{capacity}"), SequenceLocal)?;
@@ -143,18 +145,18 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
                 for stride in [576, 640] {
                     add(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"), SequenceLocal)?;
                 }
-                for mode in if capacity == 64 { &["decode", "verify"][..] } else { &["extend"][..] } {
+                for mode in if capacity <= 128 { &["decode", "verify"][..] } else { &["extend"][..] } {
                     add(format!("kimik3_dense_mla_{mode}{suffix}{cache}_m{capacity}"), SequenceLocal)?;
                 }
             }
         }
     }
-    for name in ["kimik31_kda_commit", "kimik31_lse_combine2", "kimik31_dsa_candidate_merge"] {
+    for name in ["kimik31_kda_commit", "kimik31_kda_commit_m128", "kimik31_lse_combine2", "kimik31_dsa_candidate_merge"] {
         add(name.into(), SequenceLocal)?;
     }
-    for capacity in [64, 4096] {
+    for capacity in [64, 128, 4096] {
         for stem in ["kda", "index_producer"] { add(format!("kimik31_{stem}_m{capacity}"), SequenceLocal)?; }
-        let mode = if capacity == 64 { "decode" } else { "prefill" };
+        let mode = if capacity <= 128 { "decode" } else { "prefill" };
         for stem in ["index_topk", "scored_index_topk"] {
             add(format!("kimik31_{stem}_{mode}_m{capacity}"), SequenceLocal)?;
         }
@@ -188,9 +190,9 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
     add("kimik3_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
-        for head in [0, 48] { for tile in [8, 16] {
-            add(format!("kimik3_mla_partial{cache}_h{head}_t{tile}_m64"), SequenceLocal)?;
-        }}
+        for head in [0, 48] { for tile in [8, 16] { for cap in [64, 128] {
+            add(format!("kimik3_mla_partial{cache}_h{head}_t{tile}_m{cap}"), SequenceLocal)?;
+        }}}
     }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
@@ -262,7 +264,7 @@ fn packing_inventory_with_manifest<'a>(core: Option<&serde_json::Value>, native:
 
 fn packing_program(name: &str, core: bool) -> bool {
     name.starts_with("kimik3_") || name.starts_with("kimik31_") || name.starts_with("kda_fused_")
-        || matches!(name, "kda_commit_h96" | "kda_output_h96") || core && (name.starts_with("kda_core_")
+        || matches!(name, "kda_commit_h96" | "kda_commit_h96_m128" | "kda_output_h96") || core && (name.starts_with("kda_core_")
         || name.starts_with("mla_rank_norm_") || name.starts_with("mla_query_")
         || name.starts_with("mla_gate_output_") || name.starts_with("dense_trellis_k6_"))
 }
@@ -307,6 +309,7 @@ pub(crate) struct NativePrograms<'a> {
     pub(crate) packing_cap: usize,
     graph_core: cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat,
     ranks: usize,
+    decode_rows: usize,
     scratch: NativeScratch,
     wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
 }
@@ -315,6 +318,7 @@ impl NativePrograms<'_> {
     pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
         self.graph_core
     }
+    pub(crate) fn decode_rows(&self) -> usize { self.decode_rows }
 }
 
 pub(crate) struct MlaPrograms<'a> {
@@ -337,19 +341,20 @@ struct DsaPrograms<'a> {
 }
 
 impl<'a> DsaPrograms<'a> {
-    fn load(programs: &'a Programs<'a>, format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
+    fn load(programs: &'a Programs<'a>, format: cuteafd_core::MlaCacheFormat, decode_rows: usize) -> Result<Self> {
         use cuteafd_ffi::{KimiIndexMode, KimiIndexProducer, KimiIndexTopK, KimiSparseMla};
+        let decode_cap = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
         let pages = cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT.div_ceil(64);
-        let producer = [KimiIndexProducer::load(programs, 64)?, KimiIndexProducer::load(programs, 4096)?];
-        let selector = [KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, false)?,
+        let producer = [KimiIndexProducer::load(programs, decode_cap)?, KimiIndexProducer::load(programs, 4096)?];
+        let selector = [KimiIndexTopK::load(programs, decode_cap, pages, KimiIndexMode::Decode, false)?,
             KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, false)?];
-        let scored = [KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, true)?,
+        let scored = [KimiIndexTopK::load(programs, decode_cap, pages, KimiIndexMode::Decode, true)?,
             KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, true)?];
-        let diagnostic_decode = KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, true)?;
+        let diagnostic_decode = KimiIndexTopK::load(programs, decode_cap, pages, KimiIndexMode::Decode, true)?;
         diagnostic_decode.bind_admitted_pages(pages)?;
         let partial = [
-            [KimiSparseMla::load(programs, 96, 64, format, Some(0))?,
-             KimiSparseMla::load(programs, 96, 64, format, Some(48))?],
+            [KimiSparseMla::load(programs, 96, decode_cap, format, Some(0))?,
+             KimiSparseMla::load(programs, 96, decode_cap, format, Some(48))?],
             [KimiSparseMla::load(programs, 96, 4096, format, Some(0))?,
              KimiSparseMla::load(programs, 96, 4096, format, Some(48))?],
         ];
@@ -399,8 +404,17 @@ impl<'a> NativePrograms<'a> {
         ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
         inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize,
         native: &cuteafd_loader::placement::planner::native_attention::NativePrograms) -> Result<Self> {
+        Self::load_resolved_rows(device, cfg, programs, ffn_mode, cache_format, inventory, rows, ranks, native, 64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_resolved_rows(device: Device<'a>, cfg: &KimiK3Config, programs: &'a Programs<'a>,
+        ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
+        inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize,
+        native: &cuteafd_loader::placement::planner::native_attention::NativePrograms, decode_rows: usize) -> Result<Self> {
         use cuteafd_loader::placement::planner::native_attention::NativeResolution;
-        ensure!(matches!(ranks, 1 | 2), "Kimi native program physical rank count");
+        ensure!(matches!(ranks, 1 | 2) && (1..=128).contains(&decode_rows), "Kimi native program physical rank/decode count");
+        let decode_cap = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
         ensure!(native.resolution == NativeResolution::Exact, "Kimi live native programs require exact manifest resolution");
@@ -408,14 +422,14 @@ impl<'a> NativePrograms<'a> {
         device.run(|| {
             let heads = cfg.kda_heads / ranks;
             let load_kda = if cfg.dsa.is_some() { KimiKda::load_k31 } else { KimiKda::load_heads };
-            let kda = [load_kda(programs, 64, true, heads)?, load_kda(programs, 4096, false, heads)?];
-            let dsa = cfg.dsa.map(|_| DsaPrograms::load(programs, cache_format)).transpose()?;
+            let kda = [load_kda(programs, decode_cap, true, heads)?, load_kda(programs, 4096, false, heads)?];
+            let dsa = cfg.dsa.map(|_| DsaPrograms::load(programs, cache_format, decode_rows)).transpose()?;
             // Admission can select owned MLA or explicit head split. Resolve
             // both before its measured baseline, never lazily after admission.
             let load_mla = |heads| -> Result<MlaPrograms<'a>> {
                 Ok(MlaPrograms {
-                    decode: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Decode, cache_format)?,
-                    verify: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Verify, cache_format)?,
+                    decode: super::mla::Mla::load(cfg, programs, heads, decode_cap, KimiMlaMode::Decode, cache_format)?,
+                    verify: super::mla::Mla::load(cfg, programs, heads, decode_cap, KimiMlaMode::Verify, cache_format)?,
                     extend: super::mla::Mla::load(cfg, programs, heads, 4096, KimiMlaMode::Extend, cache_format)?,
                 })
             };
@@ -424,14 +438,14 @@ impl<'a> NativePrograms<'a> {
                 mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()])
                     .chain(dsa.iter().flat_map(|dsa| dsa.partial.iter().flatten()
                         .map(|partial| [0, partial.scratch_bytes(), 0]))))?;
-            let core = super::core_runtime::CorePrograms::load_for_ranks(programs, cfg, inventory, rows, cache_format, ranks)?;
+            let core = super::core_runtime::CorePrograms::load_for_ranks_rows(programs, cfg, inventory, rows, cache_format, ranks, decode_rows)?;
             ensure!(core.as_ref().map_or(0, |core| core.native_scratch) as u64 == native.fp8_scratch_bytes,
                 "Kimi runtime native scratch differs from exact shared manifest charge");
             Ok(Self { device, w8: W8::load_for_ranks(cfg, programs, ffn_mode, ranks)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
-                kda, commit: if cfg.dsa.is_some() { KimiKdaCommit::load_k31(programs, heads)? }
-                    else { KimiKdaCommit::load_heads(programs, heads)? }, mla, dsa, latent: KimiLatent::load(programs)?,
+                kda, commit: if cfg.dsa.is_some() { KimiKdaCommit::load_k31_rows(programs, heads, decode_cap)? }
+                    else { KimiKdaCommit::load_heads_rows(programs, heads, decode_cap)? }, mla, dsa, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, core, packing_cap, ranks, scratch,
+                add: device.library.bf16_add()?, core, packing_cap, ranks, decode_rows, scratch,
                 graph_core: cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(inventory),
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
@@ -454,8 +468,8 @@ impl<'a> NativePrograms<'a> {
         ensure!(rank < self.ranks, "Kimi lane rank outside physical owners");
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
-        let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
-            cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
+        let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks_with_decode_rows(
+            cfg, rows, unit, max_context, self.scratch, self.ranks, self.decode_rows)?, core: None };
         if let Some(dsa) = &self.dsa {
             layout.base = layout.base.with_sparse_mla_rows(attention_heads, dsa.row_chunk_size)?.with_dsa(cfg, dsa.scratch)?
                 .with_live_projection_rows(attention_heads, self.ranks)?;
@@ -774,6 +788,8 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
 
     pub(super) fn rows(&self) -> usize { self.lane.rows() }
+    pub(super) fn decode_rows(&self) -> usize { self.programs.decode_rows }
+    fn decode_cap(&self) -> usize { cuteafd_loader::families::kimi_k3::decode_capacity(self.programs.decode_rows) }
     pub(super) fn windowed(&self) -> bool { self.lane.window.is_some() }
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
     pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
@@ -830,9 +846,10 @@ impl<'a> LocalLane<'a> {
         self.attention = None;
         self.lane.metadata_bank = 0;
         self.check_page_pool(pool)?;
-        let mut metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
-            self.lane.layout.max_context, pool)?;
-        if self.cfg.dsa.is_some() { metadata.add_dsa(sequences, self.kda.slots(), self.lane.layout.max_context, pool)?; }
+        let limit = self.decode_rows();
+        let mut metadata = AttentionRows::new_with_limit(sequences, self.lane.layout.unit, self.kda.slots(),
+            self.lane.layout.max_context, limit, pool)?;
+        if self.cfg.dsa.is_some() { metadata.add_dsa_with_limit(sequences, self.kda.slots(), self.lane.layout.max_context, limit, pool)?; }
         self.upload_attention(&metadata)?;
         self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
         Ok(())
@@ -902,10 +919,11 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn packed_attention(&self, sequences: &[SequenceRows<'_>],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<AttentionRows>> {
         self.check_page_pool(pool)?;
-        let mut members = AttentionRows::packed(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), pool)?;
+        let limit = self.decode_rows();
+        let mut members = AttentionRows::packed_with_limit(sequences, self.lane.layout.unit, self.kda.slots(), self.max_context(), limit, pool)?;
         if self.cfg.dsa.is_some() {
             for (metadata, sequence) in members.iter_mut().zip(sequences) {
-                metadata.add_dsa(std::slice::from_ref(sequence), self.kda.slots(), self.max_context(), pool)?;
+                metadata.add_dsa_with_limit(std::slice::from_ref(sequence), self.kda.slots(), self.max_context(), limit, pool)?;
             }
         }
         Ok(members)
@@ -945,9 +963,10 @@ impl<'a> LocalLane<'a> {
                     && unit.rows.end <= sequence.rows, "Kimi attention unit metadata extent");
                 let member = [SequenceRows { slot: sequence.slot,
                     start: sequence.start + unit.rows.start, rows: unit.rows.len(), pages: sequence.pages }];
-                let mut metadata = AttentionRows::build(&member,
-                    local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, pool, pool.is_parity())?;
-                if local.cfg.dsa.is_some() { metadata.add_dsa(&member, local.kda.slots(), local.max_context(), pool)?; }
+                let limit = local.decode_rows();
+                let mut metadata = AttentionRows::build_with_limit(&member,
+                    local.lane.layout.unit, local.kda.slots(), local.lane.layout.max_context, limit, pool, pool.is_parity())?;
+                if local.cfg.dsa.is_some() { metadata.add_dsa_with_limit(&member, local.kda.slots(), local.max_context(), limit, pool)?; }
                 local.lane.metadata_bank = bank;
                 local.upload_attention(&metadata)?;
             }
@@ -990,7 +1009,7 @@ impl<'a> LocalLane<'a> {
             for &key in keys {
                 let super::graphs::Op::Attention { layer, .. } = key.op else { continue; };
                 if self.cfg.attention.get(layer) != Some(&KimiAttention::Kda) { continue; }
-                let metadata = super::state::startup_metadata(key.rows, 1, self.kda.slots())?;
+                let metadata = super::state::startup_metadata_with_limit(key.rows, 1, self.kda.slots(), self.decode_rows())?;
                 let stream = self.stream().clone();
                 let input = self.plane("normalized", key.rows, 7168)?;
                 stream.device.run(|| {
@@ -1166,7 +1185,7 @@ impl<'a> LocalLane<'a> {
     /// executor owns the meet/publication and recurrent-slot ordering.
     pub(crate) fn attention(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<CuteafdDeviceBuffer> {
         let shape = self.attention.ok_or_else(|| anyhow::anyhow!("Kimi attention metadata not staged"))?;
-        ensure!(shape.rows == rows && (!speculative || rows <= 64), "Kimi attention staged row shape/speculation");
+        ensure!(shape.rows == rows && (!speculative || rows <= self.decode_rows()), "Kimi attention staged row shape/speculation");
         let sequences = if self.cfg.attention[layer] == cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda {
             shape.sequences
         } else { 1 };
@@ -1193,18 +1212,20 @@ impl<'a> LocalLane<'a> {
             Some(cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda) => {
                 let [state, conv_state, replay] = self.kda.layer(layer, self.lane_index)?;
                 let weights = weights.kda()?;
+                let wide = rows > self.decode_rows();
                 let batch = cuteafd_ffi::KimiKdaBatch { rows, sequences, state_slots: self.kda.slots(),
                     speculative, input: self.plane("normalized", rows, 7168)?, state, conv_state,
                     slots: self.lane.buffer("KDA slots")?, first: self.lane.buffer("KDA first")?,
                     normalized: self.lane.buffer("KDA normalized")?, output,
-                    replay: (rows <= 64).then_some(replay), scratch: self.lane.buffer("KDA scratch")? };
-                device.run(|| { self.programs.kda[usize::from(rows > 64)].launch(weights, batch, self.lane.stream.raw)?; Ok(()) })?;
+                    replay: (!wide).then_some(replay), scratch: self.lane.buffer("KDA scratch")? };
+                device.run(|| { self.programs.kda[usize::from(wide)].launch(weights, batch, self.lane.stream.raw)?; Ok(()) })?;
             }
             Some(cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla) => {
                 let programs = &self.programs.mla[usize::from(weights.attention == crate::shared::placement::layers::AttentionShare::Whole)];
-                let program = if rows > 64 { &programs.extend } else if speculative { &programs.verify } else { &programs.decode };
+                let wide = rows > self.decode_rows();
+                let program = if wide { &programs.extend } else if speculative { &programs.verify } else { &programs.decode };
                 let weights = weights.mla()?;
-                let batch = cuteafd_ffi::KimiMlaBatch { rows, requests: if rows <= 64 { rows } else { 1 },
+                let batch = cuteafd_ffi::KimiMlaBatch { rows, requests: if !wide { rows } else { 1 },
                     page_table_width: self.lane.layout.max_context.div_ceil(64), cache_pages: self.mla.pages(),
                     active_splits: program.splits(), x: self.plane("normalized", rows, 7168)?,
                     slots: self.lane.buffer("MLA slots")?, cache: self.mla.layer(layer)?,
@@ -1237,7 +1258,7 @@ impl<'a> LocalLane<'a> {
     }
 
     fn context_batch(&self, layer: usize, rows: usize, speculative: bool) -> Result<cuteafd_ffi::KimiMlaBatch> {
-        ensure!((1..=64).contains(&rows), "Kimi context decode batch rows");
+        ensure!((1..=self.decode_rows()).contains(&rows), "Kimi context decode batch rows");
         let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
         let bank = self.lane.metadata_bank;
         Ok(cuteafd_ffi::KimiMlaBatch { rows, requests: rows, page_table_width: owner.compact_width(),
@@ -1298,7 +1319,7 @@ impl<'a> LocalLane<'a> {
         let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
         let weights = self.layer(layer)?.indexer()?;
         let stream = self.stream();
-        stream.device.run(|| Ok(dsa.producer[usize::from(batch.rows > 64)].launch(weights, cuteafd_ffi::KimiIndexBatch {
+        stream.device.run(|| Ok(dsa.producer[usize::from(batch.rows > self.decode_rows())].launch(weights, cuteafd_ffi::KimiIndexBatch {
             rows: batch.rows, cache_pages: self.mla.local_pages(), x: batch.x, q_resid: batch.q_resid,
             positions: self.lane.buffer("DSA positions")?, slots: owner.metadata("context slots", self.lane.metadata_bank)?,
             cos_sin: weights.norm, cache: self.mla.index(layer)?, query_fp8: self.lane.buffer("DSA query")?,
@@ -1638,7 +1659,7 @@ impl<'a> LocalLane<'a> {
     fn mla_program(&self, layer: usize, rows: usize, speculative: bool) -> Result<&super::mla::Mla<'a>> {
         let programs = &self.programs.mla[usize::from(self.layer(layer)?.attention
             == crate::shared::placement::layers::AttentionShare::Whole)];
-        Ok(if rows > 64 { &programs.extend } else if speculative { &programs.verify } else { &programs.decode })
+        Ok(if rows > self.decode_rows() { &programs.extend } else if speculative { &programs.verify } else { &programs.decode })
     }
 
     fn mla_produce(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
@@ -1658,7 +1679,7 @@ impl<'a> LocalLane<'a> {
         let stride = if let Some(kv) = weights.native.get("mla.kv_a") { kv.layout.shape[0] }
             else { weights.core("mla.kv_a")?.shape[0] };
         self.programs.core.as_ref().context("Kimi compact programs not resolved")?.mla
-            .get(&(heads, stride, if rows > 64 { 4096 } else { 64 })).context("Kimi MLA split shape not resolved")
+            .get(&(heads, stride, if rows > self.decode_rows() { 4096 } else { self.decode_cap() })).context("Kimi MLA split shape not resolved")
     }
 
     fn mla_projected_produce(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
@@ -1698,7 +1719,7 @@ impl<'a> LocalLane<'a> {
     fn dsa_selected(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch,
         speculative: bool) -> Result<()> {
         let programs = self.programs.dsa.as_ref().context("Kimi DSA programs not resolved")?;
-        let unit = usize::from(batch.rows > 64);
+        let unit = usize::from(batch.rows > self.decode_rows());
         let cache = self.mla.index(layer)?;
         let query = self.lane.buffer("DSA query")?;
         let head_weights = self.lane.buffer("DSA head weights")?;
@@ -1760,12 +1781,12 @@ impl<'a> LocalLane<'a> {
         super::dsa_dump::record_selected(self.dsa_dump.as_deref(), self.rank, stream, layer, batch.rows, || {
             Ok((self.lane.buffer("DSA positions")?, self.lane.buffer("DSA selected lengths")?, indices))
         })?;
-        if self.rank == 0 && batch.rows <= 64 {
+        if self.rank == 0 && batch.rows <= self.decode_rows() {
             self.dump_selection(layer, batch.rows, indices, table_width)?;
         }
         if let Some(dump) = scores_dump {
             super::score_dump::record_scores(dump, self.rank, stream, layer, batch.rows, table_width,
-                batch.rows <= 64, || Ok(super::score_dump::ScoreBuffers {
+                batch.rows <= self.decode_rows(), || Ok(super::score_dump::ScoreBuffers {
                     positions: self.lane.buffer("DSA positions")?,
                     lengths: self.lane.buffer("DSA selected lengths")?,
                     frontiers: self.lane.buffer("DSA lengths")?,
@@ -1785,7 +1806,7 @@ impl<'a> LocalLane<'a> {
         // the lane retains, with no writer aliased.
         if let Some(dump) = self.dsa_keys.as_deref().filter(|dump| dump.enabled(layer)) {
             super::key_dump::record_keys(dump, self.rank, stream, layer, batch.rows, table_width,
-                batch.rows <= 64, self.mla.pages(), || Ok(super::key_dump::KeyBuffers {
+                batch.rows <= self.decode_rows(), self.mla.pages(), || Ok(super::key_dump::KeyBuffers {
                     positions: self.lane.buffer("DSA positions")?,
                     table: self.lane.buffer("DSA page table")?,
                     cache,
@@ -1909,7 +1930,7 @@ impl<'a> LocalLane<'a> {
                     let core_weights=KimiKdaCoreWeights{fab:weights.buffer("kda.fab")?,forget:weights.buffer("kda.forget")?,
                         convolution:weights.buffer("kda.conv")?,a_log:weights.buffer("kda.a_log")?,
                         dt_bias:weights.buffer("kda.dt_bias")?,norm:weights.buffer("kda.norm")?};
-                    let recurrence = &programs.kda[usize::from(rows > 64)];
+                    let recurrence = &programs.kda[usize::from(rows > self.decode_rows())];
                     if weights.native.contains_key("kda.q") {
                         for (name, output) in [("kda.q", batch.q), ("kda.k", batch.k),
                             ("kda.v", batch.v), ("kda.gate", batch.gate)] {
@@ -1928,8 +1949,9 @@ impl<'a> LocalLane<'a> {
                 KimiAttention::Mla=> {
                     let whole=weights.attention==crate::shared::placement::layers::AttentionShare::Whole;
                     let legacy=&self.programs.mla[usize::from(whole)];
-                    let attention=if rows>64 {&legacy.extend}else if speculative {&legacy.verify}else{&legacy.decode};
-                    let batch=cuteafd_ffi::KimiMlaBatch{rows,requests:if rows<=64 {rows}else{1},
+                    let wide=rows>self.decode_rows();
+                    let attention=if wide {&legacy.extend}else if speculative {&legacy.verify}else{&legacy.decode};
+                    let batch=cuteafd_ffi::KimiMlaBatch{rows,requests:if !wide {rows}else{1},
                         page_table_width:self.lane.layout.max_context.div_ceil(64),cache_pages:self.mla.pages(),
                         active_splits:attention.splits(),x:input,slots:self.lane.buffer("MLA slots")?,cache:self.mla.layer(layer)?,
                         page_table:self.lane.buffer("MLA page table")?,lengths:self.lane.buffer("MLA lengths")?,
@@ -2279,15 +2301,20 @@ struct DsaRows {
 
 impl DsaRows {
     fn build(sequences: &[SequenceRows<'_>], rows: usize, width: usize) -> Result<Self> {
+        Self::build_with_limit(sequences, rows, width, 64)
+    }
+
+    fn build_with_limit(sequences: &[SequenceRows<'_>], rows: usize, width: usize, decode_limit: usize) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && (1..=16384).contains(&width)
-            && !sequences.is_empty() && (rows <= 64 || sequences.len() == 1), "Kimi index metadata geometry");
+            && (1..=128).contains(&decode_limit)
+            && !sequences.is_empty() && (rows <= decode_limit || sequences.len() == 1), "Kimi index metadata geometry");
         for sequence in sequences {
             let end = sequence.start.checked_add(sequence.rows).context("Kimi index position overflow")?;
             ensure!(sequence.rows > 0 && end <= width * 64 && sequence.pages.len() >= end.div_ceil(64),
                 "Kimi index metadata context/pages too short");
         }
         let mut metadata = Self { positions: Vec::with_capacity(rows * 8), slots: Vec::with_capacity(rows * 8),
-            table: vec![0; if rows <= 64 { rows * width * 4 } else { width * 4 }],
+            table: vec![0; if rows <= decode_limit { rows * width * 4 } else { width * 4 }],
             lengths: Vec::with_capacity(rows * 4), offsets: Vec::with_capacity((rows + 1) * 4),
             selected_lengths: Vec::with_capacity(rows * 4) };
         metadata.offsets.extend_from_slice(&0i32.to_le_bytes());
@@ -2303,8 +2330,8 @@ impl DsaRows {
                 metadata.lengths.extend_from_slice(&((position + 1) as i32).to_le_bytes());
                 metadata.selected_lengths.extend_from_slice(&((position + 1).min(2048) as i32).to_le_bytes());
                 metadata.offsets.extend_from_slice(&((row + 1) as i32).to_le_bytes());
-                if rows <= 64 || row == 0 {
-                    let base = if rows <= 64 { row * width * 4 } else { 0 };
+                if rows <= decode_limit || row == 0 {
+                    let base = if rows <= decode_limit { row * width * 4 } else { 0 };
                     for (column, page) in sequence.pages[..end.div_ceil(64)].iter().enumerate() {
                         let at = base + column * 4;
                         metadata.table[at..at + 4].copy_from_slice(&page.to_le_bytes());
@@ -2313,7 +2340,7 @@ impl DsaRows {
                 row += 1;
             }
         }
-        ensure!(row == rows && (rows <= 64 || sequences.len() == 1), "Kimi index metadata row geometry");
+        ensure!(row == rows && (rows <= decode_limit || sequences.len() == 1), "Kimi index metadata row geometry");
         Ok(metadata)
     }
 
@@ -2348,12 +2375,17 @@ impl ContextRows {
 /// descriptor may compact addresses only after page ownership and COW checks.
 pub(crate) fn validate_sequence_pages(sequences: &[SequenceRows<'_>], capacity: usize,
     slots: usize, max_context: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<usize> {
-    ensure!((1..=4096).contains(&capacity) && slots > 0 && (1..=1_048_576).contains(&max_context)
+    validate_sequence_pages_with_limit(sequences, capacity, slots, max_context, 64, pool)
+}
+
+pub(crate) fn validate_sequence_pages_with_limit(sequences: &[SequenceRows<'_>], capacity: usize,
+    slots: usize, max_context: usize, decode_limit: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<usize> {
+    ensure!((1..=4096).contains(&capacity) && (1..=128).contains(&decode_limit) && slots > 0 && (1..=1_048_576).contains(&max_context)
         && pool.page_rows() == 64, "Kimi row descriptor capacity/pages");
     ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi row descriptor sequence count");
     let rows = sequences.iter().try_fold(0usize, |n, sequence|
         n.checked_add(sequence.rows).context("Kimi row descriptor overflow"))?;
-    ensure!(rows > 0 && rows <= capacity && (rows <= 64 || sequences.len() == 1),
+    ensure!(rows > 0 && rows <= capacity && (rows <= decode_limit || sequences.len() == 1),
         "Kimi wide prefill requires one sequence and admitted rows");
     let reserved = pool.reserved() * if pool.is_parity() { 2 } else { 1 };
     let limit = pool.capacity().checked_add(reserved).context("Kimi pool extent overflow")?;
@@ -2383,9 +2415,9 @@ pub(crate) fn validate_sequence_pages(sequences: &[SequenceRows<'_>], capacity: 
 }
 
 impl AttentionRows {
-    fn add_dsa(&mut self, sequences: &[SequenceRows<'_>], slots: usize, extent: usize,
-        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
-        self.dsa = Some(DsaRows::build(sequences, self.rows, self.width)?);
+    fn add_dsa_with_limit(&mut self, sequences: &[SequenceRows<'_>], slots: usize, extent: usize,
+        decode_limit: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<()> {
+        self.dsa = Some(DsaRows::build_with_limit(sequences, self.rows, self.width, decode_limit)?);
         if let Some(context) = self.context.as_mut().filter(|context| context.gathered.is_some()) {
             context.decode = Some([
                 super::context::DecodeRows::gathered(0, sequences, extent, slots, pool)?,
@@ -2394,8 +2426,14 @@ impl AttentionRows {
         Ok(())
     }
 
+    #[cfg(test)]
     fn packed(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<Self>> {
+        Self::packed_with_limit(sequences, capacity, slots, max_context, 64, pool)
+    }
+
+    fn packed_with_limit(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        decode_limit: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<Self>> {
         ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi packed member count");
         let mut used = std::collections::BTreeSet::new();
         let mut pages = BTreeMap::<u32, bool>::new();
@@ -2405,7 +2443,7 @@ impl AttentionRows {
             ensure!(used.insert(sequence.slot), "Kimi packed recurrent slot repeats");
             total = total.checked_add(sequence.rows).context("Kimi packed rows overflow")?;
             ensure!(total <= capacity, "Kimi packed rows exceed admitted unit");
-            let metadata = Self::build(std::slice::from_ref(sequence), capacity, slots, max_context, pool, pool.is_parity())?;
+            let metadata = Self::build_with_limit(std::slice::from_ref(sequence), capacity, slots, max_context, decode_limit, pool, pool.is_parity())?;
             for (index, &page) in sequence.pages[..(sequence.start + sequence.rows).div_ceil(64)].iter().enumerate() {
                 let writable = index >= sequence.start / 64;
                 if let Some(previous) = pages.insert(page, writable) {
@@ -2417,20 +2455,32 @@ impl AttentionRows {
         Ok(members)
     }
 
+    #[cfg(test)]
     fn new(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
-        ensure!((1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots)
-            && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
-        Self::build(sequences, capacity, slots, max_context, pool, false)
+        Self::new_with_limit(sequences, capacity, slots, max_context, 64, pool)
     }
 
+    fn new_with_limit(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        decode_limit: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
+        ensure!((1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots)
+            && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
+        Self::build_with_limit(sequences, capacity, slots, max_context, decode_limit, pool, false)
+    }
+
+    #[cfg(test)]
     fn build(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool, gathered: bool) -> Result<Self> {
+        Self::build_with_limit(sequences, capacity, slots, max_context, 64, pool, gathered)
+    }
+
+    fn build_with_limit(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
+        decode_limit: usize, pool: &cuteafd_engine::prefix::RefPagePool, gathered: bool) -> Result<Self> {
         ensure!(pool.page_rows() == 64 && (!gathered || pool.is_parity()), "Kimi row ownership mode differs");
-        let rows = validate_sequence_pages(sequences, capacity, slots, max_context, pool)?;
-        let gathered = pool.is_parity() && (gathered || rows > 64);
+        let rows = validate_sequence_pages_with_limit(sequences, capacity, slots, max_context, decode_limit, pool)?;
+        let gathered = pool.is_parity() && (gathered || rows > decode_limit);
         ensure!(!gathered || sequences.len() == 1, "Kimi gathered prefill isolates one member");
-        let per_query = rows <= 64 && !gathered;
+        let per_query = rows <= decode_limit && !gathered;
         let width = max_context.div_ceil(64);
         let requests = if per_query { rows } else { 1 };
         let commit_limit = capacity.div_ceil(64) + 1;
@@ -2443,8 +2493,8 @@ impl AttentionRows {
                 geometry.unit(1, sequence.pages, sequence.start, sequence.start, rows, commit_limit)?];
             Some(ContextRows { decode: None, gathered: Some(units), commit_limit })
         } else {
-            Some(ContextRows { decode: Some([super::context::DecodeRows::new(0, sequences, max_context, slots, pool)?,
-                super::context::DecodeRows::new(1, sequences, max_context, slots, pool)?]), gathered: None, commit_limit })
+            Some(ContextRows { decode: Some([super::context::DecodeRows::with_decode_limit(0, sequences, max_context, slots, pool, decode_limit)?,
+                super::context::DecodeRows::with_decode_limit(1, sequences, max_context, slots, pool, decode_limit)?]), gathered: None, commit_limit })
         };
         let mut metadata = Self { rows, sequences: sequences.len(), width,
             kda_slots: Vec::with_capacity(rows * 4), kda_first: Vec::with_capacity(rows * 4),
@@ -2510,6 +2560,7 @@ pub(crate) struct IoLayout {
     rank: usize,
     ranks: usize,
     rows: usize,
+    decode_rows: usize,
     hidden: usize,
     vocab: usize,
     core_head: bool,
@@ -2522,11 +2573,17 @@ impl IoLayout {
 
     pub(crate) fn for_ranks(cfg: &KimiK3Config, rank: usize, rows: usize,
         core: &cuteafd_loader::families::kimi_k3::core::CoreInventory, ranks: usize) -> Result<Self> {
+        Self::for_ranks_rows(cfg, rank, rows, core, ranks, 64)
+    }
+
+    pub(crate) fn for_ranks_rows(cfg: &KimiK3Config, rank: usize, rows: usize,
+        core: &cuteafd_loader::families::kimi_k3::core::CoreInventory, ranks: usize, decode_rows: usize) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.vocab_size == 163840, "Kimi native IO hidden/vocabulary geometry");
         ensure!(matches!(ranks, 1 | 2) && rank < ranks
-            && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
+            && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows)
+            && (1..=128).contains(&decode_rows),
             "Kimi IO rank/row geometry");
-        Ok(Self { rank, ranks, rows, hidden: cfg.hidden, vocab: cfg.vocab_size,
+        Ok(Self { rank, ranks, rows, decode_rows, hidden: cfg.hidden, vocab: cfg.vocab_size,
             core_head: rank == ranks - 1 && core.compact_head() })
     }
 
@@ -2536,7 +2593,7 @@ impl IoLayout {
     }
 
     fn logit_rows(&self) -> usize {
-        self.rows.min(64)
+        self.rows.min(self.decode_rows)
     }
 
     fn extents(&self) -> [usize; 3] {
@@ -3467,7 +3524,7 @@ mod tests {
             operands: BTreeMap::from([("delta", Allocation::new(device, 16, crate::shared::memory::TEST)?)]),
             arena: Some(Allocation::new(device, 32, crate::shared::memory::TEST)?),
             layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
-                rows: 1, unit: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
+                rows: 1, unit: 1, decode_rows: 64, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
                 arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, metadata_bank: 0, core: None };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
@@ -3504,7 +3561,7 @@ mod tests {
             device, &layout[0], packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream::new(device)?);
-        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false }
+        let io = IoLayout { rank: 0, ranks: 2, rows: 16, decode_rows: 64, hidden: 4, vocab: 8, core_head:false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
         drop(stream);

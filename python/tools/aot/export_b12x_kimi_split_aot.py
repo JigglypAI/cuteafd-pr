@@ -59,6 +59,36 @@ def programs():
             for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
                                    ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
                 result.append((f"kimik31_{name}_h{heads}_m{rows}", partial(compiler, mg, max_rows=rows), rows))
+    # Additive 128-row decode/verify stems appended after existing m64/m4096 exports.
+    wide = 128
+    for heads in (48, 96):
+        kg = KDAGeometry(hidden=7168, kda_heads=heads)
+        mg = KimiMlaGeometry(heads=heads)
+        if heads == 96:
+            result.append((f"kda_commit_h96_m{wide}",
+                           partial(compile_glmf_kda_commit_aot, kg, replay_rows=wide), wide))
+            result.append((f"kda_fused_h96_m{wide}", partial(compile_glmf_kda_aot,
+                           kg, max_rows=wide, output_kind="norm", decode=True), wide))
+        result.append((f"kda_core_h{heads}_m{wide}",
+                       partial(compile_kimi_kda_core_aot, kg, max_rows=wide, decode=True), wide))
+        for cache, cache_suffix in (("bf16", ""), ("fp8", "_fp8")):
+            cg = KimiMlaGeometry(heads=heads, kv_cache=cache)
+            for stride in (576, 640):
+                result.append((f"mla_rank_norm_h{heads}_kv{stride}{cache_suffix}_m{wide}",
+                    partial(compile_kimi_mla_rank_norm_aot, cg, max_rows=wide, kv_stride=stride), wide))
+        for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
+                               ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
+            result.append((f"{name}_h{heads}_m{wide}", partial(compiler, mg, max_rows=wide), wide))
+    for heads in (48, 96):
+        mg = KimiMlaGeometry(heads=heads, norm_eps=1e-5)
+        for cache, suffix in (("bf16", ""), ("fp8", "_fp8")):
+            cg = KimiMlaGeometry(heads=heads, kv_cache=cache, norm_eps=1e-5)
+            for stride in (576, 640):
+                result.append((f"kimik31_mla_rank_norm_h{heads}_kv{stride}{suffix}_m{wide}",
+                    partial(compile_kimi_mla_rank_norm_aot, cg, max_rows=wide, kv_stride=stride), wide))
+        for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
+                               ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
+            result.append((f"kimik31_{name}_h{heads}_m{wide}", partial(compiler, mg, max_rows=wide), wide))
     return result
 
 

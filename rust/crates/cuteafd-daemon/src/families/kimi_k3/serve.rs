@@ -60,6 +60,9 @@ pub(crate) struct ServeArgs {
     /// Pack already queued prompts, or run unknown arithmetic routes alone in exact mode.
     #[arg(long, value_enum, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
+    /// Maximum decode/verify batch rows admitted for this launch (`auto`, `64`, or `128`).
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
@@ -84,6 +87,21 @@ impl ServeArgs {
         Ok(plan)
     }
 
+    fn resolved_decode_rows(&self) -> Result<usize> {
+        let gpus = 1 + usize::from(self.split_device.is_some());
+        let rows = cuteafd_loader::plan::resolve_decode_rows(
+            "kimi_k3",
+            cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+                requested: self.decode_rows.as_option(),
+                concurrency: u64::from(self.max_sequences),
+                decode_lanes: 1,
+                rtx_gpus: gpus,
+                draft_length: self.draft_length.draft_length.map(|n| n as u32),
+            },
+        )?;
+        Ok(usize::try_from(rows)?)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(!self.tp2_dflash || (self.draft.is_some() && self.split_device.is_some()),
             "Kimi TP2 DFlash requires a drafter and two coordinator devices");
@@ -94,6 +112,7 @@ impl ServeArgs {
         ensure!(self.max_context.is_none_or(|context| context == 0 || (1..=COMPILED_CONTEXT).contains(&context)),
             "Kimi context exceeds the compiled 1M extent");
         self.prefill()?;
+        self.resolved_decode_rows()?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -130,7 +149,8 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0),
         // A selection dump reads back inside the step: serve without startup graphs.
         graphs: crate::shared::selection_dump::shared("kimi_k3")?.is_none(),
-        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
+        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
+        decode_rows: args.resolved_decode_rows()?, prefix: Some(&args.prefix),
         #[cfg(test)] prove_serve_admission: false,
     })
 }
@@ -436,6 +456,11 @@ mod tests {
         assert!(args(&["--max-sequences", "129"]).is_err());
         assert!(cuteafd_core::concurrency::validate("kimi_k3", 65).is_err());
         assert!(args(&["--speculator", "mtp"]).is_err());
+        assert_eq!(args(&["--peers", peers])?.resolved_decode_rows()?, 64);
+        assert_eq!(args(&["--peers", peers, "--decode-rows", "auto"])?.resolved_decode_rows()?, 64);
+        assert_eq!(args(&["--peers", peers, "--decode-rows", "128"])?.resolved_decode_rows()?, 128);
+        assert_eq!(args(&["--peers", peers, "--split-device", "1", "--decode-rows", "128"])?.resolved_decode_rows()?, 128);
+        assert!(args(&["--peers", peers, "--decode-rows", "129"])?.validate().is_err());
         Ok(())
     }
 }

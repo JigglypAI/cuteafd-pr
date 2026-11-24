@@ -43,6 +43,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     report.tp2_dflash = Some(opts.tp2_dflash);
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
+    let decode_rows = opts.decode_rows as usize;
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
         "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
@@ -109,16 +110,16 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let context_layout = if context_split {
         let layout = (|| -> anyhow::Result<_> {
             let manifest = manifest.as_ref().context("Kimi context requires PROGRAMS.json")?;
-            let banks = if rows <= 64 { 1 } else { rows.div_ceil(unit) };
-            crate::families::kimi_k3::context::ContextLayout::from_manifest_for_config(manifest, opts.mla_kv,
-                context as usize, unit, banks, &cfg)
+            let banks = if rows <= decode_rows { 1 } else { rows.div_ceil(unit) };
+            crate::families::kimi_k3::context::ContextLayout::from_manifest_for_config_rows(manifest, opts.mla_kv,
+                context as usize, unit, banks, &cfg, decode_rows)
         })();
         match layout {
             Ok(layout) => Some(layout),
             Err(error) => {
                 report.refuse_placement(format!("Kimi context program admission refused: {error:#}"),
                     &format!("Install PROGRAMS.json with {}.",
-                        crate::families::kimi_k3::context::program_names_for_config(opts.mla_kv, &cfg).join(", ")));
+                        crate::families::kimi_k3::context::program_names_for_config_rows(opts.mla_kv, &cfg, decode_rows).join(", ")));
                 return memory;
             }
         }
@@ -183,14 +184,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             }).transpose()?.unwrap_or(0);
             let attention_heads = if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context)
                 && gpus == 2 { 48 } else { 96 };
-            let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
+            let mut demands = allocation::baseline_demands_for_ranks_rows(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads)?;
-            let mut lane = allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, context as usize,
-                allocation::NativeScratch::from_manifest_for_config(manifest, cfg, gpus)?, gpus)?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads, decode_rows)?;
+            let mut lane = allocation::NativeLaneLayout::for_ranks_with_decode_rows(cfg, rows, unit, context as usize,
+                allocation::NativeScratch::from_manifest_for_config_rows(manifest, cfg, gpus, decode_rows)?, gpus, decode_rows)?;
             if cfg.dsa.is_some() {
-                lane = lane.with_sparse_mla_rows(attention_heads, allocation::sparse_mla_chunk(manifest)?)?.with_dsa(cfg,
-                    allocation::DsaScratch::from_manifest(manifest)?)?
+                lane = lane.with_sparse_mla_rows(attention_heads, allocation::sparse_mla_chunk_rows(manifest, decode_rows)?)?.with_dsa(cfg,
+                    allocation::DsaScratch::from_manifest_rows(manifest, decode_rows)?)?
                     .with_live_projection_rows(attention_heads, gpus)?;
             }
             demands.retain(|d| d.group != "Kimi lane 0 native operands");
@@ -217,8 +218,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             }
             if model.core.has_split_core() {
                 // The baseline already includes the full peer receive allocation.
-                let charges = core::CoreCharges::from_package_with_native(cfg, &model.core, rows, unit,
-                    manifest, &native_manifest, gpus)?;
+                let charges = core::CoreCharges::from_package_with_native_rows(cfg, &model.core, rows, unit,
+                    manifest, &native_manifest, gpus, decode_rows)?;
                 let mut stages = model.core.split_stages(core::package_lane_extents_with_base(manifest, cfg, rows, unit, gpus, &lane)?,
                     unit, gpus, cfg.dense_intermediate);
                 stages.extend(model.core.native_stages_from_manifest(&native_manifest, rows, unit, gpus)?);
@@ -265,7 +266,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let mut spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
-            crate::families::kimi_k3::spark::reserve_bytes(ranks, admitted.waves, admitted.unit_rows)?)?;
+            crate::families::kimi_k3::spark::reserve_bytes_for_rows(ranks, admitted.waves, admitted.unit_rows, decode_rows as u64)?)?;
         spark.rank_budgets = opts.spark_capacities(ranks);
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
@@ -593,7 +594,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => { report.refuse_placement(format!("Kimi host prefix refused: {error:#}"), "Disable host retention or supply a supported quota."); return memory; }
     };
     recipe.owners.push(kimi::host_prefix_owner(host_quota, maximum_pages));
-    let scoring_bytes = match kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size) {
+    let scoring_bytes = match kimi::host_scoring_bytes(rows.min(decode_rows), rows, cfg.vocab_size) {
         Ok(bytes) => bytes,
         Err(error) => { report.refuse_placement(error.to_string(), "Use supported scoring dimensions."); return memory; }
     };
@@ -706,7 +707,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             unit as u32, false, rings, 0) {
             report.refuse_placement(format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
-        if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves) {
+        if let Err(error) = kimi_owners(&mut device, &working, admitted.unit_rows, admitted.waves, decode_rows as u64) {
             report.refuse_placement(format!("Kimi Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
         device.items.extend(vision_items[rank].clone());
@@ -746,8 +747,8 @@ mod program_tests {
 }
 
 /// Kimi's typed owners, the same sum its pre-placement reserve charges.
-fn kimi_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
+fn kimi_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64, decode_rows: u64) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
     crate::families::kimi_k3::spark::charge(device, working.spark_ranks,
-        &crate::families::kimi_k3::spark_executions(waves, unit_rows)?)
+        &crate::families::kimi_k3::spark_executions_for_rows(waves, unit_rows, decode_rows)?)
 }

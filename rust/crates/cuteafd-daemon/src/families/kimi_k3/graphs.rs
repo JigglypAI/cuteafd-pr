@@ -60,7 +60,7 @@ pub(crate) fn replay_allowed(op: Op, optional: bool, window: bool) -> Result<boo
 
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
     graph_demand as demand};
-use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
+use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows, verify_graph_rows_limit};
 
 fn geometry(op: Op) -> KimiPrewarmOp {
     match op {
@@ -80,11 +80,16 @@ pub(crate) fn pinned(core: KimiCoreFormat, ranks: usize, key: Key) -> bool {
 
 /// Project observed trace geometries onto the placement's actual sites. No new
 /// prefill/window keys are invented. Sequence layout lives in device metadata.
-pub(crate) fn prewarm_keys(_cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
-    _slots: usize, capacity: usize) -> Vec<Key> {
+pub(crate) fn prewarm_keys(cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
+    slots: usize, capacity: usize) -> Vec<Key> {
+    prewarm_keys_with_limit(cfg, inventory, layout, slots, capacity, 64)
+}
+
+pub(crate) fn prewarm_keys_with_limit(_cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
+    _slots: usize, capacity: usize, decode_rows: usize) -> Vec<Key> {
     let mut keys = std::collections::HashSet::new();
     for entry in &layout.entries {
-        if !(1..=64.min(capacity)).contains(&entry.rows) { continue }
+        if !(1..=decode_rows.min(capacity)).contains(&entry.rows) { continue }
         for &template in inventory {
             if entry.op.is_none() {
                 if prewarm_selected(layout, template, false) { keys.insert(template); }
@@ -189,7 +194,7 @@ pub(crate) fn inventory_with_context(cfg: &KimiK3Config, lanes: usize, capacity:
                 for rows in decode.graph_rows(verify, slots, capacity) {
                     for layer in (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)) {
                         for speculative in [false, true] {
-                            if if speculative { verify_graph_rows(verify, slots, capacity).contains(&rows) }
+                            if if speculative { verify_graph_rows_limit(verify, slots, capacity, decode.max_rows()).contains(&rows) }
                                 else { decode.plain().contains(&rows) } {
                                 keys.push(Key { lane, rank, rows, op: Op::Context { layer, speculative } });
                             }
@@ -229,7 +234,7 @@ pub(crate) fn check_placement_for_ranks(cfg: &KimiK3Config, placement: &cuteafd_
         if let Op::Context { layer, speculative } = key.op {
             ensure!(ranks == 2 && cfg.attention.get(layer) == Some(&KimiAttention::Mla)
                 && placement.layers.get(layer).is_some_and(|a| a.mode == LayerMode::ContextSplit)
-                && (1..=64).contains(&key.rows) && (!speculative || key.rows >= 2),
+                && (1..=128).contains(&key.rows) && (!speculative || key.rows >= 2),
                 "Kimi context graph differs from accepted placement");
         }
         if let Op::Attention { layer, .. } = key.op {

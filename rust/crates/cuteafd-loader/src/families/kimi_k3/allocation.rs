@@ -43,6 +43,8 @@ pub struct NativeLaneLayout {
     /// Unit rows: hook-local scratch (the phase arena and K6 stages)
     /// serves one unit's kernel launch at a time.
     pub unit: usize,
+    /// Resolved per-lane decode/verify row budget (64 by default; up to 128).
+    pub decode_rows: usize,
     pub max_context: usize,
     pub operands: BTreeMap<&'static str, usize>,
     pub arena_offsets: BTreeMap<&'static str, usize>,
@@ -94,11 +96,16 @@ pub struct DsaScratch {
 
 impl DsaScratch {
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        Self::from_manifest_rows(manifest, 64)
+    }
+
+    pub fn from_manifest_rows(manifest: &serde_json::Value, decode_rows: usize) -> Result<Self> {
+        let decode_cap = super::decode_capacity(decode_rows);
         let mut required = Self { producer: 0, selector: 0 };
-        for rows in [64, 4096] {
+        for rows in [decode_cap, 4096] {
             required.producer = required.producer.max(program_scratch(manifest,
                 &format!("kimik31_index_producer_m{rows}"), rows)?);
-            let mode = if rows == 64 { "decode" } else { "prefill" };
+            let mode = if rows == decode_cap { "decode" } else { "prefill" };
             for stem in ["index_topk", "scored_index_topk"] {
                 required.selector = required.selector.max(program_scratch(manifest,
                     &format!("kimik31_{stem}_{mode}_m{rows}"), rows)?);
@@ -111,9 +118,14 @@ impl DsaScratch {
 
 /// Read the K3.1 compiled descriptor and validate every sparse specialization.
 pub fn sparse_mla_chunk(manifest: &serde_json::Value) -> Result<usize> {
+    sparse_mla_chunk_rows(manifest, 64)
+}
+
+pub fn sparse_mla_chunk_rows(manifest: &serde_json::Value, decode_rows: usize) -> Result<usize> {
+    let decode_cap = super::decode_capacity(decode_rows);
     let programs = manifest["programs"].as_array().context("Kimi program inventory missing")?;
     let mut policy = None;
-    for rows in [64, 4096] {
+    for rows in [decode_cap, 4096] {
         let name = format!("kimik31_index_producer_m{rows}");
         let entries = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
         ensure!(entries.len() == 1, "Kimi requires one {name} descriptor");
@@ -122,7 +134,7 @@ pub fn sparse_mla_chunk(manifest: &serde_json::Value) -> Result<usize> {
         policy = Some(chunk);
     }
     let chunk = policy.context("Kimi sparse MLA descriptor absent")?;
-    for rows in [64usize, 4096] { for cache in ["", "_fp8"] {
+    for rows in [decode_cap, 4096] { for cache in ["", "_fp8"] {
         for suffix in ["", "_h96", "_partial_h0", "_partial_h48"] {
             let name = if let Some(head) = suffix.strip_prefix("_partial_") {
                 format!("kimik31_sparse_mla_partial{cache}_{head}_m{rows}")
@@ -155,14 +167,14 @@ fn program_scratch(manifest: &serde_json::Value, name: &str, rows: usize) -> Res
 }
 
 impl NativeLaneLayout {
-    fn metadata_banks_for(rows: usize, unit: usize) -> usize {
-        if rows <= 64 { return 1; }
+    fn metadata_banks_for(rows: usize, unit: usize, decode_rows: usize) -> usize {
+        if rows <= decode_rows { return 1; }
         rows.div_ceil(unit)
     }
 
-    pub fn metadata_banks(&self) -> usize { Self::metadata_banks_for(self.rows, self.unit) }
+    pub fn metadata_banks(&self) -> usize { Self::metadata_banks_for(self.rows, self.unit, self.decode_rows) }
 
-    /// Each bank has the decode-capable extent; unit tails can be <=64 rows.
+    /// Each bank has the decode-capable extent; unit tails can be <=decode_rows rows.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
         ensure!((ATTENTION_METADATA.contains(&name) || DSA_METADATA.contains(&name)) && bank < self.metadata_banks(),
             "Kimi attention metadata bank outside admission");
@@ -181,8 +193,13 @@ impl NativeLaneLayout {
 
     pub fn for_ranks(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch, ranks: usize) -> Result<Self> {
+        Self::for_ranks_with_decode_rows(cfg, rows, unit, max_context, scratch, ranks, 64)
+    }
+
+    pub fn for_ranks_with_decode_rows(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
+        scratch: NativeScratch, ranks: usize, decode_rows: usize) -> Result<Self> {
         cfg.release_geometry()?;
-        ensure!(matches!(ranks, 1 | 2), "Kimi native lane physical rank count");
+        ensure!(matches!(ranks, 1 | 2) && (1..=128).contains(&decode_rows), "Kimi native lane physical rank/decode count");
         ensure!((1..=LANE_ROWS_MAX).contains(&rows) && (1..=UNIT_ROWS_MAX.min(rows)).contains(&unit)
             && (1..=1_048_576).contains(&max_context), "Kimi lane row/unit/context capacity");
         let mut operands = BTreeMap::new();
@@ -214,9 +231,9 @@ impl NativeLaneLayout {
         plane("MLA q residual", &[unit, cfg.q_lora_rank, 2])?;
         plane("MLA attention", &[unit, cfg.heads, 512, 2])?;
         plane("MLA LSE", &[unit, cfg.heads, 4])?;
-        // Decode/verify permits one request per row, at most the 64-row
+        // Decode/verify permits one request per row, at most the resolved decode
         // specialization. Wide prefill is one sequence. Cache pages live outside.
-        let requests = unit.min(64);
+        let requests = unit.min(decode_rows);
         plane("MLA page table", &[requests, max_context.div_ceil(64), 4])?;
         plane("MLA lengths", &[requests, 4])?;
         plane("MLA query offsets", &[requests + 1, 4])?;
@@ -224,9 +241,9 @@ impl NativeLaneLayout {
         for (name, bytes) in ["MLA producer scratch", "MLA attention scratch", "MLA output scratch"]
             .into_iter().zip(scratch.mla) { plane(name, &[bytes])?; }
         // A call stages each unit once. Metadata survives all its layers, so
-        // in-flight units require disjoint banks, including a <=64-row tail.
+        // in-flight units require disjoint banks, including a <=decode_rows tail.
         // Native kernels require every bank pointer, not just its base, aligned.
-        let banks = Self::metadata_banks_for(rows, unit);
+        let banks = Self::metadata_banks_for(rows, unit, decode_rows);
         for name in ATTENTION_METADATA {
             let bytes = operands.get_mut(name).expect("attention metadata plane");
             let stride = bytes.checked_add(15).context("Kimi metadata alignment overflow")? / 16 * 16;
@@ -246,7 +263,7 @@ impl NativeLaneLayout {
             }
             arena_bytes = arena_bytes.max(end);
         }
-        let layout = Self { rows, unit, max_context, operands, arena_offsets, arena_bytes };
+        let layout = Self { rows, unit, decode_rows, max_context, operands, arena_offsets, arena_bytes };
         layout.bytes()?;
         Ok(layout)
     }
@@ -255,7 +272,7 @@ impl NativeLaneLayout {
     /// shares this one serialized attention scratch owner on its rank.
     pub fn with_sparse_mla_rows(mut self, heads: usize, chunk: usize) -> Result<Self> {
         ensure!((1..=4096).contains(&chunk), "Kimi sparse MLA chunk outside exported bounds");
-        let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(self.unit.max(64).min(chunk), heads, false)?;
+        let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(self.unit.max(self.decode_rows).min(chunk), heads, false)?;
         let old = self.operands.insert("MLA attention scratch", bytes).context("Kimi MLA attention scratch absent")?;
         ensure!(old >= bytes, "Kimi sparse attention scratch exceeds validated exported capacity");
         self.arena_offsets.clear();
@@ -276,7 +293,7 @@ impl NativeLaneLayout {
     /// Projection offsets use live rows; sparse selection still retains its
     /// AOT-baked selector and recurrence workspaces at their declared capacity.
     pub fn with_live_projection_rows(mut self, heads: usize, ranks: usize) -> Result<Self> {
-        let rows = self.unit.max(64);
+        let rows = self.unit.max(self.decode_rows);
         for (name, stride) in [("MLA query", heads * 576 * 2), ("MLA attention", heads * 512 * 2),
             ("MLA LSE", heads * 4)] {
             self.operands.insert(name, self.unit * stride);
@@ -311,7 +328,7 @@ impl NativeLaneLayout {
             "Kimi DSA lane requires the native 32x128/top2048 indexer");
         ensure!(scratch.producer > 0 && scratch.selector > 0, "Kimi DSA scratch missing");
         let rows = self.unit;
-        let requests = rows.min(64);
+        let requests = rows.min(self.decode_rows);
         for (name, bytes) in [("DSA query", rows * 4096), ("DSA head weights", rows * 32 * 4),
             ("DSA indices", rows * 2048 * 4), ("DSA scores", rows * 2048 * 4),
             ("DSA producer scratch", scratch.producer),
@@ -336,7 +353,7 @@ impl NativeLaneLayout {
         let mut layout = self.clone();
         for name in ["MLA page table", "DSA page table"] {
             if let Some(bytes) = layout.operands.get_mut(name) {
-                *bytes = (self.unit.min(64) * context.div_ceil(64) * 4)
+                *bytes = (self.unit.min(self.decode_rows) * context.div_ceil(64) * 4)
                     .max(16).next_multiple_of(16) * self.metadata_banks();
             }
         }
@@ -405,11 +422,17 @@ impl NativeLaneLayout {
 impl NativeScratch {
     pub fn from_manifest_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config,
         ranks: usize) -> Result<Self> {
-        if cfg.dsa.is_none() { return Self::from_manifest_for_ranks(manifest, ranks); }
-        sparse_mla_chunk(manifest)?;
+        Self::from_manifest_for_config_rows(manifest, cfg, ranks, 64)
+    }
+
+    pub fn from_manifest_for_config_rows(manifest: &serde_json::Value, cfg: &KimiK3Config,
+        ranks: usize, decode_rows: usize) -> Result<Self> {
+        if cfg.dsa.is_none() { return Self::from_manifest_for_ranks_rows(manifest, ranks, decode_rows); }
+        let decode_cap = super::decode_capacity(decode_rows);
+        sparse_mla_chunk_rows(manifest, decode_rows)?;
         ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
         let mut mla = Vec::new();
-        for rows in [64, 4096] { for suffix in ["", "_h96"] { for cache in ["", "_fp8"] {
+        for rows in [decode_cap, 4096] { for suffix in ["", "_h96"] { for cache in ["", "_fp8"] {
             let output = program_scratch(manifest, &format!("kimik31_mla_output{suffix}_m{rows}"), rows)?;
             let producer = program_scratch(manifest, &format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), rows)?;
             mla.push([producer, program_scratch(manifest,
@@ -420,7 +443,7 @@ impl NativeScratch {
             }}
         }}}
         let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik31_kda" };
-        Self::combine([program_scratch(manifest, &format!("{prefix}_m64"), 64)?,
+        Self::combine([program_scratch(manifest, &format!("{prefix}_m{decode_cap}"), decode_cap)?,
             program_scratch(manifest, &format!("{prefix}_m4096"), 4096)?], mla)
     }
 
@@ -429,6 +452,11 @@ impl NativeScratch {
     }
 
     pub fn from_manifest_for_ranks(manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
+        Self::from_manifest_for_ranks_rows(manifest, ranks, 64)
+    }
+
+    pub fn from_manifest_for_ranks_rows(manifest: &serde_json::Value, ranks: usize, decode_rows: usize) -> Result<Self> {
+        let decode_cap = super::decode_capacity(decode_rows);
         ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
         let scratch = |name: &str| -> Result<usize> {
             let found = manifest["programs"].as_array().context("Kimi program inventory missing")?
@@ -439,14 +467,14 @@ impl NativeScratch {
         };
         let mut mla = Vec::new();
         for suffix in ["", "_h96"] {
-            for (mode, rows) in [("decode", 64), ("verify", 64), ("extend", 4096)] {
+            for (mode, rows) in [("decode", decode_cap), ("verify", decode_cap), ("extend", 4096)] {
                 mla.push([scratch(&format!("kimik3_mla_producer{suffix}_m{rows}"))?,
                     scratch(&format!("kimik3_dense_mla_{mode}{suffix}_m{rows}"))?,
                     scratch(&format!("kimik3_mla_output{suffix}_m{rows}"))?]);
             }
         }
         let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik3_kda" };
-        Self::combine([scratch(&format!("{prefix}_m64"))?, scratch(&format!("{prefix}_m4096"))?], mla)
+        Self::combine([scratch(&format!("{prefix}_m{decode_cap}"))?, scratch(&format!("{prefix}_m4096"))?], mla)
     }
 }
 
@@ -484,7 +512,11 @@ pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 /// `slots` requests can supply `verify` rows, capped by the native 64-row step.
 /// Zero disables speculation; one slot retains the diagnostic verify widths.
 pub fn verify_graph_rows(verify: usize, slots: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
-    2..=verify.saturating_mul(slots).min(64).min(capacity)
+    verify_graph_rows_limit(verify, slots, capacity, 64)
+}
+
+pub fn verify_graph_rows_limit(verify: usize, slots: usize, capacity: usize, decode_rows: usize) -> std::ops::RangeInclusive<usize> {
+    2..=verify.saturating_mul(slots).min(decode_rows).min(capacity)
 }
 
 /// Every captured row count: the plain buckets plus each exact verify width.
@@ -535,7 +567,7 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
         if let Some(decode) = decode {
             for rows in decode.graph_rows(verify, slots, capacity) {
                 let variants = u64::from(decode.plain().contains(&rows))
-                    + u64::from(verify_graph_rows(verify, slots, capacity).contains(&rows));
+                    + u64::from(verify_graph_rows_limit(verify, slots, capacity, decode.max_rows()).contains(&rows));
                 *count += (0..cfg.layers).filter(|&layer| context(layer) && resident(rank, layer)).count() as u64
                     * variants;
             }
@@ -581,10 +613,16 @@ pub fn kda_demands_for_layers(layers: usize, slots: usize, marks: usize, lanes: 
 
 pub fn kda_demands_for_heads(layers: usize, slots: usize, marks: usize, lanes: usize,
     rank: u8, heads: usize) -> Result<[Demand; 4]> {
+    kda_demands_for_heads_rows(layers, slots, marks, lanes, rank, heads, 64)
+}
+
+pub fn kda_demands_for_heads_rows(layers: usize, slots: usize, marks: usize, lanes: usize,
+    rank: u8, heads: usize, decode_rows: usize) -> Result<[Demand; 4]> {
+    let replay_rows = super::decode_capacity(decode_rows);
     ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && (1..=2).contains(&lanes)
         && rank < 2 && matches!(heads, 48 | 96), "Kimi KDA state geometry");
     let state = heads * 128 * 128 * 4 + 3 * 3 * heads * 128 * 2;
-    let replay = 64 * heads * (3 * 128 * 4 + 4 + 3 * 128 * 2);
+    let replay = replay_rows * heads * (3 * 128 * 4 + 4 + 3 * 128 * 2);
     Ok([(Category::Kv, "Kimi KDA active state", layers * slots * state),
         (Category::Workspace, "Kimi KDA replay", layers * lanes * replay),
         (Category::Prefix, "Kimi exact KDA marks", layers * marks * state),
@@ -598,7 +636,12 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
 
 pub fn io_extents_for_ranks(vocab: usize, rank: usize, rows: usize, core_head: bool,
     ranks: usize) -> Result<[usize; 3]> {
-    io_extents_with_logits(vocab, rank, rows, rows.min(64), core_head, ranks)
+    io_extents_for_ranks_rows(vocab, rank, rows, core_head, ranks, 64)
+}
+
+pub fn io_extents_for_ranks_rows(vocab: usize, rank: usize, rows: usize, core_head: bool,
+    ranks: usize, decode_rows: usize) -> Result<[usize; 3]> {
+    io_extents_with_logits(vocab, rank, rows, rows.min(decode_rows), core_head, ranks)
 }
 
 pub fn io_extents_with_logits(vocab: usize, rank: usize, rows: usize, logit_rows: usize,
@@ -720,15 +763,24 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
     format: cuteafd_core::SparkReplyFormat, attention_heads: usize) -> Result<Vec<Demand>> {
+    baseline_demands_for_ranks_rows(cfg, manifest, rows, shape, context, slots, verify, core, heads,
+        spark_ranks, physical_ranks, format, attention_heads, 64)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn baseline_demands_for_ranks_rows(cfg: &KimiK3Config, manifest: &serde_json::Value,
+    rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
+    core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
+    format: cuteafd_core::SparkReplyFormat, attention_heads: usize, decode_rows: usize) -> Result<Vec<Demand>> {
     ensure!(matches!(physical_ranks, 1 | 2), "Kimi baseline physical owner count");
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
-    let mut layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
-        NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
+    let mut layout = NativeLaneLayout::for_ranks_with_decode_rows(cfg, rows, unit, context,
+        NativeScratch::from_manifest_for_config_rows(manifest, cfg, physical_ranks, decode_rows)?, physical_ranks, decode_rows)?;
     if cfg.dsa.is_some() {
-        layout = layout.with_sparse_mla_rows(attention_heads, sparse_mla_chunk(manifest)?)?
-            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?
+        layout = layout.with_sparse_mla_rows(attention_heads, sparse_mla_chunk_rows(manifest, decode_rows)?)?
+            .with_dsa(cfg, DsaScratch::from_manifest_rows(manifest, decode_rows)?)?
             .with_live_projection_rows(attention_heads, physical_ranks)?;
     }
     let owners = crate::placement::attention::alternating_owners(
@@ -744,7 +796,7 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 token IO",
-            io_extents_for_ranks(cfg.vocab_size, rank, rows, core.compact_head(), physical_ranks)?
+            io_extents_for_ranks_rows(cfg.vocab_size, rank, rows, core.compact_head(), physical_ranks, decode_rows)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         if physical_ranks == 2 {
             demands.push(exchange_demand(unit, rank as u8, 0)?);
@@ -753,8 +805,8 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
             }
         }
         // Active state and retained marks are charged by the caller's mark policy.
-        demands.extend(kda_demands_for_heads(cfg.kda_layers(), slots, 1, 1, rank as u8,
-            cfg.kda_heads / physical_ranks)?.into_iter()
+        demands.extend(kda_demands_for_heads_rows(cfg.kda_layers(), slots, 1, 1, rank as u8,
+            cfg.kda_heads / physical_ranks, decode_rows)?.into_iter()
             .filter(|d| d.category == Category::Workspace));
     }
     Ok(demands)

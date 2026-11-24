@@ -107,23 +107,23 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
 
 pub fn package_lane_extents_for_ranks(manifest: &serde_json::Value, rows: usize, unit: usize,
     ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
-    package_lane_extents_with_dsa(manifest, rows, unit, ranks, false, None)
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, false, None, 64)
 }
 
 pub fn package_lane_extents_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config, rows: usize,
     unit: usize, ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
-    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(), None)
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(), None, 64)
 }
 
 pub fn package_lane_extents_with_base(manifest: &serde_json::Value, cfg: &KimiK3Config,
     rows: usize, unit: usize, ranks: usize, base: &super::allocation::NativeLaneLayout)
     -> Result<BTreeMap<&'static str, usize>> {
     package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(),
-        Some((base.operands["KDA scratch"], base.operands["MLA producer scratch"])))
+        Some((base.operands["KDA scratch"], base.operands["MLA producer scratch"])), base.decode_rows)
 }
 
 fn package_lane_extents_with_dsa(manifest: &serde_json::Value, rows: usize, unit: usize,
-    ranks: usize, dsa: bool, live_base: Option<(usize, usize)>) -> Result<BTreeMap<&'static str,usize>> {
+    ranks: usize, dsa: bool, live_base: Option<(usize, usize)>, decode_rows: usize) -> Result<BTreeMap<&'static str,usize>> {
     ensure!(matches!(ranks, 1 | 2), "Kimi K6 package physical rank count");
     let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
     let scratch=|name: &str| -> Result<usize> {
@@ -135,8 +135,9 @@ fn package_lane_extents_with_dsa(manifest: &serde_json::Value, rows: usize, unit
     };
     let family = if dsa { "kimik31" } else { "kimik3" };
     let split_prefix = if dsa { "kimik31_" } else { "" };
+    let decode_cap = super::decode_capacity(decode_rows);
     let mut base_kda=0;let mut split_kda=0;let mut base_mla=0;let mut split_mla=0;
-    for capacity in [64,4096] {
+    for capacity in [decode_cap, 4096] {
         let kda_prefix = if ranks == 1 { "kda_fused_h96".into() } else { format!("{family}_kda") };
         base_kda=base_kda.max(scratch(&format!("{kda_prefix}_m{capacity}"))?);
         split_kda=split_kda.max(scratch(&format!("kda_core_h{}_m{capacity}", 96 / ranks))?);
@@ -328,24 +329,31 @@ impl CoreCharges {
     pub fn from_package_with_native(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value, native: &crate::placement::inventory::ProgramsManifest,
         ranks: usize) -> Result<Self> {
+        Self::from_package_with_native_rows(cfg, core, rows, unit, manifest, native, ranks, 64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_package_with_native_rows(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
+        manifest: &serde_json::Value, native: &crate::placement::inventory::ProgramsManifest,
+        ranks: usize, decode_rows: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
         let mut stages = if !core.has_split_core() { BTreeMap::new() }
-            else { core.split_stages(package_lane_extents_for_config(manifest,cfg,rows,unit,ranks)?, unit, ranks, cfg.dense_intermediate) };
+            else { core.split_stages(package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(), None, decode_rows)?, unit, ranks, cfg.dense_intermediate) };
         let native_stages = core.native_stages_from_manifest(native, rows, unit, ranks)?;
         let native_stage_bytes = native_stages.values().sum::<usize>();
         stages.extend(native_stages);
         let stage_bytes = if stages.is_empty() { 0 } else {
-            let mut base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
-                super::allocation::NativeScratch::from_manifest_for_config(manifest, cfg, ranks)?, ranks)?;
+            let mut base = super::allocation::NativeLaneLayout::for_ranks_with_decode_rows(cfg, rows, unit, super::COMPILED_CONTEXT,
+                super::allocation::NativeScratch::from_manifest_for_config_rows(manifest, cfg, ranks, decode_rows)?, ranks, decode_rows)?;
             if cfg.dsa.is_some() {
-                base = base.with_sparse_mla_rows(cfg.heads, super::allocation::sparse_mla_chunk(manifest)?)?
-                    .with_dsa(cfg, super::allocation::DsaScratch::from_manifest(manifest)?)?;
+                base = base.with_sparse_mla_rows(cfg.heads, super::allocation::sparse_mla_chunk_rows(manifest, decode_rows)?)?
+                    .with_dsa(cfg, super::allocation::DsaScratch::from_manifest_rows(manifest, decode_rows)?)?;
             }
             base.clone().with_core_stages(stages.clone())?.bytes()?.checked_sub(base.bytes()?)
                 .context("Kimi core stage charge underflow")?
         };
         Ok(Self {
-            projection: projection_scratch_for_ranks(cfg,core,unit,&manifest["families"]["dense_trellis_k6"],ranks)?,
+            projection: projection_scratch_for_ranks_rows(cfg,core,unit,&manifest["families"]["dense_trellis_k6"],ranks,decode_rows)?,
             stages, stage_bytes, native_stage_bytes,
             receive: if ranks == 2 { exchange_recv_bytes(unit)? } else { 0 },
         })
@@ -382,6 +390,11 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
 
 pub fn projection_scratch_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
     metadata: &serde_json::Value, ranks: usize) -> Result<Vec<Option<ProjectionScratchLayout>>> {
+    projection_scratch_for_ranks_rows(cfg, core, rows, metadata, ranks, 64)
+}
+
+pub fn projection_scratch_for_ranks_rows(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
+    metadata: &serde_json::Value, ranks: usize, decode_rows: usize) -> Result<Vec<Option<ProjectionScratchLayout>>> {
     ensure!(matches!(ranks, 1 | 2), "Kimi K6 physical rank count");
     if core.projections.is_empty() { return Ok(vec![None; ranks]); }
     core.validate_runtime_groups(cfg)?;

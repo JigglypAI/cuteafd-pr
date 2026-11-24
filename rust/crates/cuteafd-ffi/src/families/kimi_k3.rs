@@ -1123,7 +1123,10 @@ impl KimiKdaGeometry {
     pub fn conv_state_bytes(self, slots: usize) -> W8Result<usize> {
         kda_slot_bytes(slots, 3 * 3 * self.width() * 2)
     }
-    pub fn replay_bytes(self) -> usize { 64 * self.heads * (3 * 128 * 4 + 4 + 3 * 128 * 2) }
+    pub fn replay_bytes(self) -> usize { self.replay_bytes_for(64) }
+    pub fn replay_bytes_for(self, replay_rows: usize) -> usize {
+        replay_rows * self.heads * (3 * 128 * 4 + 4 + 3 * 128 * 2)
+    }
 }
 
 /// Shared KDA recurrence -> head-local gated norm -> BF16 o_proj partial.
@@ -1168,7 +1171,7 @@ impl<'a> KimiKda<'a> {
     /// The recurrence workspace has baked offsets; only projection planes use
     /// live-row offsets. Keep its full extent beside the smaller row planes.
     pub fn scratch_bytes_for(rows: usize, capacity: usize, heads: usize, exported: usize) -> W8Result<usize> {
-        if rows == 0 || rows > capacity || !matches!(capacity, 64 | 4096) {
+        if rows == 0 || rows > capacity || !matches!(capacity, 64 | 128 | 4096) {
             return Err(KimiW8Error::Invalid("KDA scratch rows/capacity"));
         }
         let geometry = KimiKdaGeometry::new(heads)?;
@@ -1213,34 +1216,46 @@ impl<'a> KimiKda<'a> {
 /// Commit accepted speculative rows into all contiguous KDA layer pools.
 /// Tables are `[slot, first_row, accepted_rows]` per sequence; the caller
 /// guarantees in-range, non-overlapping sequences and a matching replay step.
-pub struct KimiKdaCommit<'a> { program: Program<'a>, geometry: KimiKdaGeometry }
+pub struct KimiKdaCommit<'a> { program: Program<'a>, geometry: KimiKdaGeometry, replay_rows: usize }
 impl<'a> KimiKdaCommit<'a> {
     pub fn load(programs: &'a Programs<'a>) -> W8Result<Self> {
         Self::load_heads(programs, 48)
     }
 
     pub fn load_heads(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
-        Self::load_variant(programs, heads, false)
+        Self::load_heads_rows(programs, heads, 64)
+    }
+
+    pub fn load_heads_rows(programs: &'a Programs<'a>, heads: usize, replay_rows: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, false, replay_rows)
     }
 
     pub fn load_k31(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
-        Self::load_variant(programs, heads, true)
+        Self::load_k31_rows(programs, heads, 64)
     }
 
-    fn load_variant(programs: &'a Programs<'a>, heads: usize, k31: bool) -> W8Result<Self> {
+    pub fn load_k31_rows(programs: &'a Programs<'a>, heads: usize, replay_rows: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, true, replay_rows)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, heads: usize, k31: bool, replay_rows: usize) -> W8Result<Self> {
+        if !matches!(replay_rows, 64 | 128) {
+            return Err(KimiW8Error::Invalid("KDA commit replay rows"));
+        }
         let geometry = KimiKdaGeometry::new(heads)?;
-        let name = if heads == 48 {
+        let base = if heads == 48 {
             if k31 { "kimik31_kda_commit" } else { "kimik3_kda_commit" }
         } else { "kda_commit_h96" };
-        let program = programs.program(name, &["state", "conv_state", "replay", "tables"])?;
-        validate_kda_commit_manifest(program.spec(), geometry)?;
-        Ok(Self { program, geometry })
+        let name = if replay_rows == 64 { base.to_string() } else { format!("{base}_m{replay_rows}") };
+        let program = programs.program(&name, &["state", "conv_state", "replay", "tables"])?;
+        validate_kda_commit_manifest_rows(program.spec(), geometry, replay_rows)?;
+        Ok(Self { program, geometry, replay_rows })
     }
 
     pub fn launch(&self, sequences: usize, layers: usize, slots: usize,
         state: Buffer, conv_state: Buffer, replay: Buffer, tables: Buffer,
         stream: *mut c_void) -> W8Result<()> {
-        let requirements = kda_commit_requirements(self.geometry, sequences, layers, slots, state, conv_state, replay, tables)?;
+        let requirements = kda_commit_requirements_rows(self.geometry, self.replay_rows, sequences, layers, slots, state, conv_state, replay, tables)?;
         validate_w8_buffers(&requirements, state.device_id)?;
         reject_writers(&requirements, &[0, 1])?;
         // SAFETY: checked pool extents and disjoint writes; the caller retains
@@ -1263,7 +1278,13 @@ fn validate_kda_manifest(spec: &ProgramSpec, rows: usize, decode: bool) -> W8Res
 
 fn validate_kda_manifest_heads(spec: &ProgramSpec, rows: usize, decode: bool, geometry: KimiKdaGeometry) -> W8Result<usize> {
     let g = &spec.geometry;
-    if rows != if decode { 64 } else { 4096 } || spec.capacity_rows as usize != rows
+    let valid_rows = if decode { matches!(rows, 64 | 128) } else { rows == 4096 };
+    let replay_ok = if decode && rows > 64 {
+        g["replay_rows"].as_u64() == Some(rows as u64)
+    } else {
+        g["replay_rows"].is_null()
+    };
+    if !valid_rows || spec.capacity_rows as usize != rows
         || spec.scalar_kinds != if decode { &b"ii"[..] } else { &b"i"[..] }
         || [("hidden", 7168), ("heads", geometry.heads()), ("head_dim", 128), ("max_rows", rows), ("in_width", geometry.input_width())]
             .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64))
@@ -1273,7 +1294,7 @@ fn validate_kda_manifest_heads(spec: &ProgramSpec, rows: usize, decode: bool, ge
         || g["use_gate_in_kernel"].as_bool() != Some(true) || g["safe_gate"].as_bool() != Some(true)
         || !g["state_dtype"].is_null() || !g["state_rounding"].is_null()
         || (decode && g["bf16_decode"].as_bool() != Some(true))
-        || (!decode && !g["bf16_decode"].is_null()) || !g["replay_rows"].is_null()
+        || (!decode && !g["bf16_decode"].is_null()) || !replay_ok
         || (decode && !g["chunked_min_rows"].is_null())
         || (!decode && g["chunked_min_rows"].as_u64() != Some(64)) {
         return Err(KimiW8Error::Invalid("KDA manifest geometry/scalars"));
@@ -1291,10 +1312,16 @@ fn validate_kda_manifest_heads(spec: &ProgramSpec, rows: usize, decode: bool, ge
     Ok(scratch)
 }
 
+#[cfg(test)]
 fn validate_kda_commit_manifest(spec: &ProgramSpec, geometry: KimiKdaGeometry) -> W8Result<()> {
+    validate_kda_commit_manifest_rows(spec, geometry, 64)
+}
+
+fn validate_kda_commit_manifest_rows(spec: &ProgramSpec, geometry: KimiKdaGeometry, replay_rows: usize) -> W8Result<()> {
     let g = &spec.geometry;
-    if spec.scalar_kinds != b"iii" || !spec.scratch.is_empty()
-        || [("heads", geometry.heads()), ("channels", 3 * geometry.width()), ("replay_rows", 64), ("replay_bytes", geometry.replay_bytes())]
+    if !matches!(replay_rows, 64 | 128) || spec.scalar_kinds != b"iii" || !spec.scratch.is_empty()
+        || [("heads", geometry.heads()), ("channels", 3 * geometry.width()),
+            ("replay_rows", replay_rows), ("replay_bytes", geometry.replay_bytes_for(replay_rows))]
             .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64))
         || !g["state_dtype"].is_null() || !g["state_rounding"].is_null() {
         return Err(KimiW8Error::Invalid("KDA commit manifest"));
@@ -1317,13 +1344,14 @@ fn validate_kda_buffers_heads(w: KimiKdaWeights, b: KimiKdaBatch, capacity: usiz
         return Err(KimiW8Error::Invalid("KDA batch/replay geometry"));
     }
     let width = geometry.width();
+    let replay_rows = if decode { capacity } else { 64 };
     let buffers = [(b.input, b.rows * 7168 * 2), (w.input, geometry.input_width() * 7168 * 2),
         (w.forget, width * 128 * 2), (w.convolution, 3 * width * 4 * 4), (w.a_log, geometry.heads() * 4),
         (w.dt_bias, width * 4), (w.norm, 128 * 4), (w.output, 7168 * width * 2),
         (b.conv_state, geometry.conv_state_bytes(b.state_slots)?), (b.state, geometry.state_bytes(b.state_slots)?),
         (b.slots, b.rows * 4), (b.first, b.rows * 4), (b.normalized, b.rows * width * 2),
         (b.output, b.rows * 7168 * 2), (b.scratch, scratch),
-        (b.replay.unwrap_or(b.scratch), geometry.replay_bytes())];
+        (b.replay.unwrap_or(b.scratch), geometry.replay_bytes_for(replay_rows))];
     let active = if decode { &buffers[..] } else { &buffers[..15] };
     validate_w8_buffers(active, b.input.device_id)?;
     reject_writers(active, if decode { &[8, 9, 12, 13, 14, 15] } else { &[8, 9, 12, 13, 14] })
@@ -1338,7 +1366,13 @@ fn reject_writers(buffers: &[(Buffer, usize)], writers: &[usize]) -> W8Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn kda_commit_requirements(geometry: KimiKdaGeometry, sequences: usize, layers: usize, slots: usize,
+    state: Buffer, conv_state: Buffer, replay: Buffer, tables: Buffer) -> W8Result<[(Buffer, usize); 4]> {
+    kda_commit_requirements_rows(geometry, 64, sequences, layers, slots, state, conv_state, replay, tables)
+}
+
+fn kda_commit_requirements_rows(geometry: KimiKdaGeometry, replay_rows: usize, sequences: usize, layers: usize, slots: usize,
     state: Buffer, conv_state: Buffer, replay: Buffer, tables: Buffer) -> W8Result<[(Buffer, usize); 4]> {
     if sequences == 0 || sequences > slots || sequences > i32::MAX as usize || !(1..=69).contains(&layers) {
         return Err(KimiW8Error::Invalid("KDA commit dimensions"));
@@ -1346,7 +1380,7 @@ fn kda_commit_requirements(geometry: KimiKdaGeometry, sequences: usize, layers: 
     let layer_bytes = |bytes: usize| bytes.checked_mul(layers).ok_or(KimiW8Error::Invalid("KDA extent overflow"));
     Ok([(state, layer_bytes(geometry.state_bytes(slots)?)?),
         (conv_state, layer_bytes(geometry.conv_state_bytes(slots)?)?),
-        (replay, layer_bytes(geometry.replay_bytes())?), (tables, sequences * 3 * 4)])
+        (replay, layer_bytes(geometry.replay_bytes_for(replay_rows))?), (tables, sequences * 3 * 4)])
 }
 
 /// Native RMSNorm: F32 normalization -> BF16 -> BF16 weight product -> BF16.

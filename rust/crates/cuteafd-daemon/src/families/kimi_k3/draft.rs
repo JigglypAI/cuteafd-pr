@@ -919,7 +919,7 @@ mod tests {
             rows: 2048, waves: 2, prefill_rows: Some(1024),
             context: cuteafd_loader::placement::planner::Context::pinned(8192), slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
             ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, decode_rows: 64, prefix: None,
             prove_serve_admission: false,
         }))?;
         let engine = &loaded.engine;
@@ -1009,7 +1009,7 @@ mod tests {
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, context: cuteafd_loader::placement::planner::Context::pinned(524_288), slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format, context_window: 0, draft_kv_cache: Default::default() }), verify_rows: 0, decode_rows: 64, prefix: None,
             prove_serve_admission: false,
         })?;
         let engine = &loaded.engine;

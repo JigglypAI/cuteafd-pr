@@ -12,8 +12,12 @@ use std::rc::Rc;
 /// Warm the exact single- or multi-sequence closure on valid startup slots.
 /// Chunked prefill has no negative-slot semantics (#1486).
 pub(super) fn startup_metadata(rows: usize, sequences: usize, slots: usize) -> Result<[Vec<i32>; 2]> {
+    startup_metadata_with_limit(rows, sequences, slots, 64)
+}
+
+pub(super) fn startup_metadata_with_limit(rows: usize, sequences: usize, slots: usize, decode_rows: usize) -> Result<[Vec<i32>; 2]> {
     ensure!((1..=4096).contains(&rows) && sequences > 0 && sequences <= slots
-        && sequences <= rows && (rows <= 64 || sequences == 1),
+        && sequences <= rows && (rows <= decode_rows || sequences == 1),
         "Kimi startup KDA sequences exceed valid distinct slots or row geometry");
     let indices = (0..rows).map(|row| (row * sequences / rows) as i32).collect::<Vec<_>>();
     let mut first = vec![0; rows];
@@ -39,6 +43,10 @@ pub(crate) struct Accepted<'p> {
 
 impl Provisional {
     pub(crate) fn new(sequences: &[(&mut super::prefix::Placement, &[u32])], slots: usize) -> Result<Self> {
+        Self::with_limit(sequences, slots, 64)
+    }
+
+    pub(crate) fn with_limit(sequences: &[(&mut super::prefix::Placement, &[u32])], slots: usize, decode_rows: usize) -> Result<Self> {
         ensure!(!sequences.is_empty(), "Kimi provisional batch is empty");
         let mut first = 0usize;
         let mut seen = std::collections::BTreeSet::new();
@@ -48,7 +56,7 @@ impl Provisional {
                 "Kimi provisional slot/frontier is invalid or repeated");
             let start = first;
             first = first.checked_add(tokens.len()).context("Kimi provisional rows overflow")?;
-            ensure!(first <= 64 && placement.len.checked_add(tokens.len()).is_some(),
+            ensure!(first <= decode_rows && placement.len.checked_add(tokens.len()).is_some(),
                 "Kimi provisional batch exceeds native replay rows");
             Ok(((**placement).clone(), tokens.to_vec(), start))
         }).collect::<Result<Vec<_>>>()?;
@@ -100,6 +108,7 @@ pub(crate) struct KdaLayout {
     slots: usize,
     marks: usize,
     lanes: usize,
+    replay_rows: usize,
     state: usize,
     conv: usize,
     replay: usize,
@@ -112,7 +121,12 @@ impl KdaLayout {
     }
 
     pub(crate) fn for_ranks(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize, ranks: usize) -> Result<Self> {
+        Self::for_ranks_rows(cfg, slots, marks, lanes, ranks, 64)
+    }
+
+    pub(crate) fn for_ranks_rows(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize, ranks: usize, decode_rows: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi KDA physical rank count");
+        let replay_rows = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
         let geometry = KimiKdaGeometry::new(cfg.kda_heads / ranks)?;
         ensure!(cfg.layers == cfg.attention.len() && cfg.kda_heads == 96
             && cfg.kda_head_dim == 128 && cfg.kda_conv == 4,
@@ -128,10 +142,10 @@ impl KdaLayout {
         ensure!((1..=69).contains(&layers), "Kimi KDA state layer count");
         let state = geometry.state_bytes(slots)?;
         let conv = geometry.conv_state_bytes(slots)?;
-        let replay = geometry.replay_bytes();
+        let replay = geometry.replay_bytes_for(replay_rows);
         let mark = geometry.state_bytes(1)?.checked_add(geometry.conv_state_bytes(1)?)
             .and_then(|bytes| bytes.checked_mul(layers)).context("Kimi KDA mark extent overflow")?;
-        let layout = Self { geometry, ordinals, layers, slots, marks, lanes, state, conv, replay, mark };
+        let layout = Self { geometry, ordinals, layers, slots, marks, lanes, replay_rows, state, conv, replay, mark };
         layout.extents()?;
         Ok(layout)
     }
@@ -139,7 +153,7 @@ impl KdaLayout {
     pub(crate) fn mark_bytes(&self) -> usize { self.mark }
 
     /// One contiguous pool for each native commit operand; only replay/tables
-    /// are lane-local. The commit ABI strides state by slots and replay by 64 rows.
+    /// are lane-local. The commit ABI strides state by slots and replay by `replay_rows`.
     fn extents(&self) -> Result<[usize; 4]> {
         Ok([self.state.checked_mul(self.layers).context("Kimi KDA state pool overflow")?,
             self.conv.checked_mul(self.layers).context("Kimi KDA convolution pool overflow")?,
@@ -149,8 +163,8 @@ impl KdaLayout {
 
     pub(crate) fn demands(&self, rank: u8) -> Result<[Demand; 4]> {
         let [state, conv, replay, marks] = self.extents()?;
-        let demands = cuteafd_loader::families::kimi_k3::allocation::kda_demands_for_heads(
-            self.layers, self.slots, self.marks, self.lanes, rank, self.geometry.heads())?;
+        let demands = cuteafd_loader::families::kimi_k3::allocation::kda_demands_for_heads_rows(
+            self.layers, self.slots, self.marks, self.lanes, rank, self.geometry.heads(), self.replay_rows)?;
         ensure!(demands.iter().map(|d| d.bytes).collect::<Vec<_>>() ==
             vec![(state + conv) as u64, (replay * self.lanes) as u64, marks as u64,
                 (self.lanes * self.slots * 3 * 4) as u64], "Kimi state owner differs from shared admission");

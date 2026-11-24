@@ -64,9 +64,13 @@ pub(crate) struct GoldenArgs {
     /// the prompt is prefilled up to score_from, then committed 1 row per step.
     #[arg(long, group = "step_scored", requires = "nll")] decode: bool,
     /// Score the windows as teacher-forced speculative verify cycles of this
-    /// many rows (2..=64; all rows accepted) instead of prefill-shaped chunks:
+    /// many rows (2..=128; all rows accepted) instead of prefill-shaped chunks:
     /// the C1 serving verify shape, with the prompt prefilled up to score_from.
-    #[arg(long, group = "step_scored", requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
+    #[arg(long, group = "step_scored", requires = "nll", value_parser = clap::value_parser!(u16).range(2..=128))] verify_rows: Option<u16>,
+    /// Maximum decode/verify batch rows admitted for this golden run (`auto`, `64`, or `128`).
+    #[arg(long, default_value = "auto")] decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
+    /// Multi-sequence 128-row verify + KDA commit + graphed replay parity oracle (16 x 8 = 128 rows).
+    #[arg(long, group = "step_scored", requires = "nll")] wide_batch: bool,
     /// With --decode or --verify-rows: replay startup graphs (on) or run eagerly (off).
     /// Explicit context placement always needs startup graphs, including prefill scoring.
     #[arg(long, requires = "step_scored", default_value = "on", value_parser = ["on", "off"])] graphs: String,
@@ -224,10 +228,25 @@ impl GoldenArgs {
         })?)
     }
 
+    fn resolved_decode_rows(&self) -> Result<usize> {
+        let gpus = 1 + usize::from(self.split_device.is_some());
+        let rows = cuteafd_loader::plan::resolve_decode_rows(
+            "kimi_k3",
+            cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+                requested: self.decode_rows.as_option(),
+                concurrency: 16,
+                decode_lanes: 1,
+                rtx_gpus: gpus,
+                draft_length: None,
+            },
+        )?;
+        Ok(usize::try_from(rows)?)
+    }
+
     fn startup_graphs(&self) -> Result<bool> {
         let context = self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context || self.graphs == "on", "Kimi context cannot score without startup decode graphs");
-        Ok((context || self.decode || self.verify_rows.is_some()) && self.graphs == "on")
+        Ok((context || self.decode || self.verify_rows.is_some() || self.wide_batch) && self.graphs == "on")
     }
 
     fn role(&self) -> super::startup::Role {
@@ -276,7 +295,9 @@ impl GoldenArgs {
             "skip_routed_experts": self.skip_routed_experts,
             "resolved_attention_placement": self.resolved_attention(),
             "decode": self.decode,
-            "verify_rows": self.verify_rows, "graphs": (self.decode || self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
+            "wide_batch": self.wide_batch,
+            "decode_rows": self.resolved_decode_rows().ok(),
+            "verify_rows": self.verify_rows, "graphs": (self.decode || self.verify_rows.is_some() || self.wide_batch || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
 
@@ -883,11 +904,203 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
     Ok(())
 }
 
+/// Multi-sequence 128-row verify + KDA commit + graphed replay oracle.
+/// Runs 16 independent sequences (distinct prefixes, 8 verify tokens each = 128 rows)
+/// solo (1x8), batched 16x8 eager, and batched 16x8 graphed (capture + replay),
+/// then commits partial kept counts (1..=8) via `kda_commit_m128` and checks
+/// post-commit follow-up decode logits against solo.
+fn score_wide_batch(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
+    windows: &[cuteafd_bench::reference::Window], full: &KimiK3Config, cfg: &KimiK3Config,
+    ownership: &super::startup::Ownership) -> Result<()> {
+    use cuteafd_engine::prefix::PrefixFamily;
+    let decode_rows = args.resolved_decode_rows()?;
+    ensure!(decode_rows == 128, "Kimi --wide-batch requires --decode-rows 128 (got {decode_rows})");
+    ensure!(!windows.is_empty(), "Kimi --wide-batch needs at least one reference window");
+    let root = args.save_logits.as_deref().context("--wide-batch requires --save-logits")?;
+    std::fs::create_dir(root).context("Kimi wide-batch output must be a new directory")?;
+    let provenance = args.loaded_provenance(engine.target_view(), full, cfg, ownership);
+    let family = engine.prefix_family()?;
+    let library = engine.library();
+    let head_device = args.split_device.unwrap_or(args.device);
+    let vocab = cfg.vocab_size;
+
+    const SEQS: usize = 16;
+    const VERIFY: usize = 8;
+    const TOTAL_ROWS: usize = SEQS * VERIFY;
+    // Build 16 distinct (prefix, verify[8], kept, followup_tok) samples from the sealed quick windows.
+    struct Sample { prefix: Vec<u32>, verify: Vec<u32>, kept: usize, followup: u32 }
+    let mut samples = Vec::with_capacity(SEQS);
+    for idx in 0..SEQS {
+        let win = &windows[idx % windows.len()];
+        let prefix_len = 24 + (idx * 5) % 40;
+        let offset = (idx / windows.len()) * 80;
+        ensure!(offset + prefix_len + VERIFY + 1 <= win.tokens.len(), "Kimi --wide-batch window too short");
+        let prefix = win.tokens[offset..offset + prefix_len].to_vec();
+        let verify = win.tokens[offset + prefix_len..offset + prefix_len + VERIFY].to_vec();
+        let kept = (idx % VERIFY) + 1; // exercises kept = 1..=8 across the 16 slots
+        let followup = win.tokens[offset + prefix_len + kept];
+        samples.push(Sample { prefix, verify, kept, followup });
+    }
+
+    let argmax = |row: &[f32]| -> usize {
+        row.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0)
+    };
+    let compare_rows = |a: &[Vec<f32>], b: &[Vec<f32>]| -> (usize, usize, f32) {
+        let mut bit_eq = 0usize;
+        let mut top1_eq = 0usize;
+        let mut max_abs = 0.0f32;
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            let mut exact = true;
+            for (&x, &y) in ra.iter().zip(rb.iter()) {
+                if x.to_bits() != y.to_bits() { exact = false; }
+                let diff = (x - y).abs();
+                if diff > max_abs { max_abs = diff; }
+            }
+            if exact { bit_eq += 1; }
+            if argmax(ra) == argmax(rb) { top1_eq += 1; }
+        }
+        (bit_eq, top1_eq, max_abs)
+    };
+
+    // 1. Solo reference: each sequence individually (8-row verify + partial commit + 1-row follow-up).
+    let mut solo_verify: Vec<Vec<f32>> = Vec::with_capacity(TOTAL_ROWS);
+    let mut solo_followup: Vec<Vec<f32>> = Vec::with_capacity(SEQS);
+    for sample in &samples {
+        let total_toks = sample.prefix.len() + VERIFY + 1;
+        let units = pool.alloc(total_toks.div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
+        let mut placement = super::prefix::Placement { media_spans: Vec::new(), units: units.clone(), slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        engine.step_device(&mut [(&mut placement, &sample.prefix)], pool, 1, false)?;
+        let start = placement.len;
+        let logits = engine.verify_device(&mut [(&mut placement, &sample.verify)], pool, false)?;
+        library.cuda_set_device(head_device)?;
+        let values = logits.to_host(library)?;
+        ensure!(values.len() == VERIFY * vocab, "Kimi solo verify logits shape");
+        for row in values.chunks_exact(vocab) { solo_verify.push(row.to_vec()); }
+        let mut seq = super::backend::DraftState::default();
+        placement.len = start + VERIFY;
+        engine.accept_provisional::<_, ()>(&mut [crate::shared::qwen::scheduler::Verified {
+            placement: &mut placement, seq: &mut seq, start, history: (), rows: &sample.verify,
+            first_row: 0, kept: Some((sample.kept, 0)), finished: false, neural: false }])?;
+        let follow = engine.step_device(&mut [(&mut placement, &[sample.followup])], pool, 1, false)?;
+        library.cuda_set_device(head_device)?;
+        let follow_vals = follow.to_host(library)?;
+        ensure!(follow_vals.len() == vocab, "Kimi solo follow-up logits shape");
+        solo_followup.push(follow_vals);
+        family.drain().map_err(|error| anyhow::anyhow!("{error}"))?;
+        family.discard(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        pool.release(&units);
+    }
+
+    // Helper: run all 16 sequences together as one 128-row verify + 16-slot commit + 16-row follow-up.
+    let mut run_batched = |graphed: bool| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, u64, u64)> {
+        let mut all_units = Vec::with_capacity(SEQS);
+        let mut placements = Vec::with_capacity(SEQS);
+        for (slot, sample) in samples.iter().enumerate() {
+            let total_toks = sample.prefix.len() + VERIFY + 1;
+            let units = pool.alloc(total_toks.div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
+            let mut placement = super::prefix::Placement { media_spans: Vec::new(), units: units.clone(), slot, len: 0, state_len: 0 };
+            family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+            engine.step_device(&mut [(&mut placement, &sample.prefix)], pool, 1, false)?;
+            all_units.push(units);
+            placements.push(placement);
+        }
+        let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
+        let captures_before = cuteafd_ffi::graph_captures();
+        let replays_before = engine.graph_replays()?;
+        let logits = {
+            let mut batch: Vec<(&mut super::prefix::Placement, &[u32])> = placements.iter_mut()
+                .zip(&samples).map(|(p, s)| (p, s.verify.as_slice())).collect();
+            engine.verify_device(&mut batch, pool, graphed)?
+        };
+        library.cuda_set_device(head_device)?;
+        let values = logits.to_host(library)?;
+        let captures_delta = cuteafd_ffi::graph_captures() - captures_before;
+        let replays_delta = engine.graph_replays()? - replays_before;
+        ensure!(values.len() == TOTAL_ROWS * vocab, "Kimi wide-batch verify logits shape");
+        let verify_rows: Vec<Vec<f32>> = values.chunks_exact(vocab).map(|r| r.to_vec()).collect();
+        let mut states: Vec<super::backend::DraftState> = (0..SEQS).map(|_| Default::default()).collect();
+        for (p, &start) in placements.iter_mut().zip(&starts) { p.len = start + VERIFY; }
+        {
+            let mut verified: Vec<crate::shared::qwen::scheduler::Verified<'_, super::prefix::Placement, super::backend::DraftState, ()>> =
+                placements.iter_mut().zip(states.iter_mut()).zip(&starts).zip(&samples).enumerate()
+                    .map(|(i, (((p, seq), &start), s))| crate::shared::qwen::scheduler::Verified {
+                        placement: p, seq, start, history: (), rows: &s.verify,
+                        first_row: i * VERIFY, kept: Some((s.kept, 0)), finished: false, neural: false
+                    }).collect();
+            engine.accept_provisional(&mut verified)?;
+        }
+        let follow_slices: Vec<[u32; 1]> = samples.iter().map(|s| [s.followup]).collect();
+        let follow_logits = {
+            let mut batch: Vec<(&mut super::prefix::Placement, &[u32])> = placements.iter_mut()
+                .zip(&follow_slices).map(|(p, t)| (p, t.as_slice())).collect();
+            engine.step_device(&mut batch, pool, SEQS, false)?
+        };
+        library.cuda_set_device(head_device)?;
+        let follow_vals = follow_logits.to_host(library)?;
+        ensure!(follow_vals.len() == SEQS * vocab, "Kimi wide-batch follow-up logits shape");
+        let follow_rows: Vec<Vec<f32>> = follow_vals.chunks_exact(vocab).map(|r| r.to_vec()).collect();
+        family.drain().map_err(|error| anyhow::anyhow!("{error}"))?;
+        for p in &mut placements { family.discard(p).map_err(|error| anyhow::anyhow!("{error}"))?; }
+        for units in &all_units { pool.release(units); }
+        Ok((verify_rows, follow_rows, captures_delta, replays_delta))
+    };
+
+    // 2. Batched 128-row eager (Note: Context-split MLA always replays/captures its Context graph; optional KDA/FFN run eager).
+    let (eager_verify, eager_follow, eager_caps, eager_replays) = run_batched(false)?;
+    // 3. Batched 128-row graphed capture pass, followed by graphed replay pass (must see 0 new captures).
+    let (cap_verify, cap_follow, cap_caps, cap_replays) = run_batched(true)?;
+    let (rep_verify, rep_follow, rep_caps, rep_replays) = run_batched(true)?;
+
+    let (solo_vs_eager_bit, solo_vs_eager_top1, solo_vs_eager_max) = compare_rows(&solo_verify, &eager_verify);
+    let (eager_vs_rep_bit, eager_vs_rep_top1, eager_vs_rep_max) = compare_rows(&eager_verify, &rep_verify);
+    let (cap_vs_rep_bit, cap_vs_rep_top1, cap_vs_rep_max) = compare_rows(&cap_verify, &rep_verify);
+    let (follow_solo_vs_eager_bit, follow_solo_vs_eager_top1, follow_solo_vs_eager_max) = compare_rows(&solo_followup, &eager_follow);
+    let (follow_solo_vs_rep_bit, follow_solo_vs_rep_top1, follow_solo_vs_rep_max) = compare_rows(&solo_followup, &rep_follow);
+
+    let receipt = serde_json::json!({
+        "schema": "cuteafd.kimi.wide-batch-128/1",
+        "decode_rows": decode_rows,
+        "sequences": SEQS,
+        "verify_per_sequence": VERIFY,
+        "total_verify_rows": TOTAL_ROWS,
+        "provenance": provenance,
+        "passes": {
+            "eager": { "captures": eager_caps, "replays": eager_replays },
+            "graphed_capture": { "captures": cap_caps, "replays": cap_replays },
+            "graphed_replay": { "captures": rep_caps, "replays": rep_replays },
+        },
+        "verify_parity": {
+            "solo_vs_eager": { "bit_identical_rows": solo_vs_eager_bit, "top1_exact_rows": solo_vs_eager_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": solo_vs_eager_max },
+            "eager_vs_graphed_replay": { "bit_identical_rows": eager_vs_rep_bit, "top1_exact_rows": eager_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": eager_vs_rep_max },
+            "graphed_capture_vs_replay": { "bit_identical_rows": cap_vs_rep_bit, "top1_exact_rows": cap_vs_rep_top1, "total_rows": TOTAL_ROWS, "max_abs_diff": cap_vs_rep_max },
+        },
+        "kda_commit_m128_followup_parity": {
+            "solo_vs_eager": { "bit_identical_rows": follow_solo_vs_eager_bit, "top1_exact_rows": follow_solo_vs_eager_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_eager_max },
+            "solo_vs_graphed_replay": { "bit_identical_rows": follow_solo_vs_rep_bit, "top1_exact_rows": follow_solo_vs_rep_top1, "total_rows": SEQS, "max_abs_diff": follow_solo_vs_rep_max },
+        },
+    });
+    println!("Kimi wide-batch 128-row oracle: {}", serde_json::to_string_pretty(&receipt)?);
+    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("wide-batch-128.json"))?;
+    serde_json::to_writer_pretty(out, &receipt)?;
+
+    ensure!(rep_caps == 0 && rep_replays > 0, "Kimi 128-row graphed replay recaptured ({rep_caps}) or had zero replays ({rep_replays})");
+    ensure!(solo_vs_eager_top1 == TOTAL_ROWS, "Kimi 128-row solo vs batched verify top-1 mismatch ({solo_vs_eager_top1}/{TOTAL_ROWS}, max_abs={solo_vs_eager_max})");
+    ensure!(eager_vs_rep_top1 == TOTAL_ROWS && cap_vs_rep_bit == TOTAL_ROWS,
+        "Kimi 128-row graphed replay diverged (eager_vs_rep top1={eager_vs_rep_top1}/{TOTAL_ROWS} max={eager_vs_rep_max}, cap_vs_rep bit={cap_vs_rep_bit}/{TOTAL_ROWS})");
+    ensure!(follow_solo_vs_eager_top1 == SEQS && follow_solo_vs_rep_top1 == SEQS,
+        "Kimi 16-slot kda_commit_m128 follow-up mismatch (eager={follow_solo_vs_eager_top1}/{SEQS}, rep={follow_solo_vs_rep_top1}/{SEQS})");
+    Ok(())
+}
+
 fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     programs: &'a cuteafd_ffi::programs::Programs<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
     full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
     prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
     -> Result<super::startup::Loaded<'a>> {
+    let decode_rows = args.resolved_decode_rows()?;
+    ensure!(verify <= decode_rows, "Kimi golden --verify-rows {verify} exceeds resolved --decode-rows {decode_rows}");
+    let slots = if args.wide_batch { 16 } else { 1 };
     super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { media: None, role: args.role(), expert_usage: false, expert_usage_reader: Default::default(),
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
@@ -896,9 +1109,9 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-        context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
+        context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
         pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
-        hosted_layers: args.hosted(cfg)?, verify_rows: verify, prefix: None,
+        hosted_layers: args.hosted(cfg)?, verify_rows: verify, decode_rows, prefix: None,
         #[cfg(test)] prove_serve_admission: false,
     })
 }
@@ -941,7 +1154,9 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     }
     let mut pool = super::prefix::diagnostic_pool(layout);
     let actual = if let Some(windows) = scoring {
-        if let Some(verify) = verify {
+        if args.wide_batch {
+            score_wide_batch(args, &engine, &mut pool, windows, full, cfg, &ownership)?;
+        } else if let Some(verify) = verify {
             score_verify(args, &engine, &mut pool, windows, rows, verify, graphs, full, cfg, &ownership)?;
         } else if args.decode {
             score_decode(args, &engine, &mut pool, windows, rows, graphs, full, cfg, &ownership)?;
@@ -1396,10 +1611,13 @@ mod tests {
         assert_eq!((verify.verify_rows, verify.graphs.as_str(), verify.verify_limit), (Some(8), "off", Some(64)));
         assert_eq!(verify.provenance()["graphs"], "off");
         assert_eq!(parsed.provenance()["graphs"], serde_json::Value::Null);
-        for bad in [&["--verify-rows", "1"][..], &["--verify-rows", "65"], &["--graphs", "off"], &["--verify-limit", "4"],
+        for bad in [&["--verify-rows", "1"][..], &["--verify-rows", "129"], &["--graphs", "off"], &["--verify-limit", "4"],
             &["--grouped-kda", "maybe"]] {
             assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(bad.iter().copied())).is_err(), "{bad:?}");
         }
+        let crate::cli::Commands::KimiGolden(wide) = crate::cli::Cli::try_parse_from(args.into_iter()
+            .chain(["--decode-rows", "128", "--wide-batch"]))?.command else { panic!("Kimi command"); };
+        assert!(wide.wide_batch && wide.resolved_decode_rows()? == 128 && wide.startup_graphs()?);
         Ok(())
     }
 

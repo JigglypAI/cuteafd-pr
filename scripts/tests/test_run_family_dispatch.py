@@ -1197,8 +1197,10 @@ if family == "minimax_m3" and decode_rows > 128:
     sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
 if family == "inkling2" and decode_rows > 128:
     sys.exit("inkling2 supports DECODE_ROWS up to 128 (missing inkling2_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2") and decode_rows > 64:
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
+if family == "kimi_k3" and decode_rows > 128:
+    sys.exit("kimi_k3 supports DECODE_ROWS up to 128 (missing kimi_k3_*_m256)")
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes, decode_rows=decode_rows)
 expert_world = int(report.get("spark_expert_world", ranks))

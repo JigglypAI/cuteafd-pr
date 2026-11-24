@@ -21,17 +21,24 @@ pub(crate) struct Programs<'a> {
 impl<'a> Programs<'a> {
     pub(crate) fn load(programs: &'a cuteafd_ffi::programs::Programs<'a>,
         format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
-        Self::load_variant(programs, format, false)
+        Self::load_variant(programs, format, false, 64)
     }
 
     pub(crate) fn load_for_config(programs: &'a cuteafd_ffi::programs::Programs<'a>,
         format: cuteafd_core::MlaCacheFormat,
         cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config) -> Result<Self> {
-        Self::load_variant(programs, format, cfg.dsa.is_some())
+        Self::load_for_config_rows(programs, format, cfg, 64)
+    }
+
+    pub(crate) fn load_for_config_rows(programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        format: cuteafd_core::MlaCacheFormat,
+        cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config,
+        decode_rows: usize) -> Result<Self> {
+        Self::load_variant(programs, format, cfg.dsa.is_some(), decode_rows)
     }
 
     fn load_variant(programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        format: cuteafd_core::MlaCacheFormat, dsa: bool) -> Result<Self> {
+        format: cuteafd_core::MlaCacheFormat, dsa: bool, decode_rows: usize) -> Result<Self> {
         if dsa {
             let combine = programs.spec("kimik31_lse_combine2")?;
             ensure!(combine.scalar_kinds == b"i" && combine.geometry["heads"] == 48
@@ -46,6 +53,7 @@ impl<'a> Programs<'a> {
                 gather: Some(programs.bound(&name, &["pool", "table", "staging"] )?),
                 sms: programs.library().sm_count()? });
         }
+        let decode_cap = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
         let tag = format.program_suffix();
         let combine = programs.spec("kimik3_lse_combine2")?;
         ensure!(combine.scalar_kinds == b"i" && combine.geometry["heads"] == 48
@@ -57,14 +65,14 @@ impl<'a> Programs<'a> {
         let mut tiles = None;
         let partial = [8, 16].map(|tile| -> Result<_> {
             let ranges = [0, 48].map(|begin| -> Result<_> {
-                let name = format!("kimik3_mla_partial{tag}_h{begin}_t{tile}_m64");
+                let name = format!("kimik3_mla_partial{tag}_h{begin}_t{tile}_m{decode_cap}");
                 let geometry = &programs.spec(&name)?.geometry;
                 ensure!(geometry["heads_per_tile"] == tile, "Kimi context partial tile differs");
-                let policy = cuteafd_loader::families::kimi_k3::context::TilePolicy::from_geometry(geometry)?;
+                let policy = cuteafd_loader::families::kimi_k3::context::TilePolicy::from_geometry_rows(geometry, decode_cap)?;
                 ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
                     "Kimi context partial tile policies differ");
                 tiles = Some(policy);
-                Ok(cuteafd_ffi::KimiMlaPartial::load(programs, &name, begin, 64, format)?)
+                Ok(cuteafd_ffi::KimiMlaPartial::load(programs, &name, begin, decode_cap, format)?)
             });
             let [first, second] = ranges;
             Ok([first?, second?])
@@ -86,9 +94,16 @@ impl<'a> Programs<'a> {
     pub(crate) fn layout(programs: &cuteafd_ffi::programs::Programs<'_>,
         format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize,
         cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config) -> Result<ContextLayout> {
-        let mut names = cuteafd_loader::families::kimi_k3::context::program_names_for_config(format, cfg);
+        Self::layout_rows(programs, format, extent, rows, banks, cfg, 64)
+    }
+
+    pub(crate) fn layout_rows(programs: &cuteafd_ffi::programs::Programs<'_>,
+        format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize,
+        cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config, decode_rows: usize) -> Result<ContextLayout> {
+        let decode_cap = cuteafd_loader::families::kimi_k3::decode_capacity(decode_rows);
+        let mut names = cuteafd_loader::families::kimi_k3::context::program_names_for_config_rows(format, cfg, decode_rows);
         if cfg.dsa.is_some() {
-            names.extend(["kimik31_index_producer_m64".into(), "kimik31_index_producer_m4096".into()]);
+            names.extend([format!("kimik31_index_producer_m{decode_cap}"), "kimik31_index_producer_m4096".into()]);
         }
         names.extend(programs.names().filter(|name| name.starts_with("dense_trellis_k6_trellis_"))
             .map(str::to_owned));
@@ -97,7 +112,7 @@ impl<'a> Programs<'a> {
             Ok(serde_json::json!({"name": name, "geometry": spec.geometry,
                 "scratch_bytes_at_capacity": spec.scratch}))
         }).collect::<Result<Vec<_>>>()?;
-        ContextLayout::from_manifest_for_config(&serde_json::json!({"programs": entries}), format, extent, rows, banks, cfg)
+        ContextLayout::from_manifest_for_config_rows(&serde_json::json!({"programs": entries}), format, extent, rows, banks, cfg, decode_rows)
     }
 }
 
@@ -208,10 +223,11 @@ impl<'a> Rank<'a> {
     }
 
     pub(crate) fn partial(&self, peer: bool, rows: usize) -> Result<crate::shared::peer_split::attention::Partial> {
-        ensure!((1..=64).contains(&rows), "Kimi partial output rows");
+        let decode_rows = usize::try_from(self.layout.buffers().decode_rows)?;
+        ensure!((1..=decode_rows).contains(&rows), "Kimi partial output rows");
         let buffer = self.buffer(if peer { "peer-head partial" } else { "own-head partial" })?;
         Ok(crate::shared::peer_split::attention::Partial { values: buffer.ptr,
-            lse: crate::shared::prefix::view(buffer, 64 * 48 * 512 * 2, rows * 48 * 4)?.ptr })
+            lse: crate::shared::prefix::view(buffer, decode_rows * 48 * 512 * 2, rows * 48 * 4)?.ptr })
     }
 
     pub(crate) fn staging(&self, slot: usize) -> Result<CuteafdDeviceBuffer> {
@@ -301,7 +317,7 @@ impl<'a> ContextOwner<'a> {
 pub(crate) use cuteafd_loader::families::kimi_k3::context::SPLIT_BUCKETS;
 
 pub(crate) fn split_bucket(owned_pages: usize, rows: usize, sms: usize) -> Result<usize> {
-    ensure!((1..=64).contains(&rows) && sms > 0, "invalid Kimi split work geometry");
+    ensure!((1..=128).contains(&rows) && sms > 0, "invalid Kimi split work geometry");
     let wave = sms.div_ceil(rows * 6);
     let work = owned_pages.div_ceil(8);
     let traversal = owned_pages.div_ceil(64);
@@ -316,6 +332,7 @@ pub(crate) struct DecodeRows {
     pub rows: usize,
     pub width: usize,
     pub owned_pages: usize,
+    decode_limit: usize,
     slots: Vec<u8>,
     tables: Vec<u8>,
     lengths: Vec<u8>,
@@ -325,21 +342,26 @@ pub(crate) struct DecodeRows {
 impl DecodeRows {
     pub(crate) fn new(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
         slots: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
-        Self::with_capacity(rank, sequences, extent, slots, pool, 64)
+        Self::with_decode_limit(rank, sequences, extent, slots, pool, 64)
+    }
+
+    pub(crate) fn with_decode_limit(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
+        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool, decode_rows: usize) -> Result<Self> {
+        Self::with_capacity(rank, sequences, extent, slots, pool, decode_rows, decode_rows)
     }
 
     pub(crate) fn gathered(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
         slots: usize, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
-        Self::with_capacity(rank, sequences, extent, slots, pool, 4096)
+        Self::with_capacity(rank, sequences, extent, slots, pool, 4096, 64)
     }
 
     fn with_capacity(rank: usize, sequences: &[super::device::SequenceRows<'_>], extent: usize,
-        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool, capacity: usize) -> Result<Self> {
+        slots: usize, pool: &cuteafd_engine::prefix::RefPagePool, capacity: usize, decode_limit: usize) -> Result<Self> {
         use crate::shared::peer_split::context::{local_pages, shard_rows};
         ensure!(rank < 2 && pool.is_parity(), "Kimi compact metadata needs two-rank parity pages");
-        let rows = super::device::validate_sequence_pages(sequences, capacity, slots, extent, pool)?;
+        let rows = super::device::validate_sequence_pages_with_limit(sequences, capacity, slots, extent, decode_limit, pool)?;
         let width = extent.div_ceil(64).div_ceil(2);
-        let mut result = Self { rows, width, owned_pages: 0, slots: Vec::with_capacity(rows * 8),
+        let mut result = Self { rows, width, owned_pages: 0, decode_limit, slots: Vec::with_capacity(rows * 8),
             tables: vec![0; rows * width * 4], lengths: Vec::with_capacity(rows * 4),
             offsets: (0..=rows as i32).flat_map(i32::to_le_bytes).collect() };
         let mut row = 0;
@@ -371,7 +393,7 @@ impl DecodeRows {
     }
 
     pub(crate) fn pad(&mut self, bucket: usize) -> Result<()> {
-        ensure!((self.lengths.len() / 4..=64).contains(&bucket), "Kimi context decode padding extent");
+        ensure!((self.lengths.len() / 4..=self.decode_limit).contains(&bucket), "Kimi context decode padding extent");
         self.slots.resize(bucket * 8, 0xff);
         self.tables.resize(bucket * self.width * 4, 0);
         self.lengths.resize(bucket * 4, 0);
@@ -641,7 +663,7 @@ mod tests {
                     native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
                     rows: 256, waves: 1, prefill_rows: Some(256), slots: 2, marks: 2, max_context: 8192,
                     context: cuteafd_loader::placement::planner::Context::pinned(8192), pool_tokens: Some(8192),
-                    graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, prefix: None,
+                    graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, decode_rows: 64, prefix: None,
                     prove_serve_admission: false,
                 })?;
             let engine = loaded.engine;

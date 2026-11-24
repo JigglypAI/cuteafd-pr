@@ -12,10 +12,16 @@ pub const SPLIT_BUCKETS: [usize; 4] = [2, 4, 8, 16];
 pub struct DecodeBuckets {
     thresholds: Vec<usize>,
     plain: Vec<usize>,
+    max_rows: usize,
 }
 
 impl DecodeBuckets {
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        Self::from_manifest_rows(manifest, ROWS)
+    }
+
+    pub fn from_manifest_rows(manifest: &serde_json::Value, max_rows: usize) -> Result<Self> {
+        ensure!((1..=128).contains(&max_rows), "Kimi context decode row capacity");
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
         let mut thresholds = Vec::new();
         for program in programs.iter().filter(|p| p["name"].as_str().is_some_and(|name|
@@ -36,25 +42,29 @@ impl DecodeBuckets {
         thresholds.sort_unstable();
         thresholds.dedup();
         let mut plain = if thresholds.is_empty() { vec![1, 4, 16, 64] } else { vec![1, 4, 64] };
-        plain.extend(&thresholds);
+        if max_rows > 64 { plain.push(max_rows); }
+        plain.retain(|&r| r <= max_rows);
+        if !plain.contains(&max_rows) { plain.push(max_rows); }
+        plain.extend(thresholds.iter().copied().filter(|&edge| edge <= max_rows));
         plain.sort_unstable();
         plain.dedup();
-        let buckets = Self { thresholds, plain };
-        for rows in 1..=64 { buckets.bucket(rows)?; }
+        let buckets = Self { thresholds, plain, max_rows };
+        for rows in 1..=max_rows { buckets.bucket(rows)?; }
         Ok(buckets)
     }
 
     fn for_dsa(mut self) -> Self {
         // Index append/frontier metadata has no padded rows. Admission and
         // runtime use the same exact-shape graph inventory for this variant.
-        self.plain = (1..=ROWS).collect();
+        self.plain = (1..=self.max_rows).collect();
         self
     }
 
     pub fn plain(&self) -> &[usize] { &self.plain }
+    pub fn max_rows(&self) -> usize { self.max_rows }
 
     pub fn bucket(&self, rows: usize) -> Result<usize> {
-        ensure!((1..=64).contains(&rows), "Kimi context decode rows");
+        ensure!((1..=self.max_rows).contains(&rows), "Kimi context decode rows");
         let bucket = *self.plain.iter().find(|&&bucket| rows <= bucket)
             .context("Kimi context decode bucket absent")?;
         ensure!(self.thresholds.iter().all(|&edge| (rows <= edge) == (bucket <= edge)),
@@ -70,7 +80,7 @@ impl DecodeBuckets {
 
     pub fn graph_rows(&self, verify: usize, slots: usize, capacity: usize) -> Vec<usize> {
         let mut rows = self.plain.iter().copied()
-            .chain(super::allocation::verify_graph_rows(verify, slots, capacity))
+            .chain(super::allocation::verify_graph_rows_limit(verify, slots, capacity, self.max_rows))
             .filter(|&rows| rows <= capacity).collect::<Vec<_>>();
         rows.sort_unstable();
         rows.dedup();
@@ -84,9 +94,13 @@ pub struct TilePolicy(Vec<usize>);
 
 impl TilePolicy {
     pub fn from_geometry(geometry: &serde_json::Value) -> Result<Self> {
+        Self::from_geometry_rows(geometry, ROWS)
+    }
+
+    pub fn from_geometry_rows(geometry: &serde_json::Value, rows: usize) -> Result<Self> {
         let routes = geometry["context_heads_per_tile"].as_array()
             .context("Kimi context tile policy missing")?;
-        ensure!(routes.len() == ROWS, "Kimi context tile policy must cover rows 1..64");
+        ensure!(routes.len() == rows, "Kimi context tile policy must cover rows 1..{rows}");
         let routes = routes.iter().map(|value| -> Result<usize> {
             let tile = value.as_u64().context("Kimi context tile policy value is not an integer")?;
             ensure!(matches!(tile, 8 | 16), "Kimi context tile policy requires an unexported tile");
@@ -96,7 +110,7 @@ impl TilePolicy {
     }
 
     pub fn tile(&self, rows: usize) -> Result<usize> {
-        ensure!((1..=ROWS).contains(&rows), "Kimi context tile row outside policy");
+        ensure!((1..=self.0.len()).contains(&rows), "Kimi context tile row outside policy");
         Ok(self.0[rows - 1])
     }
 
@@ -122,25 +136,35 @@ pub struct ContextLayout {
 
 /// Required names are format-specific: a BF16 package cannot admit FP8 context.
 pub fn program_names(format: MlaCacheFormat) -> Vec<String> {
+    program_names_rows(format, ROWS)
+}
+
+pub fn program_names_rows(format: MlaCacheFormat, decode_rows: usize) -> Vec<String> {
+    let cap = super::decode_capacity(decode_rows);
     let tag = if format == MlaCacheFormat::Fp8 { "_fp8" } else { "" };
     let mut names = vec!["kimik3_lse_combine2".into(), format!("kimik3_paged_staging_gather{tag}")];
     for head in [0, HEADS] { for tile in [8, 16] {
-        names.push(format!("kimik3_mla_partial{tag}_h{head}_t{tile}_m64"));
+        names.push(format!("kimik3_mla_partial{tag}_h{head}_t{tile}_m{cap}"));
     }}
     names
 }
 
 pub fn program_names_for_config(format: MlaCacheFormat, cfg: &super::config::KimiK3Config) -> Vec<String> {
-    variant_program_names(format, cfg.dsa.is_some())
+    program_names_for_config_rows(format, cfg, ROWS)
 }
 
-fn variant_program_names(format: MlaCacheFormat, dsa: bool) -> Vec<String> {
-    if !dsa { return program_names(format); }
+pub fn program_names_for_config_rows(format: MlaCacheFormat, cfg: &super::config::KimiK3Config, decode_rows: usize) -> Vec<String> {
+    variant_program_names(format, cfg.dsa.is_some(), decode_rows)
+}
+
+fn variant_program_names(format: MlaCacheFormat, dsa: bool, decode_rows: usize) -> Vec<String> {
+    if !dsa { return program_names_rows(format, decode_rows); }
+    let cap = super::decode_capacity(decode_rows);
     let tag = format.program_suffix();
     let mut names = vec!["kimik31_lse_combine2".into(), "kimik31_dsa_candidate_merge".into(),
         format!("kimik31_paged_staging_gather{tag}")];
     for begin in [0, HEADS] {
-        names.push(format!("kimik31_sparse_mla_partial{tag}_h{begin}_m64"));
+        names.push(format!("kimik31_sparse_mla_partial{tag}_h{begin}_m{cap}"));
     }
     names
 }
@@ -148,24 +172,32 @@ fn variant_program_names(format: MlaCacheFormat, dsa: bool) -> Vec<String> {
 impl ContextLayout {
     pub fn from_manifest(manifest: &serde_json::Value, format: MlaCacheFormat,
         max_context: usize, unit_rows: usize, metadata_banks: usize) -> Result<Self> {
-        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, false)
+        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, false, ROWS)
     }
 
     pub fn from_manifest_for_config(manifest: &serde_json::Value, format: MlaCacheFormat,
         max_context: usize, unit_rows: usize, metadata_banks: usize,
         cfg: &super::config::KimiK3Config) -> Result<Self> {
-        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, cfg.dsa.is_some())
+        Self::from_manifest_for_config_rows(manifest, format, max_context, unit_rows, metadata_banks, cfg, ROWS)
+    }
+
+    pub fn from_manifest_for_config_rows(manifest: &serde_json::Value, format: MlaCacheFormat,
+        max_context: usize, unit_rows: usize, metadata_banks: usize,
+        cfg: &super::config::KimiK3Config, decode_rows: usize) -> Result<Self> {
+        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, cfg.dsa.is_some(), decode_rows)
     }
 
     fn from_variant(manifest: &serde_json::Value, format: MlaCacheFormat,
-        max_context: usize, unit_rows: usize, metadata_banks: usize, dsa: bool) -> Result<Self> {
-        ensure!((1..=super::COMPILED_CONTEXT).contains(&max_context)
+        max_context: usize, unit_rows: usize, metadata_banks: usize, dsa: bool, decode_rows: usize) -> Result<Self> {
+        let decode_cap = super::decode_capacity(decode_rows);
+        ensure!((1..=128).contains(&decode_rows)
+            && (1..=super::COMPILED_CONTEXT).contains(&max_context)
             && (1..=super::allocation::UNIT_ROWS_MAX).contains(&unit_rows)
             && (1..=super::allocation::LANE_ROWS_MAX).contains(&metadata_banks),
             "Kimi context allocation capacity outside supported geometry");
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
         let descriptor_chunk = if dsa {
-            let chunks = [64, 4096].into_iter().map(|rows| -> Result<usize> {
+            let chunks = [decode_cap, 4096].into_iter().map(|rows| -> Result<usize> {
                 let name = format!("kimik31_index_producer_m{rows}");
                 let entries = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
                 ensure!(entries.len() == 1, "Kimi context requires one {name} descriptor");
@@ -176,7 +208,7 @@ impl ContextLayout {
         } else { None };
         let mut scratch = 0;
         let mut tiles = None;
-        for name in variant_program_names(format, dsa) {
+        for name in variant_program_names(format, dsa, decode_rows) {
             let entries = programs.iter().filter(|p| p["name"].as_str() == Some(&name)).collect::<Vec<_>>();
             ensure!(entries.len() == 1, "Kimi context requires one {name} program");
             if dsa && name.ends_with("lse_combine2") {
@@ -201,8 +233,8 @@ impl ContextLayout {
                 if dsa {
                     let begin = if name.contains("_h0_") { 0 } else { HEADS };
                     ensure!(geometry["heads"] == 96 && geometry["head_begin"] == begin
-                        && geometry["head_count"] == HEADS && geometry["max_rows"] == ROWS
-                        && geometry["row_chunk_size"].as_u64() == Some(ROWS.min(descriptor_chunk.unwrap()) as u64)
+                        && geometry["head_count"] == HEADS && geometry["max_rows"] == decode_cap
+                        && geometry["row_chunk_size"].as_u64() == Some(decode_cap.min(descriptor_chunk.unwrap()) as u64)
                         && geometry["page_size"] == 1 && geometry["topk"] == 2048
                         && geometry["num_splits"] == 16 && geometry["lse_base"] == 2
                         && geometry["norm_eps"] == 1e-5 && geometry["kv_cache"] == format.label(),
@@ -210,7 +242,7 @@ impl ContextLayout {
                 } else {
                     let tile = if name.contains("_t8_") { 8 } else { 16 };
                     ensure!(geometry["heads_per_tile"] == tile, "Kimi context {name} tile geometry differs");
-                    let policy = TilePolicy::from_geometry(geometry)?;
+                    let policy = TilePolicy::from_geometry_rows(geometry, decode_cap)?;
                     ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
                         "Kimi context tile policies differ between programs");
                     tiles = Some(policy);
@@ -219,7 +251,7 @@ impl ContextLayout {
                         && geometry["lse_base"] == 2,
                         "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
                 }
-                let scratch_rows = descriptor_chunk.map_or(ROWS, |chunk| ROWS.min(chunk));
+                let scratch_rows = descriptor_chunk.map_or(decode_cap, |chunk| decode_cap.min(chunk));
                 let expected = (scratch_rows * HEADS * 16 * 512 * 2).next_multiple_of(1024)
                     + scratch_rows * HEADS * 16 * 4;
                 ensure!(bytes == expected, "Kimi context {name} scratch extent {bytes} differs from native {expected}");
@@ -227,19 +259,19 @@ impl ContextLayout {
             }
         }
         let half_pages = max_context.div_ceil(ROWS).div_ceil(2);
-        let partial = ROWS * HEADS * (512 * 2 + 4);
+        let partial = decode_rows * HEADS * (512 * 2 + 4);
         let mut workspace = vec![("own-head partial", partial), ("peer-head partial", partial), ("partial scratch", scratch),
-            ("decode input", ROWS * 7168 * 2), ("decode output", ROWS * 7168 * 2)];
+            ("decode input", decode_rows * 7168 * 2), ("decode output", decode_rows * 7168 * 2)];
         if dsa {
             for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices"] {
-                workspace.push((name, unit_rows.max(ROWS) * 2048 * 4));
+                workspace.push((name, unit_rows.max(decode_rows) * 2048 * 4));
             }
-            workspace.push(("DSA local slots", ROWS * 2048 * 4));
-            workspace.push(("DSA local lengths", ROWS * 4));
-            let stride = (unit_rows.max(ROWS) * 4).next_multiple_of(256);
+            workspace.push(("DSA local slots", decode_rows * 2048 * 4));
+            workspace.push(("DSA local lengths", decode_rows * 4));
+            let stride = (unit_rows.max(decode_rows) * 4).next_multiple_of(256);
             workspace.push(("DSA merged lengths", stride * metadata_banks));
         }
-        let metadata_rows = if dsa { unit_rows.max(ROWS) } else { ROWS };
+        let metadata_rows = if dsa { unit_rows.max(decode_rows) } else { decode_rows };
         for (name, bytes) in METADATA.into_iter().zip([unit_rows * 8,
             metadata_rows * half_pages * 4, metadata_rows * 4, (metadata_rows + 1) * 4, 2 * half_pages * 4,
             3 * (unit_rows.div_ceil(ROWS) + 1) * 8, 4]) {
@@ -252,10 +284,10 @@ impl ContextLayout {
             staging_unit_rows: ROWS as u64, compiled_extent: max_context as u64,
             query_row_bytes: (HEADS * 576 * 2) as u64, partial_row_bytes: (HEADS * (512 * 2 + 4)) as u64,
             candidate_row_bytes: if dsa { 2048 * 8 } else { 0 },
-            decode_rows: ROWS as u64, lanes: 1, workspace_bytes, ..Default::default() };
+            decode_rows: decode_rows as u64, lanes: 1, workspace_bytes, ..Default::default() };
         buffers.demands()?;
         ensure!(dsa || tiles.is_some(), "Kimi context tile policy missing");
-        let decode = DecodeBuckets::from_manifest(manifest)?;
+        let decode = DecodeBuckets::from_manifest_rows(manifest, decode_rows)?;
         let decode = if dsa { decode.for_dsa() } else { decode };
         Ok(Self { buffers, workspace, metadata_banks, metadata_rows, decode, tiles, dsa })
     }
@@ -455,7 +487,7 @@ mod tests {
     fn k31_context_admits_selected_partials_and_exact_candidate_owners() -> Result<()> {
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
             let scratch = ROWS * HEADS * 16 * (512 * 2 + 4);
-            let entries = variant_program_names(format, true).into_iter().map(|name| {
+            let entries = variant_program_names(format, true, ROWS).into_iter().map(|name| {
                 let begin = if name.contains("_h0_") { 0 } else { HEADS };
                 serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":scratch},
                     "geometry":{"heads":96,"head_begin":begin,"head_count":HEADS,"max_rows":ROWS,
@@ -471,7 +503,7 @@ mod tests {
             manifest["programs"][0]["geometry"] = serde_json::json!({"heads":HEADS,"has_sink":false});
             manifest["programs"][2]["geometry"] = serde_json::json!({"row_bytes":format.record_bytes(),
                 "page_rows":ROWS,"page_bytes":ROWS * format.record_bytes()});
-            let layout = ContextLayout::from_variant(&manifest, format, 8192, 2752, 3, true)?;
+            let layout = ContextLayout::from_variant(&manifest, format, 8192, 2752, 3, true, ROWS)?;
             assert!(layout.dsa() && layout.tiles().is_none());
             assert_eq!(layout.decode().plain(), (1..=ROWS).collect::<Vec<_>>());
             assert_eq!(layout.decode().graph_rows(0, 1, ROWS), (1..=ROWS).collect::<Vec<_>>());
@@ -481,7 +513,7 @@ mod tests {
                 .map(|(_, bytes)| *bytes).sum::<usize>();
             assert_eq!(candidates, 2752 * 4 * 2048 * 4 + ROWS * (2048 * 4 + 4) + 2752 * 4 * 3);
             for unit in [64, 2752, 4096] {
-                let layout = ContextLayout::from_variant(&manifest, format, 8192, unit, 3, true)?;
+                let layout = ContextLayout::from_variant(&manifest, format, 8192, unit, 3, true, ROWS)?;
                 let owners = layout.workspace();
                 for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices"] {
                     assert_eq!(owners.iter().filter(|(key, _)| *key == name).count(), 1);
@@ -490,10 +522,10 @@ mod tests {
                 assert_eq!(layout.metadata_extent("DSA merged lengths", 2)?, (2 * unit * 4, unit * 4));
                 assert_eq!(layout.metadata_extent("compact page tables", 0)?.1, unit * 64 * 4);
             }
-            let prepared = ContextLayout::from_variant(&manifest, format, 1_048_576, 2752, 3, true)?;
+            let prepared = ContextLayout::from_variant(&manifest, format, 1_048_576, 2752, 3, true, ROWS)?;
             for extent in [1, 65, 8192, 131_201, 997_376, 1_048_576] {
                 let resolved = prepared.with_served_context(extent)?;
-                let fresh = ContextLayout::from_variant(&manifest, format, extent, 2752, 3, true)?;
+                let fresh = ContextLayout::from_variant(&manifest, format, extent, 2752, 3, true, ROWS)?;
                 assert_eq!(resolved, fresh, "resolved history must equal fresh layout at {extent}");
                 assert_eq!(resolved.metadata_extent("compact page tables", 0)?.1,
                     (2752 * extent.div_ceil(64).div_ceil(2) * 4).max(256).next_multiple_of(256));
@@ -508,12 +540,12 @@ mod tests {
             for field in ["norm_eps", "lse_base", "topk", "head_begin", "page_size", "kv_cache"] {
                 let mut broken = manifest.clone();
                 broken["programs"][3]["geometry"][field] = serde_json::Value::Null;
-                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true).is_err(), "{field}");
+                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true, ROWS).is_err(), "{field}");
             }
-            for name in variant_program_names(format, true) {
+            for name in variant_program_names(format, true, ROWS) {
                 let mut broken = manifest.clone();
                 broken["programs"].as_array_mut().unwrap().retain(|program| program["name"] != name);
-                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true).is_err(), "{name}");
+                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true, ROWS).is_err(), "{name}");
             }
         }
         Ok(())

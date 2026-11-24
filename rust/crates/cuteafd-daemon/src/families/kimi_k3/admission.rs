@@ -818,6 +818,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
     let mut lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
+    let decode_rows = lane_layouts.first().and_then(|pair| pair.first()).map_or(64, |layout| layout.decode_rows);
     let mut shaped = lane_layouts.iter().enumerate().flat_map(|(lane, pair)| pair.iter().enumerate()
         .map(move |(rank, layout)| layout.shaped_owner(rank as u8, lane))).collect::<Result<Vec<_>>>()?;
     let state_slots = inputs.state_slots;
@@ -825,7 +826,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let final_tap = inputs.draft.as_ref().is_some_and(|draft| draft.needs_final_attn_res(cfg.layers));
     let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?.into_iter()
         .map(|layout| layout.with_final_attn_res(cfg, final_tap)).collect::<Result<Vec<_>>>()?;
-    let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len()))
+    let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks_rows(cfg, rank, inputs.rows, &core, devices.len(), decode_rows))
         .collect::<Result<Vec<_>>>()?;
     let rtx = inputs.rtx.take();
     let spark_budget = inputs.spark_budget.take();
@@ -998,7 +999,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     }, usize::try_from(request.pool.compiled_context())?, graph_slots)).transpose()?.flatten();
     recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
     let rows = lane_layouts[0][0].rows();
-    let scoring_bytes = kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size)?;
+    let scoring_bytes = kimi::host_scoring_bytes(rows.min(decode_rows), rows, cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
     recipe.owners.extend(kimi::stream_slab_owners_with_block(RANKS,maximum_pages,
@@ -1021,6 +1022,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "kimi_k3");
     let placement = admitted.placement;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
+    cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
     let pool_tokens = usize::try_from(placement.pool_tokens)?;
     let served = usize::try_from(admitted.solved.served_context())?;
@@ -1042,7 +1044,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
                 reserve = "estimated; pending load/steady census", "Kimi Spark budget selection");
         }
     }
-    let kda_layout = KdaLayout::for_ranks(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize, RANKS)?;
+    let kda_layout = KdaLayout::for_ranks_rows(cfg, state_slots, usize::try_from(mark_selection.slots)?, lanes as usize, RANKS, decode_rows)?;
     tracing::info!(selection = %mark_selection.summary(), "Kimi retained mark admission");
     if RANKS == 1 { SINGLE.check(&placement)?; } else { EXECUTOR.check(&placement)?; }
     let layouts = placement.layers.iter().enumerate().map(|(layer, assignment)|
@@ -1127,6 +1129,9 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten()
         .all(|layout| layout.rows() == i.rows && layout.unit == unit),
         "Kimi lane operand layouts differ from executor geometry");
+    let decode_rows = i.lane_layouts[0][0].decode_rows;
+    ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.decode_rows == decode_rows),
+        "Kimi lanes must share the decode row capacity");
     let context = i.lane_layouts[0][0].max_context();
     if let Some(layout) = &i.context {
         ensure!(RANKS == 2 && i.lanes == 1 && cfg.mla_layers() > 0,
@@ -1182,7 +1187,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
         fixed.push(demand);
     }
     for rank in 0..RANKS {
-        let layout = IoLayout::for_ranks(cfg, rank, i.rows, &i.core, RANKS)?;
+        let layout = IoLayout::for_ranks_rows(cfg, rank, i.rows, &i.core, RANKS, decode_rows)?;
         for lane in 0..i.lanes {
             let demand = layout.demand(lane)?;
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
@@ -1190,7 +1195,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             fixed.push(demand);
         }
     }
-    let kda = KdaLayout::for_ranks(cfg, i.state_slots, i.prefix_marks, i.lanes, RANKS)?;
+    let kda = KdaLayout::for_ranks_rows(cfg, i.state_slots, i.prefix_marks, i.lanes, RANKS, decode_rows)?;
     for rank in 0..RANKS {
         for demand in kda.demands(rank as u8)? {
             ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),

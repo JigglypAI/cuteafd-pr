@@ -27,10 +27,20 @@ pub fn resolve_attention(requested: Option<crate::placement::AttentionPlacement>
 /// (#762 census). GlmFlashK64 does not retain the m16 specialization.
 pub const SPARK_SLOT_BYTES: u64 = 844_696_852;
 
+/// Compiled Kimi decode/verify capacity covering `decode_rows`.
+pub const fn decode_capacity(decode_rows: usize) -> usize {
+    if decode_rows > 64 { 128 } else { 64 }
+}
+
 /// Kimi's typed Spark owners on its EXL3 K64 ladder.
 pub fn spark_executions(waves: u64, unit_rows: u64) -> anyhow::Result<cuteafd_core::SparkExecutions> {
+    spark_executions_for_rows(waves, unit_rows, 64)
+}
+
+/// Kimi's typed Spark owners with an explicit decode/verify row budget.
+pub fn spark_executions_for_rows(waves: u64, unit_rows: u64, decode_rows: u64) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::GlmFlashK64).exports();
-    crate::plan::spark_executions::admit_family("kimi_k3", &exports, None, unit_rows, waves)
+    crate::plan::spark_executions::admit_family("kimi_k3", &exports, Some(u32::try_from(decode_rows)?), unit_rows, waves)
 }
 
 /// One Kimi owner's bytes (the shared EXL3 owner census at latent width).
@@ -43,7 +53,11 @@ pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cu
 /// runtime residual plus the typed owners (one prefill scratch at the admitted
 /// unit's export, the decode owner, per-unit route staging times the waves).
 pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
-    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(spark_owner_bytes)?
+    spark_reserve_bytes_for_rows(waves, unit_rows, 64)
+}
+
+pub fn spark_reserve_bytes_for_rows(waves: u64, unit_rows: u64, decode_rows: u64) -> anyhow::Result<u64> {
+    let owners = spark_executions_for_rows(waves, unit_rows, decode_rows)?.workspace_bytes(spark_owner_bytes)?
         .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;
     cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
         .and_then(|runtime| runtime.checked_add(owners))
