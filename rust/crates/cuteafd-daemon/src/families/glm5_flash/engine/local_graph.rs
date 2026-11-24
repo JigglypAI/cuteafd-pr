@@ -340,12 +340,16 @@ impl<'a> GlmfEngine<'a> {
                 })?;
                 let out1 = self.peer_ffn_out(index, w1, layer1)?;
                 if split_core_ffn {
+                    // One-way 1->0 core partial: Rank 1 zeros its local output and publishes immediately
+                    // without waiting for Rank 0.
                     self.core_publish_ffn(1, w1, index, t)?;
+                    self.core_zero_ffn(1, w1, out1, t)?;
+                    self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
                 } else {
                     self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
                 }
 
-                // Rank 0 dense FFN (strictly rank-local capture) -> push!
+                // Rank 0 dense FFN (strictly rank-local capture) -> reduce (if split_core) -> push!
                 if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 0, att_slot)?;
                 }
@@ -360,20 +364,14 @@ impl<'a> GlmfEngine<'a> {
                     self.local_dense_ffn(0, w, index, t, cap)
                 })?;
                 if split_core_ffn {
-                    self.core_publish_ffn(0, w, index, t)?;
-                    // Both core_publish_ffn pushes are queued; reduce/zero then exchange final BF16 FFN.
-                    self.core_finish_ffn(1, w1, layer1, index, out1, t)?;
-                    self.exchange_push(exchange, "main", 1, ffn_slot, out1, ffn_bytes)?;
-                    self.core_finish_ffn(0, w, layer0, index, w.delta.buffer.ptr, t)?;
-                    if !last {
-                        self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
-                    }
-                } else if !last {
+                    self.core_finish_ffn(w, layer0, index, w.delta.buffer.ptr, t)?;
+                }
+                if !last {
                     self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
                 }
             } else if self.tp2_layer(index) && self.tp2_routes_replicated() {
-                // Production TP2 MoE (replicated routers): pipeline Rank 1 ahead across both
-                // split-core shared-expert FFN and EXL3 routed experts.
+                // Production TP2 MoE (replicated routers): run Rank 1's entire post-attention,
+                // shared FFN, router, EXL3 routed experts and publish without stalling on Rank 0.
                 if output_shard_ptrs.is_none() {
                     self.exchange_wait(exchange, "main", 1, att_slot)?;
                 }
@@ -385,7 +383,10 @@ impl<'a> GlmfEngine<'a> {
                 if split_core_ffn {
                     self.core_ffn_local(1, w1, layer1, cap, w1.shared.buffer.ptr, rows)?;
                     self.core_publish_ffn(1, w1, index, t)?;
+                    self.core_zero_ffn(1, w1, w1.shared.buffer.ptr, t)?;
                     self.router_on(1, w1, layer1, t, &[Span { first: 0, rows: t }])?;
+                    self.tp2_rank(1, index, 0, w1, t, w1.delta.buffer.ptr)?;
+                    self.tp2_publish(index, 0, t, Some(w1))?;
 
                     if output_shard_ptrs.is_none() {
                         self.exchange_wait(exchange, "main", 0, att_slot)?;
@@ -397,14 +398,7 @@ impl<'a> GlmfEngine<'a> {
                     self.post_pre_on(0, w, att0, 0, layer0, "ffn", "post_norm", rows, cap)?;
                     self.moe_front(w, index, layer0, t, rows, cap, &[Span { first: 0, rows: t }])?;
                     self.core_ffn_local(0, w, layer0, cap, w.shared.buffer.ptr, rows)?;
-                    self.core_publish_ffn(0, w, index, t)?;
-
-                    // Both core_publish_ffn pushes are queued: finish Rank 1 shared + EXL3 + publish first.
-                    self.core_finish_ffn(1, w1, layer1, index, w1.shared.buffer.ptr, t)?;
-                    self.tp2_rank(1, index, 0, w1, t, w1.delta.buffer.ptr)?;
-                    self.tp2_publish(index, 0, t, Some(w1))?;
-
-                    self.core_finish_ffn(0, w, layer0, index, w.shared.buffer.ptr, t)?;
+                    self.core_finish_ffn(w, layer0, index, w.shared.buffer.ptr, t)?;
                     self.tp2_rank(0, index, 0, w, t, w.delta.buffer.ptr)?;
                     if !last {
                         self.exchange_push(exchange, "main", 0, ffn_slot, w.delta.buffer.ptr, ffn_bytes)?;
@@ -653,28 +647,28 @@ mod tests {
                         Mode::Dense => {
                             s.wait(1, "main", att, format!("L{index} r1 wait att"));
                             capture_point(&mut s, &format!("L{index} r1 dense sub1"));
-                            s.push(1, "main", ffn, format!("L{index} r1 push ffn/core"));
+                            if split_core {
+                                s.push_to(1, "main", ffn, 1, format!("L{index} r1 push core_ffn"));
+                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                            } else {
+                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
+                            }
                             s.wait(0, "main", att, format!("L{index} r0 wait att"));
                             capture_point(&mut s, &format!("L{index} r0 dense sub1"));
                             if split_core {
-                                s.push(0, "main", ffn, format!("L{index} r0 push core_ffn"));
-                                s.wait(1, "main", ffn, format!("L{index} r1 wait core_ffn"));
-                                s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                                s.wait(0, "main", ffn, format!("L{index} r0 wait core_ffn"));
-                                if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
-                            } else if !last {
+                                s.wait_for(0, "main", ffn, 1, format!("L{index} r0 wait core_ffn"));
+                            }
+                            if !last {
                                 s.push(0, "main", ffn, format!("L{index} r0 push ffn"));
                             }
                         }
                         Mode::Tp2Replicated => {
                             s.wait(1, "main", att, format!("L{index} r1 wait att"));
                             if split_core {
-                                s.push(1, "main", ffn, format!("L{index} r1 push core_ffn"));
-                                s.wait(0, "main", att, format!("L{index} r0 wait att"));
-                                s.push(0, "main", ffn, format!("L{index} r0 push core_ffn"));
-                                s.wait(1, "main", ffn, format!("L{index} r1 wait core_ffn"));
+                                s.push_to(1, "main", ffn, 1, format!("L{index} r1 push core_ffn"));
                                 s.push(1, "main", ffn, format!("L{index} r1 push ffn"));
-                                s.wait(0, "main", ffn, format!("L{index} r0 wait core_ffn"));
+                                s.wait(0, "main", att, format!("L{index} r0 wait att"));
+                                s.wait_for(0, "main", ffn, 1, format!("L{index} r0 wait core_ffn"));
                                 if !last { s.push(0, "main", ffn, format!("L{index} r0 push ffn")); }
                             } else {
                                 s.push(1, "main", ffn, format!("L{index} r1 push ffn"));

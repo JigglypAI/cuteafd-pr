@@ -327,21 +327,29 @@ impl<'a> GlmfEngine<'a> {
     pub(super) fn core_publish_ffn(&self, rank: usize, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
         let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
         let at = super::slot(index, true, slot.lane);
-        self.core_publish(rank, w, at, rows, 1)
+        // `core_received` is disjoint from `exchange.recv` (target 0); tag target 1 so
+        // pipelined 1->0 `core_publish_ffn` + `tp2_publish`/`exchange_push` on `at` stay distinct.
+        self.record_exchange_target(rank, "main", at, 1, true);
+        self.exchange()?.push_to(rank, at, slot.retained[1].buffer.ptr,
+            self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)
     }
-    pub(super) fn core_finish_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, index: usize,
+    /// Zero Rank 1's shared/dense FFN output buffer without waiting on Rank 0:
+    /// only Rank 0 contributes the reduced split-core FFN partial.
+    pub(super) fn core_zero_ffn(&self, rank: usize, w: &Workspace<'_>, output: *mut c_void, rows: usize) -> Result<()> {
+        ensure!(rank == 1, "core_zero_ffn is rank-1 only");
+        let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
+        // SAFETY: only rank 0 contributes the fully transformed shared/dense result.
+        self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(output, output.bytes, self.stream_of(rank)) })
+    }
+    /// Rank 0 consumes Rank 1's `core_publish_ffn` partial and reduces `rank 0 + rank 1` into `output`.
+    pub(super) fn core_finish_ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, index: usize,
         output: *mut c_void, rows: usize) -> Result<()> {
         let slot = w.core.as_ref().context("Flash K6 FFN slot")?;
         let at = super::slot(index, true, slot.lane);
-        self.exchange_wait(self.exchange()?, "main", rank, at)?;
+        self.exchange_wait_target(self.exchange()?, "main", 0, at, 1)?;
         let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
         let key = ffn_key(layer, "down");
-        if rank == 0 {
-            self.core_reduce(rank, w, layer, &key, at, rows, 1, output)
-        } else {
-            // SAFETY: only rank 0 contributes the fully transformed shared/dense result.
-            self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(output, output.bytes, self.stream_of(rank)) })
-        }
+        self.core_reduce(0, w, layer, &key, at, rows, 1, output)
     }
     pub(super) fn core_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str,
         output: *mut c_void, count: Scalar) -> Result<()> {
