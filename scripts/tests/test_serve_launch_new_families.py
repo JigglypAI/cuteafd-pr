@@ -96,8 +96,8 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
     assert "--split-device" not in shlex.split(serve_s4)
 
 
-@pytest.mark.parametrize("mode", ["off", "dfly2"])
-def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str) -> None:
+@pytest.mark.parametrize("mode,selected", [("off", "off"), ("dfly2", "dfly2"), ("auto", "dfly2"), ("", "dfly2")])
+def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, selected: str) -> None:
     config = {"model_type": "hy_v4_flash", "num_hidden_layers": 42, "dfly_num_hidden_layers": 5,
               "mlp_layer_types": ["dense"] + ["sparse"] * 41}
     keys = f"SPARK_COUNT=0\nRTX_GPUS=1\nEXPERT_BACKEND=local\nSPECULATOR={mode}\nVISION=off\nAUDIO=off\n"
@@ -106,10 +106,10 @@ def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str) -
         physical_gpus=(0,), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0})
     plan = _line(result, "cuteafd plan")
     serve_line = _line(result, "serve-hy4f --snapshot")
-    assert _flag(plan, "--speculator") == mode
+    assert _flag(plan, "--speculator") == selected
     assert _flag(plan, "--decode-rows") == _flag(serve_line, "--decode-rows") == "32"
     serve = shlex.split(serve_line)
-    assert ("--dfly2" in serve) == (mode == "dfly2")
+    assert ("--dfly2" if selected == "dfly2" else "--dfly2=false") in serve
 
 
 def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path) -> None:

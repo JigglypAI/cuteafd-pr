@@ -649,15 +649,7 @@ GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
 GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "glm5": "dflash2", "glm5_flash": "dflash2",
                             "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
-                            "muse_spark": "dflash2", "minimax_m3": "dspark"}
-# Card name -> why it intentionally differs from the family default. Empty:
-# no gate card overrides its family's shipped drafter.
-GATE_SPECULATOR_EXCEPTIONS: dict[str, str] = {
-    "hy4f-exl3-min": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
-    "hy4f-exl3-max": "Hy4-flash's bundled DFly2 drafter is not served yet (#2478 follow-up); remove when it lands.",
-}
-
-
+                            "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2"}
 def _default_speculator(family: str, model: str) -> str:
     if family == "kimi_k3":
         return "dspark" if "K3.1" in model else "dflash2"
@@ -674,9 +666,6 @@ def test_gate_kit_cards_resolve_each_family_default_speculator() -> None:
         values = {**keys(ROOT / entry["config"]), **entry.get("set", {})}
         if entry["family"] == "kimi_k3":
             kimi.add(values["MODEL_ID"])
-        if entry["name"] in GATE_SPECULATOR_EXCEPTIONS:
-            assert GATE_SPECULATOR_EXCEPTIONS[entry["name"]].strip(), entry["name"]
-            continue
         declared = values.get("SPECULATOR", "auto")
         expected = _default_speculator(entry["family"], values["MODEL_ID"])
         assert declared != "off", f"{entry['name']}: cards run the family's shipped drafter"

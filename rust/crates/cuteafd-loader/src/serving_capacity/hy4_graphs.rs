@@ -127,6 +127,28 @@ pub fn reserve(layout: Option<Hy4GraphLayout>, rank: usize) -> (u64, u64) {
         .map_or((0, 0), |data| (data.reserve_base_bytes, data.reserve_extra_bytes))
 }
 
+/// Two donor-off, no-prewarm C1 passes (short and 32K). W1 uses the
+/// larger of charged and settled physical bytes. Margin rounds up the
+/// trace-priced maximum draft + verify step plus 8 MiB (at least 2x growth).
+pub fn draft_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<(u64, u64)> {
+    let (working, margin) = match (layout, rank) {
+        (Some(Hy4GraphLayout::Exl3Min), 0) => (86, 30),
+        (Some(Hy4GraphLayout::Exl3Max), 0) => (120, 32),
+        (Some(Hy4GraphLayout::Exl3Max), 1) => (118, 30),
+        _ => return None,
+    };
+    Some((working << 20, margin << 20))
+}
+
+pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize, dfly2: bool)
+    -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    if let Some((w1, margin)) = dfly2.then(|| draft_working_set(layout, rank)).flatten() {
+        return crate::placement::graph_reserve::current_with_step_margin(rank, false, w1, 0, Some(margin));
+    }
+    let (base, tail) = reserve(layout, rank);
+    crate::placement::graph_reserve::current(rank, false, base, tail)
+}
+
 /// Select complete rows against all devices; never borrow an untraced layout.
 pub fn selected_rows(layout: Option<Hy4GraphLayout>, max_rows: usize) -> anyhow::Result<Vec<(usize, bool)>> {
     let Some(trace) = prewarm(layout) else {
@@ -189,6 +211,18 @@ mod tests {
         assert_eq!(Hy4GraphLayout::Exl3Max.ranks(), 2);
         assert_eq!(Hy4GraphLayout::Exl3MinSpark.ranks(), 1);
         assert_eq!(Hy4GraphLayout::Exl3MaxSpark.ranks(), 2);
+    }
+
+    #[test]
+    fn draft_working_sets_are_rank_local_and_do_not_cover_spark_layouts() {
+        let mib = 1 << 20;
+        let min = Some(Hy4GraphLayout::Exl3Min);
+        let max = Some(Hy4GraphLayout::Exl3Max);
+        assert_eq!(draft_working_set(min, 0), Some((86 * mib, 30 * mib)));
+        assert_eq!(draft_working_set(min, 1), None);
+        assert_eq!(draft_working_set(max, 0), Some((120 * mib, 32 * mib)));
+        assert_eq!(draft_working_set(max, 1), Some((118 * mib, 30 * mib)));
+        assert_eq!(draft_working_set(Some(Hy4GraphLayout::Exl3MinSpark), 0), None);
     }
 
     #[test]

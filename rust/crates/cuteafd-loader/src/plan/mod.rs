@@ -55,6 +55,15 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
+/// DeepSeek V4.1 has no audio encoder. An omitted request defaults to off.
+pub fn v41_audio(requested: Option<MediaMode>) -> Result<MediaMode, PlanError> {
+    match requested {
+        None | Some(MediaMode::Off) => Ok(MediaMode::Off),
+        Some(_) => Err(PlanError::InvalidOption { option: "AUDIO (--audio)",
+            reason: "DeepSeek V4.1 has no audio encoder; use off".into() }),
+    }
+}
+
 /// Resolve a checkpoint's bundled native audio tower before placement.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {

@@ -1893,7 +1893,7 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
     keys += "".join(f"SPARK_{rank}_HOST=worker-{rank}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
                     for rank in range(8))
     if family == "deepseek_v41":
-        keys += "SPARKINFER_EXL3=disable\nRTX_EXPERT_LAYERS=auto\n"
+        keys += "RTX_EXPERT_LAYERS=auto\n"
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/eight-rank"
     result = _family_launch_result(temporary, config, model, keys,
         physical_gpus=tuple(range(deployment["rtx_gpus"])), root_launcher=True,

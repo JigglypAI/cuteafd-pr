@@ -1121,7 +1121,7 @@ release_known_key() {
     DECODE_LANES|DECODE_ROWS|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units & decode/verify row budget (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_NSYS_ROOT|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARKINFER_EXL3|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_REVISION|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_COUNT|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -1330,12 +1330,10 @@ release_load_config() {
 
   local default_model_id=deepseek-ai/DeepSeek-V4.1-Flash-1017
   MODEL_ID="$default_model_id"
-  MODEL_VARIANT=flash
   VISION=auto
   AUDIO=auto
   MODEL_REVISION=1bae0e1088993b9b82de08f59de5be5a34e42170
   SERVED_MODEL_ID=
-  EXPERT_FORMAT=native
   SPECULATOR=dspark
   TP2_ATTENTION=off
   TP2_QUERY_PROJECTION=off
@@ -1370,7 +1368,6 @@ release_load_config() {
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
   for release_memory_key in "${RELEASE_MEMORY_KEYS[@]}"; do printf -v "$release_memory_key" '%s' ""; done
-  SPARKINFER_EXL3=disable
   if [[ -z "${_release_count_env_saved:-}" ]]; then
     _release_count_env="${SPARK_COUNT-}" _release_hosts_env="${SPARK_HOSTS-}"
     _release_count_env_saved=1
@@ -1487,24 +1484,8 @@ release_load_config() {
   [[ "$VISION" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$VISION" != auto:* && "$VISION" != off:* ) ]] ||
     release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
   case "$AUDIO" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
-  case "$MODEL_VARIANT" in flash|pro) ;; *) release_die "MODEL_VARIANT must be flash or pro" ;; esac
-  case "$EXPERT_FORMAT" in native|exl3) ;; *) release_die "EXPERT_FORMAT must be native or exl3" ;; esac
-  if [[ "$mode" == launch ]]; then
-    [[ "$MODEL_VARIANT" != pro || "$EXPERT_FORMAT" == exl3 ]] ||
-      release_die "DeepSeek V4 Pro requires EXPERT_FORMAT=exl3"
-  fi
   [[ -z "$DRAFT_LENGTH" || "$DRAFT_LENGTH" =~ ^[1-9][0-9]*$ ]] ||
     release_die "DRAFT_LENGTH must be a positive integer"
-  case "$SPARKINFER_EXL3" in
-    auto|disable|force) ;;
-    *) release_die "SPARKINFER_EXL3 must be auto, disable, or force" ;;
-  esac
-  if [[ "$mode" == launch ]]; then
-    [[ "$SPARKINFER_EXL3" != disable || "$EXPERT_FORMAT" == native ]] ||
-      release_die "SPARKINFER_EXL3=disable requires EXPERT_FORMAT=native"
-    [[ "$SPARKINFER_EXL3" != force || "$EXPERT_FORMAT" == exl3 ]] ||
-      release_die "SPARKINFER_EXL3=force requires EXPERT_FORMAT=exl3"
-  fi
   if [[ "$mode" == stop ]]; then
     RTX_EXPERT_LAYERS="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" --onboard "$RTX_EXPERT_LAYERS")" || return 2
   else
@@ -1695,7 +1676,6 @@ release_resolve_local_model_revision() {
     release_die "resolved model revision is not 40..64 lowercase hex: $RELEASE_MODEL_REVISION"
   [[ -d "$model_root/snapshots/$RELEASE_MODEL_REVISION" ]] ||
     release_die "model snapshot is missing: $RELEASE_MODEL_ID@$RELEASE_MODEL_REVISION"
-  AUDIO="$(release_resolve_audio_mode "$AUDIO" "$model_root/snapshots/$RELEASE_MODEL_REVISION")"
 }
 
 # Two or three Spark ranks form the compact EXL3 topology (TP2 or TP3), not

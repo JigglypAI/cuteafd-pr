@@ -82,9 +82,9 @@ pub(crate) struct ServeArgs {
     /// Optional explicit path to `exl3-hy4f-k45-mul1/rtx-tp{1,2}` package directory.
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
-    /// Run the checkpoint's bundled DFly2 drafter.
-    #[arg(long)]
-    pub dfly2: bool,
+    /// Run bundled DFly2; auto enables it for Spark-free serving when present.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub dfly2: Option<bool>,
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
@@ -115,7 +115,7 @@ impl ServeArgs {
                 concurrency: self.max_sequences as u64,
                 decode_lanes: 1,
                 rtx_gpus: gpus,
-                draft_length: if self.dfly2 {
+                draft_length: if self.dfly2.unwrap_or(false) {
                     self.draft_length.draft_length.map(u32::try_from).transpose()?
                 } else { Some(0) },
             },
@@ -214,9 +214,8 @@ fn publish_provenance(
     );
     let graph_policies: Vec<_> = (0..runtime.gpus.len())
         .map(|gpu| {
-            let (base, tail) =
-                cuteafd_loader::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
-            cuteafd_loader::placement::graph_reserve::current(gpu, false, base, tail)
+            cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy(
+                graph_layout, gpu, args.dfly2 == Some(true))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
@@ -392,12 +391,21 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Hy4-flash supports 0..=6 distinct Spark peer endpoints"
     );
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
-    let decode_rows = args.resolved_decode_rows(gpus)?;
+    args.resolved_decode_rows(gpus)?;
     let resolved_attention = resolve_attention_placement(gpus, args.attention_placement.as_str())?;
+    // Resolve after the early decode-width and attention checks, but before admission.
+    if args.dfly2.is_none() && args.peers.is_empty() {
+        let view = args.attention.selected_view.clone().map(Ok)
+            .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+        args.dfly2 = Some(cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(&view.config()?));
+        args.attention.selected_view = Some(view);
+    }
+    let decode_rows = args.resolved_decode_rows(gpus)?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
     cuteafd_bench::context::ResolvedSettings::prefill(prefill)
         .value("decode-rows", decode_rows)
+        .value("dfly2", args.dfly2 == Some(true))
         .value("attention-placement", resolved_attention)
         .publish();
 
@@ -524,7 +532,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 catalog: &catalog,
                 cfg: &cfg,
                 model_core: &model.core,
-                dfly2: worker_args.dfly2,
+                dfly2: worker_args.dfly2 == Some(true),
                 kv_format: worker_args.kv_format,
                 manifest_path: Some(&worker_args.manifest),
                 coordinator: Coordinator::Measured { samples, loaded_code },
@@ -774,11 +782,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .value("rtx-expert-layers", onboarded_layers.len())
                 .value("prefill-rows", unit_rows)
                 .value("prefill-waves", prefill.waves)
-                .value("speculator", if worker_args.dfly2 { "dfly2" } else { "off" })
+                .value("speculator", if worker_args.dfly2 == Some(true) { "dfly2" } else { "off" })
                 .publish();
 
             let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
-            backend.warm_decode_graphs(graph_layout)?;
+            if worker_args.dfly2 != Some(true)
+                || cuteafd_loader::serving_capacity::hy4_graphs::draft_working_set(graph_layout, 0).is_none() {
+                backend.warm_decode_graphs(graph_layout)?;
+            }
             backend.enable_expert_usage();
             let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
                 cuteafd_engine::media::EmbeddingCache::new(0),
@@ -907,6 +918,7 @@ mod tests {
             assert_eq!(decode_rows, 32);
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("decode-rows", decode_rows)
+                .value("dfly2", args.dfly2 == Some(true))
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)

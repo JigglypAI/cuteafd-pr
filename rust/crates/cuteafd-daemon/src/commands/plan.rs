@@ -368,7 +368,7 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
         if let Some(value) = get("CORE_VIEW") { args.attention.core_view = value.parse()?; }
     }
     if !args.explicit_settings.contains("vision") { if let Some(value) = get("VISION") { args.vision = value.parse().map_err(anyhow::Error::msg)?; } }
-    if !args.explicit_settings.contains("audio") { if let Some(value) = get("AUDIO") { args.audio = value.parse().map_err(anyhow::Error::msg)?; } }
+    resolve_plan_audio_config(args, cfg)?;
     if !args.explicit_settings.contains("host_cache_bytes") {
         if let Some(value) = get("HOST_CACHE_BYTES") { args.host_cache_bytes = value.parse().map_err(anyhow::Error::msg)?; }
     }
@@ -376,9 +376,19 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     Ok(())
 }
 
+fn resolve_plan_audio_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if !args.explicit_settings.contains("audio") {
+        if let Some(value) = cfg.get("AUDIO").filter(|value| !value.is_empty()) {
+            args.audio = value.parse().map_err(|error| anyhow::anyhow!("AUDIO: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     use clap::ValueEnum;
     let get = |key: &str| cfg.get(key).filter(|v| !v.is_empty());
+    if family == "deepseek_v41" { resolve_v41_audio(args, cfg)?; }
     if family == "inkling2" {
         if !args.explicit_settings.contains("draft_kv_cache") {
             if let Some(value) = get("DRAFT_KV_CACHE") { args.draft_kv_cache = value.parse()?; }
@@ -424,6 +434,15 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
     if matches!(family, "qwen4" | "step5") && !args.explicit_settings.contains("native_mtp_layers") {
         if let Some(value) = get("SPECULATOR_DEPTH") { args.native_mtp_layers = value.parse().context("SPECULATOR_DEPTH")?; }
     }
+    Ok(())
+}
+
+fn resolve_v41_audio(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    use cuteafd_loader::plan::MediaMode;
+    let configured = cfg.get("AUDIO").is_some_and(|value| !value.is_empty());
+    let requested = (configured || args.explicit_settings.contains("audio") || args.audio != MediaMode::Auto)
+        .then_some(args.audio);
+    args.audio = cuteafd_loader::plan::v41_audio(requested)?;
     Ok(())
 }
 
@@ -1070,6 +1089,10 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let default = match family {
         "minimax_m3" | "inkling2" => "dspark",
+        "hy4_flash" if args.spark_ranks.unwrap_or(args.available_sparks) == 0
+            && (args.speculator == "auto" || args.include_speculator)
+            && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
+                &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1192,8 +1215,13 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     if let Some(mode) = cfg.get("VISION") { args.vision = mode.parse().map_err(anyhow::Error::msg)?; }
-    if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
-    args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
+    if family == "deepseek_v41" {
+        resolve_plan_audio_config(&mut args, &cfg)?;
+        resolve_v41_audio(&mut args, &cfg)?;
+    } else {
+        if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
+        args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
+    }
     Ok(args)
 }
 
@@ -2772,6 +2800,37 @@ mod tests {
                 assert_eq!(from_config.exlr8_manifest, explicit.exlr8_manifest, "{family} {key}");
                 assert_eq!(from_config.chat_template_from, explicit.chat_template_from, "{family} {key}");
             }
+        }
+    }
+
+    #[test]
+    fn v41_planner_audio_defaults_off_and_refuses_explicit_non_off_modes() {
+        use cuteafd_loader::plan::MediaMode;
+        let parse = |args: &[&str]| {
+            use clap::{CommandFactory, FromArgMatches};
+            let matches = crate::cli::Cli::command().try_get_matches_from(
+                ["cuteafd", "plan", "/unused"].into_iter().chain(args.iter().copied())).unwrap();
+            let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
+            let crate::cli::Commands::Plan(mut plan) = cli.command else { unreachable!() };
+            if let Some(mode) = cli.audio {
+                plan.audio = mode;
+                plan.explicit_settings.insert("audio".into());
+            }
+            plan
+        };
+        let mut plan = parse(&[]);
+        resolve_v41_audio(&mut plan, &Default::default()).unwrap();
+        assert_eq!(plan.audio, MediaMode::Off);
+        for value in ["auto", "rtx", "spark:0"] {
+            let cfg = [("AUDIO".into(), value.into())].into_iter().collect();
+            let mut configured = parse(&[]);
+            resolve_config(&mut configured, &cfg).unwrap();
+            assert!(resolve_v41_audio(&mut configured, &cfg).unwrap_err().to_string().contains("AUDIO"));
+            assert!(resolve_v41_audio(&mut parse(&["--audio", value]), &Default::default()).is_err());
+            let mut explicit_off = parse(&["--audio", "off"]);
+            resolve_config(&mut explicit_off, &cfg).unwrap();
+            resolve_v41_audio(&mut explicit_off, &cfg).unwrap();
+            assert_eq!(explicit_off.audio, MediaMode::Off);
         }
     }
 

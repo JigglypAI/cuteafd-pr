@@ -32,8 +32,6 @@ V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Fl
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
                         qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4', minimax_m3='MINIMAX',
                         inkling2='INKLING2', hy4_flash='HY4F')
-FORMAT_ALIASES = dict(exl3='exl3', tr3='exl3', nvfp4='nvfp4', nvfp4a4='nvfp4',
-                      fp8='fp8', mxfp4='fp8', bf16='fp8', native='fp8')
 # Families whose bundled vision tower runs the shared BF16 attention exports
 # (native/shared/cuda/vision_runtime.cu shared-runtime towers, including PE and
 # independent still towers). MiMo's ABI-1 tower and V4.1's own tower need none.
@@ -463,11 +461,6 @@ def model_id_format(model):
 
 
 def expert_format(family, values):
-    declared = str(values.get('EXPERT_FORMAT', '')).strip().lower()
-    if declared:
-        if declared not in FORMAT_ALIASES:
-            raise ValueError(f'unsupported EXPERT_FORMAT={values["EXPERT_FORMAT"]!r} for {family}')
-        return FORMAT_ALIASES[declared]
     model = str(values.get('MODEL_ID') or values.get('MODEL') or '').strip()
     config = checkpoint_config(values, default_model='')
     if config is not None:
@@ -479,15 +472,18 @@ def expert_format(family, values):
         if from_model is not None:
             return from_model
     raise ValueError(f'cannot derive WIP AOT expert format for {family} ({model or "missing MODEL_ID"}): '
-                     'checkpoint config.json is missing; download its metadata or set EXPERT_FORMAT')
+                     'download checkpoint config.json with supported quantization metadata')
 
 
-def is_pro_variant(values):
-    variant = str(values.get('MODEL_VARIANT', '')).strip().lower()
-    if variant in ('pro', 'flash'):
-        return variant == 'pro'
+def is_pro_variant(values, pro_hidden):
+    config = checkpoint_config(values, default_model='')
+    if config is not None:
+        text = config.get('text_config', config)
+        hidden = text.get('hidden_size', text.get('dim'))
+        if hidden in (4096, pro_hidden):
+            return hidden == pro_hidden
     model = str(values.get('MODEL_ID') or values.get('MODEL') or '').lower()
-    return 'pro' in model
+    return 'pro' in model.rsplit('/', 1)[-1]
 
 
 def dense_switch(values):
@@ -541,7 +537,7 @@ def family_scopes(cards, config_reader):
         if family in VISION_ATTENTION_FAMILIES and values.get('VISION', 'auto') != 'off':
             env['CUTEAFD_WIP_VISION_ATTENTION_AOT'] = 'ON'
         if family == 'deepseek_v4':
-            tag = 'dsv4p' if is_pro_variant(values) else 'dsv4f'
+            tag = 'dsv4p' if is_pro_variant(values, 7168) else 'dsv4f'
             scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count != 4 and count in native_spark_artifacts(tag) else ':spark')})
             if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
                 scopes.add(tag + ':rtx_tp2')
@@ -601,8 +597,10 @@ def family_scopes(cards, config_reader):
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
             env['CUTEAFD_WIP_EXLR8_AOT'] = 'ON'
-        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimop' if is_pro_variant(values) else 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
+        for fam, tag, switch in [('glm5', 'glm', 'GLM'), ('glm5_flash', 'glmf', 'GLMF'), ('mimo_v2', 'mimof', 'MIMO'), ('qwen4', 'qwen4', 'QWEN4'), ('step5', 'step5', 'STEP5')]:
             if family == fam:
+                if fam == 'mimo_v2' and is_pro_variant(values, 6144):
+                    tag = 'mimop'
                 env['CUTEAFD_WIP_' + switch + '_AOT'] = 'ON'
                 if exlr8:
                     families = set(filter(None, env.get('CUTEAFD_WIP_EXLR8_FAMILIES', '').split(';')))

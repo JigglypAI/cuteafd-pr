@@ -254,6 +254,7 @@ const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
     DerivedArguments { family: Some("mimo_v2"), names: &["max-sequences", "rings", "draft-sequences", "draft-context-slots",
         "http-queue-depth", "split-device", "embedding-placement", "fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"] },
     DerivedArguments { family: Some("qwen4"), names: &["slots", "mtp"] },
+    DerivedArguments { family: Some("hy4_flash"), names: &["dfly2"] },
     DerivedArguments { family: Some("deepseek_v41"), names: &["prefill-batch-tokens", "prefill-reserve-rows", "decode-lanes", "max-context-tokens", "embedding-placement", "kv-pool-size"] },
 ];
 fn derived_argument(family: &str, name: &str) -> bool {
@@ -375,7 +376,7 @@ pub(crate) fn assert_resolved_family_seam<T>(family: &str, later: &[&str],
         let mut context = cuteafd_bench::context::ServerContext { command: family.into(), ..Default::default() };
         for argument in definition.get_arguments() {
             if let Some(name) = argument.get_long() {
-                if derived_argument("", name) { context.require_resolved(name); }
+                if derived_argument(family_of(family).unwrap_or(""), name) { context.require_resolved(name); }
             }
         }
         context

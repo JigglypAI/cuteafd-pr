@@ -126,7 +126,6 @@ default-off performance lever adds its row here in the same PR (AGENTS.md).
 | `DECODE_LANES` | V4.1 | `DECODE_LANES=1` (default `2`; one lane at `CONCURRENCY=1`) | One decode batch of up to `min(CONCURRENCY, 32)` requests instead of two independent lanes; the second lane's workspaces, graphs, Spark link and decode execution return to the KV pool. V4.1 max (2 RTX PRO 6000 + 6 Sparks, dSpark), one interleaved matched-prompt launch per arm on `53f461beff` (2026-11-23, no power-cap or thermal slowdown): one/two-lane code-decode ratio C1/C2/C4/C8/C16 0.97/1.03/1.02/0.78/0.98 under `DRAFT_POLICY=history` and 1.05/1.02/0.77/0.84/0.73 at `DRAFT_LENGTH=7`. KV pool 7,520,768 to 8,007,680 tokens (+6.5%). Strict lossless 10/10 on every arm (#2460). | No precision change; one lane splits the verify-row budget (default 64; configurable via `DECODE_ROWS`) across all requests. |
 | `DECODE_ROWS` | V4.1, GLM Flash | `DECODE_ROWS=128` or `256` (default `auto` = `64`; GLM Flash up to `128` on 1 GPU; other families refuse `>64` pending exports) | Raises the per-lane decode/verify row budget up to `CONCURRENCY × (max_draft + 1)` within the family's exported decode programs so high-concurrency batches can verify deeper drafts in one pass; effect is workload/acceptance-dependent. Measured (2026-11-23, one warmed interleaved matched-prompt launch/arm, no thermal slowdown): GLM Flash 1× RTX PRO 6000 + 2 Sparks (`glmf-exl3-min`, K3.25-Core-FP8, DFlash2, KV pool 2,375,168→2,343,168, −1.35%): on shipping pin `e1d168c7` (`a711428996`, lower-acceptance-tail prompt nonce, `pwr_cap` 1→2 s / 0→1 s) C16 312.3→305.6 tok/s (−2.1%) under `DRAFT_POLICY=history` and 281.2→260.7 (−7.3%) at `DRAFT_LENGTH=7`; on prior pin `c29797e1` (`302a6bd3cc`, higher-acceptance-tail prompt nonce) C16 300.5→313.5 (+4.3%) under `history` and 293.9→299.6 (+1.9%) at `DRAFT_LENGTH=7` (C1 flat in both sessions). V4.1 2× RTX PRO 6000 + 6 Sparks (`v41-flash-max`, dSpark, prior pin `c29797e1` at `7505936344`, 0.0 s power-cap): `DECODE_LANES=1 DECODE_ROWS=128` vs default `2×64` is 0.79/0.88/0.84× at C4/C8/C16 (442.2/605.3/891.0→349.2/532.6/745.4) under `history` and 0.80/0.95/0.97× (429.6/570.7/828.0→344.1/539.3/805.4) at `DRAFT_LENGTH=7` (recovering from #2460's 0.73× at `1×64` C16; C1 flat; KV pool 7,520,768→7,347,712, −2.30%). Default stays `auto` (`64`). | No precision change (controlled 8-row vs 128-row decode-shaped fidelity matches on both families); larger per-row workspaces, verify logits, replay records and Spark decode owners reduce the admitted KV pool accordingly. |
 | `DRAFT_POLICY` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `DRAFT_POLICY=clamped` (default `history`) | `history`'s calibrated product keep with a per-round cut clamp(K / (x + M), 0.3, 0.45), K = 2, M = 1 (`cuteafd_core::clamped`, second refit 2026-11-23 on the live 7-card traces, #2460: worst card 0.996, mean 1.0095 of `history` in counterfactual replay; the first constants K = 3.4, HI = 0.7 measured Qwen4 1+0 C4/C16 0.93/0.95 because round time is concave in rows). x = (N / requests) / e from an online least-squares line t = N + e*rows through each context band's recent per-row-count round times; no time tables or card constants; 0.3 until a band's line exists. Higher concurrency means smaller x and a stricter cut. Live 7-card A/B of the first constants vs `history` (2026-11-23, strict lossless 10/10 on all 14 arms): V4.1, Kimi and MiniMax gained up to 1.10 at C4-C8, Qwen4, Inkling and Muse lost up to 0.93 at C4-C16; the replay that priced rows by the band line (fixed-7, +14.8%) overstated the gain. Expected effect of these constants: about +1% mean, unmeasured live. Both policies share the exploration rule in the `DRAFT_POLICY` reference below. | Drafts fewer positions per request at high concurrency (higher acceptance, more target-only rounds); no precision cost. |
-| `SPECULATOR` | Hy4-flash | `SPECULATOR=dfly2` (default `off`) | Reuses committed target MLA KV and indexer recall for up to five bundled DFly2 proposals. Serving throughput unmeasured. | Separate 1.58 GiB BF16 or 0.89 GiB K8 MUL1 drafter arena (plus workspace); target verifies every emitted token. |
 | `DRAFT_CONTEXT_WINDOW` | Kimi K3 | `DRAFT_CONTEXT_WINDOW=2048` (default `0`, native) | Bound full-context draft KV; unmeasured. Lithos K3.1 uses 40 MiB BF16 or 21.25 MiB FP8 per sequence at window 2048, instead of 20,480 or 10,880 bytes per token in the full-context pool. | Changes draft attention/acceptance, not verified target output. Native full context is retained at 0. |
 | `GRAPH_PREWARM` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Inkling, Hy4-flash, MiniMax | `GRAPH_PREWARM=off` (default `on`) | Skip startup prewarm of rank-local graph sites; they capture lazily on first use. Spanning (cross-device) sites always prewarm, because they cannot be captured after readiness (#1878). With donor-always, V4.1 min measured graph high-water 3.114 GB to 0.902 GB; GLM Flash min 52.4 MB to 35.7 MB (2026-11-16, RTX PRO 6000, one warmed launch/arm). V4.1 max (2 RTX + 6 Sparks, dSpark): one prompt-matched launch per arm on dev `21376c2ded` (2026-11-19, no throttling), C1 173.8 → 180.6 tok/s (1.039×), C16 1010.6 → 1046.9 tok/s (1.036×), readiness 30.68 → 28.15 s, strict lossless 10/10 on both. `off` defers rank-local captures to first use in early serving, building a subset of the `on` warm set; startup graph arena fell from ~1.24 GB to 4–6 MiB per GPU. Neither arm captured during C1; C16 warm-up recorded 910 → 8,022 capture attempts and the timed wave 182 → 1,638 (#2506). Other two-GPU max cards (off/on ratios, one launch per arm on one seal, 2026-11-19, no throttling): GLM Flash C1 1.11 / C16 0.97; Kimi K3.1 MC C1 1.00 / C16 1.02; Inkling MC (split head) C1 1.12 / C16 1.05; readiness at most 1.5 s faster. Those pairs passed strict lossless 10/10 with identical fidelity. Other families unmeasured. | First-use capture latency; no intended precision change. Admission reserve is unchanged: lower physical high-water alone does not expand KV; a separately qualified lower explicit reserve is needed. |
 | `GRAPH_DONOR_ALWAYS` | V4.1, V4, GLM 5.3 / ML4, MiMo, Qwen4, Qwen dense, Kimi K3, Step-5, Muse, Hy4-flash, MiniMax | `GRAPH_DONOR_ALWAYS=on` (default `off`) | Prefer a same-topology cold donor below the soft cap as well as above it. With prewarm off, V4.1 min C1/C16/post-C1 126.02/541.62/123.42 to 125.49/501.17/121.26 tok/s; 165,824 request-time updates/re-keys. GLM Flash min 109.41/393.98/87.17 to 109.02/397.93/87.10 tok/s; 1,270 updates/re-keys. One warmed matched launch/arm, RTX PRO 6000, no thermal slowdown, unchanged KL/top-1. | May replace a reusable cached shape and require a later update; no intended precision change. |
@@ -358,8 +357,9 @@ ContextSplit LSE and cross-GPU scored-indexer exports land (#2579), while
 explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
 refuses). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
-`off`). `SPECULATOR=dfly2` opts into the checkpoint's bundled five-stage
-DFly2 on one RTX or explicit two-RTX `heads`. It reuses committed target MLA KV
+`off`). `SPECULATOR=auto` (default) uses the checkpoint's bundled five-stage
+DFly2 on Spark-free layouts, including explicit two-RTX `heads`; Spark layouts
+retain their drafter-off default. `SPECULATOR=dfly2` explicitly enables it. It reuses committed target MLA KV
 and compressed-indexer recall; a fully restored prefix takes one target-only
 round before proposing. Proposals batch across requests; rank-local draft and
 verify sections graph exact live rows. Recall gathering, metadata uploads and
@@ -367,11 +367,19 @@ TP2 head handoff remain eager. `SPECULATION_TRACE` uses the shared speculation t
 Stored K8/K6 views load the bundled K8 MUL1 linears, except KV-B, which follows
 the target's absorbed-BF16 layout. `SPECULATOR=off` admits no drafter storage. Hy4-flash uses the shared `DECODE_ROWS` budget
 (up to 64 target rows, including anchors; `auto` is 64).
+The minimum layout is one RTX PRO 6000 with no Sparks. In the original-core test, with the
+bundled drafter enabled, its measured pool is 538,368 tokens (754,944 with the
+drafter off, same 512 MiB graph reserve and KV cap). Both clear the 262,144-token
+context floor. This layout intentionally falls short of the 2,097,152-token soft
+placement target even without the drafter; it does not add a Spark to reach it.
 `RTX_EXPERT_LAYERS=auto|all|N`,
 `PREFILL_ROWS`, `PREFILL_WAVES` (1–3), `PREFILL_PACKING=unrestricted`,
 `POOL_TOKENS`, `MAX_CONTEXT_TOKENS`, `CONCURRENCY`, `PREFIX_CACHE_ENTRIES`,
 `HOST_CACHE_BYTES`, `GPU_GRAPH_RESERVE` (with extra/cap keys) and `GRAPH_TRACE`
-follow the shared contracts. `PREFILL_PACKING=exact` refuses at startup: Hy4
+follow the shared contracts. With DFly2 and no Sparks, rank-local graphs
+capture lazily. The default reserve is the short/32K C1 working set plus one
+step of headroom: 116 MiB on TP1 and 152/148 MiB on TP2. Donors are used only
+under pressure by default. `PREFILL_PACKING=exact` refuses at startup: Hy4
 attests no coordinator packed-route cap yet. Exact prefix restores preserve SWA ring banks, DSA
 KV/indexer pages and the Engram rolling token tail byte-identically.
 
@@ -618,9 +626,6 @@ support draft/MTP comparisons or `--save-logits`.
 | `MODEL_ID` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | HF repo id | Checkpoint to serve; starting configs always set it. |
 | `MODEL_REVISION` | `1bae0e1088993b9b82de08f59de5be5a34e42170` | empty or 40–64 lowercase hex | Empty takes the hub checkout. |
 | `SERVED_MODEL_ID` | `MODEL_ID` | string | Public id in the API. |
-| `MODEL_VARIANT` | `flash` | `flash`, `pro` | V4.1 only; `pro` requires `EXPERT_FORMAT=exl3`. |
-| `EXPERT_FORMAT` | `native` | `native`, `exl3` | V4.1 routed-expert format. |
-| `SPARKINFER_EXL3` | `disable` | `auto`, `disable`, `force` | V4.1; `disable` needs `native`, `force` needs `exl3`. |
 | `INSTANCE` | unset | `[A-Za-z0-9_.-]` | Namespaces containers and state. |
 | `WIP_INSTANCE`, `WIP_ROOT` | unset | instance / absolute path | `--wip` slot staging. |
 | `WIP_BUILD_SEED` | `kakapo` | seed | Site build seed; every launch path accepts it. |
@@ -798,7 +803,7 @@ The old `-HQA` checkpoints were withdrawn from Hugging Face. Historical results 
 | `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable MC dense-core view. Plain checkpoints support original only. FP8 converts exactly original `core_tensors` from its BF16 index with the shared block-128 recipe; no alternate index reads. Flash supports its full MC core. Muse supports its full MC selection (q/k/v/o, optional gate, pre/post-expert projections and padded vocabulary head); it stays explicit, not default. Kimi K3.1 supports its full MC selection (KDA/MLA projections, shared FFN, routed latent projections and vocabulary head). GLM/Step support their selected target core; Step includes MTP core, never routed experts. Unselected operands stay native. GLM and Step require v52e coordinator exports. Measured speed/quality costs are in Optional performance levers; original stays default, FP8 stays opt-in. Already-FP8 sources refuse. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
-| `ATTENTION_PRECISION` | `bf16` | `bf16`, `fp8` | Shared MLA quality tier for prefill, decode and verification. The default `bf16` uses the fastest qualified kernel that meets BF16-tier accuracy, regardless of operand format. The opt-in `fp8` selects a faster, lower-quality route where available. Neither GLM 5.3 nor GLM Flash has a separate lower tier for native prefill: GLM 5.3 uses native BF16 and GLM Flash uses two-term E4M3 Q2P2 under both settings. The key still selects the qualified split-decode tier. Neither tier changes projection or weight precision or KV storage. Kimi K3 compact-record native prefill already widens to BF16 and uses BF16 MMAs: both settings keep it, and K3 prefill has no lower tier. K3.1 sparse MLA and V4.1 also keep their qualified attention under either setting. Non-MLA families without an FP8-tier program keep their native attention under either setting. Plan, serve and golden use `--attention-precision`. |
+| `ATTENTION_PRECISION` | `bf16` | `bf16`, `fp8` | Shared MLA quality tier for prefill, decode and verification. The default `bf16` uses the fastest qualified kernel that meets BF16-tier accuracy, regardless of operand format. The opt-in `fp8` selects a faster, lower-quality route where available. Neither GLM 5.3 nor GLM Flash has a separate lower tier for native prefill: GLM 5.3 uses native BF16 and GLM Flash uses two-term E4M3 Q2P2 under both settings. The key still selects the qualified split-decode tier. Neither tier changes projection or weight precision or KV storage. Kimi K3 compact-record native prefill already widens to BF16 and uses BF16 MMAs: both settings keep it, and K3 prefill has no lower tier. K3.1 sparse MLA keeps its qualified attention under either setting. V4.1 accepts `fp8` but resolves it to `bf16`; it has no FP8 attention tier. Non-MLA families without an FP8-tier program keep their native attention under either setting. Plan, serve and golden use `--attention-precision`. |
 | `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
@@ -892,7 +897,7 @@ when the server has no drafter or its effective draft policy is `off`.
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
-| `AUDIO` | `auto` | `auto`, `off` | Bundled audio tower. |
+| `AUDIO` | `auto` (V4.1: `off`) | `auto`, `off` (V4.1: `off` only) | Bundled audio tower. V4.1 has no audio encoder. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
 | `MEDIA_CACHE_BYTES` | engine | byte size | Host embedding-cache quota for an enabled media tower. On the GLM engine this applies to ML4 vision only (default min(8 GiB, 5% of host RAM)); the same quota goes to plan and serve. |
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
@@ -1218,7 +1223,7 @@ Media:
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | ✓ (`auto`/`off`; auto starts none) |
-| `AUDIO` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
+| `AUDIO` | `off` (default; no tower) | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
 
 Native EXLR8 (`EXLR8_MANIFEST`): GLM 5.3/ML4 and GLM Flash, the only
 architectures EXLR8 checkpoints declare. Placement is 1–2 RTX plus 1–8 Sparks; GLM Flash TP2 also
@@ -1242,9 +1247,6 @@ original core is already FP8, not an MC publication.
 | `MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MODEL_REVISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SERVED_MODEL_ID` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MODEL_VARIANT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `EXPERT_FORMAT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `SPARKINFER_EXL3` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_INSTANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `WIP_ROOT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -1301,7 +1303,7 @@ original core is already FP8, not an MC publication.
 | `CORE_VIEW` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `ATTENTION_PRECISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ATTENTION_PRECISION` | ✓ (`fp8` resolves to `bf16`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
@@ -1351,7 +1353,7 @@ original core is already FP8, not an MC publication.
 | `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Media** | | | | | | | | | | |  | |  |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `AUDIO` | ✓ (`off` only) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `VISION_REPLICAS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_CACHE_BYTES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 | `MEDIA_FEATURES_DIR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

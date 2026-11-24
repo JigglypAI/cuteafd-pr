@@ -105,9 +105,9 @@ def parse_doc() -> tuple[dict[str, dict[str, bool]], set[str]]:
                 if key.startswith("**"):
                     continue
                 cells = row[1:]
-                assert all(cell in {"✓", "✗"} for cell in cells), row
+                assert all(re.fullmatch(r"[✓✗](?: \(.+\))?", cell) for cell in cells), row
                 assert key not in matrix, f"duplicate matrix row: {key}"
-                matrix[key] = {column: cell == "✓" for column, cell in zip(COLUMNS, cells)}
+                matrix[key] = {column: cell.startswith("✓") for column, cell in zip(COLUMNS, cells)}
             continue
         if header and header[0] == "Key":
             for row in rows:
@@ -424,10 +424,6 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == COLUMNS
                 assert "`DRAFT_POLICY=clamped`" in lever["enable"]
                 assert "clamped) draft_policy_args=(--draft-policy clamped) ;;" in (ROOT / "scripts/launch/run-family.sh").read_text()
-            elif key == "SPECULATOR":
-                assert default == "family default"
-                assert lever["families"] == ["Hy4-flash"]
-                assert lever["enable"] == "`SPECULATOR=dfly2` (default `off`)"
             elif key == "DRAFT_CONTEXT_WINDOW":
                 assert default == "0"
                 assert lever["families"] == ["Kimi K3"]
@@ -596,3 +592,19 @@ def test_serve_glm_standard_option_contract(checkpoint_family):
             "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS"} <= keys
     assert not {"CHAT_TEMPLATE_FROM", "EXPERT_INPUT", "RTX_EXPERT_PEER",
                 "PREFILL_BATCH_TOKENS", "TP2_DFLASH"} & keys
+
+
+
+def test_v41_public_id_and_option_limits_are_documented():
+    assert MATRIX["SERVED_MODEL_ID"]["V4.1"]
+    assert MATRIX["AUDIO"]["V4.1"]
+    assert MATRIX["ATTENTION_PRECISION"]["V4.1"]
+    text = DOC.read_text()
+    assert "| `AUDIO` | `off` (default; no tower) |" in text
+    assert "| `ATTENTION_PRECISION` | ✓ (`fp8` resolves to `bf16`) |" in text
+
+
+def test_retired_v41_keys_are_not_known_or_documented():
+    for key in ("MODEL_VARIANT", "EXPERT_FORMAT", "SPARKINFER_EXL3", "SPARK_REDUCTION_MIN_ROWS", "KV_POOL_TOKENS"):
+        assert key not in MATRIX and key not in DOCUMENTED and key not in UNION
+        assert run_bash(f"release_known_key {key}").returncode != 0
