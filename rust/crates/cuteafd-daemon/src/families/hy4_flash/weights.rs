@@ -37,7 +37,7 @@ use cuteafd_loader::shared::token_table::{AdmissionTimedOut, TablePipeline};
 use cuteafd_loader::{GatherLease, GatherTicket, TableStatsSnapshot};
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::{fs::File, ops::Range, os::unix::fs::FileExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -430,6 +430,19 @@ fn packed_engram_rects(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, name: &str
     Ok(None)
 }
 
+pub(super) fn read_tensor_bytes(checkpoint: &Checkpoint, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
+    let entry = checkpoint
+        .tensors
+        .iter()
+        .find(|t| t.meta.name == name)
+        .with_context(|| format!("Hy4-flash checkpoint missing tensor {name}"))?;
+    let file = File::open(checkpoint.snapshot.join(&entry.shard))
+        .with_context(|| format!("opening shard {} for {name}", entry.shard))?;
+    let mut bytes = vec![0u8; usize::try_from(entry.meta.byte_length)?];
+    file.read_exact_at(&mut bytes, entry.meta.byte_offset)?;
+    Ok((bytes, entry.meta.dtype.clone(), entry.meta.shape.clone()))
+}
+
 fn dense_rect(checkpoint: &Checkpoint, name: &str, rank: usize, gpus: usize) -> Result<Rect> {
     let stem = name.strip_suffix(".weight").unwrap_or(name);
     let tensor = if checkpoint.contains_tensor(name) { name.to_owned() } else { format!("{name}.weight") };
@@ -460,8 +473,7 @@ fn dense_rect(checkpoint: &Checkpoint, name: &str, rank: usize, gpus: usize) -> 
     Rect::tensor(checkpoint, &tensor, rows, cols)
 }
 
-#[cfg(test)]
-fn pack_kv_b_absorbed(
+pub(super) fn pack_kv_b_absorbed(
     raw: &[u8],
     local_heads: usize,
     nope: usize,

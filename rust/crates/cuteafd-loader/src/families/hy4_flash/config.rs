@@ -457,6 +457,26 @@ impl Hy4FlashConfig {
 }
 
 impl Hy4DflyConfig {
+    /// The block contains the uncached bonus token followed by mask slots.
+    pub fn block_rows(&self) -> usize {
+        self.num_speculative_tokens + 1
+    }
+
+    pub fn validate_serving(&self, root: &Value, text: &Hy4FlashConfig) -> Result<()> {
+        let unique = self.target_kv_layers.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        ensure!(self.layers == 5 && unique.len() == self.layers
+            && self.target_kv_layers == self.target_index_layers
+            && unique.iter().all(|&layer| text.sparse_layer.get(layer) == Some(&true)),
+            "Hy4 DFly2 requires five distinct paired sparse KV and indexer taps");
+        ensure!(self.target_index_topk == text.indexer_candidate_topk
+            && self.enable_hidden_correction && self.mtp_fusion == "slot0"
+            && root.get("dfly_context_local_window").is_none_or(|w| w.is_null() || w.as_u64() == Some(0)),
+            "Hy4 DFly2 requires shared full recall, slot0 fusion and hidden correction");
+        ensure!((1..=5).contains(&self.num_speculative_tokens),
+            "Hy4 DFly2 supports 1 to 5 speculative tokens in config, found {}", self.num_speculative_tokens);
+        Ok(())
+    }
+
     pub fn from_hf(root: &Value, text: &Hy4FlashConfig) -> Result<Option<Self>> {
         let Some(layers) = root.get("dfly_num_hidden_layers").and_then(Value::as_u64) else {
             return Ok(None);

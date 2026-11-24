@@ -523,6 +523,22 @@ fn installed_hy4_flash_plan_across_all_mc_views_and_two_cards() {
         let catalog = input.expert_catalog().expect("real hy4f EXL3 MUL1 expert catalog");
         let exl3 = catalog.exl3().expect("hy4f catalog must be EXL3");
         assert_eq!(exl3.package_name("hy4f"), "exl3-hy4f-k45-mul1");
+        let draft_config = Hy4DflyConfig::from_hf(&input.checkpoint().config, &Hy4FlashConfig::read(&snap).unwrap()).unwrap().unwrap();
+        assert_eq!(draft_config.target_kv_layers, [25, 29, 33, 37, 41]);
+        assert_eq!(draft_config.block_rows(), 6);
+        let draft_checkpoint = Checkpoint::open_view_for_role(&selected, "test DFly2", |n| n.starts_with(draft::PREFIX)).unwrap();
+        let model = Model::open(input.checkpoint()).unwrap();
+        let facts = draft::Admission::new(&draft_checkpoint, &model.cfg, &draft_config, &model.core,
+            crate::families::hy4_flash::Hy4KvCache::Fp8, 16, 64).unwrap();
+        let compact = matches!(view, CoreView::K8Compact | CoreView::K6Compact);
+        assert_eq!(facts.weights.native.len(), if compact { 40 } else { 0 });
+        assert_eq!(facts.weights.absorbed.len(), if compact { 5 } else { 0 });
+        for stem in facts.weights.absorbed.keys() {
+            assert!(facts.weights.arena.view(&format!("{stem}.weight")).is_some());
+            assert!(facts.weights.arena.view(&format!("{stem}.trellis")).is_none());
+        }
+        assert!(facts.backing_bytes(0).unwrap() > facts.weights.arena.bytes() as u64);
+        assert!(facts.backing_bytes(1).unwrap() < 1 << 22);
         let report = input.plan(&PlanOptions::default()).expect("plan Hy4 view");
         assert_eq!(report.family.as_deref(), Some("hy4_flash"), "view={view}");
         assert!(report.unclassified.is_empty(), "view={view} unclassified: {:?}", report.unclassified);
@@ -640,6 +656,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         spark_ranks: 4,
         spark_bytes: spark_bytes.clone(),
         prefill,
+        dfly2: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,
@@ -669,6 +686,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         spark_ranks: 4,
         spark_bytes,
         prefill,
+        dfly2: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,
@@ -729,6 +747,7 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
         spark_ranks: 4,
         spark_bytes: vec![120u64 << 30; 4],
         prefill,
+        dfly2: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,

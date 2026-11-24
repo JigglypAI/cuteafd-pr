@@ -56,6 +56,8 @@ pub(crate) struct GoldenArgs {
     /// Prefill wave slots in flight (`1..=3`) for multi-wave byte-identity verification.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=3))]
     pub(crate) prefill_waves: u8,
+    #[arg(long, default_value = "auto")]
+    pub(crate) decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     /// Serving-shaped N=1 decode parity: prefill `0..score_from-1` in chunks, then step 1 token at a time.
     #[arg(long)]
     pub(crate) decode: bool,
@@ -88,6 +90,12 @@ pub(crate) struct GoldenArgs {
     /// (prompt A in wave k, prompt B in wave k+1) and disjoint per-wave Engram buffers.
     #[arg(long)]
     pub(crate) verify_waves: bool,
+    /// Qualify the bundled drafter with the exact resume check and a rejected tail.
+    #[arg(long, requires = "resume_at")]
+    pub(crate) resume_dfly2: bool,
+    /// Compare serial greedy continuation to forced multi-row verify with those same tokens.
+    #[arg(long, requires = "resume_at", conflicts_with = "resume_dfly2")]
+    pub(crate) resume_verify: bool,
 }
 
 fn read_u32_bin(path: &Path) -> Result<Vec<u32>> {
@@ -298,6 +306,13 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         device_ids.push(second);
     }
     let devices: Vec<Device<'_>> = device_ids.iter().map(|&id| Device { library: &library, id }).collect();
+    let decode_rows = cuteafd_loader::plan::resolve_decode_rows("hy4_flash",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(),
+            concurrency: if args.resume_at.is_empty() { 1 } else { 2 },
+            decode_lanes: 1, rtx_gpus: devices.len(), draft_length: None,
+        })? as usize;
+
     ensure!(
         args.expert_package.is_none() || !args.skip_routed_experts,
         "--expert-package conflicts with --skip-routed-experts"
@@ -320,9 +335,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     &catalog,
                     pkg,
                     layers,
-                    unit,
+                    unit.max(decode_rows),
                     budget,
-                    RtxSelectionPolicy::FirstCapacity,
+                    RtxSelectionPolicy::CanonicalDecode,
                 )?;
                 vec![Some(w.execution()?)]
             } else {
@@ -332,9 +347,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     cuteafd_core::ExpertGeometry::HY4_FLASH,
                     [pkg.as_path(), pkg.as_path()],
                     layers,
-                    unit,
+                    unit.max(decode_rows),
                     [budget, budget],
-                    RtxSelectionPolicy::FirstCapacity,
+                    RtxSelectionPolicy::CanonicalDecode,
                 )?;
                 vec![Some(w0.execution()?), Some(w1.execution()?)]
             }
@@ -363,7 +378,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             cfg.clone(),
             args.kv_cache,
             unit,
-            unit.min(cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS as usize),
+            decode_rows,
             prefill_waves,
             max_pages,
             2,
@@ -381,12 +396,25 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             cfg.clone(),
             args.kv_cache,
             unit,
+            decode_rows,
             prefill_waves,
             max_pages,
             args.skip_routed_experts,
             onboarded,
         )?
     };
+
+    if args.resume_dfly2 {
+        use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
+        let model = hy4_plan::Model::open(&checkpoint)?;
+        let config = Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?.context("no bundled DFly2")?;
+        let layout = draft::Admission::new(&checkpoint, &cfg, &config, &model.core, args.kv_cache,
+            2, decode_rows)?;
+        let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint,
+            &cfg, config, layout, args.kv_cache, 2, decode_rows))?;
+        engine.attach_drafter(drafter)?;
+    }
+    if args.resume_verify { engine.allocate_verify_keys()?; }
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {
         let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
@@ -444,7 +472,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             }
             tokens.truncate(max_resume);
         }
-        return run_resume_check(&mut engine, &tokens, &args.resume_at, args.resume_rows, unit, args.resume_host);
+        return run_resume_check(&mut engine, &tokens, &args.resume_at, args.resume_rows, unit,
+            args.resume_host, args.resume_dfly2, args.resume_verify);
     }
 
     let vocab = cfg.vocab_size;
@@ -741,6 +770,8 @@ fn run_resume_check(
     resume_rows: usize,
     unit_rows: usize,
     use_host: bool,
+    dfly2: bool,
+    forced_verify: bool,
 ) -> Result<()> {
     use super::cache::Hy4Placement;
     use super::execution::HeadMode;
@@ -750,6 +781,11 @@ fn run_resume_check(
     use cuteafd_loader::formats::mapped_table::ReadPriority;
 
     ensure!(resume_rows > 0, "--resume-rows must be positive");
+    if forced_verify {
+        ensure!((2..=engine.decode_rows).contains(&resume_rows), "forced verify needs 2..={} rows", engine.decode_rows);
+    }
+    let dump_root = forced_verify.then(|| engine.dump_dir.take()).flatten();
+    let mut verify_exact = true;
     let library = engine.library();
     let family = engine.prefix()?;
     let layout = family.layout();
@@ -815,30 +851,31 @@ fn run_resume_check(
         Ok(last_logits)
     };
 
-    let run_decode_step = |engine: &mut Hy4Engine<'_>, placement: &mut Hy4Placement, tok: u32| -> Result<Vec<f32>> {
+    let run_verify = |engine: &mut Hy4Engine<'_>, placement: &mut Hy4Placement, input: &[u32], keep: usize| -> Result<Vec<f32>> {
         let pos = placement.len;
+        let rows = input.len();
         let unit = Unit {
             index: 0,
             sequence: 0,
             segments: vec![UnitSegment {
                 sequence: 0,
-                rows: 0..1,
-                tokens: pos..pos + 1,
+                rows: 0..rows,
+                tokens: pos..pos + rows,
                 prompt_end: false,
                 snapshot: false,
                 head: true,
             }],
-            rows: 0..1,
+            rows: 0..rows,
             layers: 0..layers,
             slot: 0,
             barrier: false,
         };
         let mut next = [placement.clone()];
-        let src = [tok];
         let mut logits = Vec::new();
-        engine.run_units(
+        engine.set_provisional(rows > 1)?;
+        let result = engine.run_units(
             &mut next,
-            &[&src],
+            &[input],
             &[unit],
             ReadPriority::Decode,
             |_| HeadMode::Suffix(0),
@@ -846,8 +883,19 @@ fn run_resume_check(
                 logits = tile.to_host(library)?;
                 Ok(())
             },
-        )?;
-        *placement = next.into_iter().next().unwrap();
+        );
+        engine.set_provisional(false)?;
+        result?;
+        let mut next = next.into_iter().next().unwrap();
+        if rows > 1 {
+            engine.commit_provisional_keys(placement.slot, pos, 0, keep)?;
+            engine.accept_draft(placement.slot, keep - 1, pos + keep)?;
+            next.len = pos + keep;
+            next.state_len = next.len;
+            next.engram_tail = cuteafd_loader::families::hy4_flash::advance_tail(placement.engram_tail, input, keep);
+        }
+        *placement = next;
+        logits.truncate(keep * vocab);
         Ok(logits)
     };
 
@@ -894,6 +942,59 @@ fn run_resume_check(
             );
         }
 
+        if forced_verify {
+            let greedy = |logits: &[f32]| -> Result<u32> {
+                ensure!(logits.iter().all(|f| f.is_finite()), "nonfinite target logits in forced verify");
+                let mut best = 0;
+                for i in 1..logits.len() { if logits[i] > logits[best] { best = i; } }
+                Ok(best as u32)
+            };
+            let mut next = greedy(&logits_p)?;
+            let mut input = Vec::with_capacity(resume_rows);
+            let mut serial = Vec::with_capacity(resume_rows);
+            for j in 0..resume_rows {
+                input.push(next);
+                engine.dump_dir = if j == 0 { dump_root.as_ref().map(|p| p.join(format!("{at}/singleton"))) } else { None };
+                let logits = run_verify(engine, &mut p_a, &[next], 1)?;
+                next = greedy(&logits)?;
+                serial.push(logits);
+            }
+            engine.dump_dir = dump_root.as_ref().map(|p| p.join(format!("{at}/batch")));
+            let batched = run_verify(engine, &mut p_b, &input, input.len())?;
+            engine.dump_dir = None;
+            let mut exact = 0;
+            let mut matching_ids = 0;
+            for (j, (a, b)) in serial.iter().zip(batched.chunks_exact(vocab)).enumerate() {
+                let mismatches = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                let max_abs = a.iter().zip(b).map(|(x, y)| (x-y).abs()).fold(0.0f32, f32::max);
+                let ids_equal = greedy(a)? == greedy(b)?;
+                exact += usize::from(mismatches == 0);
+                matching_ids += usize::from(ids_equal);
+                println!("hy4f-golden forced verify prefix={at} row={j} hash_match={} mismatches={mismatches} max_abs={max_abs:.8e} argmax_match={ids_equal}", mismatches == 0);
+            }
+            let left = engine.dump_state(&p_a)?;
+            let right = engine.dump_state(&p_b)?;
+            let state_exact = left.iter().zip(&right).all(|(a, b)| a.diff(b).is_empty());
+            println!("hy4f-golden forced verify prefix={at} exact={exact}/{resume_rows} argmax={matching_ids}/{resume_rows} state_exact={state_exact}");
+            verify_exact &= exact == resume_rows && state_exact;
+            cache.release(&family, &p_a.units)?;
+            cache.release(&family, &p_b.units)?;
+            continue;
+        }
+
+        if dfly2 {
+            // No physical recall pointers live in the mark. The restored
+            // request must recover them from its first ordinary target step.
+            engine.invalidate_draft(p_b.slot);
+            let started = std::time::Instant::now();
+            let candidates = engine.draft_propose(&p_a, tokens[at], 5)?;
+            let draft_us = started.elapsed().as_micros();
+            ensure!(!candidates.is_empty(), "DFly2 fresh request produced no proposals");
+            ensure!(engine.draft_propose(&p_b, tokens[at], 5)?.is_empty(),
+                "DFly2 restored request proposed from stale taps");
+            println!("hy4f-golden DFly2 resume={at}: restored request skips one proposal; fresh draft_us={draft_us} proposed={}", candidates.len());
+        }
+
         // 4) 1-token-at-a-time decode continuation comparison: A (straight) vs B (restored).
         let mut max_abs_diff = 0.0f32;
         let mut bitwise_eq = 0usize;
@@ -901,9 +1002,22 @@ fn run_resume_check(
         let mut first_diff_step: Option<(usize, f32)> = None;
         for step in 0..resume_rows {
             let tok = tokens[at + step];
-            let la = run_decode_step(engine, &mut p_a, tok)?;
-            let lb = run_decode_step(engine, &mut p_b, tok)?;
-            if step == 0 {
+            let verify = if dfly2 && step == 1 {
+                // Submit the same accepted token with deliberately rejected
+                // tails on both paths; a following ordinary step exercises
+                // all four Engram layers using the recovered history.
+                vec![tok, (tok + 1) % vocab as u32, (tok + 2) % vocab as u32, (tok + 3) % vocab as u32]
+            } else { vec![tok] };
+            let la = run_verify(engine, &mut p_a, &verify, 1)?;
+            let lb = run_verify(engine, &mut p_b, &verify, 1)?;
+            if dfly2 {
+                ensure!(engine.draft_valid(&p_b), "DFly2 restore did not rejoin after one target row");
+                let expected = &tokens[..at + step + 1];
+                let tail = &expected[expected.len().saturating_sub(2)..];
+                ensure!(p_a.engram_tail.ends_with(tail) && p_b.engram_tail.ends_with(tail),
+                    "DFly2 rejected rows advanced Engram state");
+            }
+            if step == 0 || (dfly2 && step <= 2) {
                 let after_a = engine.dump_state(&p_a)?;
                 let after_b = engine.dump_state(&p_b)?;
                 for (rank_idx, (sa, sb)) in after_a.iter().zip(&after_b).enumerate() {
@@ -966,6 +1080,7 @@ fn run_resume_check(
             "hy4f-golden --resume-at {at}: idle page leak ({idle:?})"
         );
     }
+    ensure!(verify_exact, "Hy4 forced target verify differs from serial greedy decode");
     println!("hy4f-golden --resume-at: PASS");
     Ok(())
 }

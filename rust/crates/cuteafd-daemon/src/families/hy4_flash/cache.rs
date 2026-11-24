@@ -25,7 +25,7 @@ use std::rc::Rc;
 /// Bytes per sequence per DSA layer reserved for `0..=3` pending incomplete indexer token keys.
 pub(crate) const PENDING_KEY_SLOT_BYTES: usize = 3 * 128 * 4;
 
-fn slice_buf(buf: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+pub(super) fn slice_buf(buf: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(
         bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= buf.bytes),
         "Hy4-flash cache slice [{offset}..+{bytes}] exceeds allocation {}",

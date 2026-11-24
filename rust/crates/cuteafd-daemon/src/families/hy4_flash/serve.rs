@@ -24,7 +24,7 @@ use cuteafd_loader::{
         families::hy4_flash::{self as hy4_place, AdmittedHy4, Hy4Inputs},
         planner::{
             ComponentKind, CoordinatorDevices, Lifetime, Location, Operation, PrefillShape,
-            Receipt, Recipe, ResolvedPlan,
+            Phase, Receipt, Recipe, ResolvedPlan,
         },
         ArchContext, AttentionPlacement, Onboard,
     },
@@ -82,6 +82,9 @@ pub(crate) struct ServeArgs {
     /// Optional explicit path to `exl3-hy4f-k45-mul1/rtx-tp{1,2}` package directory.
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
+    /// Run the checkpoint's bundled DFly2 drafter.
+    #[arg(long)]
+    pub dfly2: bool,
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
@@ -112,7 +115,9 @@ impl ServeArgs {
                 concurrency: self.max_sequences as u64,
                 decode_lanes: 1,
                 rtx_gpus: gpus,
-                draft_length: Some(0),
+                draft_length: if self.dfly2 {
+                    self.draft_length.draft_length.map(u32::try_from).transpose()?
+                } else { Some(0) },
             },
         )? as usize)
     }
@@ -256,9 +261,11 @@ fn reconcile_runtime_inventory(
 ) -> Result<()> {
     // 1. Target weight arenas: exactly one physical backing per coordinator GPU, matching bytes & location.
     let mut target_backings = 0usize;
+    let mut draft_backings = 0usize;
     for receipt in weight_receipts.iter().filter(|r| r.allocation.view.is_none()) {
         let actual = &receipt.allocation;
-        if actual.id.starts_with("hy4_flash/target/gpu") {
+        let drafter = actual.id == cuteafd_loader::families::hy4_flash::draft::ARENA_ID;
+        if drafter || actual.id.starts_with("hy4_flash/target/gpu") {
             let planned = plan
                 .facts
                 .allocations
@@ -272,7 +279,7 @@ fn reconcile_runtime_inventory(
                 actual.bytes,
                 planned.bytes
             );
-            target_backings += 1;
+            if drafter { draft_backings += 1; } else { target_backings += 1; }
         }
     }
     ensure!(
@@ -280,6 +287,8 @@ fn reconcile_runtime_inventory(
         "Hy4-flash target arena backing count {target_backings} != {} GPUs",
         inputs.gpus
     );
+
+    ensure!(draft_backings == usize::from(inputs.draft.is_some()), "Hy4-flash drafter arena backing count differs");
 
     // 2. Retained device backings: cache, packed rank scratch, packed wave scratches, head workspace, native scratch.
     let contract = inputs.prepare(&plan.request)?;
@@ -290,12 +299,13 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
             || id.starts_with("expert-usage.gpu")
+            || (id.starts_with("hy4_flash/dfly2/") && id != cuteafd_loader::families::hy4_flash::draft::ARENA_ID)
     };
     let planned: BTreeMap<&str, &cuteafd_loader::placement::planner::Allocation> = plan
         .facts
         .allocations
         .iter()
-        .filter(|a| a.view.is_none() && selected(&a.id))
+        .filter(|a| a.view.is_none() && selected(&a.id) && a.lifetime.contains(Phase::Ready, contract.phase_order))
         .map(|a| (a.id.as_str(), a))
         .collect();
 
@@ -514,6 +524,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 catalog: &catalog,
                 cfg: &cfg,
                 model_core: &model.core,
+                dfly2: worker_args.dfly2,
                 kv_format: worker_args.kv_format,
                 manifest_path: Some(&worker_args.manifest),
                 coordinator: Coordinator::Measured { samples, loaded_code },
@@ -599,7 +610,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 let executions = cuteafd_loader::plan::spark_executions::admit_family(
                     "hy4_flash",
                     &backend_exec.exports(),
-                    None,
+                    Some(decode_rows as u32),
                     prefill.unit_rows,
                     prefill.waves,
                 )?;
@@ -649,6 +660,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 None
             };
 
+            // Use the same ordered reduction on singleton decode and multi-row verify.
             let onboarded: Vec<Option<Exl3Tp2<'_>>> = if onboarded_layers.is_empty() {
                 (0..gpus).map(|_| None).collect()
             } else {
@@ -669,7 +681,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         onboarded_layers.clone(),
                         capacity_rows,
                         avail[0],
-                        RtxSelectionPolicy::FirstCapacity,
+                        RtxSelectionPolicy::CanonicalDecode,
                     )?;
                     vec![Some(w.execution()?)]
                 } else {
@@ -681,7 +693,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         onboarded_layers.clone(),
                         capacity_rows,
                         [avail[0], avail[1]],
-                        RtxSelectionPolicy::FirstCapacity,
+                        RtxSelectionPolicy::CanonicalDecode,
                     )?;
                     vec![Some(w0.execution()?), Some(w1.execution()?)]
                 }
@@ -705,6 +717,16 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 false,
                 onboarded,
             )?;
+            let drafts = if let Some(layout) = inputs.draft.clone() {
+                let config = cuteafd_loader::families::hy4_flash::Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?
+                    .context("admitted DFly2 config is missing")?;
+                let depth = config.num_speculative_tokens;
+                let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint, &cfg, config,
+                    layout, worker_args.kv_format, worker_args.max_sequences,
+                    decode_rows))?;
+                engine.attach_drafter(drafter)?;
+                scheduler::Drafts::Neural { depth }
+            } else { scheduler::Drafts::None };
             if let Some(link) = spark_link {
                 engine.attach_spark(link, onboarded_layers.clone());
             }
@@ -752,6 +774,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .value("rtx-expert-layers", onboarded_layers.len())
                 .value("prefill-rows", unit_rows)
                 .value("prefill-waves", prefill.waves)
+                .value("speculator", if worker_args.dfly2 { "dfly2" } else { "off" })
                 .publish();
 
             let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
@@ -769,7 +792,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 &mut receive,
                 &worker_stats,
                 worker_args.max_sequences,
-                scheduler::Drafts::None,
+                drafts,
                 worker_args.draft_length,
                 eos,
                 worker_args.decode_share,
@@ -1091,6 +1114,7 @@ mod tests {
             prefix_mark_slots: 16,
             targets: vec![target],
             target_mount_load: Default::default(),
+            draft: None,
             placement: AttentionPlacement::Heads,
             modes,
             routed: routed.clone(),

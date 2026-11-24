@@ -2194,6 +2194,12 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    if "hy4f2" in geometries and "hy4f" not in geometries:
+        from export_b12x_hy4_aot import programs as hy4_programs
+        draft_shared = {"rms_norm_3072", "q_a", "kv_a", "q_b_dsa", "linear_gate_dsa", "o_proj_dsa",
+                        "mla_q_absorb_dsa", "mla_sink_gate_uv_dsa", "mla_rank_norm_pack_bf16", "mla_rank_norm_pack_fp8"}
+        work += [("hy4f", *item) for item in hy4_programs(1, args.decode_rows, args.prefill_rows, args.max_context)
+                 if item[0].startswith("draft_") or item[0] in draft_shared]
     for hy4_name in ("hy4f", "hy4f2"):
         if hy4_name in geometries:
             from export_b12x_hy4_aot import programs as hy4_programs
@@ -2210,7 +2216,7 @@ def main() -> None:
         from export_b12x_dense_trellis_k6_aot import HY4F_SHAPES
         existing_fp8 = {suffix for family, suffix, *_ in work if family == "native_attention"}
         for name, k, n, side in HY4F_SHAPES:
-            if name.startswith("hy4f_kv_b") or name in ("hy4f_dense_down", "hy4f_dense_down_tp2", "hy4f_shared_down_tp2"):
+            if name.startswith(("hy4f_kv_b", "hy4f_draft_")) or name in ("hy4f_dense_down", "hy4f_dense_down_tp2", "hy4f_shared_down_tp2"):
                 continue  # absorbed kv_b_proj and TP2 K-split down_proj (K=6912/768 not 512-aligned) stay BF16 in fp8-compact
             is_head = n in (120832, 60416)
             precision = "f32" if (is_head or side == 2) else "bf16"

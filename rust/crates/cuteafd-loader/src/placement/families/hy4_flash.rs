@@ -147,6 +147,7 @@ pub struct Hy4Inputs {
     pub prefix_mark_slots: usize,
     pub targets: Vec<CoordinatorWeights>,
     pub target_mount_load: crate::shared::dense_read::MountLoad,
+    pub draft: Option<crate::families::hy4_flash::draft::Admission>,
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
     pub routed: Vec<usize>,
@@ -422,6 +423,24 @@ impl Hy4Inputs {
 
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
+        if let Some(draft) = &self.draft {
+            out.extend(buffer(format!("hy4_flash/dfly2/verify-keys/gpu{gpu}"), location,
+                draft.verify_bytes as u64, Lifetime::TARGET, Category::Workspace, "DFly2 provisional index keys", maximum));
+            if gpu == 0 {
+                out.extend(weight_arena_components(&draft.weights.arena, location, Lifetime::RESIDENT,
+                    maximum, MemoryKind::DrafterWeights)?);
+                out.extend(buffer(draft.workspace.id(), location, draft.workspace.bytes() as u64,
+                    Lifetime::TARGET, Category::Drafter, "DFly2 proposal workspace", maximum));
+                out.extend(buffer("hy4_flash/dfly2/trellis", location, draft.trellis_bytes as u64,
+                    Lifetime::TARGET, Category::Drafter, "DFly2 serialized K8 projection", maximum));
+                for (i, &bytes) in draft.conversion_requests.iter().enumerate() {
+                    out.extend(buffer(format!("hy4_flash/dfly2/kv-b-mount/{i}"), location, bytes,
+                        Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                        "DFly2 absorbed KV-B conversion", maximum));
+                }
+            }
+        }
+
         if !target.core.is_empty() {
             out.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum));
         }
