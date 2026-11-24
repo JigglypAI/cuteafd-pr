@@ -56,17 +56,26 @@ fn piece_tokens(tables: &[Arc<dyn LookaheadTable>]) -> usize {
 #[cfg(test)]
 fn bench_override(name: &str) -> Option<usize> { std::env::var(name).ok().and_then(|v| v.parse().ok()) }
 
-/// Reads in flight (the placement microbench sweeps it).
-fn max_inflight() -> usize {
+/// Prefill table reads in flight (the placement microbench sweeps this target).
+fn prefill_target() -> usize {
     #[cfg(test)]
     if let Some(reads) = bench_override("LOOKAHEAD_BENCH_INFLIGHT") { return reads.max(1); }
-    MAX_INFLIGHT
+    PREFILL_INFLIGHT
 }
-/// Prefill table reads (one piece, one table) in flight at once. A read holds
-/// one reactor buffer per plane (two for a paired weight and scale table) and
-/// at most one decode piece runs; reads never wait for a buffer, so the planner
-/// can never block holding buffers while a gather waits for one.
-const MAX_INFLIGHT: usize = 3;
+const PREFILL_INFLIGHT: usize = 3;
+const MAX_BUFFERS_PER_READ: usize = 2;
+
+/// One decode piece per lane can read all tables at once. Each table read uses
+/// at most two reactor buffers (one per plane); prefill uses the remaining
+/// look-ahead credits. The planner alone cannot exhaust the pool, and its reads
+/// never wait for a buffer another reader owns.
+fn prefill_limit(tables: usize, decode_lanes: usize, target: usize) -> Result<usize> {
+    let max_reads = super::reactor::LOOKAHEAD_BUFFER_BUDGET / MAX_BUFFERS_PER_READ;
+    let decode_reads = tables.saturating_mul(decode_lanes);
+    anyhow::ensure!(decode_lanes > 0 && decode_reads < max_reads,
+        "token-table look-ahead exceeds the reactor buffer budget: {decode_lanes} decode lanes, {tables} tables");
+    Ok(target.min(max_reads - decode_reads))
+}
 
 /// One table the look-ahead fills: its row cache and a reader.
 pub trait LookaheadTable: Send + Sync + 'static {
@@ -118,7 +127,7 @@ enum Command {
         committed: Arc<AtomicU64>, reserved: Arc<AtomicU64>, running: Arc<std::sync::atomic::AtomicBool> },
     /// A decode round's rows per table: read into the decode shares now,
     /// published and left evictable for the verify gather.
-    Decode(Vec<Vec<u64>>),
+    Decode { lane: usize, rows: Vec<Vec<u64>> },
     Wake,
     Cancel(u64),
     Stop,
@@ -163,6 +172,49 @@ type Read = (Box<dyn RowLanding>, Vec<u32>);
 
 /// A decode round's pins and reads, one per table.
 struct DecodePiece { pins: Vec<Pins>, reads: Vec<Option<Read>> }
+
+/// A lane can replace its pending round, but must drain an active one.
+#[derive(Default)]
+struct DecodeSlot { active: Option<DecodePiece>, pending: Option<Vec<Vec<u64>>> }
+
+impl DecodeSlot {
+    fn busy(&self) -> bool { self.active.is_some() || self.pending.is_some() }
+
+    fn start(&mut self, lane: usize, tables: &[Arc<dyn LookaheadTable>]) -> bool {
+        if self.active.is_some() { return false; }
+        let Some(rows) = self.pending.take() else { return false; };
+        match start_decode(&rows, tables) {
+            Ok(piece) => { self.active = piece; self.active.is_some() }
+            Err(error) => {
+                tracing::warn!(lane, %error, "token-table decode look-ahead read failed; rows load on demand");
+                false
+            }
+        }
+    }
+
+    fn poll(&mut self, lane: usize, tables: &[Arc<dyn LookaheadTable>]) -> bool {
+        let mut progressed = false;
+        if let Some(piece) = &mut self.active {
+            for (index, table) in tables.iter().enumerate() {
+                if let Some((read, _)) = piece.reads[index].as_mut() {
+                    match read.poll() {
+                        Ok(true) => {
+                            let read = piece.reads[index].take().expect("landed");
+                            if publish(&mut piece.pins[index], read, table.as_ref(), true).is_ok() { progressed = true; }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(lane, %error, "token-table decode look-ahead read failed; rows load on demand");
+                            piece.reads[index] = None;
+                        }
+                    }
+                }
+            }
+            if piece.reads.iter().all(Option::is_none) { self.active = None; }
+        }
+        progressed || (self.active.is_none() && self.pending.is_some())
+    }
+}
 
 /// One table's share of a prefill piece: its distinct rows not yet reserved
 /// (until its deadline turn, `started` is false), the pins of the batches
@@ -226,6 +278,7 @@ struct Plan {
 pub struct Lookahead {
     send: mpsc::Sender<Command>,
     ids: AtomicU64,
+    decode_lanes: usize,
     /// Some table has every copy on other hosts: prompts are read ahead only
     /// from the call after the one running (the demand gathers own the current
     /// call's rows on the capped remote read path).
@@ -235,24 +288,26 @@ pub struct Lookahead {
 
 impl Lookahead {
     /// `tables` in the order their consumers run within a unit.
-    pub fn new(name: &str, tables: Vec<Arc<dyn LookaheadTable>>) -> Result<Self> {
+    pub fn new(name: &str, tables: Vec<Arc<dyn LookaheadTable>>, decode_lanes: usize) -> Result<Self> {
         anyhow::ensure!(!tables.is_empty(), "a look-ahead needs at least one table");
+        let prefill_inflight = prefill_limit(tables.len(), decode_lanes, prefill_target())?;
         let remote = tables.iter().any(|table| table.placement() == super::placement::Placement::Remote);
-        tracing::info!(name, remote, placements = ?tables.iter().map(|table| table.placement()).collect::<Vec<_>>(),
+        tracing::info!(name, remote, decode_lanes, prefill_inflight, placements = ?tables.iter().map(|table| table.placement()).collect::<Vec<_>>(),
             "token-table look-ahead");
         let (send, receive) = mpsc::channel();
         let thread = std::thread::Builder::new().name(format!("{name}-lookahead"))
-            .spawn(move || run(tables, receive, remote)).context("starting a token-table look-ahead")?;
-        Ok(Self { send, ids: AtomicU64::new(1), remote, thread: Some(thread) })
+            .spawn(move || run(tables, receive, remote, decode_lanes, prefill_inflight)).context("starting a token-table look-ahead")?;
+        Ok(Self { send, ids: AtomicU64::new(1), decode_lanes, remote, thread: Some(thread) })
     }
     /// Whether prompts are read ahead only from the next call (a remote table).
     pub fn remote(&self) -> bool { self.remote }
 
     /// Read a decode round's rows (per table) into the decode shares as soon as
     /// they are known; the verify gather then finds them landed or in flight.
-    /// A newer round's rows replace an unstarted older round's. Never blocks.
-    pub fn decode(&self, rows: Vec<Vec<u64>>) {
-        let _ = self.send.send(Command::Decode(rows));
+    /// A newer round's rows replace only its lane's unstarted round. Never blocks.
+    pub fn decode(&self, lane: usize, rows: Vec<Vec<u64>>) {
+        assert!(lane < self.decode_lanes, "invalid token-table decode lane {lane}");
+        let _ = self.send.send(Command::Decode { lane, rows });
     }
 
     /// Read ahead `source`'s tokens, which start at absolute position `start`.
@@ -279,47 +334,23 @@ impl Drop for Lookahead {
     }
 }
 
-fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, remote: bool) {
+fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, remote: bool,
+    decode_lanes: usize, prefill_inflight: usize) {
     let mut plans: Vec<Plan> = Vec::new();
-    let mut decode: Option<DecodePiece> = None;
-    let mut next_decode: Option<Vec<Vec<u64>>> = None;
+    let mut decode: Vec<_> = (0..decode_lanes).map(|_| DecodeSlot::default()).collect();
     loop {
         loop {
             match receive.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
-                Ok(Command::Decode(rows)) => next_decode = Some(rows),
-                Ok(command) => apply(&mut plans, command, tables.len(), remote),
+                Ok(command) => apply(&mut plans, &mut decode, command, tables.len(), remote),
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
         let mut progressed = false;
-        // One decode piece at a time (its gather reads what has not landed).
-        if decode.is_none() {
-            if let Some(rows) = next_decode.take() {
-                match start_decode(&rows, &tables) {
-                    Ok(piece) => { progressed |= piece.is_some(); decode = piece; }
-                    Err(error) => tracing::warn!(%error, "token-table decode look-ahead read failed; rows load on demand"),
-                }
-            }
-        }
-        if let Some(piece) = &mut decode {
-            for (index, table) in tables.iter().enumerate() {
-                if let Some((read, _)) = piece.reads[index].as_mut() {
-                    match read.poll() {
-                        Ok(true) => {
-                            let read = piece.reads[index].take().expect("landed");
-                            if publish(&mut piece.pins[index], read, table.as_ref(), true).is_ok() { progressed = true; }
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "token-table decode look-ahead read failed; rows load on demand");
-                            piece.reads[index] = None;
-                        }
-                    }
-                }
-            }
-            if piece.reads.iter().all(Option::is_none) { decode = None; }
-        }
+        // Submit all ready lanes before polling any of them. Decode keeps its
+        // reactor priority over prefill regardless of which lane posted first.
+        for (lane, slot) in decode.iter_mut().enumerate() { progressed |= slot.start(lane, &tables); }
+        for (lane, slot) in decode.iter_mut().enumerate() { progressed |= slot.poll(lane, &tables); }
         for plan in &mut plans {
             let committed = plan.committed.load(Ordering::Acquire);
             // Committed pieces release their rows; unread later-table rows are no longer needed.
@@ -340,7 +371,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
         let reading = |plans: &[Plan]| plans.iter().flat_map(|plan| &plan.pieces).map(PlanPiece::reading).sum::<usize>();
         // The next batch of a started step goes first (oldest piece of the
         // earliest-admitted request): its deadline is the earliest.
-        while reading(&plans) < max_inflight() {
+        while reading(&plans) < prefill_inflight {
             let Some((plan, index, table)) = plans.iter_mut().find_map(|plan| {
                 let committed = plan.committed.load(Ordering::Acquire);
                 plan.pieces.iter().enumerate().find_map(|(index, piece)| piece.next_batch(committed).map(|table| (index, table)))
@@ -351,13 +382,13 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
         }
         // Later-table reads that are due go next: their deadline is earlier
         // than any table-0 piece not yet started. `plans` is in admission order.
-        while reading(&plans) < max_inflight() {
+        while reading(&plans) < prefill_inflight {
             let Some((plan, index, table)) = plans.iter_mut()
                 .find_map(|plan| due(plan, &tables).map(|(index, table)| (plan, index, table))) else { break };
             if let Err(error) = start_table(plan, index, table, &tables) { abandon(plan, &error); }
             progressed = true;
         }
-        if reading(&plans) < max_inflight() {
+        if reading(&plans) < prefill_inflight {
             // The earliest-admitted request with room in its window goes first.
             if let Some(plan) = plans.iter_mut().filter(|plan| ready_to_plan(plan, &tables)).min_by_key(|plan| plan.id) {
                 match start_piece(plan, &tables) {
@@ -370,10 +401,11 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
         if progressed { continue; }
         // Reads in flight, or later-table rows waiting on rows a gather is
         // reading: check again shortly, staying responsive to decode commands.
-        let busy = decode.is_some() || plans.iter().any(|plan| plan.pieces.iter()
+        let decode_busy = decode.iter().any(DecodeSlot::busy);
+        let busy = decode_busy || plans.iter().any(|plan| plan.pieces.iter()
             .any(|piece| piece.steps.iter().any(|step| step.read.is_some() || !step.queue.is_empty() || !step.started)));
         let command = if busy {
-            match receive.recv_timeout(std::time::Duration::from_micros(if decode.is_some() { 50 } else { 200 })) {
+            match receive.recv_timeout(std::time::Duration::from_micros(if decode_busy { 50 } else { 200 })) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -383,14 +415,13 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
         };
         match command {
             Some(Command::Stop) => return,
-            Some(Command::Decode(rows)) => next_decode = Some(rows),
-            Some(command) => apply(&mut plans, command, tables.len(), remote),
+            Some(command) => apply(&mut plans, &mut decode, command, tables.len(), remote),
             None => {}
         }
     }
 }
 
-fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize, remote: bool) {
+fn apply(plans: &mut Vec<Plan>, decode: &mut [DecodeSlot], command: Command, tables: usize, remote: bool) {
     match command {
         Command::Start { id, tag, start, source, mut units, committed, reserved, running } => {
             let end = start + source.tokens() as u64;
@@ -403,7 +434,8 @@ fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize, remote: bool) {
                 committed, reserved, pieces: VecDeque::new(), needed: vec![0; tables], cached: vec![0; tables],
                 joined: vec![0; tables], read: vec![0; tables], read_waiting: vec![0; tables], skipped: 0, skipped_tokens: 0 });
         }
-        Command::Wake | Command::Stop | Command::Decode(_) => {}
+        Command::Decode { lane, rows } => decode[lane].pending = Some(rows),
+        Command::Wake | Command::Stop => {}
         // Dropping the plan drains its reads, then fails unread rows and unpins.
         Command::Cancel(id) => plans.retain(|plan| plan.id != id),
     }
@@ -640,6 +672,116 @@ mod tests {
     fn shape(width: usize, rows: usize, shares: [usize; 2]) -> Arc<dyn LookaheadTable> {
         let stats = Arc::new(TableStats::default());
         Arc::new(Shape { cache: RowCache::new(width, shares, Arc::clone(&stats)).unwrap(), rows, stats })
+    }
+
+    /// A fake reactor whose reads land only when explicitly released. It uses
+    /// the real planner's command loop and real cache pins without OS timing.
+    struct ControlledTable {
+        cache: Arc<RowCache>,
+        stats: Arc<TableStats>,
+        started: mpsc::Sender<(u64, ReadPriority, Arc<std::sync::atomic::AtomicBool>)>,
+    }
+    struct ControlledRead { byte: u8, ready: Arc<std::sync::atomic::AtomicBool> }
+    impl RowLanding for ControlledRead {
+        fn poll(&mut self) -> Result<bool> { Ok(self.ready.load(Ordering::Acquire)) }
+        fn row(&self, _: usize) -> [&[u8]; 2] { [std::slice::from_ref(&self.byte), &[]] }
+    }
+    impl LookaheadTable for ControlledTable {
+        fn cache(&self) -> &Arc<RowCache> { &self.cache }
+        fn start_read(&self, rows: &[u64], priority: ReadPriority) -> Result<Box<dyn RowLanding>> {
+            let &[row] = rows else { panic!("expected one distinct row per test piece") };
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.started.send((row, priority, Arc::clone(&ready)))?;
+            Ok(Box::new(ControlledRead { byte: row as u8, ready }))
+        }
+        fn stats(&self) -> &TableStats { &self.stats }
+        fn rows_per_token(&self) -> usize { 1 }
+        fn placement(&self) -> super::super::placement::Placement { super::super::placement::Placement::Local }
+    }
+
+    fn check_decode_slots(lanes: usize) {
+        let (started, reads) = mpsc::channel();
+        let tables: Vec<_> = (0..2).map(|_| {
+            let stats = Arc::new(TableStats::default());
+            Arc::new(ControlledTable { cache: RowCache::new(1, [8, 8], Arc::clone(&stats)).unwrap(),
+                stats, started: started.clone() }) as Arc<dyn LookaheadTable>
+        }).collect();
+        let (send, receive) = mpsc::channel();
+        let post = |lane, row| send.send(Command::Decode { lane, rows: vec![vec![row], vec![row + 10]] }).unwrap();
+        // Both lanes post before start. Lane 0's replacement must not discard
+        // lane 1's pending round, even though that command arrived in between.
+        post(0, 1);
+        if lanes == 2 { post(1, 2); }
+        post(0, 3);
+        let planner = {
+            let tables = tables.clone();
+            std::thread::spawn(move || run(tables, receive, false, lanes, PREFILL_INFLIGHT))
+        };
+        let check_started = |row, priority| {
+            let (actual, actual_priority, release) = reads.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!((actual, actual_priority), (row, priority));
+            release
+        };
+        let anchor = check_started(3, ReadPriority::DecodeFirst);
+        let later = check_started(13, ReadPriority::Decode);
+        let peer = if lanes == 2 {
+            Some((check_started(2, ReadPriority::DecodeFirst), check_started(12, ReadPriority::Decode)))
+        } else { None };
+        post(0, 4);
+        post(0, 5);
+        let check_landed = |row: u64| {
+            for (table, delta) in tables.iter().zip([0, 10]) {
+                let id = row + delta;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let (pins, lookups) = table.cache().acquire(&[id], RowClass::Decode);
+                    match lookups[0] {
+                        Lookup::Ready(slot) => { assert_eq!(pins.row(slot)[0], id as u8); break; }
+                        Lookup::Wait(_) => {}
+                        ref other => panic!("submitted row {id} missing from cache: {other:?}"),
+                    }
+                    assert!(std::time::Instant::now() < deadline, "row {id} did not land");
+                    std::thread::yield_now();
+                }
+            }
+        };
+        if let Some((peer_anchor, peer_later)) = peer {
+            peer_anchor.store(true, Ordering::Release);
+            peer_later.store(true, Ordering::Release);
+            check_landed(2); // lane 1 lands while lane 0 is still held in flight
+        }
+        anchor.store(true, Ordering::Release);
+        later.store(true, Ordering::Release);
+        check_landed(3); // a queued replacement must not cancel an active read
+        check_started(5, ReadPriority::DecodeFirst).store(true, Ordering::Release);
+        check_started(15, ReadPriority::Decode).store(true, Ordering::Release);
+        check_landed(5);
+        send.send(Command::Stop).unwrap();
+        planner.join().unwrap();
+        assert!(reads.try_recv().is_err());
+    }
+
+    #[test]
+    fn two_decode_lanes_land_independently_and_replace_only_their_own_pending_rounds() {
+        check_decode_slots(2)
+    }
+
+    #[test]
+    fn one_decode_lane_drains_the_active_round_and_keeps_only_the_newest_pending_round() {
+        check_decode_slots(1)
+    }
+
+    #[test]
+    fn all_active_decode_and_prefill_reads_fit_the_reactor_buffer_budget() -> Result<()> {
+        for (tables, lanes) in [(1, 1), (2, 1), (2, 2), (4, 1)] {
+            assert_eq!(prefill_limit(tables, lanes, PREFILL_INFLIGHT)?, PREFILL_INFLIGHT);
+            let at_max = prefill_limit(tables, lanes, usize::MAX)?;
+            assert!(at_max > 0);
+            assert!((at_max + tables * lanes) * MAX_BUFFERS_PER_READ <= super::super::reactor::LOOKAHEAD_BUFFER_BUDGET);
+        }
+        assert!(prefill_limit(2, 0, PREFILL_INFLIGHT).is_err());
+        assert!(prefill_limit(4, 2, PREFILL_INFLIGHT).is_err());
+        Ok(())
     }
 
     /// One read fills at most a reactor buffer in every table; at the admitted

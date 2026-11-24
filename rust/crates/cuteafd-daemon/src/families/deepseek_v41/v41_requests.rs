@@ -332,13 +332,13 @@ impl<'a> Requests<'a> {
     /// then anchor + drafts the moment the drafter returns (before trimming);
     /// rows already cached or in flight are not read again.
     /// Advisory: the verify gather reads whatever has not landed.
-    pub fn prefetch_drafts(&self, proposals: &[(CacheLease, &[u32])]) {
+    pub fn prefetch_drafts(&self, lane: usize, proposals: &[(CacheLease, &[u32])]) {
         // Image requests keep their masks at gather time; drafts never carry images,
         // but a request's own image history is resolved there, not here.
         if self.image_requests > 0 { return; }
         let inputs: Result<Vec<_>> = proposals.iter().filter(|(_, tokens)| !tokens.is_empty())
             .map(|&(lease, tokens)| Ok((&self.request(lease)?.history, tokens))).collect();
-        if let Err(error) = inputs.and_then(|inputs| self.pipeline.prefetch_drafts(&inputs)) {
+        if let Err(error) = inputs.and_then(|inputs| self.pipeline.prefetch_drafts(lane, &inputs)) {
             tracing::debug!(%error, "Engram draft look-ahead skipped");
         }
     }
@@ -907,7 +907,7 @@ mod tests {
         let catalog =
             cuteafd_loader::read_official_v41_catalog(&model)?;
         let map = cuteafd_loader::EngramTokenMap::from_file(&model.join("tokenizer.json"))?;
-        let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(80, 2)?, 0)? };
+        let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(80, 2, 1)?, 0)? };
         let mut requests = Requests::new(
             &lib,
             pipeline,

@@ -7,6 +7,7 @@ use std::{collections::VecDeque, fs::File, os::fd::{AsRawFd, FromRawFd, OwnedFd}
 
 const SLOTS: usize = 16;
 const DECODE_SLOTS: usize = 2;
+pub(super) const LOOKAHEAD_BUFFER_BUDGET: usize = SLOTS - DECODE_SLOTS;
 pub(super) const BUFFER_BYTES: usize = 1 << 20;
 const WAKE: u64 = u64::MAX;
 

@@ -233,7 +233,7 @@ mod tests {
     fn engram_host_formula_replaces_payload_attribution_without_double_charge() -> Result<()> {
         for k in 1..=4 {
             let rows = 8192usize.div_ceil(k.max(2)).div_ceil(64) * 64;
-            let shape = cuteafd_loader::EngramStagingShape::new(rows, k)?;
+            let shape = cuteafd_loader::EngramStagingShape::new(rows, k, 1)?;
             let formulas = [("v41/engram-prefill", shape.host_resident_bytes() as u64),
                 ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)];
             let pinned = std::collections::BTreeMap::from([

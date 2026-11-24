@@ -55,14 +55,14 @@ impl RowSource for EngramSource {
 pub struct EngramLookahead(lookahead::Lookahead);
 
 impl EngramLookahead {
-    pub fn new(tables: [Arc<EngramTable>; 2]) -> Result<Self> {
+    pub fn new(tables: [Arc<EngramTable>; 2], decode_lanes: u8) -> Result<Self> {
         let tables = tables.into_iter().map(|table| Arc::new(EngramLayer(table)) as Arc<dyn LookaheadTable>).collect();
-        Ok(Self(lookahead::Lookahead::new("engram", tables)?))
+        Ok(Self(lookahead::Lookahead::new("engram", tables, usize::from(decode_lanes))?))
     }
 
     /// Read a decode round's drafted rows (per layer) into the decode share the
     /// moment the drafter emits them. Never blocks.
-    pub fn decode(&self, rows: [Vec<u64>; 2]) { self.0.decode(rows.into()) }
+    pub fn decode(&self, lane: usize, rows: [Vec<u64>; 2]) { self.0.decode(lane, rows.into()) }
 
     /// Read ahead `tokens` (compressed ids, None for image rows) that follow
     /// `history`'s frontier. `history` is a fork: its batches are never committed.
@@ -113,7 +113,7 @@ mod tests {
         let batch = history.prepare(0, &tokens, 300)?;
         let rows = [batch.prefetch_rows(0)?, batch.prefetch_rows(1)?];
         let tables = [table(0, &rows[0])?, table(1, &rows[1])?];
-        let ahead = EngramLookahead::new(tables.clone())?;
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
         let units = || UnitPlan::new(vec![128, 256, 300], 3);
         let handle = ahead.start(history.fork()?, tokens.clone(), units());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -162,7 +162,7 @@ mod tests {
         let mut owned = [table(0, &[])?, table(1, &[])?].map(|t| Arc::try_unwrap(t).ok().expect("sole owner"));
         for table in &mut owned { table.set_cache_shares([2 * 3 * 256 * 24, 1024])?; }
         let tables = owned.map(Arc::new);
-        let ahead = EngramLookahead::new(tables.clone())?;
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
         let _handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![256, 512, 768, 1024, 1280], 3));
         let snapshot = |layer: usize| tables[layer].weights().stats().snapshot();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -186,7 +186,7 @@ mod tests {
         let tokens: Vec<Option<u32>> = (0..640u32).map(|i| Some(i + 9)).collect();
         let history = EngramHistory::new(2)?;
         let tables = [table(0, &[])?, table(1, &[])?];
-        let ahead = EngramLookahead::new(tables.clone())?;
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
         let handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![128, 256, 384, 512, 640], 1));
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -205,8 +205,8 @@ mod tests {
         let batch = history.prepare(0, &[Some(11), Some(12), Some(13)], 3)?;
         let rows = [batch.prefetch_rows(0)?, batch.prefetch_rows(1)?];
         let tables = [table(0, &rows[0])?, table(1, &rows[1])?];
-        let ahead = EngramLookahead::new(tables.clone())?;
-        ahead.decode(rows.clone());
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
+        ahead.decode(0, rows.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while tables.iter().any(|t| t.weights().stats().snapshot().lookahead_pieces < 1) {
             assert!(std::time::Instant::now() < deadline, "draft look-ahead did not land");
@@ -230,7 +230,7 @@ mod tests {
         let mut owned = tables.map(|t| Arc::try_unwrap(t).ok().expect("sole owner"));
         for table in &mut owned { table.set_cache_shares([2 * PIECE_TOKENS * 24, 64])?; }
         let tables = owned.map(Arc::new);
-        let ahead = EngramLookahead::new(tables.clone())?;
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
         let handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![128, 256], 3));
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -249,13 +249,13 @@ mod tests {
     fn decode_flood_never_starves_a_gather_of_reactor_buffers() -> Result<()> {
         let history = EngramHistory::new(2)?;
         let tables = [table(0, &[])?, table(1, &[])?];
-        let ahead = EngramLookahead::new(tables.clone())?;
+        let ahead = EngramLookahead::new(tables.clone(), 1)?;
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
         // Far more pieces than the reactor has buffers, every row cold.
         for _ in 0..64 {
             let rows = [0, 1].map(|layer| (0..24).map(|_| next() % cuteafd_core::ENGRAM_ROWS[layer]).collect::<Vec<_>>());
-            ahead.decode(rows);
+            ahead.decode(0, rows);
         }
         let batch = std::sync::Arc::new(history.prepare(0, &[Some(41), Some(42), Some(43)], 3)?);
         let gather_tables = tables.clone();

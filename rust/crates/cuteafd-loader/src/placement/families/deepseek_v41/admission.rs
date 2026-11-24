@@ -702,6 +702,7 @@ fn invalid(detail: &str) -> Refusal {
 /// Header-derived host owners shared by offline planning and the live executor.
 #[derive(Debug, Clone)]
 pub struct HostFacts {
+    pub engram_shape: crate::EngramStagingShape,
     pub owners: Vec<Owner>,
     pub estimates: Vec<Opaque>,
     pub prefix_bytes: u64,
@@ -731,11 +732,11 @@ impl HostFacts {
     }
 
     pub fn prepare(config: &serde_json::Value, headers: &[&crate::SafetensorsTensorMetadata],
-        prefill: PrefillShape, gpus: usize, sparks: usize, context: u64, concurrency: u64,
+        prefill: PrefillShape, decode_lanes: u8, gpus: usize, sparks: usize, context: u64, concurrency: u64,
         draft: bool, prefix: Option<u64>, prefix_enabled: bool, chunk: u64,
         host: (u64, u64), preload_cap: u64, preload_budget: Option<u64>) -> anyhow::Result<Self> {
         use anyhow::{Context, ensure};
-        let shape = crate::EngramStagingShape::new(prefill.rows as usize, prefill.waves as usize)?;
+        let shape = crate::EngramStagingShape::new(prefill.rows as usize, prefill.waves as usize, decode_lanes)?;
         let mapped = Self::mapped_placement(headers, shape, preload_budget.unwrap_or_else(|| host.1.saturating_sub(host.0 / 10)), preload_cap)?;
         let row_bytes = headers.iter().find(|h| h.name.contains(".engram.embed."))
             .map(|h| if h.name.contains("strided_") { h.shape[1] } else {
@@ -791,7 +792,7 @@ impl HostFacts {
         }
         estimate("workspace/router", (prefill.rows + 64) * (5120 * 2 + 8 * 8), false);
         estimate("staging/tables-and-sync", (prefill.rows + 64) * 5120 * 8 + (2 << 20), true);
-        Ok(Self { owners, estimates, prefix_bytes, mapped })
+        Ok(Self { engram_shape: shape, owners, estimates, prefix_bytes, mapped })
     }
 }
 

@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     // SAFETY: the configured native library and snapshot remain immutable.
     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map,
-        cuteafd_loader::EngramStagingShape::new(256, 2)?, cap)? };
+        cuteafd_loader::EngramStagingShape::new(256, 2, 1)?, cap)? };
     let mut histories = [pipeline.new_history()?, pipeline.new_history()?];
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {

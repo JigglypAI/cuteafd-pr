@@ -15,6 +15,8 @@ pub enum EngramStagingError {
     Shape { units: usize, rows: usize },
     #[error("Engram shape needs {required} host slots, got {available}")]
     Slots { required: usize, available: usize },
+    #[error("unsupported Engram decode lane count: {0}")]
+    DecodeLanes(u8),
 }
 
 /// Shape is a requirement, not a memory tuning knob. The executor can begin k
@@ -27,16 +29,20 @@ pub enum EngramStagingError {
 /// OS fault latency is unbounded: readiness remains a correctness fence even
 /// with the mandatory burst of lead time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EngramStagingShape { rows: usize, units: usize }
+pub struct EngramStagingShape { rows: usize, units: usize, decode_lanes: u8 }
 impl EngramStagingShape {
-    pub fn new(rows: usize, units: usize) -> std::result::Result<Self, EngramStagingError> {
+    pub fn new(rows: usize, units: usize, decode_lanes: u8) -> std::result::Result<Self, EngramStagingError> {
         if !(1..=4096).contains(&rows) || !(1..=4).contains(&units) {
             return Err(EngramStagingError::Shape { rows, units });
         }
-        Ok(Self { rows, units })
+        if !(1..=crate::plan::decode_lanes::MAX_DECODE_LANES).contains(&decode_lanes) {
+            return Err(EngramStagingError::DecodeLanes(decode_lanes));
+        }
+        Ok(Self { rows, units, decode_lanes })
     }
     pub fn rows(self) -> usize { self.rows }
     pub fn units(self) -> usize { self.units }
+    pub fn decode_lanes(self) -> u8 { self.decode_lanes }
     pub fn decode_slots(self) -> usize { 2 * 2 }
     pub fn decode_rows(self) -> usize { self.rows.min(256) }
     pub fn decode_host_resident_bytes(self) -> usize {
@@ -69,7 +75,7 @@ impl EngramStagingShape {
     /// windows of every decode lane. Rows of 24 per token.
     pub fn cache_shares(self) -> [usize; 2] {
         let prefill = (super::engram_lookahead::window_units(self.units) + 1) * self.rows;
-        let decode = 2 * cuteafd_core::V41_VERIFY_ROWS * crate::plan::decode_lanes::MAX_DECODE_LANES as usize;
+        let decode = 2 * cuteafd_core::V41_VERIFY_ROWS * usize::from(self.decode_lanes);
         [prefill * 24, decode * 24]
     }
     /// Both layers' row caches for an encoding's row width (weight + scale bytes).
@@ -264,9 +270,23 @@ mod lifecycle_tests {
     impl Drop for CopyLease { fn drop(&mut self) { self.drops.borrow_mut().push(self.id); } }
 
     #[test]
+    fn decode_cache_share_holds_two_verify_windows_per_admitted_lane() -> Result<()> {
+        let single = EngramStagingShape::new(2752, 3, 1)?;
+        let pair = EngramStagingShape::new(2752, 3, 2)?;
+        let [prefill, decode] = single.cache_shares();
+        assert_eq!(decode, 2 * cuteafd_core::V41_VERIFY_ROWS * 24);
+        assert_eq!(pair.cache_shares(), [prefill, 2 * decode]);
+        assert!(pair.cache_bytes(264) > single.cache_bytes(264));
+        for invalid in [0, crate::plan::decode_lanes::MAX_DECODE_LANES + 1] {
+            assert_eq!(EngramStagingShape::new(2752, 3, invalid), Err(EngramStagingError::DecodeLanes(invalid)));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn preload_budget_reserves_every_staging_owner_and_lazy_workspace() -> Result<()> {
         for (rows, units) in [(2752, 3), (4096, 2), (2048, 4)] {
-            let shape = EngramStagingShape::new(rows, units)?;
+            let shape = EngramStagingShape::new(rows, units, 1)?;
             for width in [264, 144] {
                 let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(width)
                     + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
@@ -281,7 +301,7 @@ mod lifecycle_tests {
     #[test]
     fn engram_copy_pending_pool_reclaims_on_completion_with_bounded_polls() -> Result<()> {
         for k in 1..=4 {
-            let shape = EngramStagingShape::new(((8192usize.div_ceil(k.max(2)) + 63) / 64 * 64), k)?;
+            let shape = EngramStagingShape::new(((8192usize.div_ceil(k.max(2)) + 63) / 64 * 64), k, 1)?;
             let drops = Rc::new(RefCell::new(Vec::new()));
             let mut pool = crate::shared::token_table::CopyPool::new(shape.host_slots());
             let mut events = Vec::new();
@@ -330,7 +350,7 @@ mod lifecycle_tests {
     fn engram_lifecycle_exact_pool_and_adversarial_layer14_admission() -> Result<()> {
         for k in 1..=4 {
             let rows = 8192usize.div_ceil(k.max(2)).div_ceil(64) * 64;
-            let shape = EngramStagingShape::new(rows, k)?;
+            let shape = EngramStagingShape::new(rows, k, 1)?;
             let n = shape.host_slots();
             assert_eq!(n, 4 * k);
             assert_eq!(shape.host_resident_bytes(), n * EngramBatchStaging::storage_bytes(rows)?);
@@ -376,7 +396,7 @@ mod lifecycle_tests {
     #[test]
     fn engram_cancel_queued_gathering_ready_and_copy_states_return_once() -> Result<()> {
         for k in 1..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k, 1)?.host_slots();
             // Block the first gather deterministically; the second is queued.
             let (started, seen) = std::sync::mpsc::sync_channel(1);
             let (release, wait) = std::sync::mpsc::sync_channel(1);
@@ -420,7 +440,7 @@ mod lifecycle_tests {
         struct Counter(std::sync::atomic::AtomicUsize);
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
         for k in 1..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k, 1)?.host_slots();
             let worker = crate::GatherWorker::new("engram-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
             let mut copies = crate::shared::token_table::CopyPool::new(n);
@@ -451,7 +471,7 @@ mod lifecycle_tests {
         struct Counter(std::sync::atomic::AtomicUsize);
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
         for k in 1..=4 {
-            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
+            let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k, 1)?.host_slots();
             let worker = crate::GatherWorker::new("engram-mixed-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
             let mut copies = crate::shared::token_table::CopyPool::new(n);
@@ -526,8 +546,8 @@ mod lifecycle_tests {
     #[test]
     fn engram_shape_refusal_is_typed_and_never_shrinks_lookahead() {
         for (rows, units) in [(0, 2), (4097, 2), (8192, 1), (4096, 0), (4096, 5)] {
-            assert_eq!(EngramStagingShape::new(rows, units), Err(EngramStagingError::Shape { rows, units }));
+            assert_eq!(EngramStagingShape::new(rows, units, 1), Err(EngramStagingError::Shape { rows, units }));
         }
-        for k in 1..=4 { assert_eq!(EngramStagingShape::new(4096, k).unwrap().prefetch_units(), k); }
+        for k in 1..=4 { assert_eq!(EngramStagingShape::new(4096, k, 1).unwrap().prefetch_units(), k); }
     }
 }
