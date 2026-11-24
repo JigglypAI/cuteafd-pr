@@ -6,7 +6,12 @@ use std::ffi::c_void;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    Mix, Mask, Gate, Fold, Finish, ResidualNorm,
+    Mix { hidden: usize, taps: usize },
+    Mask { hidden: usize },
+    Gate,
+    Fold { hidden: usize },
+    Finish,
+    ResidualNorm { hidden: usize },
     QkRope { query_heads: usize, kv_heads: usize },
     Silu { intermediate: usize },
     Bias { width: usize, bf16: bool },
@@ -15,11 +20,26 @@ pub enum Op {
 impl Op {
     pub fn name(self) -> Result<String> {
         Ok(format!("inkling_draft_{}", match self {
-            Self::Mix => "dflare_mix".into(), Self::Mask => "mask_init".into(),
-            Self::Gate => "recurrent_gate".into(), Self::Fold => "head_fold".into(),
-            Self::Finish => "logit_finish".into(), Self::ResidualNorm => "residual_norm".into(),
+            Self::Mix { hidden, taps } => {
+                ensure!(matches!((hidden, taps), (4608, 8) | (2304, 4)), "invalid recurrent dflare_mix geometry");
+                if (hidden, taps) == (4608, 8) { "dflare_mix".into() } else { format!("dflare_mix_h{hidden}_t{taps}") }
+            }
+            Self::Mask { hidden } => {
+                ensure!(matches!(hidden, 4608 | 2304), "invalid recurrent mask_init hidden");
+                if hidden == 4608 { "mask_init".into() } else { format!("mask_init_h{hidden}") }
+            }
+            Self::Gate => "recurrent_gate".into(),
+            Self::Fold { hidden } => {
+                ensure!(matches!(hidden, 4608 | 2304), "invalid recurrent head_fold hidden");
+                if hidden == 4608 { "head_fold".into() } else { format!("head_fold_h{hidden}") }
+            }
+            Self::Finish => "logit_finish".into(),
+            Self::ResidualNorm { hidden } => {
+                ensure!(matches!(hidden, 4608 | 2304), "invalid recurrent residual_norm hidden");
+                if hidden == 4608 { "residual_norm".into() } else { format!("residual_norm_h{hidden}") }
+            }
             Self::QkRope { query_heads, kv_heads } => {
-                ensure!([(48,8),(24,4),(0,8),(0,4)].contains(&(query_heads,kv_heads)), "invalid recurrent rotary heads");
+                ensure!([(48,8),(24,8),(24,4),(0,8),(0,4)].contains(&(query_heads,kv_heads)), "invalid recurrent rotary heads");
                 format!("qk_norm_rope_q{query_heads}_k{kv_heads}")
             }
             Self::Silu { intermediate } => {
@@ -38,12 +58,12 @@ impl Op {
     }
     fn pointers(self) -> &'static [&'static str] {
         match self {
-            Self::Mix => &["features","alpha","gamma","mixed"],
-            Self::Mask => &["normalized_anchors","mask","block"],
+            Self::Mix { .. } => &["features","alpha","gamma","mixed"],
+            Self::Mask { .. } => &["normalized_anchors","mask","block"],
             Self::Gate => &["raw","state","new_state","latent"],
-            Self::Fold => &["lm_head","hidden_out","hidden_bias","folded_weight","folded_bias"],
+            Self::Fold { .. } => &["lm_head","hidden_out","hidden_bias","folded_weight","folded_bias"],
             Self::Finish => &["base","correction","output"],
-            Self::ResidualNorm => &["residual","delta","gamma","residual_out","norm_out"],
+            Self::ResidualNorm { .. } => &["residual","delta","gamma","residual_out","norm_out"],
             Self::QkRope { .. } => &["qkv","q_gamma","k_gamma","positions","inv_freq","q_out","k_out","v_out"],
             Self::Silu { .. } => &["gate_up","activated"],
             Self::Bias { .. } => &["x","bias","out"],
@@ -51,21 +71,21 @@ impl Op {
         }
     }
     fn scalar_kinds(self) -> &'static [u8] {
-        match self { Self::Mix|Self::ResidualNorm|Self::QkRope {..}=>b"if", Self::Fold=>b"ii", _=>b"i" }
+        match self { Self::Mix { .. }|Self::ResidualNorm { .. }|Self::QkRope {..}=>b"if", Self::Fold { .. }=>b"ii", _=>b"i" }
     }
     fn outputs(self) -> usize {
-        match self { Self::Mix|Self::Mask|Self::Finish|Self::Silu{..}|Self::Bias{..}=>1,
-            Self::Gate|Self::Fold|Self::ResidualNorm|Self::Store{..}=>2, Self::QkRope{..}=>3 }
+        match self { Self::Mix { .. }|Self::Mask { .. }|Self::Finish|Self::Silu{..}|Self::Bias{..}=>1,
+            Self::Gate|Self::Fold { .. }|Self::ResidualNorm { .. }|Self::Store{..}=>2, Self::QkRope{..}=>3 }
     }
     fn shapes(self, rows: usize) -> Result<Vec<usize>> {
         let m = |dims: &[usize]| dims.iter().try_fold(1usize,|n,d|n.checked_mul(*d)).context("recurrent operand bytes overflow");
         Ok(match self {
-            Self::Mix=>vec![m(&[rows,8,4608,2])?,16,9216,m(&[rows,4608,2])?],
-            Self::Mask=>vec![m(&[rows,4608,2])?,9216,m(&[rows,8,4608,2])?],
+            Self::Mix { hidden, taps }=>vec![m(&[rows,taps,hidden,2])?,taps*2,hidden*2,m(&[rows,hidden,2])?],
+            Self::Mask { hidden }=>vec![m(&[rows,hidden,2])?,hidden*2,m(&[rows,8,hidden,2])?],
             Self::Gate=>vec![m(&[rows,768,4])?,m(&[rows,256,2])?,m(&[rows,256,2])?,m(&[rows,256,2])?],
-            Self::Fold=>vec![201024*4608*2,4608*256*2,9216,201024*256*2,201024*2],
+            Self::Fold { hidden }=>vec![201024*hidden*2,hidden*256*2,hidden*2,201024*256*2,201024*2],
             Self::Finish=>vec![m(&[rows,201024,2])?,m(&[rows,201024,2])?,m(&[rows,200058,2])?],
-            Self::ResidualNorm=>vec![m(&[rows,4608,2])?,m(&[rows,4608,2])?,9216,m(&[rows,4608,2])?,m(&[rows,4608,2])?],
+            Self::ResidualNorm { hidden }=>vec![m(&[rows,hidden,2])?,m(&[rows,hidden,2])?,hidden*2,m(&[rows,hidden,2])?,m(&[rows,hidden,2])?],
             Self::QkRope {query_heads:q,kv_heads:k}=>vec![m(&[rows,q+2*k,128,2])?,256,256,m(&[rows,8])?,256,
                 m(&[rows,q,128,2])?,m(&[rows,k,128,2])?,m(&[rows,k,128,2])?],
             Self::Silu{intermediate:i}=>vec![m(&[rows,2,i,2])?,m(&[rows,i,2])?],
@@ -93,11 +113,11 @@ impl<'a> Primitive<'a> {
         let cap=self.program.spec().capacity_rows as usize;
         ensure!(rows>0 && rows<=cap,"recurrent primitive rows exceed export capacity");
         ensure!(eps.is_finite() && eps>0.,"recurrent primitive epsilon invalid");
-        if self.op==Op::Fold { ensure!(first.checked_add(rows).is_some_and(|end|end<=201024),"fold row tile exceeds head"); }
+        if matches!(self.op, Op::Fold { .. }) { ensure!(first.checked_add(rows).is_some_and(|end|end<=201024),"fold row tile exceeds head"); }
         let mut extents=self.op.shapes(rows)?;
-        if self.op==Op::Fold {
+        if let Op::Fold { hidden } = self.op {
             let end=first+rows;
-            extents[0]=end*4608*2;
+            extents[0]=end*hidden*2;
             extents[3]=end*256*2;
             extents[4]=end*2;
         }
@@ -119,8 +139,8 @@ impl<'a> Primitive<'a> {
             }
         }
         let scalars=match self.op {
-            Op::Mix|Op::ResidualNorm|Op::QkRope{..}=>vec![Scalar::I32(i32::try_from(rows)?),Scalar::F32(eps)],
-            Op::Fold=>vec![Scalar::I32(i32::try_from(first)?),Scalar::I32(i32::try_from(rows)?)],
+            Op::Mix { .. }|Op::ResidualNorm { .. }|Op::QkRope{..}=>vec![Scalar::I32(i32::try_from(rows)?),Scalar::F32(eps)],
+            Op::Fold { .. }=>vec![Scalar::I32(i32::try_from(first)?),Scalar::I32(i32::try_from(rows)?)],
             _=>vec![Scalar::I32(i32::try_from(rows)?)],
         };
         // SAFETY: validated extents and disjoint outputs; caller retains owners,
@@ -130,7 +150,7 @@ impl<'a> Primitive<'a> {
 }
 
 fn validate_spec(op:Op,spec:&ProgramSpec)->Result<()> {
-    let capacity=match op {Op::Mask|Op::Gate=>64,Op::Finish|Op::Bias{..}=>448,_=>4096};
+    let capacity=match op {Op::Mask { .. }|Op::Gate=>64,Op::Finish|Op::Bias{..}=>448,_=>4096};
     ensure!(spec.name==op.name()? && spec.capacity_rows==capacity
         && spec.scalar_kinds==op.scalar_kinds() && spec.scratch.is_empty()
         && spec.pointers.iter().map(String::as_str).eq(op.pointers().iter().copied()),
@@ -140,12 +160,12 @@ fn validate_spec(op:Op,spec:&ProgramSpec)->Result<()> {
         ensure!(g[key]==value,"recurrent primitive geometry.{key} differs");Ok(())
     };
     match op {
-        Op::Mix=>{equal("hidden",4608.into())?;equal("taps",8.into())?;}
-        Op::Mask=>{equal("hidden",4608.into())?;equal("block",8.into())?;}
+        Op::Mix { hidden, taps }=>{equal("hidden",hidden.into())?;equal("taps",taps.into())?;}
+        Op::Mask { hidden }=>{equal("hidden",hidden.into())?;equal("block",8.into())?;}
         Op::Gate=>equal("rank",256.into())?,
-        Op::Fold=>{equal("vocab",201024.into())?;equal("hidden",4608.into())?;equal("rank",256.into())?;}
+        Op::Fold { hidden }=>{equal("vocab",201024.into())?;equal("hidden",hidden.into())?;equal("rank",256.into())?;}
         Op::Finish=>{equal("vocab",201024.into())?;equal("valid_vocab",200058.into())?;equal("softcap",30.into())?;}
-        Op::ResidualNorm=>equal("hidden",4608.into())?,
+        Op::ResidualNorm { hidden }=>equal("hidden",hidden.into())?,
         Op::QkRope{query_heads,kv_heads}=>{equal("q_heads",query_heads.into())?;equal("kv_heads",kv_heads.into())?;equal("head_dim",128.into())?;}
         Op::Silu{intermediate}=>equal("intermediate",intermediate.into())?,
         Op::Bias{width,bf16}=>{equal("width",width.into())?;equal("output_dtype",if bf16{"torch.bfloat16"}else{"torch.float32"}.into())?;}

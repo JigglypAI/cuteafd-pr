@@ -623,8 +623,8 @@ def build(args: argparse.Namespace) -> None:
         allowed = geometry_worlds(args.geometry)
         if any(int(layout.partition("-w")[0][2:]) not in allowed for layout in layouts):
             raise SystemExit(f"NVFP4 is deprecated; worlds {allowed}")
-    if args.geometry.startswith("glmfdense") and not args.layouts:
-        layouts = ["tp1"]  # One always-selected dense expert is not an RTX TP2 backend.
+    if args.geometry.startswith(("glmfdense", "inkling2_mini")) and not args.layouts:
+        layouts = ["tp1"]  # Coordinator TP1-only expert package (no RTX TP2 backend).
     if args.exact_slices:
         # Exact layouts beside each padded TP layout whose ranks would store padding.
         for layout in list(layouts):
@@ -825,7 +825,7 @@ def main() -> None:
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
                                                "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4a4",
-                                               "inkling2_mxfp8", "inkling2_nvfp4"),
+                                               "inkling2_mxfp8", "inkling2_nvfp4", "inkling2_mini_mxfp8", "inkling2_mini_nvfp4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

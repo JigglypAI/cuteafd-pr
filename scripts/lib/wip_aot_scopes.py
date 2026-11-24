@@ -31,12 +31,12 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
                         qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4', minimax_m3='MINIMAX',
-                        inkling2='INKLING2', hy4_flash='HY4F')
+                        inkling2='INKLING2', inkling2_mini='INKLING2_MINI', hy4_flash='HY4F')
 # Families whose bundled vision tower runs the shared BF16 attention exports
 # (native/shared/cuda/vision_runtime.cu shared-runtime towers, including PE and
 # independent still towers). MiMo's ABI-1 tower and V4.1's own tower need none.
 VISION_ATTENTION_FAMILIES = {'qwen4', 'glm5_flash', 'muse_spark', 'mistral_large4',
-                             'minimax_m3', 'kimi_k3', 'inkling2', 'step5', 'hy4_flash'}
+                             'minimax_m3', 'kimi_k3', 'inkling2', 'inkling2_mini', 'step5', 'hy4_flash'}
 NATIVE_FAMILY_TOKENS = {'deepseek', 'glm', 'glmf', 'mimo', 'mimof', 'mimop', 'qwen', 'qwen4', 'step', 'step5'}
 NATIVE_FP8_SLUGS = {
     'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4-pro',
@@ -578,6 +578,11 @@ def family_scopes(cards, config_reader):
                     scopes.add('inkling2:nvfp4a4')
             if count:
                 counts.add(f'inkling2={count}')
+        if family == 'inkling2_mini':
+            # TP1-only looped transformer (0 Sparks): native NVFP4 (layers 0-19) + MXFP8 (layers 20-23).
+            env['CUTEAFD_WIP_INKLING2_MINI_AOT'] = 'ON'
+            scopes.add('inkling2_mini:nvfp4a4')
+            scopes.add('inkling2_mini:mxfp8')
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.
@@ -646,7 +651,7 @@ def family_scopes(cards, config_reader):
                     env['CUTEAFD_WIP_MIMO_GEOMETRIES'] = ';'.join(sorted(set(env.get('CUTEAFD_WIP_MIMO_GEOMETRIES', '').split(';')) - {''} | wanted))
         card_scopes, scopes = scopes, scopes_before | scopes
         if count:
-            spark_scopes |= {scope for scope in card_scopes if not scope.startswith('glmfdense:')}
+            spark_scopes |= {scope for scope in card_scopes if not scope.startswith(('glmfdense:', 'inkling2_mini:'))}
     env.update(CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES=';'.join(sorted(scopes)),
                CUTEAFD_WIP_GENERIC_SPARK_COUNTS=';'.join(sorted(counts)),
                CUTEAFD_WIP_EXPERT_FAMILIES=';'.join(sorted(spark_scopes)),

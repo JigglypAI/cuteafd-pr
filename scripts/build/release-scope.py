@@ -283,6 +283,8 @@ def requirements(repo, matrix, scope):
             programs = {'minimax'}
         elif family == 'inkling2':
             programs = {'inkling2', 'dense_trellis_k6', 'native_attention'}
+        elif family == 'inkling2_mini':
+            programs = {'inkling2_mini'}
         elif family == 'hy4_flash':
             programs = {'hy4f', 'dense_trellis_k6'} | ({'hy4f2'} if dual else set())
         elif family == 'muse_spark':

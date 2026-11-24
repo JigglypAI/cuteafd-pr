@@ -10,7 +10,7 @@ impl<'a> Convolution<'a>{
         Self::load_rows(programs,width,dynamic,64)
     }
     pub fn load_rows(programs:&'a Programs<'a>,width:usize,dynamic:bool,max_rows:usize)->Result<Self>{
-        ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)|(512,false)|(512,true))
+        ensure!(matches!((width,dynamic),(4608,false)|(2304,false)|(1024,false)|(1024,true)|(512,false)|(512,true))
             && matches!(max_rows,64|128),"Inkling replay convolution geometry");
         let heads=if dynamic{width/128}else{1};
         let suffix=if max_rows==64{""}else{"_m128"};

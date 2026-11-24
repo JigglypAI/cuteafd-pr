@@ -6,7 +6,8 @@ bool valid_perception(const cuteafd_vision_spec& s) {
   bool ink=s.reserved==6;const auto& p=*s.perception;
   uint32_t h=ink?1024:1536,i=ink?4096:8960,d=ink?23:47;
   if(s.hidden!=h || s.depth!=d || s.heads!=16 || s.kv_heads!=16 || s.head_dim!=h/16 ||
-     s.intermediate!=i || s.patch_size!=(ink?20:14) || s.output_width!=(ink?4608:4096) ||
+     s.intermediate!=i || s.patch_size!=(ink?20:14) ||
+     (ink ? (s.output_width!=4608 && s.output_width!=2304) : s.output_width!=4096) ||
      s.merger_width!=h*4 || p.activation!=uint32_t(!ink) || p.position_grid!=(ink?32:52) ||
      p.class_token!=uint32_t(ink) || p.output_kind!=uint32_t(!ink) || !p.scale1 || !p.scale2 ||
      !s.weight_bytes || s.weight_bytes>(5ULL<<30))return false;

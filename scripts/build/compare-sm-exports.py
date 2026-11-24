@@ -283,6 +283,11 @@ def jobs(scope):
     result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES, "--layouts", "tp1,tp2"])
                   for geometry in ("inkling2_mxfp8", "inkling2_nvfp4"))
+    result.append(("inkling2-mini-attention", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "inkling2_mini", "--decode-rows", "64", "--prefill-rows", "4096"]))
+    result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
+                   ["--geometry", geometry, "--capacities", CAPACITIES, "--layouts", "tp1"])
+                  for geometry in ("inkling2_mini_mxfp8", "inkling2_mini_nvfp4"))
     for geometry in ("mimo", "mimof"):
         result.append((f"routed-{geometry}-row-addresses", "package_fp8_moe_aot.py",
                        ["--geometry", geometry, "--capacities", "2752", "--layouts", "tp2", "--row-addresses"]))

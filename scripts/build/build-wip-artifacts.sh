@@ -339,6 +339,7 @@ cmake \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_INKLING2_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_INKLING2_MINI_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_INKLING2_MINI_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_HY4F_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_HY4F_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_WIP_EXLR8_FAMILIES:-}" \

@@ -614,6 +614,166 @@ def inkling2_input_quant_program():
                       exact_row_cap=2**31-1))
 
 
+def inkling2_mini_attention_programs(decode_rows: int, prefill_rows: int):
+    """Inkling 2 Mini TP1 biased-sink GQA (24 Q / 8 KV heads, group 3, prefill_tokens 21)."""
+    from functools import partial
+    from b12x.integration.cuteafd import INKLING2_MINI
+    from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot
+
+    result = []
+    for kind in ("local", "global"):
+        for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
+            for route, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+                params = dict(kind=kind, route=route, max_rows=rows, kv_format=kv_format)
+                result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}",
+                               "attention", params,
+                               partial(compile_inkling2_attention_aot, INKLING2_MINI, **params)))
+    return result
+
+
+def inkling2_mini_producer_programs(prefill_rows: int):
+    """Inkling 2 Mini TP1 producers, 4-query cross-pass residual, and loop controllers."""
+    from functools import partial
+    import torch
+    from b12x.integration.cuteafd.inkling2_convolution import compile_inkling2_convolution_aot
+    from b12x.integration.cuteafd.inkling2_clip import compile_inkling2_clip_aot
+    from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
+    from b12x.integration.cuteafd.inkling2_loop_controller import (
+        compile_inkling2_loop_pair_norm_aot, compile_inkling2_loop_blend_norm_aot,
+    )
+    from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+
+    result = []
+    def add(stem, op, compiler, **params):
+        params = {**params, "max_rows": prefill_rows}
+        serial = {key: str(value).removeprefix("torch.") if isinstance(value, torch.dtype) else value
+                  for key, value in params.items()}
+        result.append((stem, op, serial, partial(compiler, **params)))
+
+    for dtype, suffix in [(torch.bfloat16, "bf16"), (torch.float32, "f32")]:
+        for width, dynamic in ((2304, False), (1024, False), (1024, True)):
+            kind = "dynamic" if dynamic else "static"
+            add(f"conv_{kind}_h{width}_{suffix}_v2", "convolution", compile_inkling2_convolution_aot,
+                width=width, heads=8 if dynamic else 1, dynamic=dynamic, dtype=dtype)
+        for local in (True, False):
+            for name, heads, dim, threshold, scaled in (
+                ("q", 24, 128, 128**.5*2, True),
+                ("k", 8, 128, 128**.5*2, False),
+                ("r", 24, 16, 8., True),
+            ):
+                if name == "k" and not local:
+                    continue
+                kind = "local" if local else "global"
+                add(f"clip_{kind}_{name}_{suffix}", "l2_clip", compile_inkling2_clip_aot,
+                    heads=heads, dim=dim, threshold=threshold, scaled=scaled, dtype=dtype,
+                    log_floor=0 if local else 8192, log_alpha=0. if local else 0.1)
+        add(f"gate_h3072_{suffix}", "gate", compile_inkling2_gate_aot, width=3072, dtype=dtype)
+        add(f"norm_h2304_{suffix}", "rms_norm", compile_inkling2_norm_aot, width=2304, output_dtype=dtype)
+        add(f"norm_v_h8_d128_{suffix}", "rms_norm", compile_inkling2_norm_aot,
+            width=128, heads=8, weighted=False, output_dtype=dtype)
+        for kv_format in ("bf16", "fp8"):
+            add(f"kv_pack_{kv_format}_{suffix}_v2", "kv_pack", compile_inkling2_kv_pack_aot,
+                heads=8, input_dtype=dtype, kv_format=kv_format)
+    for queries, max_candidates in ((1, 5), (3, 5), (4, 2)):
+        for addend in (False, True):
+            add(f"residual_q{queries}_c{max_candidates}_{'add' if addend else 'keep'}", "attn_res",
+                compile_inkling2_residual_aot, hidden=2304, queries=queries,
+                max_candidates=max_candidates, addend=addend)
+    for slots, bcast in ((1, False), (3, True), (3, False)):
+        tag = "_bcast" if bcast else ""
+        add(f"loop_pair_norm_s{slots}{tag}", "loop_pair_norm",
+            compile_inkling2_loop_pair_norm_aot, hidden=2304, slots=slots, broadcast_dest=bcast)
+        add(f"loop_blend_norm_s{slots}{tag}", "loop_blend_norm",
+            compile_inkling2_loop_blend_norm_aot, hidden=2304, slots=slots,
+            broadcast_dest=bcast, broadcast_weight=bcast)
+    add("router_e128_k8", "router", compile_inkling2_router_aot, experts=128, topk=8, route_scale=8.)
+    return result
+
+
+def inkling2_mini_draft_programs():
+    """Bundled 3-layer recurrent MTP primitives for Inkling 2 Mini (H=2304, taps=4, Q24/K8)."""
+    from functools import partial
+    from b12x.integration.cuteafd import inkling_drafter as draft
+    out = [
+        ("dflare_mix_h2304_t4", "dflare_mix", {"max_rows": 4096},
+         partial(draft.compile_inkling_dflare_mix_aot, hidden=2304, taps=4)),
+        ("mask_init_h2304", "mask_init", {"max_rows": 64},
+         partial(draft.compile_inkling_mask_init_aot, hidden=2304)),
+        ("head_fold_h2304", "head_fold", {"max_rows": 4096},
+         partial(draft.compile_inkling_head_fold_aot, hidden=2304)),
+        ("residual_norm_h2304", "residual_norm", {"max_rows": 4096},
+         partial(draft.compile_inkling_residual_norm_aot, hidden=2304)),
+        ("qk_norm_rope_q24_k8", "qk_norm_rope", {"max_rows": 4096},
+         partial(draft.compile_inkling_qk_norm_rope_aot, q_heads=24, kv_heads=8)),
+        ("recurrent_gate", "recurrent_gate", {"max_rows": 64}, draft.compile_inkling_recurrent_gate_aot),
+        ("logit_finish", "logit_finish", {"max_rows": 448}, draft.compile_inkling_logit_finish_aot),
+        ("qk_norm_rope_q0_k8", "qk_norm_rope", {"max_rows": 4096},
+         partial(draft.compile_inkling_qk_norm_rope_aot, q_heads=0, kv_heads=8)),
+        ("silu_mul_i9216", "silu_mul", {"max_rows": 4096},
+         partial(draft.compile_inkling_silu_mul_aot, intermediate=9216)),
+        ("bias_add_w768_f32", "bias_add", {"max_rows": 448},
+         partial(draft.compile_inkling_bias_add_aot, width=768)),
+        ("bias_add_w201024_bf16", "bias_add", {"max_rows": 448},
+         partial(draft.compile_inkling_bias_add_aot, width=201024)),
+        ("kv_store_k8_fp8", "kv_store", {"max_rows": 4096},
+         partial(draft.compile_inkling_kv_store_aot, kv_heads=8, kv_format="fp8")),
+        ("kv_store_k8_bf16", "kv_store", {"max_rows": 4096},
+         partial(draft.compile_inkling_kv_store_aot, kv_heads=8, kv_format="bf16")),
+    ]
+    return out
+
+
+def inkling2_mini_fir_programs():
+    from functools import partial
+    from b12x.integration.cuteafd.fir_history import compile_fir_history_commit_aot
+    from b12x.integration.cuteafd.inkling2_convolution_replay import compile_inkling2_convolution_replay_aot
+    from b12x.integration.cuteafd.inkling2_convolution_strided import compile_inkling2_convolution_strided_aot
+    out = [("fir_history_commit", "fir_history_commit", {"max_rows": 64}, compile_fir_history_commit_aot)]
+    for width, dynamic in ((2304, False), (1024, False), (1024, True)):
+        kind = "dynamic" if dynamic else "static"
+        params = dict(width=width, heads=width // 128 if dynamic else 1, dynamic=dynamic)
+        for suffix, capacity, compile_ in (("replay", 64, compile_inkling2_convolution_replay_aot),
+                                          ("strided", 4096, compile_inkling2_convolution_strided_aot)):
+            out.append((f"conv_{kind}_h{width}_f32_{suffix}", f"convolution_{suffix}", {"max_rows": capacity},
+                        partial(compile_, **params)))
+    return out
+
+
+def inkling2_mini_input_quant_program():
+    """Group-32 MXFP8 wire quantizer for Inkling 2 Mini layers 20-23 (H=2304, row_bytes=2376)."""
+    import torch
+    from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
+    from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+    compiled = compile_mxfp8_rows_quant_aot(size_k=2304, expected_m=80, amax_floor=0., wire_rows=True)
+    return AotProgram(name="inkling2_mini_expert_input_quant", compiled=compiled,
+        operands=(Operand("source_ptr", torch.bfloat16, "[rows,2304]"),
+                  Operand("values_ptr", torch.uint32, "[rows,594]", "out"),
+                  Operand("scale_rows_ptr", torch.uint8, "values_ptr+2304", "out", align=1),
+                  Operand("scale_mma_ptr", torch.uint8, "unused")),
+        scalars=(Scalar("m"), Scalar("grid_x")),
+        geometry=dict(hidden=2304, row_bytes=2376, expected_m=80, amax_floor=0.,
+                      exact_row_cap=2**31-1))
+
+
+def inkling2_mini_projection_shapes():
+    """(K, N, output) shapes for Mini target (f1940f40eb BF16/F32) and bundled 3-layer MTP."""
+    bf16 = {
+        # Target BF16 dense projections & controller down_proj
+        (2304, 3072), (2304, 384), (2304, 1024), (2304, 24), (3072, 2304), (64, 1024), (4608, 64),
+        # Bundled 3-layer MTP BF16 projections
+        (2304, 9216), (9216, 2304), (2304, 201024), (256, 201024),
+    }
+    f32 = {
+        # Target F32 islands: dynamic conv taps, router, controller [forget; gain], plus fallback F32
+        (2304, 32), (2304, 128), (64, 4608),
+        (2304, 3072), (2304, 384), (2304, 1024), (2304, 24), (3072, 2304), (64, 1024),
+        # Bundled MTP Markov head F32 projections
+        (5120, 768), (256, 201024),
+    }
+    return bf16, f32
+
+
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
     # Fused top-k has fixed CTA-group spin barriers. The native table has no
     # loaded-kernel occupancy gate/fallback; even a new decode bucket must not
@@ -1994,9 +2154,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "hy4f", "hy4f2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "inkling2_mini", "hy4f", "hy4f2", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, hy4f, hy4f2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, inkling2_mini, hy4f, hy4f2, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -2128,7 +2288,7 @@ def main() -> None:
             }
             work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
-        if name in ("minimax", "inkling2"):
+        if name in ("minimax", "inkling2", "inkling2_mini"):
             continue  # appended after existing programs to preserve their indices
         if name in ("hy4f", "hy4f2"):
             continue  # appended after inkling2 to preserve existing indices
@@ -2328,6 +2488,43 @@ def main() -> None:
             if suffix not in existing:
                 work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
                              lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+    if "inkling2_mini" in geometries:
+        from b12x.integration.cuteafd import INKLING2_MINI
+        from b12x.integration.cuteafd.inkling2_glue import compile_padded_transpose_aot
+        manifest["families"]["inkling2_mini"] = dataclasses.asdict(INKLING2_MINI)
+        work += [("inkling2_mini", *item) for item in inkling2_mini_attention_programs(args.decode_rows, args.prefill_rows)]
+        work += [("inkling2_mini", *item) for item in inkling2_mini_producer_programs(args.prefill_rows)]
+        existing_all = {(family, suffix) for family, suffix, *_ in work}
+        if ("inkling2", "padded_transpose_bf16_r16_c1024_p64") not in existing_all:
+            work.append(("inkling2", "padded_transpose_bf16_r16_c1024_p64", "padded_transpose",
+                         {"dtype": "bfloat16", "rows": 16, "cols": 1024, "padded_cols": 64},
+                         functools.partial(compile_padded_transpose_aot, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64)))
+            existing_all.add(("inkling2", "padded_transpose_bf16_r16_c1024_p64"))
+        for suffix, op, params, compile_ in inkling2_mini_fir_programs():
+            family = "fir" if suffix == "fir_history_commit" else "inkling2"
+            name = "history_commit" if family == "fir" else suffix
+            if (family, name) not in existing_all:
+                work.append((family, name, op, params, compile_))
+                existing_all.add((family, name))
+        for suffix, op, params, compile_ in inkling2_mini_draft_programs():
+            if ("inkling_draft", suffix) not in existing_all:
+                work.append(("inkling_draft", suffix, op, params, compile_))
+                existing_all.add(("inkling_draft", suffix))
+        work.append(("inkling2_mini", "expert_input_quant", "expert_input_quant", {"max_rows": 4096},
+                     inkling2_mini_input_quant_program))
+        bf16_shapes, f32_shapes = inkling2_mini_projection_shapes()
+        for k, n in sorted(bf16_shapes):
+            suffix = f"k{k}_n{n}"
+            if ("draft_bf16", suffix) not in existing_all:
+                work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
+                             lambda k=k, n=n: compile_draft_bf16_projection(k, n, "bf16")))
+                existing_all.add(("draft_bf16", suffix))
+        for k, n in sorted(f32_shapes):
+            suffix = f"k{k}_n{n}_f32"
+            if ("draft_bf16", suffix) not in existing_all:
+                work.append(("draft_bf16", suffix, "bf16_projection", {"max_rows": 4096},
+                             lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32")))
+                existing_all.add(("draft_bf16", suffix))
     if "hy4f2" in geometries and "hy4f" not in geometries:
         from export_b12x_hy4_aot import programs as hy4_programs
         draft_shared = {"rms_norm_3072", "q_a", "kv_a", "q_b_dsa", "linear_gate_dsa", "o_proj_dsa",

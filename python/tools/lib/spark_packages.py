@@ -27,9 +27,14 @@ def native_layout(family: str, format: str) -> dict:
     return package_entry(family, format)['native_layout']
 
 
+def _split_geometry(geometry: str) -> tuple[str, str]:
+    family, sep, fmt = geometry.rpartition('_')
+    return (family, fmt) if sep else (geometry, 'fp8')
+
+
 def geometry_native_layout(geometry: str) -> dict | None:
-    family, _, format = geometry.partition('_')
-    format = (format or 'fp8').removesuffix('a4')
+    family, format = _split_geometry(geometry)
+    format = format.removesuffix('a4')
     entry = json.loads(RANGES_PATH.read_text())['entries'].get(f'{family}:{format}')
     return entry['native_layout'] if entry else None
 
@@ -113,8 +118,8 @@ def package_worlds(family: str, format: str) -> list[int]:
 
 
 def geometry_worlds(geometry: str) -> list[int]:
-    family, _, format = geometry.partition('_')
-    return package_worlds(family, format or 'fp8')
+    family, format = _split_geometry(geometry)
+    return package_worlds(family, format)
 
 
 # Stable legacy ABI ids. Unequal source ownership selects width-keyed artifacts.

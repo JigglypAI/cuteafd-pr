@@ -156,8 +156,8 @@ cuteafd_vision_owner_entry(d128 HEAD_DIM 128 POINTWISE_GROUP pixtral
   POINTWISE_PROGRAMS vision_axial_rotary_d128_bf16 vision_rms_bf16_gamma_h2048
   POINTWISE_ARGS --group pointwise --head-dim 128 --hidden 2048 --bf16-products --bf16-before-gamma)
 # Lender groups must precede their borrowers; the helper validates availability.
-foreach(kind inkling2 step5)
-  if(kind STREQUAL "inkling2")
+foreach(kind inkling2 inkling2_mini step5)
+  if(kind STREQUAL "inkling2" OR kind STREQUAL "inkling2_mini")
     set(dim 64)
   else()
     set(dim 96)
@@ -168,8 +168,18 @@ foreach(kind inkling2 step5)
     message(FATAL_ERROR "Cannot read ${kind} PE export inventory")
   endif()
   set(shared_attention)
+  set(borrow_group muse)
   set(borrowed_programs vision_gelu_h4096)
-  if(kind STREQUAL "step5")
+  if(kind STREQUAL "inkling2_mini")
+    set(shared_attention DIRECTORY "${CUTEAFD_VISION_ATTENTION_DIR}/pe_inkling2")
+    set(borrow_group pe_inkling2)
+    set(borrowed_programs
+      vision_pe_norm_h1024 vision_pe_scale_h1024 vision_pe_position_h1024 vision_pe_rotary_d64
+      vision_biased_projection_h1024_o3072 vision_biased_projection_h1024_o1024
+      vision_biased_projection_h1024_o4096 vision_biased_projection_h4096_o1024
+      vision_projection_h1200_o1024 vision_pe_rgb_p20 vision_pe_merge_h1024
+      vision_pe_patch_projection_h4096_o4096)
+  elseif(kind STREQUAL "step5")
     set(shared_attention DIRECTORY "${CUTEAFD_VISION_ATTENTION_DIR}/d96_full")
     set(borrowed_programs
       vision_biased_projection_h1536_o4608 vision_biased_projection_h1536_o1536
@@ -177,7 +187,7 @@ foreach(kind inkling2 step5)
   endif()
   cuteafd_vision_owner_entry(pe_${kind} HEAD_DIM ${dim} POINTWISE_GROUP pe_${kind} ${shared_attention}
     PROGRAMS vision_attention_d${dim}_full ARGS --group attention --head-dim ${dim}
-    BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
+    BORROW_POINTWISE_GROUP ${borrow_group} BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
     POINTWISE_PROGRAMS ${pe_programs} POINTWISE_ARGS --group perception --perception ${kind})
 endforeach()
 # Generic still towers own dynamic-row attention and an independent program group.
