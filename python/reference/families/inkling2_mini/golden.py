@@ -39,7 +39,12 @@ ROOT_ARITHMETIC = {
 def expected_source_identity(runtime):
     if runtime:
         raise ValueError("Mini reference has no dynamic model dependencies")
-    return {"transformers": HF, "snapshot": PINS,
+    return {"revision": REVISION, "transformers": HF, "snapshot": PINS,
+            "vllm": {"revision": "a0c1f162f4ded00f0f40928698b4b5816f4d3bd7", "files": {
+                "vllm/models/inkling2/nvidia/loop.py": "94d0d7221c5709b5c4cf8fa96e4be1c82d254d510bb002f860aee6c3b96e896c",
+                "vllm/models/inkling2/nvidia/ops/nvfp4.py": "7830385a15c4b57f12aaf4b84103724de0b4a0ba3cf3bafef16bb1e42c9151bd"}},
+            "sglang": {"revision": "daba437630ff7c1e02a9b1d88a7d8414376acff7", "files": {
+                "python/sglang/srt/models/inkling_common/inkling2_loop.py": "70d8797b523b0fcdaad6e709e14bfc4bbdcc735a4b49824b430997ff1018dd78"}},
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(__file__),
             "inkling_primitives_sha256": digest(ROOT / "python/reference/families/inkling2/model.py"),
@@ -67,7 +72,7 @@ def execute(a):
     if a.check_only:
         print(f"verified {len(weights.formats)} packed Mini expert projections; {len(weights.contracts)} physical layers")
         return
-    manifest = load_set(a.windows)
+    manifest = load_set(a.windows, "inkling2_mini")
     if manifest["checkpoint"] != CHECKPOINT or any(w.get("media") for w in manifest["windows"]):
         raise ValueError("Mini golden accepts only its text panel")
     if any(t >= cfg.unpadded_vocab_size for w in manifest["windows"] for t in w["tokens"]):
