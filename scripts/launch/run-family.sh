@@ -226,8 +226,7 @@ case "$(get DRAFT_POLICY history)" in
 esac
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
-# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
-# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
+# (CUTEAFD_SPECULATION_TRACE; read by scripts/bench/speculation-replay.py).
 shared_trace_args() {
 trace_args=()
 trace="$(get SPECULATION_TRACE)"
@@ -1416,6 +1415,12 @@ if [[ "$family" == mistral_large4 ]]; then
     *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
   esac
 fi
+# Refuse retired GLM/ML4 keys before handling their values or staging anything.
+if [[ "$family" == glm5 ]]; then
+  for key in CHAT_TEMPLATE_FROM EXPERT_INPUT RTX_EXPERT_PEER PREFILL_BATCH_TOKENS; do
+    [[ -z "$(get "$key")" ]] || release_die "unused configuration key: $key"
+  done
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -1909,13 +1914,23 @@ case $family in
   minimax_m3|inkling2|hy4_flash)
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)") ;;
 esac
+if [[ $family == mimo_v2 || $family == glm5 ]]; then
+  [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
+  [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
+fi
+if [[ $family == glm5 ]]; then
+  glm_decode_graphs="$(get DECODE_GRAPHS)"
+  case "$glm_decode_graphs" in
+    "") ;;
+    on|off) family_args+=(--decode-graphs "$glm_decode_graphs") ;;
+    *) release_die "DECODE_GRAPHS must be on or off" ;;
+  esac
+fi
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 || $checkpoint_family == mistral_large4 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
 if [[ $family == mimo_v2 ]]; then
-  [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
-  [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
   [[ "$(get MIMO_PREFIX_DRAFT off)" != on ]] || family_args+=(--mimo-prefix-draft)
   [[ "$(get MIMO_SNAPSHOT_WAIT off)" != on ]] || family_args+=(--mimo-snapshot-wait)
   [[ -z "$(get MIMO_PREFILL_CHUNK_S)" ]] || family_args+=(--prefill-chunk-s "$(get MIMO_PREFILL_CHUNK_S)")
@@ -2526,6 +2541,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == glm5 ]]; then
+    [[ -z "$glm_decode_graphs" ]] || plan_draft_args+=(--glm-decode-graphs "$glm_decode_graphs")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
@@ -2571,7 +2587,7 @@ audio_encoder_hash=""
     'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
     key_name="${pair%%:*}"; flag="${pair#*:}"
-    [[ "$family:$key_name" != mimo_v2:PREFILL_BATCH_TOKENS ]] || continue
+    [[ "$key_name" != PREFILL_BATCH_TOKENS || ( "$family" != mimo_v2 && "$family" != glm5 ) ]] || continue
     value="$(get "$key_name")"
     if [[ -n "$value" && "$value" != auto && " ${plan_draft_args[*]} " != *" $flag "* ]]; then
       plan_draft_args+=("$flag" "$value")
@@ -2729,7 +2745,7 @@ audio_encoder_hash=""
     release_die "deployment does not name a supported verify-row budget"
   if [[ ( -n "$decode_rows" && "$decode_rows" != auto ) || "$resolved_decode_rows" != 64 ]]; then
     case "$family" in
-      glm5_flash|hy4_flash) family_args+=(--decode-rows "$resolved_decode_rows") ;;
+      glm5_flash|hy4_flash|minimax_m3) family_args+=(--decode-rows "$resolved_decode_rows") ;;
     esac
   fi
   case "$(family_prefill_mode "$family")" in

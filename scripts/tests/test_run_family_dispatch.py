@@ -1193,7 +1193,9 @@ if family == "glm5_flash" and gpus == 2 and decode_rows > 64:
     sys.exit("glm5_flash on 2 RTX GPUs supports DECODE_ROWS up to 64 (missing glmf2_*_m128)")
 if family == "glm5_flash" and decode_rows > 128:
     sys.exit("glm5_flash on 1 RTX GPU supports DECODE_ROWS up to 128 (missing glmf_*_m256)")
-if family not in ("deepseek_v41", "glm5_flash") and decode_rows > 64:
+if family == "minimax_m3" and decode_rows > 128:
+    sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes, decode_rows=decode_rows)
@@ -2653,9 +2655,9 @@ def test_glm53_rejects_retired_peer_expert_ranges(tmp_path, value):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
     }, "test/glm", keys)
-    if value == "on":
+    if value is not None:
         assert result.returncode == 2
-        assert "GPU1 whole-layer expert ranges were replaced by TP2 halves" in result.stderr
+        assert "unused configuration key: RTX_EXPERT_PEER" in result.stderr
         assert not any("docker run" in line and "--resolve-settings-only" not in line for line in result.stderr.splitlines()) and "nest drop-caches" not in result.stderr
     else:
         assert result.returncode == 0, result.stderr

@@ -72,9 +72,9 @@ impl Family for Glm {
         Some((prefix, first..first.checked_add(count)?))
     }
     fn fp8_prefill_groups(&self) -> &'static [crate::plan::fp8_prefill::Group] {
-        use crate::plan::fp8_prefill::GLMF_GROUPS;
+        use crate::plan::fp8_prefill::{GLMF_GROUPS, GLM_GROUPS};
         if self.id == "glm5_flash" { GLMF_GROUPS }
-        else { &[] }
+        else { GLM_GROUPS }
     }
     fn native_head_widths(&self) -> &'static [usize] {
         if self.id == "glm5_flash" { crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS }

@@ -52,7 +52,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             baseline: Baseline::Forecast { occupied: 0, source: "test physical witness".into(), assumed: false },
             headroom: 0 });
     }
-    ProductionInput { expert_usage: false, cfg, layers: cfg.layers, context: 4096, pool: crate::placement::prepare_pool(pool_facts(
+    ProductionInput { decode_graphs: true, expert_usage: false, cfg, layers: cfg.layers, context: 4096, pool: crate::placement::prepare_pool(pool_facts(
         cfg, &vec![96 << 30; gpus], 4096, Some(4096), if gpus == 2 { 128 } else { 64 })).unwrap(),
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
         gpus, prefill, blas_head: serving::BlasHead::TensorLt, blas: vec![],
@@ -89,6 +89,16 @@ fn ml4_alpha_is_one_pinned_load_owner_not_a_host_rss_subset() {
     assert_eq!(owners[0].lifetime, Lifetime { first: Phase::Load, last: Phase::PostTargetKv });
     assert_eq!(owners[0].category, Category::Staging);
     assert!(owners[0].view.is_none());
+}
+
+#[test]
+fn decode_graphs_off_disables_both_rank_reserves() {
+    let graphs = StartupGraphs::new(4096, AttentionPlacement::Heads, 2,
+        &[GlmGraphLayer { dense: true, local: false, attention_owner: None }], 0).unwrap()
+        .with_decode_graphs(false);
+    assert_eq!(graphs.reserves().unwrap(), vec![0, 0]);
+    assert_eq!(graphs.reserve_policy(0).unwrap().source, "DECODE_GRAPHS=off");
+    assert!(graphs.components(64).unwrap().is_empty());
 }
 
 #[test]

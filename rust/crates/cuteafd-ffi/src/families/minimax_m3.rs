@@ -68,6 +68,28 @@ impl Mode {
             Self::AttentionExtend => "minimax_attention_extend_h32",
         }
     }
+    pub fn name_for_rows(self, decode_rows: u32) -> &'static str {
+        if decode_rows > 64 {
+            match self {
+                Self::IndexDecode => "minimax_index_decode_m128",
+                Self::AttentionDecode => "minimax_attention_decode_m128",
+                _ => self.name(),
+            }
+        } else {
+            self.name()
+        }
+    }
+    pub fn heads_name_for_rows(self, decode_rows: u32) -> &'static str {
+        if decode_rows > 64 {
+            match self {
+                Self::IndexDecode => "minimax_index_decode_h2_m128",
+                Self::AttentionDecode => "minimax_attention_decode_h32_m128",
+                _ => self.heads_name(),
+            }
+        } else {
+            self.heads_name()
+        }
+    }
     fn mode(self) -> &'static str {
         match self {
             Self::IndexDecode | Self::AttentionDecode => "decode",
@@ -141,7 +163,11 @@ impl Layout {
     pub fn kv_heads(self) -> u32 { self.kv_heads }
     pub fn query_heads(self) -> u32 { 16 * self.kv_heads }
     pub fn name(self) -> &'static str {
-        if self.kv_heads == 2 { self.mode.heads_name() } else { self.mode.name() }
+        if self.kv_heads == 2 {
+            self.mode.heads_name_for_rows(self.rows)
+        } else {
+            self.mode.name_for_rows(self.rows)
+        }
     }
     fn with_heads(mode: Mode, rows: u32, extent: u32, kv_heads: u32) -> Result<Self> {
         if rows == 0 || extent == 0 || rows > i32::MAX as u32 || extent > i32::MAX as u32 {
@@ -293,6 +319,10 @@ impl Layout {
         out
     }
     pub fn from_spec(spec: &ProgramSpec) -> Result<Self> {
+        let (base_name, wide_decode) = match spec.name.strip_suffix("_m128") {
+            Some(base) => (base, true),
+            None => (spec.name.as_str(), false),
+        };
         let mode = [
             Mode::IndexDecode,
             Mode::IndexPrefill,
@@ -300,7 +330,10 @@ impl Layout {
             Mode::AttentionExtend,
         ]
         .into_iter()
-        .find(|mode| spec.name == mode.name() || spec.name == mode.heads_name())
+        .find(|mode| {
+            (!wide_decode || matches!(mode, Mode::IndexDecode | Mode::AttentionDecode))
+                && (base_name == mode.name() || base_name == mode.heads_name())
+        })
         .ok_or_else(|| invalid("unknown program name"))?;
         let g = &spec.geometry;
         let field = |name: &str| {
@@ -309,10 +342,14 @@ impl Layout {
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| invalid(format!("geometry.{name}")))
         };
-        let kv_heads = if spec.name == mode.heads_name() { 2 } else { 4 };
+        let kv_heads = if base_name == mode.heads_name() { 2 } else { 4 };
+        let max_rows = field("max_rows")?;
+        if wide_decode && max_rows != 128 {
+            return Err(invalid("wide _m128 decode program must have max_rows=128"));
+        }
         let layout = Self::with_heads(
             mode,
-            field("max_rows")?,
+            max_rows,
             field(if mode.index() {
                 "max_pages"
             } else {
@@ -607,57 +644,75 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1746);
-        let dense_slices = [
-            "exlr8_dense_mxfp8_k6144_n4096_s1_a8",
-            "exlr8_dense_mxfp8_k6144_n256_s1_a8",
-            "exlr8_dense_mxfp8_k6144_n6144_s1_a8",
-            "exlr8_dense_mxfp8_k6144_n1536_s1_a8",
-            "exlr8_dense_mxfp8_k4096_n6144_s1_a8",
-            "exlr8_dense_mxfp8_k1536_n6144_s1_a8",
-            "exlr8_dense_quant_k4096_bf16_a8",
-            "exlr8_dense_quant_k1536_bf16_a8",
+        let total = entries.len();
+        assert!(total > 0, "installed programs array must not be empty");
+        // Pin every MiniMax-owned stem (base + 4 m128 additions = 48 total:
+        // 20 EXLR8 dense/quant + 28 minimax_* stems) without coupling this test
+        // to unrelated families' program counts.
+        let expected_dense = [
+            ("exlr8_dense_mxfp8_k12288_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k1536_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k3072_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k4096_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n12288_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n128_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n1536_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n256_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n3072_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n4096_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n512_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k6144_n8192_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_mxfp8_k8192_n6144_s1_a8", "dense_mxfp8"),
+            ("exlr8_dense_quant_k12288_bf16_a8", "dense_mxfp8_quant"),
+            ("exlr8_dense_quant_k1536_bf16_a8", "dense_mxfp8_quant"),
+            ("exlr8_dense_quant_k3072_bf16_a8", "dense_mxfp8_quant"),
+            ("exlr8_dense_quant_k4096_bf16_a8", "dense_mxfp8_quant"),
+            ("exlr8_dense_quant_k6144_bf16_a8", "dense_mxfp8_quant"),
+            ("exlr8_dense_quant_k8192_bf16_a8", "dense_mxfp8_quant"),
         ];
-        for name in dense_slices {
-            let selected = entries.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
-            assert_eq!(selected.len(), 1, "missing or duplicate rank-local dense stem {name}");
-            assert_eq!(selected[0]["family"], "minimax");
-            assert_eq!(selected[0]["op"], if name.contains("_quant_") { "dense_mxfp8_quant" } else { "dense_mxfp8" });
-        }
-        // Inkling is appended after every existing family. Pin its complete
-        // producer inventory too, so a publication cannot silently add stems.
-        let mut inkling2 = vec![
-            "inkling2_local_attention_decode_m64".to_string(),
-            "inkling2_local_attention_prefill_m4096".to_string(),
-            "inkling2_global_attention_decode_m64".to_string(),
-            "inkling2_global_attention_prefill_m4096".to_string(),
+        let expected_minimax = [
+            ("minimax_attention_decode", "minimax_attention", "msa"),
+            ("minimax_attention_decode_h32", "minimax_attention", "msa"),
+            ("minimax_attention_decode_h32_m128", "minimax_attention", "msa"),
+            ("minimax_attention_decode_m128", "minimax_attention", "msa"),
+            ("minimax_attention_extend", "minimax_attention", "msa"),
+            ("minimax_attention_extend_h32", "minimax_attention", "msa"),
+            ("minimax_index_cache_gather", "index_cache_gather", "gather"),
+            ("minimax_index_decode", "minimax_index", "msa"),
+            ("minimax_index_decode_h2", "minimax_index", "msa"),
+            ("minimax_index_decode_h2_m128", "minimax_index", "msa"),
+            ("minimax_index_decode_m128", "minimax_index", "msa"),
+            ("minimax_index_prefill", "minimax_index", "msa"),
+            ("minimax_index_prefill_h2", "minimax_index", "msa"),
+            ("minimax_index_producer", "minimax_index_producer", "producer"),
+            ("minimax_index_producer_h2", "minimax_index_producer", "producer"),
+            ("minimax_kv_pack", "minimax_kv_pack", "forward"),
+            ("minimax_kv_pack_h2", "minimax_kv_pack", "forward"),
+            ("minimax_norm_rope_h2", "minimax_norm_rope", "producer"),
+            ("minimax_norm_rope_h32", "minimax_norm_rope", "producer"),
+            ("minimax_norm_rope_h4", "minimax_norm_rope", "producer"),
+            ("minimax_norm_rope_h64", "minimax_norm_rope", "producer"),
+            ("minimax_nvfp4_wire_rows", "nvfp4_wire_rows", "wire"),
+            ("minimax_oai_split_i12288", "minimax_oai_split", "producer"),
+            ("minimax_oai_split_i1536", "minimax_oai_split", "producer"),
+            ("minimax_oai_split_i3072", "minimax_oai_split", "producer"),
+            ("minimax_oai_split_i6144", "minimax_oai_split", "producer"),
+            ("minimax_residual_norm", "minimax_residual_norm", "forward"),
+            ("minimax_router_scores", "minimax_router_scores", "forward"),
         ];
-        for suffix in ["bf16", "f32"] {
-            for name in ["conv_static_h4608", "conv_static_h1024", "conv_dynamic_h1024",
-                "clip_local_q", "clip_local_k", "clip_local_r", "clip_global_q", "clip_global_r",
-                "gate_h6144", "situ_h2304", "norm_h4608", "norm_v_h8_d128", "kv_pack"] {
-                inkling2.push(format!("inkling2_{name}_{suffix}"));
-            }
-        }
-        inkling2.extend(["residual_q1_keep", "residual_q1_add", "residual_q3_keep", "residual_q3_add", "router_e384_k8", "expert_input_quant"]
-            .map(|name| format!("inkling2_{name}")));
-        let installed = entries.iter().filter(|entry| entry["family"] == "inkling2"
-            || entry["name"].as_str().is_some_and(|name| name.starts_with("inkling2")))
-            .map(|entry| entry["name"].as_str().expect("installed program name")).collect::<Vec<_>>();
-        assert_eq!(installed, inkling2);
-        let first = entries.iter().position(|entry| entry["name"].as_str() == Some(inkling2[0].as_str())).unwrap();
-        assert_eq!(entries[first..first + inkling2.len()].iter()
-            .map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(), inkling2);
-        for entry in &entries[first..first + inkling2.len()] {
-            assert_eq!(entry["family"], "inkling2");
-            assert!(matches!(entry["op"].as_str(), Some("attention" | "convolution" | "l2_clip" | "gate"
-                | "situ" | "rms_norm" | "kv_pack" | "attn_res" | "router" | "expert_input_quant")));
-        }
+        let mut actual_family_stems = Vec::new();
         let mut partition = Vec::new();
         for entry in entries {
             let name = entry["name"].as_str().expect("installed program name");
+            let family = entry["family"].as_str().unwrap_or("");
+            let op = entry["op"].as_str().unwrap_or("");
+            if family == "minimax" || name.starts_with("minimax_") {
+                assert_eq!(family, "minimax", "unexpected family for MiniMax stem {name}");
+                actual_family_stems.push((name, op));
+            }
             if !name.starts_with("minimax_") { continue; }
-            let route = if entry["op"] == "index_cache_gather" {
+            let route = if op == "index_cache_gather" {
                 assert_eq!(entry_validator(name), None);
                 "gather"
             } else {
@@ -668,43 +723,26 @@ mod tests {
                     None => "msa",
                 }
             };
-            partition.push((name, route));
+            partition.push((name, op, route));
         }
+        actual_family_stems.sort_unstable();
+        let mut expected_family_stems: Vec<(&str, &str)> = expected_dense.iter().copied()
+            .chain(expected_minimax.iter().map(|&(name, op, _)| (name, op)))
+            .collect();
+        expected_family_stems.sort_unstable();
+        assert_eq!(actual_family_stems, expected_family_stems,
+            "installed MiniMax family stems/ops must match the exact pinned base + 4 m128 inventory");
         partition.sort_unstable();
-        assert_eq!(partition, vec![
-            ("minimax_attention_decode", "msa"),
-            ("minimax_attention_decode_h32", "msa"),
-            ("minimax_attention_extend", "msa"),
-            ("minimax_attention_extend_h32", "msa"),
-            ("minimax_index_cache_gather", "gather"),
-            ("minimax_index_decode", "msa"),
-            ("minimax_index_decode_h2", "msa"),
-            ("minimax_index_prefill", "msa"),
-            ("minimax_index_prefill_h2", "msa"),
-            ("minimax_index_producer", "producer"),
-            ("minimax_index_producer_h2", "producer"),
-            ("minimax_kv_pack", "forward"),
-            ("minimax_kv_pack_h2", "forward"),
-            ("minimax_norm_rope_h2", "producer"),
-            ("minimax_norm_rope_h32", "producer"),
-            ("minimax_norm_rope_h4", "producer"),
-            ("minimax_norm_rope_h64", "producer"),
-            ("minimax_oai_split_i12288", "producer"),
-            ("minimax_oai_split_i1536", "producer"),
-            ("minimax_oai_split_i3072", "producer"),
-            ("minimax_oai_split_i6144", "producer"),
-            ("minimax_residual_norm", "forward"),
-            ("minimax_router_scores", "forward"),
-        ]);
+        assert_eq!(partition, expected_minimax);
         let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1746);
+        assert_eq!(programs.names().count(), total);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1746 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
+        println!("validated {total} installed stems; MiniMax: 20 EXLR8 dense/quant, 12 MSA, 10 Producer, 4 Forward, 1 Wire, 1 gather");
         Ok(())
     }
 
@@ -1092,6 +1130,12 @@ impl<'a> Msa<'a> {
     }
     pub fn bind_heads(programs: &'a Programs<'a>, mode: Mode) -> Result<Self> {
         Self::bind_name(programs, mode.heads_name())
+    }
+    pub fn bind_for_rows(programs: &'a Programs<'a>, mode: Mode, decode_rows: u32) -> Result<Self> {
+        Self::bind_name(programs, mode.name_for_rows(decode_rows))
+    }
+    pub fn bind_heads_for_rows(programs: &'a Programs<'a>, mode: Mode, decode_rows: u32) -> Result<Self> {
+        Self::bind_name(programs, mode.heads_name_for_rows(decode_rows))
     }
     fn bind_name(programs: &'a Programs<'a>, name: &str) -> Result<Self> {
         let spec = programs

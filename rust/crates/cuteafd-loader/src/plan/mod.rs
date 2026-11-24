@@ -1239,6 +1239,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    if matches!(family.id(), "glm5" | "mistral_large4") {
+        fp8_prefill::validate_glm_groups(&options.fp8_prefill, family.id() == "mistral_large4")
+            .map_err(|reason| PlanError::InvalidOption { option: "FP8_PREFILL", reason })?;
+    }
     // The served concurrency (0 is the launcher's derived default), as serve resolves it.
     let resolved_concurrency = options.layout.as_ref().map_or(16, |layout| layout.resolved_concurrency(family.id()));
     let rtx_gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());

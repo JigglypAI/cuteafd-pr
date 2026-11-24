@@ -166,10 +166,10 @@ impl<'a> Owners<'a> {
         let mut streams = Vec::with_capacity(loaded.len());
         for (gpu, rank) in loaded.into_iter().enumerate() {
             let layout = inputs.targets[gpu].clone();
-            let bind = if inputs.heads() { Kernels::bind_heads }
-                else if inputs.split() { Kernels::bind_split } else { Kernels::bind };
+            let bind = if inputs.heads() { Kernels::bind_heads_for_decode }
+                else if inputs.split() { Kernels::bind_split_for_decode } else { Kernels::bind_for_decode };
             let kernels = bind(rank.streams.decode.device, programs, &inputs.manifest,
-                &inputs.cfg, &layout, capacity.execution_rows(), u32::try_from(inputs.context.maximum)?)?;
+                &inputs.cfg, &layout, capacity.decode.rows, capacity.execution_rows(), u32::try_from(inputs.context.maximum)?)?;
             let make_unit = |stream: Rc<crate::shared::memory::device::Stream<'a>>, rows, prefill| -> Result<_> {
                 let mut unit = if inputs.heads() { UnitOwner::new_heads(&kernels, stream, &inputs.cfg, &layout, rows, prefill) }
                 else if inputs.split() {
@@ -769,7 +769,7 @@ pub(super) mod tests {
         Ok(MiniMaxInputs { cfg: cfg.clone(), gpus, split_wire: Some(cuteafd_loader::families::minimax_m3::execution::WirePrecision::Bf16),
             attention: canonical::MINIMAX_M3.check_attention(None, gpus, gpus == 2)?,
             spark_ranks: 2, context: ModelContext::pinned(257),
-            pool: cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(ModelContext::pinned(257), Some(129 * 64), 64))?, prefill, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
+            pool: cuteafd_loader::placement::prepare_pool(cuteafd_loader::placement::PoolFacts::new(ModelContext::pinned(257), Some(129 * 64), 64))?, prefill, decode_rows: 64, sequences: concurrency, manifest: std::sync::Arc::new(manifest(&targets)?),
             routed: routed.clone(), expert_backings, owners, budgets,
             local: LocalPackage::Installed { scratch: 64 << 20, output: prefill.rows * 6144 * 2 },
             spark: (0..=routed.len()).map(|count| vec![if count == routed.len() {

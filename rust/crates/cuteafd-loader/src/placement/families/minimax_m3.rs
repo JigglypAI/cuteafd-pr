@@ -35,6 +35,8 @@ use cuteafd_core::spark_reply::SparkReplyFormats;
 
 /// Native MSA page quantum (64-token pages; the selector's blocks are 128).
 pub const PAGE_ROWS: u64 = 64;
+/// Largest native verify-row capacity supported by MiniMax decode programs (`_m128`).
+pub const MAX_DECODE_ROWS: u32 = 128;
 /// Prefill transport endpoints: one shared link (LaneSupport::One).
 pub const LANES: u64 = 1;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
@@ -60,7 +62,7 @@ impl RequestCapacity {
     pub fn with_queries(concurrency: u64, unit_rows: u64, queries: u64) -> Result<Self, Refusal> {
         let mut capacity = Self::new(concurrency, unit_rows)?;
         let queries = u32::try_from(queries).map_err(|_| Refusal::Overflow("MiniMax query rows"))?;
-        if queries < capacity.requests || queries > 64 {
+        if queries < capacity.requests || queries > MAX_DECODE_ROWS {
             return Err(invalid("query rows must cover actual requests within native capacity"));
         }
         capacity.decode = UnitMetadata::for_requests(queries, queries)?;
@@ -348,6 +350,8 @@ pub struct MiniMaxInputs {
     /// The resolved pool policy used for both curve preparation and admission.
     pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
+    /// Admitted per-lane verify-row budget (`--decode-rows`: default 64, up to 128).
+    pub decode_rows: u32,
     /// Boot concurrency C: per-sequence page tables, lane members, selector.
     pub sequences: u64,
     /// Per-rank target arenas (one per coordinator GPU).
@@ -438,10 +442,15 @@ pub fn spark_executions(prefill: PrefillShape) -> anyhow::Result<cuteafd_core::S
 
 /// Boot concurrency and admitted draft width determine the largest wire verify.
 pub fn spark_verify_rows(concurrency:u64, drafts:usize) -> anyhow::Result<u32> {
+    spark_verify_rows_capped(concurrency, drafts, 64)
+}
+
+pub fn spark_verify_rows_capped(concurrency:u64, drafts:usize, max_rows:u32) -> anyhow::Result<u32> {
     anyhow::ensure!(concurrency > 0 && concurrency <= 64,"MiniMax Spark concurrency {concurrency} outside 1..=64");
+    anyhow::ensure!(max_rows > 0 && max_rows <= MAX_DECODE_ROWS, "MiniMax Spark decode rows {max_rows} outside 1..={MAX_DECODE_ROWS}");
     concurrency.checked_mul(u64::try_from(drafts)?.checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("MiniMax draft width overflow"))?)
-        .and_then(|rows| u32::try_from(rows.min(64)).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
+        .and_then(|rows| u32::try_from(rows.min(u64::from(max_rows))).ok()).ok_or_else(|| anyhow::anyhow!("MiniMax Spark verify rows overflow"))
 }
 
 pub fn spark_executions_for_rows(prefill:PrefillShape,rows:u32) -> anyhow::Result<cuteafd_core::SparkExecutions> {
@@ -488,8 +497,15 @@ impl MiniMaxInputs {
     pub fn maximum_pages(&self) -> u64 { self.pool.maximum_tokens().div_ceil(PAGE_ROWS) }
 
     pub fn request_capacity(&self) -> Result<RequestCapacity, Refusal> {
-        RequestCapacity::with_queries(self.sequences, self.prefill.rows,
-            self.drafter.as_ref().map_or(self.sequences, |draft| (draft.native.verify_rows as u64).min(64)))
+        let cap = if self.decode_rows == 0 { 64 } else { self.decode_rows };
+        if cap > MAX_DECODE_ROWS {
+            return Err(invalid(format!("MiniMax decode rows {cap} exceeds {MAX_DECODE_ROWS}")));
+        }
+        let queries = self.drafter.as_ref().map_or_else(
+            || if cap > 64 { self.sequences.max(u64::from(cap)) } else { self.sequences },
+            |draft| (draft.native.verify_rows as u64).min(u64::from(cap)),
+        );
+        RequestCapacity::with_queries(self.sequences, self.prefill.rows, queries)
     }
 
     pub fn heads(&self) -> bool { self.gpus == 2 && self.attention == AttentionPlacement::Heads }
@@ -1078,7 +1094,7 @@ mod tests {
             assert_eq!(capacity.decode.requests as u64, queries);
             assert_eq!(capacity.validate().unwrap(), capacity);
         }
-        assert!(RequestCapacity::with_queries(1, 2752, 128).is_err());
+        assert!(RequestCapacity::with_queries(1, 2752, 129).is_err());
         assert!(RequestCapacity::with_queries(16, 2752, 8).is_err());
     }
 
