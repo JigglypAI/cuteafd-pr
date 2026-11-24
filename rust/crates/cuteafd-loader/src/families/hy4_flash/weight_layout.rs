@@ -79,10 +79,15 @@ pub fn core_contract(stem: &str) -> Option<CoreContract> {
             "q_a_proj" | "q_b_proj" | "kv_a_proj_with_mqa" | "kv_b_proj"
                 | "linear_gate" | "o_proj" | "gate_proj" | "up_proj" | "down_proj"
         );
+        let split = match leaf {
+            "q_b_proj" | "kv_b_proj" | "linear_gate" | "gate_proj" | "up_proj" => CoreSplit::Output,
+            "o_proj" | "down_proj" => CoreSplit::Input,
+            _ => CoreSplit::Whole,
+        };
         return eligible.then_some(CoreContract {
             family: "Hy4-flash DFly2 drafter",
             widths: &[6, 8],
-            split: CoreSplit::Whole,
+            split,
             padded_outputs: leaf == "kv_a_proj_with_mqa",
             view_varying: false,
         });

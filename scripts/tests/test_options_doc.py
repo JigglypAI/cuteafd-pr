@@ -222,8 +222,8 @@ def test_tp2_dflash_default_table_matches_supported_families():
                         if section == "Family support: option values" and header[0] == "Layout")
     assert header[1:] == [family for family in COLUMNS if MATRIX["TP2_DFLASH"][family]]
     assert rows == [
-        ["Two RTX with DFlash2", "`on`", "`on`", "`on`", "checkpoint geometry", "`on`"],
-        ["One RTX or no DFlash2", "`off`", "`off`", "`off`", "`off`", "`off`"],
+        ["Two RTX with DFlash2 / DFly2", "`on`", "`on`", "`on`", "checkpoint geometry", "`on`", "`on`"],
+        ["One RTX or no DFlash2 / DFly2", "`off`", "`off`", "`off`", "`off`", "`off`", "`off`"],
     ]
     assert DEFAULTS["TP2_DFLASH"] == "on"
 

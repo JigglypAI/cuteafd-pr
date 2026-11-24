@@ -531,14 +531,29 @@ fn installed_hy4_flash_plan_across_all_mc_views_and_two_cards() {
         let facts = draft::Admission::new(&draft_checkpoint, &model.cfg, &draft_config, &model.core,
             crate::families::hy4_flash::Hy4KvCache::Fp8, 16, 64).unwrap();
         let compact = matches!(view, CoreView::K8Compact | CoreView::K6Compact);
-        assert_eq!(facts.weights.native.len(), if compact { 40 } else { 0 });
-        assert_eq!(facts.weights.absorbed.len(), if compact { 5 } else { 0 });
-        for stem in facts.weights.absorbed.keys() {
-            assert!(facts.weights.arena.view(&format!("{stem}.weight")).is_some());
-            assert!(facts.weights.arena.view(&format!("{stem}.trellis")).is_none());
+        assert_eq!(facts.ranks.len(), 1);
+        assert_eq!(facts.ranks[0].weights.native.len(), if compact { 40 } else { 0 });
+        assert_eq!(facts.ranks[0].weights.absorbed.len(), if compact { 5 } else { 0 });
+        for stem in facts.ranks[0].weights.absorbed.keys() {
+            assert!(facts.ranks[0].weights.arena.view(&format!("{stem}.weight")).is_some());
+            assert!(facts.ranks[0].weights.arena.view(&format!("{stem}.trellis")).is_none());
         }
-        assert!(facts.backing_bytes(0).unwrap() > facts.weights.arena.bytes() as u64);
+        assert!(facts.backing_bytes(0).unwrap() > facts.ranks[0].weights.arena.bytes() as u64);
         assert!(facts.backing_bytes(1).unwrap() < 1 << 22);
+
+        let split = draft::Admission::new_tp(&draft_checkpoint, &model.cfg, &draft_config, &model.core,
+            crate::families::hy4_flash::Hy4KvCache::Fp8, 16, 64, 2).unwrap();
+        assert_eq!(split.ranks.len(), 2);
+        assert_eq!(split.ranks[0].weights.arena.id(), "hy4_flash/dfly2/gpu0");
+        assert_eq!(split.ranks[1].weights.arena.id(), "hy4_flash/dfly2/gpu1");
+        assert_eq!(split.ranks[0].workspace.id(), "hy4_flash/dfly2/workspace/gpu0");
+        assert_eq!(split.ranks[1].workspace.id(), "hy4_flash/dfly2/workspace/gpu1");
+        assert!(split.ranks[0].weights.arena.bytes() < facts.ranks[0].weights.arena.bytes());
+        assert!(split.ranks[1].weights.arena.bytes() > 0);
+        assert!(split.ranks[1].weights.arena.view("model.dfly_layers.mtp_fusion.eh_proj.weight").is_none());
+        assert!(split.ranks[0].weights.arena.view("model.dfly_layers.mtp_fusion.eh_proj.weight").is_some());
+        assert_eq!(split.ranks[0].weights.native.len(), if compact { 40 } else { 0 });
+        assert_eq!(split.ranks[1].weights.native.len(), if compact { 40 } else { 0 });
         let report = input.plan(&PlanOptions::default()).expect("plan Hy4 view");
         assert_eq!(report.family.as_deref(), Some("hy4_flash"), "view={view}");
         assert!(report.unclassified.is_empty(), "view={view} unclassified: {:?}", report.unclassified);
@@ -657,6 +672,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         spark_bytes: spark_bytes.clone(),
         prefill,
         dfly2: false,
+        tp2_dflash: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,
@@ -687,6 +703,7 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         spark_bytes,
         prefill,
         dfly2: false,
+        tp2_dflash: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,
@@ -748,6 +765,7 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
         spark_bytes: vec![120u64 << 30; 4],
         prefill,
         dfly2: false,
+        tp2_dflash: false,
         decode_rows: hy4_place::DECODE_ROWS,
         context_tokens: 0,
         pool_tokens: None,
@@ -828,5 +846,200 @@ fn hy4_flash_cache_geometry_auto_resolves_context_on_2gpu_and_whole_on_1gpu() ->
         .expect("1-GPU auto cache geometry");
     assert_eq!(one_auto.placement, KvPlacement::SingleDevice);
     assert_eq!(one_auto.logical_unit_rows, 64);
+    Ok(())
+}
+
+#[test]
+#[ignore = "reads installed wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC snapshot via CUTEAFD_DEPLOYMENT_TEST_HF_HOME"]
+fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_table() -> anyhow::Result<()> {
+    use crate::families::hy4_flash::admission::{self, Coordinator, FactsRequest};
+    use crate::families::hy4_flash::execution::hy4_peer_slot_sizes;
+    use crate::families::hy4_flash::Hy4KvCache;
+    use crate::placement::families::hy4_flash as hy4_place;
+    use crate::placement::planner::{
+        sm120_request_backing, Location, Operation, Phase, PrefillShape, Recipe,
+    };
+    use crate::placement::Onboard;
+
+    let snap = hy4_snapshot().expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME missing Hy4-flash snapshot");
+    let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap())
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json")
+        });
+    assert!(manifest.is_file(), "missing PROGRAMS.json at {}", manifest.display());
+
+    let rtx_bytes = vec![96u64 << 30, 96u64 << 30];
+    let prefill = PrefillShape { rows: 2048, waves: 1 };
+    let replies = cuteafd_core::spark_reply::SparkReplyFormats::default();
+
+    for view in [CoreView::Original, CoreView::K6Compact] {
+        let selected = CheckpointView::select(&snap, view)?;
+        let checkpoint = crate::plan::Checkpoint::open_view(&selected)?;
+        let catalog = crate::read_expert_catalog_view(&selected)?;
+        let model = Model::open(&checkpoint)?;
+
+        let run_arm = |tp2_dflash: bool| -> anyhow::Result<(hy4_place::Hy4Inputs, hy4_place::AdmittedHy4)> {
+            let inputs = admission::gather(&FactsRequest {
+                checkpoint: &checkpoint,
+                catalog: &catalog,
+                cfg: &model.cfg,
+                model_core: &model.core,
+                kv_format: Hy4KvCache::Fp8,
+                dfly2: true,
+                tp2_dflash,
+                manifest_path: Some(&manifest),
+                coordinator: Coordinator::Planned { rtx_bytes: rtx_bytes.clone() },
+                attention: AttentionPlacement::Heads,
+                spark_ranks: 0,
+                spark_bytes: Vec::new(),
+                prefill,
+                decode_rows: hy4_place::DECODE_ROWS,
+                context_tokens: 0,
+                pool_tokens: None,
+                target_pool_tokens: None,
+                sequences: 16,
+                host: (512 << 30, 400 << 30),
+                host_cache_bytes: None,
+                prefix_entries: 64,
+                prefix_mark_budget: 2u64 << 30,
+                prefix_slots: None,
+                replies,
+                expert_usage: true,
+                resident_weight_limit: None,
+            })?;
+            let req = hy4_place::request(
+                inputs.context,
+                None,
+                Onboard::Auto,
+                prefill,
+                Operation::Serving,
+                None,
+                replies,
+            );
+            let admitted = inputs.admit(req)?;
+            Ok((inputs, admitted))
+        };
+
+        let (_whole_in, whole) = run_arm(false)?;
+        let (split_in, split) = run_arm(true)?;
+
+        // 1. Per-rank drafter weight, workspace, and trellis arenas admitted on both GPUs.
+        let facts = &split.solved.facts;
+        for gpu in 0..2 {
+            let loc = Location::coordinator(gpu as u8);
+            let w_id = format!("hy4_flash/dfly2/gpu{gpu}");
+            let ws_id = format!("hy4_flash/dfly2/workspace/gpu{gpu}");
+            assert!(
+                facts.allocations.iter().any(|a| a.view.is_none() && a.id == w_id && a.location == loc),
+                "missing drafter weight arena {w_id}"
+            );
+            assert!(
+                facts.allocations.iter().any(|a| a.view.is_none() && a.id == ws_id && a.location == loc),
+                "missing drafter workspace arena {ws_id}"
+            );
+            // Every standalone DFly2 device backing >= 1 MiB must carry an exact allocation-granularity tail.
+            for alloc in facts
+                .allocations
+                .iter()
+                .filter(|a| a.view.is_none() && a.location == loc && a.id.starts_with("hy4_flash/dfly2/"))
+            {
+                let slack = sm120_request_backing(alloc.bytes)? - alloc.bytes;
+                let tails: Vec<_> = facts
+                    .allocation_granularity
+                    .iter()
+                    .filter(|t| t.backings.iter().any(|b| b.backing == alloc.id))
+                    .collect();
+                assert_eq!(
+                    tails.len(),
+                    usize::from(slack != 0),
+                    "{} bytes={} slack={slack}",
+                    alloc.id,
+                    alloc.bytes
+                );
+                for tail in tails {
+                    assert_eq!(tail.bytes()?, slack, "{}", alloc.id);
+                }
+            }
+            // PeerExchange slots sized by max(capacity_rows, draft_rows) charged once per rank.
+            let expected_peer = hy4_peer_slot_sizes(&model.cfg, 2048);
+            for slot in 0..2 {
+                let peer_id = format!("hy4_flash.peer.{gpu}.peer.recv.{slot}");
+                let matches: Vec<_> = facts
+                    .allocations
+                    .iter()
+                    .filter(|a| a.view.is_none() && a.id == peer_id && a.location == loc)
+                    .collect();
+                assert_eq!(matches.len(), 1, "peer slot {peer_id} must be charged exactly once");
+                assert_eq!(matches[0].bytes, expected_peer[slot] as u64, "{peer_id}");
+            }
+        }
+        // Check small prefill_rows (< draft_rows = 16*6 = 96) sizes peer slots by draft_rows without double charge.
+        let mut small_in = split_in.clone();
+        small_in.prefill = PrefillShape { rows: 64, waves: 1 };
+        let small_req = hy4_place::request(
+            small_in.context,
+            None,
+            Onboard::Auto,
+            small_in.prefill,
+            Operation::Serving,
+            None,
+            replies,
+        );
+        let small_contract = small_in.prepare(&small_req)?;
+        let small_expected = hy4_peer_slot_sizes(&model.cfg, 96);
+        for gpu in 0..2 {
+            for slot in 0..2 {
+                let peer_id = format!("hy4_flash.peer.{gpu}.peer.recv.{slot}");
+                let bytes: Vec<u64> = small_contract
+                    .components
+                    .iter()
+                    .filter_map(|c| match &c.kind {
+                        crate::placement::planner::ComponentKind::Allocation { template, .. }
+                            if template.id == peer_id =>
+                        {
+                            Some(template.bytes)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(bytes, vec![small_expected[slot] as u64], "{peer_id} small unit");
+            }
+        }
+
+        // 2. Print per-GPU fixed-burden and KV pool table for reporting.
+        let fixed_and_kv = |adm: &hy4_place::AdmittedHy4, gpu: usize| -> (u64, u64, u64) {
+            let growth = adm
+                .solved
+                .phases
+                .iter()
+                .find(|p| p.budget == format!("rtx{gpu}") && p.phase == Phase::Growth)
+                .map_or(0, |p| p.owned + p.opaque);
+            let kv: u64 = adm.placement.items[gpu]
+                .iter()
+                .filter(|item| item.group == "DSA MLA paged KV records" || item.group == "DSA compressed-indexer group cache")
+                .map(|item| item.bytes)
+                .sum();
+            (growth.saturating_sub(kv), kv, adm.solved.pool_tokens)
+        };
+        let (wf0, wkv0, wpool) = fixed_and_kv(&whole, 0);
+        let (wf1, wkv1, _) = fixed_and_kv(&whole, 1);
+        let (sf0, skv0, spool) = fixed_and_kv(&split, 0);
+        let (sf1, skv1, _) = fixed_and_kv(&split, 1);
+        eprintln!(
+            "HY4F_BURDEN view={view}: whole(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={wpool}) -> split(gpu0_fixed={:.3}GiB gpu1_fixed={:.3}GiB kv={:.3}/{:.3}GiB pool={spool})",
+            wf0 as f64 / (1u64 << 30) as f64,
+            wf1 as f64 / (1u64 << 30) as f64,
+            wkv0 as f64 / (1u64 << 30) as f64,
+            wkv1 as f64 / (1u64 << 30) as f64,
+            sf0 as f64 / (1u64 << 30) as f64,
+            sf1 as f64 / (1u64 << 30) as f64,
+            skv0 as f64 / (1u64 << 30) as f64,
+            skv1 as f64 / (1u64 << 30) as f64,
+        );
+        assert!(sf0 < wf0, "split must reduce GPU0 fixed burden ({sf0} < {wf0})");
+        assert!(spool >= wpool, "split must not reduce admitted KV pool ({spool} >= {wpool})");
+    }
     Ok(())
 }

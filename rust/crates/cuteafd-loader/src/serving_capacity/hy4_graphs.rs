@@ -50,6 +50,29 @@ pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Res
     }
 }
 
+/// Short and 32K C1 physical graph-arena census for split DFly2 on `Exl3Max`
+/// (2x RTX, 0 Sparks). Populated from C1 census; `None` delegates to the base
+/// `Exl3Max` working set until recorded.
+pub fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
+    let _ = (layout, rank);
+    None
+}
+
+/// Resolve the per-rank graph reserve policy, routing split-DFly2 layouts through
+/// the shared `graph_reserve::current_working_set` policy (`soft = W1 + margin`)
+/// with no local margin total.
+pub fn reserve_policy_for(
+    layout: Option<Hy4GraphLayout>,
+    rank: usize,
+    tp2_dfly2: bool,
+) -> Result<Resolved, Error> {
+    if tp2_dfly2 {
+        if let Some(measured) = split_dfly2_working_set(layout, rank) {
+            return graph_reserve::current_working_set(rank, measured);
+        }
+    }
+    reserve_policy(layout, rank)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

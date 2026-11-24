@@ -1601,6 +1601,7 @@ impl<'a> Hy4Engine<'a> {
             0,
             skip_routed_experts,
             onboarded_experts,
+            0,
         )
     }
 
@@ -1625,6 +1626,7 @@ impl<'a> Hy4Engine<'a> {
         mark_slots: usize,
         skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
+        draft_peer_rows: usize,
     ) -> Result<Self> {
         ensure!((1..=DECODE_ROWS as usize).contains(&decode_rows),
             "Hy4-flash split-K decode exports cover at most {DECODE_ROWS} rows; got {decode_rows}");
@@ -1759,10 +1761,13 @@ impl<'a> Hy4Engine<'a> {
             });
         }
 
-        let ffn_routed_recv_offset = hy4_peer_ffn_routed_offset(&cfg, max_rows);
+        let peer_rows = max_rows.max(draft_peer_rows);
+        let ffn_routed_recv_offset = hy4_peer_ffn_routed_offset(&cfg, peer_rows);
         let peer_exchange = if gpus == 2 {
-            let sizes = hy4_peer_slot_sizes(&cfg, max_rows);
-            let decode_lane_bytes = (decode_rows * HC * H * 2).max(decode_rows * (H + LATENT_H) * 4);
+            let sizes = hy4_peer_slot_sizes(&cfg, peer_rows);
+            let decode_lane_bytes = (decode_rows * HC * H * 2)
+                .max(decode_rows * (H + LATENT_H) * 4)
+                .max(draft_peer_rows.min(96) * H * 4);
             let exchange = PeerExchange::new_abortable_sized(
                 devices[0].library,
                 [
@@ -2008,19 +2013,26 @@ impl<'a> Hy4Engine<'a> {
 
     pub(super) fn draft_batch(&self, members: &[super::draft::Member]) -> Result<Vec<Vec<u32>>> {
         let Some(draft) = &self.draft else { return Ok(Vec::new()); };
-        let r = &self.ranks[0];
-        let embedding = r.weights.embedding.as_ref().context("DFly2 target embedding missing")?;
-        let graphs = self.graphs_active().then_some(&r.graphs);
+        let r0 = &self.ranks[0];
+        let embedding = r0.weights.embedding.as_ref().context("DFly2 target embedding missing")?;
+        let streams: Vec<&Stream<'a>> = self.ranks.iter().map(|r| r.stream.as_ref()).collect();
+        let graphs_vec: Vec<&Hy4Graphs<'a>> = self.ranks.iter().map(|r| &r.graphs).collect();
+        let graphs = self.graphs_active().then_some(graphs_vec.as_slice());
+        let ropes: Vec<CuteafdDeviceBuffer> = self.ranks.iter().map(|r| r.weights.inv_freq_dsa.buffer).collect();
         if graphs.is_some() {
             self.set_graph_cycle(ReadPriority::Decode);
         }
-        let peer_cache_closure = |layer: usize| self.ranks[1].cache.dsa_kv_layer(self.dsa_index_of[&layer]);
-        let peer_cache: Option<&dyn Fn(usize) -> Result<CuteafdDeviceBuffer>> =
-            self.context_split.then_some(&peer_cache_closure as &dyn Fn(usize) -> Result<CuteafdDeviceBuffer>);
-        let result = draft.propose(&r.stream, embedding, members, graphs, r.weights.inv_freq_dsa.buffer,
-            |layer| r.cache.dsa_kv_layer(self.dsa_index_of[&layer]),
-            peer_cache,
-            |hidden, rows| self.project_vocab_tile(0, hidden, rows));
+        let result = draft.propose(
+            &streams,
+            embedding,
+            members,
+            graphs,
+            &ropes,
+            self.peer_exchange.as_ref(),
+            self.context_split,
+            |rank, layer| self.ranks[rank].cache.dsa_kv_layer(self.dsa_index_of[&layer]),
+            |hidden, rows| self.project_vocab_tile(0, hidden, rows),
+        );
         // Successful proposals settle with their following target round. On an
         // error there may not be a target round to settle an aborted capture.
         if graphs.is_some() && result.is_err() {
@@ -2031,8 +2043,8 @@ impl<'a> Hy4Engine<'a> {
 
     pub(super) fn accept_draft(&self, slot: usize, row: usize, pos: usize) -> Result<()> {
         if let Some(draft) = &self.draft {
-            let r = &self.ranks[0];
-            r.device.run(|| draft.accept(slot, row, pos, &r.stream))?;
+            let streams: Vec<&Stream<'a>> = self.ranks.iter().map(|r| r.stream.as_ref()).collect();
+            draft.accept(slot, row, pos, &streams)?;
         }
         Ok(())
     }
@@ -2075,8 +2087,9 @@ impl<'a> Hy4Engine<'a> {
         &mut self,
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
     ) -> Result<()> {
+        let tp2_dfly2 = self.draft.as_ref().is_some_and(|d| d.tp() == 2);
         for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank, layout)?;
+            r.graphs.attach(r.device.library, r.device.id, rank, layout, tp2_dfly2)?;
         }
         self.graphs_enabled.set(true);
         Ok(())
@@ -2088,7 +2101,12 @@ impl<'a> Hy4Engine<'a> {
 
     pub(super) fn retained_draft_graph_rows(&self, members: usize) -> usize {
         self.draft.as_ref().map_or(0, |draft| {
-            self.ranks[0].graphs.retained_draft_rows(members * draft.cfg.block_rows())
+            let rows = members * draft.cfg.block_rows();
+            self.ranks[..draft.tp()]
+                .iter()
+                .map(|r| r.graphs.retained_draft_rows(rows))
+                .min()
+                .unwrap_or(0)
         })
     }
 
@@ -3061,29 +3079,32 @@ impl<'a> Hy4Engine<'a> {
             let recv_p = [recv_p0, recv_p1];
             let recv_l = [recv_l0, recv_l1];
 
-            // (f) DFly2 dual recall capture on rank 0: wait_partial(0, slot) guarantees rank 1's
-            // merge_expand_owned already populated rank 1's ctx.draft_slots.
+            // (f) DFly2 dual recall capture on participating drafter ranks: wait_partial(rank, slot)
+            // guarantees the peer's merge_expand_owned already populated its ctx.draft_slots.
             if write_draft != 0 {
                 if let Some(draft) = &self.draft {
-                    let r0 = &self.ranks[0];
-                    let ctx0 = r0.shared.ctx.as_ref().context("Hy4 rank 0 ContextSplit scratch missing")?;
+                    let ctx0 = self.ranks[0].shared.ctx.as_ref().context("Hy4 rank 0 ContextSplit scratch missing")?;
                     let ctx1 = self.ranks[1].shared.ctx.as_ref().context("Hy4 rank 1 ContextSplit scratch missing")?;
                     let chunk_end = chunk_start + c_rows;
-                    r0.device.run(|| {
-                        for member in &batch.members {
-                            let end = member.row_start + member.row_len;
-                            let start = if self.verifying { member.row_start } else { end - 1 };
-                            for row in start.max(chunk_start)..end.min(chunk_end) {
-                                let local_row = row - chunk_start;
-                                let dst_row = if self.verifying { row } else { member.slot };
-                                let src0 = slice_buf(ctx0.draft_slots.buffer, local_row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
-                                let src1 = slice_buf(ctx1.draft_slots.buffer, local_row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
-                                draft.capture_recall(self.verifying, dst_row, layer, src0, &r0.stream)?;
-                                draft.capture_recall_peer(self.verifying, dst_row, layer, src1, &r0.stream)?;
+                    for rank in 0..draft.tp() {
+                        let r = &self.ranks[rank];
+                        let (local_ctx, peer_ctx) = if rank == 0 { (ctx0, ctx1) } else { (ctx1, ctx0) };
+                        r.device.run(|| {
+                            for member in &batch.members {
+                                let end = member.row_start + member.row_len;
+                                let start = if self.verifying { member.row_start } else { end - 1 };
+                                for row in start.max(chunk_start)..end.min(chunk_end) {
+                                    let local_row = row - chunk_start;
+                                    let dst_row = if self.verifying { row } else { member.slot };
+                                    let src_local = slice_buf(local_ctx.draft_slots.buffer, local_row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
+                                    let src_peer = slice_buf(peer_ctx.draft_slots.buffer, local_row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
+                                    draft.capture_recall(rank, self.verifying, dst_row, layer, src_local, &r.stream)?;
+                                    draft.capture_recall_peer(rank, self.verifying, dst_row, layer, src_peer, &r.stream)?;
+                                }
                             }
-                        }
-                        Ok(())
-                    })?;
+                            Ok(())
+                        })?;
+                    }
                 }
             }
 
@@ -3362,15 +3383,16 @@ impl<'a> Hy4Engine<'a> {
                     )
                 })
             }?;
-            if r.device.id == self.ranks[0].device.id {
-                if let Some(draft) = &self.draft {
+            if let Some(draft) = &self.draft {
+                let rank_idx = usize::from(r.device.id != self.ranks[0].device.id);
+                if rank_idx < draft.tp() {
                     r.device.run(|| {
                         for member in &batch.members {
                             let end = member.row_start + member.row_len;
                             let start = if self.verifying { member.row_start } else { end - 1 };
                             for row in start..end {
                                 let src = slice_buf(r.shared.idx_cand_slots.buffer, row * CANDIDATE_TOPK * 4, CANDIDATE_TOPK * 4)?;
-                                draft.capture_recall(self.verifying, if self.verifying { row } else { member.slot }, layer, src, &r.stream)?;
+                                draft.capture_recall(rank_idx, self.verifying, if self.verifying { row } else { member.slot }, layer, src, &r.stream)?;
                             }
                         }
                         Ok(())

@@ -110,6 +110,33 @@ def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, s
     assert _flag(plan, "--decode-rows") == _flag(serve_line, "--decode-rows") == "32"
     serve = shlex.split(serve_line)
     assert ("--dfly2" if selected == "dfly2" else "--dfly2=false") in serve
+    assert _flag(serve_line, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == "false"
+
+
+@pytest.mark.parametrize(("speculator", "setting", "expected"), [
+    ("dfly2", None, "true"),
+    ("auto", None, "true"),
+    ("dfly2", "on", "true"),
+    ("dfly2", "off", "false"),
+])
+def test_hy4_tp2_dflash_defaults_on_for_dual_rtx_dfly2_and_honors_off(
+    tmp_path: Path, speculator: str, setting: str | None, expected: str
+) -> None:
+    config = {"model_type": "hy_v4_flash", "num_hidden_layers": 42, "dfly_num_hidden_layers": 5,
+              "mlp_layer_types": ["dense"] + ["sparse"] * 41}
+    keys = (
+        "SPARK_COUNT=0\nRTX_GPUS=2\nEXPERT_BACKEND=local\nATTENTION_PLACEMENT=heads\n"
+        f"SPECULATOR={speculator}\nVISION=off\nAUDIO=off\nDECODE_ROWS=32\n"
+    )
+    if setting is not None:
+        keys += f"TP2_DFLASH={setting}\n"
+    result = _family_launch_result(
+        tmp_path, config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC", keys,
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0},
+    )
+    plan = _line(result, "cuteafd plan")
+    serve_line = _line(result, "serve-hy4f --snapshot")
+    assert _flag(plan, "--tp2-dflash") == _flag(serve_line, "--tp2-dflash") == expected
 
 
 def test_inkling_native_launcher_composes_single_and_paired_argv(tmp_path: Path) -> None:

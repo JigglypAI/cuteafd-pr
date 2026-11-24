@@ -1767,15 +1767,21 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
   esac
 fi
 tp2_dflash_default=off
-if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+tp2_dflash_supported=0
+if [[ "$family" == hy4_flash && "$speculator" == dfly2 ]]; then
+  tp2_dflash_supported=1
+elif [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$speculator" == dflash2 ]]; then
+  tp2_dflash_supported=1
+fi
+if [[ "$tp2_dflash_supported" == 1 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off ]]; then
   tp2_dflash_default=on
   [[ "$family" != kimi_k3 ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == kimi_k3 && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
-[[ "$tp2_dflash" != on || ( ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
-  release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
-if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
+[[ "$tp2_dflash" != on || ( "$tp2_dflash_supported" == 1 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 ) ]] ||
+  release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2 or Hy4-flash with DFly2 and two selected RTX GPUs"
+if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2438,7 +2444,7 @@ audio_encoder_hash=""
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
   plan_draft_args=(--draft-context-window "$draft_context_window" --concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
+  if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
