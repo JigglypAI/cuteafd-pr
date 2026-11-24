@@ -77,9 +77,23 @@ def main():
     offload = None
     if torch.device(a.device).type == "cuda":
         offload = a.out.parent / "hf-offload"
-        placement["model.vision_tower"] = "disk"
-        placement.update({f"model.language_model.layers.{i}.mlp.experts": "disk"
-                          for i in range(0, cfg.num_hidden_layers, 2)})
+        # A root device entry recursively moves the still-meta offloaded
+        # descendants before their hooks run. Map resident leaves explicitly.
+        placement = {"lm_head": a.device, "model.vision_tower": "disk"}
+        text = "model.language_model"
+        for name in ("embed_tokens", "norm", "final_input", "message_input"):
+            placement[f"{text}.{name}"] = a.device
+        for i in range(cfg.num_hidden_layers):
+            layer = f"{text}.layers.{i}"
+            if i % 2:
+                placement[layer] = a.device
+                continue
+            for name in ("attention_input", "mlp_input", "self_attn", "input_layernorm",
+                         "q_input_layernorm", "k_input_layernorm", "v_input_layernorm",
+                         "post_attention_layernorm", "post_attention_convolution", "post_mlp_convolution",
+                         "q_message_gate", "k_message_gate", "v_message_gate", "mlp_message_gate", "mlp.gate"):
+                placement[f"{layer}.{name}"] = a.device
+            placement[f"{layer}.mlp.experts"] = "disk"
     model, info = Inkling2LoopForConditionalGeneration.from_pretrained(
         a.snapshot, config=config, dtype=torch.float32, device_map=placement,
         offload_folder=offload, local_files_only=True, attn_implementation="eager",
