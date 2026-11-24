@@ -17,7 +17,8 @@ Two arithmetic modes:
 - ``"f32"``: the same graph with every weight upcast and IEEE-F32 math
   (TF32 off); outputs stay F32.
 
-``encode(...)`` returns ``Stages``. ``embed`` is ``[n, 1152]`` (patch + position);
+``encode(...)`` returns ``Stages`` (``encode_batch`` one per image). ``patch`` is ``[n, 1152]``
+(conv + bias); ``embed`` is ``[n, 1152]`` (patch + position);
 ``layers[i]`` is the ``[n, 1152]`` output of block ``i`` (27 entries);
 ``merger_norm`` is ``[n, 1152]``, the merger RMSNorm output with rows in raster
 order; ``output`` is ``[h/2 * (w/2+1), 3072]``. ``n = h * w``.
@@ -104,6 +105,7 @@ def output_rows(grid):
 
 @dataclass
 class Stages:
+    patch: torch.Tensor = None
     embed: torch.Tensor = None
     layers: list = field(default_factory=list)
     merger_norm: torch.Tensor = None
@@ -128,51 +130,79 @@ def _positions(table, h, w, dtype):
 
 def encode(weights, pixels, grid, *, mode="serving", observer=None):
     """``pixels``: ``[h*w, 3*16*16]`` normalized raster patches (F32 or BF16). One image."""
+    return encode_batch(weights, [pixels], [grid], mode=mode, observer=observer)[0]
+
+
+def encode_batch(weights, pixels, grids, *, mode="serving", observer=None):
+    """SGLang varlen batch: rows of every image concatenated; attention per image (cu_seqlens)."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
-    _, h, w = grid
-    rows = output_rows(grid)
-    n = h * w
-    if tuple(pixels.shape) != (n, 3 * PATCH * PATCH):
-        raise ValueError("pixel rows differ from grid")
+    counts = [g[1] * g[2] for g in grids]
+    for value, grid, n in zip(pixels, grids, counts):
+        output_rows(grid)
+        if tuple(value.shape) != (n, 3 * PATCH * PATCH):
+            raise ValueError("pixel rows differ from grid")
     dtype = torch.float32 if mode == "f32" else torch.bfloat16
     W = {k: v.to(dtype) for k, v in weights.items()}
-    stages = Stages()
+    device = W["embeddings.patch_embedding.weight"].device
+    total = sum(counts)
+    offsets = [0]
+    for n in counts:
+        offsets.append(offsets[-1] + n)
+    stages = [Stages() for _ in grids]
 
     def keep(name, value):
+        for j, s in enumerate(stages):
+            part = value[offsets[j]:offsets[j + 1]]
+            if name == "patch":
+                s.patch = part
+            elif name == "embed":
+                s.embed = part
+            elif name == "merger_norm":
+                s.merger_norm = part
+            else:
+                s.layers.append(part)
         if observer is not None:
             observer(name, value)
-        return value
 
-    x = F.conv2d(pixels.to(W["embeddings.patch_embedding.weight"].device, dtype).reshape(n, 3, PATCH, PATCH),
-                 W["embeddings.patch_embedding.weight"], W["embeddings.patch_embedding.bias"], stride=PATCH)
-    x = x.reshape(n, HIDDEN)
-    x = x + _positions(weights["embeddings.position_embedding.weight"], h, w, dtype)
-    stages.embed = keep("embed", x)
+    flat = torch.cat([v.to(device, dtype) for v in pixels])
+    x = F.conv2d(flat.reshape(total, 3, PATCH, PATCH), W["embeddings.patch_embedding.weight"],
+                 W["embeddings.patch_embedding.bias"], stride=PATCH).reshape(total, HIDDEN)
+    keep("patch", x)
+    x = x + torch.cat([_positions(weights["embeddings.position_embedding.weight"], g[1], g[2], dtype) for g in grids])
+    keep("embed", x)
     for i in range(LAYERS):
         p = f"layers.{i}."
         res = x
         y = F.layer_norm(x, (HIDDEN,), W[p + "input_layernorm.weight"], W[p + "input_layernorm.bias"], EPS)
         q, k, v = (F.linear(y, W[p + f"self_attn.{n_}_proj.weight"], W[p + f"self_attn.{n_}_proj.bias"])
-                   .reshape(n, HEADS, HEAD_DIM).transpose(0, 1) for n_ in "qkv")
+                   .reshape(total, HEADS, HEAD_DIM).transpose(0, 1) for n_ in "qkv")
+        parts = []
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-            o = F.scaled_dot_product_attention(q[None], k[None], v[None], scale=HEAD_DIM ** -0.5)[0]
-        o = F.linear(o.transpose(0, 1).reshape(n, HIDDEN), W[p + "self_attn.o_proj.weight"], W[p + "self_attn.o_proj.bias"])
+            for a, b in zip(offsets, offsets[1:]):
+                parts.append(F.scaled_dot_product_attention(q[None, :, a:b], k[None, :, a:b], v[None, :, a:b],
+                                                            scale=HEAD_DIM ** -0.5)[0])
+        o = torch.cat(parts, dim=1)
+        o = F.linear(o.transpose(0, 1).reshape(total, HIDDEN), W[p + "self_attn.o_proj.weight"], W[p + "self_attn.o_proj.bias"])
         x = res + o
         y = F.layer_norm(x, (HIDDEN,), W[p + "post_attention_layernorm.weight"], W[p + "post_attention_layernorm.bias"], EPS)
         y = F.gelu(F.linear(y, W[p + "mlp.dense_h_to_4h.weight"], W[p + "mlp.dense_h_to_4h.bias"]))
         x = x + F.linear(y, W[p + "mlp.dense_4h_to_h.weight"], W[p + "mlp.dense_4h_to_h.bias"])
-        stages.layers.append(keep(f"layer{i}", x))
-    y = _rms(x, weights["perceive.norm.weight"], mode)
-    stages.merger_norm = keep("merger_norm", y)
-    y = y.reshape(1, h, w, HIDDEN).permute(0, 3, 1, 2)
-    y = F.gelu(F.conv2d(y, W["perceive.proj.0.weight"], W["perceive.proj.0.bias"], stride=MERGE))
-    y = F.conv2d(y, W["perceive.proj.2.weight"], W["perceive.proj.2.bias"])
-    newline = W["perceive.image_newline"].reshape(1, OUT, 1, 1).expand(1, OUT, h // MERGE, 1)
-    y = torch.cat((y, newline), dim=-1).flatten(2).transpose(1, 2)[0]
-    if y.shape != (rows, OUT):
-        raise ValueError("merged output rows differ from grid")
-    stages.output = keep("output", y)
+        keep(f"layer{i}", x)
+    norm = _rms(x, weights["perceive.norm.weight"], mode)
+    keep("merger_norm", norm)
+    for j, grid in enumerate(grids):
+        _, h, w = grid
+        y = norm[offsets[j]:offsets[j + 1]].reshape(1, h, w, HIDDEN).permute(0, 3, 1, 2)
+        y = F.gelu(F.conv2d(y, W["perceive.proj.0.weight"], W["perceive.proj.0.bias"], stride=MERGE))
+        y = F.conv2d(y, W["perceive.proj.2.weight"], W["perceive.proj.2.bias"])
+        newline = W["perceive.image_newline"].reshape(1, OUT, 1, 1).expand(1, OUT, h // MERGE, 1)
+        y = torch.cat((y, newline), dim=-1).flatten(2).transpose(1, 2)[0]
+        if y.shape != (output_rows(grid), OUT):
+            raise ValueError("merged output rows differ from grid")
+        stages[j].output = y
+        if observer is not None:
+            observer(f"output{j}", y)
     return stages
 
 

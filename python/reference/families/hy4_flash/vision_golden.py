@@ -40,12 +40,34 @@ def dump(folder, name, value):
     return {"shape": list(value.shape), "dtype": suffix, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def write_raw(folder, rgb8, grid, stages):
+    """Numpy-free engine fixture: rgb.u8 (H x W x 3), F32 row-major stages, meta.json."""
+    import hy4_flash_media as media
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "rgb.u8").write_bytes(rgb8.tobytes())
+    table = media.normalization_table().astype("<f4").tobytes()
+    named = [("0", stages.patch), ("pos", stages.embed)] + [(str(i + 1), x) for i, x in enumerate(stages.layers)] + [
+        ("28", stages.merger_norm), ("out", stages.output)]
+    files = {}
+    for key, value in named:
+        data = value.float().contiguous().cpu().numpy().astype("<f4").tobytes()
+        (folder / f"stage_{key}.f32").write_bytes(data)
+        files[key] = {"rows": int(value.shape[0]), "width": int(value.shape[1]), "sha256": hashlib.sha256(data).hexdigest()}
+    meta = {"schema": "cuteafd.hy4f.vision-stages/1", "grid": [grid[1], grid[2]], "canvas": [rgb8.shape[0], rgb8.shape[1]],
+            "rgb_sha256": hashlib.sha256(rgb8.tobytes()).hexdigest(), "lut_sha256": hashlib.sha256(table).hexdigest(),
+            "lut": "(v/255 - 0.5)/0.5 in F32, 256 entries per channel", "mode": "serving (BF16, values widened to F32)",
+            "pixel_order": "raster (h, w) patches, (c, py, px) inside each", "stages": [k for k, _ in named], "files": files}
+    (folder / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    return str(folder)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--panel", type=Path, required=True, help="vision panel windows.json")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--hf", action="store_true", help="cross-check against the pinned Transformers tower")
+    p.add_argument("--raw-dir", type=Path, help="engine-test dumps: <name>/{rgb.u8,meta.json,stage_*.f32}, batch/")
     a = p.parse_args()
     import torch
     from PIL import Image
@@ -68,6 +90,7 @@ def main():
               "vision_sha256": hashlib.sha256(Path(vision.__file__).read_bytes()).hexdigest(),
               "media_sha256": hashlib.sha256(Path(media.__file__).read_bytes()).hexdigest(), "fixtures": {}}
     root = a.panel.parent
+    batch_inputs = []
     for window in manifest["windows"]:
         for span in window.get("media", []):
             name = window["id"]
@@ -120,13 +143,33 @@ def main():
                 ours = {"embed": sv.embed, "output": sv.output, **{f"layer{i:02d}": x for i, x in enumerate(sv.layers)}}
                 entry["serving_vs_hf"] = {k: metrics(ours[k], captured[k]) for k in ours if k in captured}
                 del captured, result
+            if a.raw_dir is not None:
+                entry["raw"] = write_raw(a.raw_dir / name, rgb8, grid, stages["serving"])
+            batch_inputs.append((name, pixels, grid, stages["serving"].output))
             report["fixtures"][name] = entry
             print(name, grid, "serving-vs-f32 output cos %.6f" % entry["serving_vs_f32"]["output"]["cosine"],
                   *(["hf layer26 maxabs %.4g output maxabs %.4g cos %.7f" % (
                       entry["serving_vs_hf"]["layer26"]["max_abs"], entry["serving_vs_hf"]["output"]["max_abs"],
                       entry["serving_vs_hf"]["output"]["cosine"])] if hf is not None else []), flush=True)
-            del stages, pixels
+            del stages
             torch.cuda.empty_cache()
+    if batch_inputs:
+        with torch.inference_mode():
+            batch = vision.encode_batch(weights, [b[1] for b in batch_inputs], [b[2] for b in batch_inputs])
+        rows = torch.cat([s.output for s in batch])
+        singles = torch.cat([b[3] for b in batch_inputs])
+        report["batch_vs_singles"] = {"order": [b[0] for b in batch_inputs], **metrics(rows, singles),
+                                      "bitwise_equal": bool(torch.equal(rows, singles))}
+        if a.raw_dir is not None:
+            folder = a.raw_dir / "batch"
+            folder.mkdir(parents=True, exist_ok=True)
+            data = rows.float().contiguous().cpu().numpy().astype("<f4").tobytes()
+            (folder / "stage_out.f32").write_bytes(data)
+            (folder / "meta.json").write_text(json.dumps({"order": [b[0] for b in batch_inputs],
+                "grids": [[b[2][1], b[2][2]] for b in batch_inputs], "rows": [vision.output_rows(b[2]) for b in batch_inputs],
+                "width": vision.OUT, "sha256": hashlib.sha256(data).hexdigest(),
+                "bitwise_equal_to_singles": report["batch_vs_singles"]["bitwise_equal"]}, indent=1) + "\n")
+        print("batch vs singles", report["batch_vs_singles"], flush=True)
     report["seconds"] = time.monotonic() - started
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "tower.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")

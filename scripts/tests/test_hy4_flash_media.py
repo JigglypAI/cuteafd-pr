@@ -239,3 +239,20 @@ def test_engine_identity_matches_probe_contract(tmp_path):
     assert identity == {"snapshot_revision": snapshot.name, "family": "Hy4Flash", "source": "sglang@ccb8d9cc",
                         **{f"{n}_sha256": hashlib.sha256(n.encode()).hexdigest()
                            for n in ("config.json", "tokenizer.json", "model.safetensors.index.json")}}
+
+
+@pytest.mark.container_torch
+def test_varlen_batch_matches_singles_and_keeps_images_independent(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from families.hy4_flash import vision
+    monkeypatch.setattr(vision, "LAYERS", 1)
+    torch.manual_seed(1)
+    weights = {k.removeprefix(vision.PREFIX): (torch.randn(v) * 0.02).bfloat16()
+               for k, v in vision.contract().items() if not k.startswith("vit.layers.") or k.split(".")[2] == "0"}
+    grids = [[1, 4, 6], [1, 2, 2]]
+    pixels = [torch.randn(24, 768), torch.randn(4, 768)]
+    batch = vision.encode_batch(weights, pixels, grids, mode="f32")
+    for value, grid, got in zip(pixels, grids, batch):
+        single = vision.encode(weights, value, grid, mode="f32")
+        assert got.patch.shape == single.patch.shape and len(got.layers) == 1
+        torch.testing.assert_close(got.output, single.output, rtol=1e-5, atol=1e-5)
