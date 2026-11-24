@@ -2649,9 +2649,9 @@ def test_glm53_rejects_retired_peer_expert_ranges(tmp_path, value):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
     }, "test/glm", keys)
-    if value == "on":
+    if value is not None:
         assert result.returncode == 2
-        assert "GPU1 whole-layer expert ranges were replaced by TP2 halves" in result.stderr
+        assert "unused configuration key: RTX_EXPERT_PEER" in result.stderr
         assert not any("docker run" in line and "--resolve-settings-only" not in line for line in result.stderr.splitlines()) and "nest drop-caches" not in result.stderr
     else:
         assert result.returncode == 0, result.stderr
