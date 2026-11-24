@@ -608,7 +608,7 @@ def compiler_cache_receipt(env, target):
 def gate_lease(directory=None, slots=None, timeout=GATE_LEASE_WAIT):
     """Count whole gates, including pytest and base comparisons, on this host."""
     directory = directory or Path.home() / '.cache/cuteafd'
-    slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 2)
+    slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 3)
     directory.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     log(f'waiting for gate lease ({slots} slots, timeout {timeout}s)')
