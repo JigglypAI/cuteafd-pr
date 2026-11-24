@@ -259,11 +259,9 @@ pub(crate) struct EngineArgs {
     /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
-    /// Split GQA drafter heads, KV and MLP over the target's peer GPUs.
+    /// Split GQA drafter heads, KV and MLP over the target's peer GPUs (default with two GPUs and DFlash2).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub tp2_dflash: bool,
-    #[arg(skip = true)]
-    pub tp2_dflash_auto: bool,
 
     /// Diagnostic drafter head arithmetic for golden/replay and --draft-modes: `exact` uses
     /// the target's FP32 path; `tensor` uses the legacy tensor route past one draft block.
@@ -2426,25 +2424,9 @@ impl Opened {
         }
         let inventory = self.admission_inventory(args, &programs, layers, split_device, attention,
             native_admission.as_ref())?;
-        let mut draft_args = args.clone();
-        let admitted = if args.tp2_dflash_auto {
-            draft_args.tp2_dflash = false;
-            let whole = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), false, attention, native_admission.as_ref(), &inventory);
-            draft_args.tp2_dflash = true;
-            let split = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), false, attention, native_admission.as_ref(), &inventory);
-            let whole_pool = whole.as_ref().ok().map(|a| a.0.pool_tokens);
-            let split_pool = split.as_ref().ok().map(|a| a.0.pool_tokens);
-            draft_args.tp2_dflash = cuteafd_loader::placement::families::glm5_flash::prefer_tp2_dflash(whole_pool, split_pool);
-            tracing::info!(whole_pool, split_pool, split = draft_args.tp2_dflash, "TP2_DFLASH auto selection");
-            if draft_args.tp2_dflash { split } else { whole }
-        } else {
-            self.admit_candidate(args, &programs, layers, index_cache, mark_slots,
-                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), remote_draft, attention, native_admission.as_ref(), &inventory)
-        }?;
-        let args = &draft_args;
-        let remote_draft = false;
+        let admitted = self.admit_candidate(args, &programs, layers, index_cache, mark_slots,
+            split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context),
+            remote_draft, attention, native_admission.as_ref(), &inventory)?;
         cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
         let (placement, admitted_graphs, working, admitted_host, admitted_native_load,
             admitted_mount_load, admitted_plan) = admitted;

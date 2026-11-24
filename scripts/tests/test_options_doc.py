@@ -217,6 +217,17 @@ def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_pat
     }
 
 
+def test_tp2_dflash_default_table_matches_supported_families():
+    header, rows = next((header, rows) for section, header, rows in tables(DOC.read_text().splitlines())
+                        if section == "Family support: option values" and header[0] == "Layout")
+    assert header[1:] == [family for family in COLUMNS if MATRIX["TP2_DFLASH"][family]]
+    assert rows == [
+        ["Two RTX with DFlash2", "`on`", "`on`", "checkpoint geometry", "`on`"],
+        ["One RTX or no DFlash2", "`off`", "`off`", "`off`", "`off`"],
+    ]
+    assert DEFAULTS["TP2_DFLASH"] == "on"
+
+
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
     bounded = {"mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5", "muse_spark", "step5", "inkling2", "hy4_flash", "minimax_m3"}

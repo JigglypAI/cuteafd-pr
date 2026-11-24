@@ -307,21 +307,6 @@ pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u6
     draft::remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0)
 }
 
-/// Pool capacity wins; an equal pool uses the split to balance compute.
-pub fn prefer_tp2_dflash(whole_pool: Option<u64>, split_pool: Option<u64>) -> bool {
-    split_pool.is_some_and(|split| whole_pool.is_none_or(|whole| split >= whole))
-}
-
-#[test]
-fn tp2_dflash_choice_maximizes_pool_and_balances_ties() {
-    assert!(!prefer_tp2_dflash(Some(1430016), Some(1325568)));
-    assert!(prefer_tp2_dflash(Some(2097152), Some(2097152)));
-    assert!(prefer_tp2_dflash(Some(1), Some(2)));
-    assert!(prefer_tp2_dflash(None, Some(1)));
-    assert!(!prefer_tp2_dflash(Some(1), None));
-    assert!(!prefer_tp2_dflash(None, None));
-}
-
 /// Derive bridge capacity from the same checkpoint and batch used by runtime.
 /// Opaque fixture byte totals and dSpark do not imply a remote executor.
 pub fn drafter_bridge_inventory(config: &serde_json::Value, slots: usize, sequences: usize)

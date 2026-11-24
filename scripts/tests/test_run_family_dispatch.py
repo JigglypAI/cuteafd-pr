@@ -4587,19 +4587,32 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
         assert f"--vision {mode or 'auto'}" in preflight
 
 
-@pytest.mark.parametrize("selected", [False, True])
-def test_glmf_tp2_dflash_auto_passes_planner_choice_to_server(tmp_path, selected):
-    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
-            "tp2_dflash": selected}
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
-        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n",
-        encoder_plan=plan)
+@pytest.mark.parametrize("rtx, speculator, configured, split", [
+    (2, "dflash2", None, True), (2, "dflash2", "off", False),
+    (2, "dflash2", "on", True), (1, "dflash2", None, False),
+    (2, "off", None, False), (2, "dspark", None, False),
+    (1, "dflash2", "on", None), (2, "dspark", "on", None),
+    (2, "dflash2", "auto", None),
+])
+def test_glmf_tp2_dflash_plan_and_serve_use_same_placement(tmp_path, rtx, speculator, configured, split):
+    # An opposite mocked planner choice cannot override the launcher decision.
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "tp2_dflash": not split}
+    keys = f"RTX_GPUS={rtx}\nSPECULATOR={speculator}\nVISION=off\nAUDIO=off\n"
+    if speculator != "off":
+        keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
+    if configured is not None:
+        keys += f"TP2_DFLASH={configured}\n"
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash", keys, encoder_plan=plan)
+    if split is None:
+        assert result.returncode != 0 and "TP2_DFLASH " in result.stderr, result.stderr
+        return
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
-    server = next(line for line in lines if "cuteafd serve-glmf" in line)
-    assert "--tp2-dflash" not in shlex.split(planner)
-    assert f"--tp2-dflash {str(selected).lower()}" in server
+    planner = shlex.split(next(line for line in lines if "cuteafd plan" in line and "--deployment" in line))
+    server = shlex.split(next(line for line in lines if "cuteafd serve-glmf" in line))
+    assert planner[planner.index("--tp2-dflash") + 1] == server[server.index("--tp2-dflash") + 1] == str(split).lower()
+    if speculator != "off":
+        assert planner[planner.index("--drafter-snapshot") + 1] == server[server.index("--draft") + 1]
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -4622,11 +4635,14 @@ def test_glmf_plan_uses_served_drafter_precision_and_rows(tmp_path, precision, m
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "tp2_dflash": True}
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
         "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n"
-        f"SPECULATOR_FP8={precision}\nGLM5_FLASH_DRAFT_LINEAR={mode}\n", encoder_plan=plan)
+        f"SPECULATOR_FP8={precision}\nGLM5_FLASH_DRAFT_LINEAR={mode}\n"
+        "DRAFT_KV_CACHE=bf16\nDRAFT_CONTEXT_SLOTS=19\nDRAFT_SEQUENCES=12\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     planner = shlex.split(next(line for line in lines if "cuteafd plan" in line and "--deployment" in line))
     server = shlex.split(next(line for line in lines if "cuteafd serve-glmf" in line))
+    for flag in ("--draft-kv-cache", "--draft-context-slots", "--draft-sequences"):
+        assert planner[planner.index(flag) + 1] == server[server.index(flag) + 1]
     assert "--draft-linear" not in planner
     assert (server[server.index("--draft-linear") + 1] if "--draft-linear" in server else "w8a16") == mode
     assert ("--draft-fp8" in planner) == ("--draft-fp8" in server)
@@ -5557,7 +5573,7 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
         keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
     if value is not None:
         keys += f"TP2_DFLASH={value}\n"
-    automatic = family in {"glm5_flash", "kimi_k3"} and value is None
+    automatic = family == "kimi_k3" and value is None
     result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys,
         encoder_plan={"tp2_dflash": True} if automatic else None)
     assert result.returncode == 0, result.stderr

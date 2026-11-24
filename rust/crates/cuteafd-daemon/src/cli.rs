@@ -19,9 +19,11 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         _ => None,
     };
     if let Some(engine) = glmf {
-        engine.tp2_dflash_auto = !explicit && engine.split_device.is_some()
-            && engine.draft.as_ref().is_some_and(|path|
-                crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain));
+        if !explicit {
+            let dflash2 = engine.draft.as_ref().is_some_and(|path|
+                crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|dspark| !dspark));
+            engine.tp2_dflash = tp2_dflash_default("glm5_flash", engine.split_device.is_some(), dflash2);
+        }
         return Ok(());
     }
     if let Commands::ServeKimi(args) = command {
@@ -639,7 +641,7 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
-    /// Split MiMo/Kimi/GLM Flash DFlash over both target GPUs (explicit false wins over config).
+    /// Split MiMo/Kimi/GLM Flash/Muse DFlash over both target GPUs (explicit false wins over config).
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
@@ -996,8 +998,7 @@ mod tests {
                     let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
                     super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
                     let super::Commands::ServeGlmf(args) = cli.command else { panic!("expected GLM Flash"); };
-                    assert_eq!(args.engine.tp2_dflash, explicit.is_some_and(|v| v == "true"));
-                    assert_eq!(args.engine.tp2_dflash_auto, explicit.is_none() && split && compatible);
+                    assert_eq!(args.engine.tp2_dflash, explicit.map_or(split && compatible, |v| v == "true"));
                 }
             }
         }

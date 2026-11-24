@@ -997,7 +997,7 @@ Keys here that are optional and off by default are also listed under
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
 | `TP2_DSPARK_EXPERTS` | `on` with dual RTX + dSpark, otherwise `off` | `on`, `off` | V4/V4.1 TP2 draft experts; requires two RTX GPUs and dSpark. Explicit `off` retains GPU0-only draft experts. |
-| `TP2_DFLASH` | MiMo/Muse dual-RTX DFlash2: `on`; Kimi/GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Muse defaults to `on` with dual-RTX DFlash2 (`off` remains available): rank-local query/KV heads and MLP neurons use the existing target peer exchange; selector and vocabulary head stay on GPU1. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi derives Context support from checkpoint geometry: noncausal h64 defaults to split cache/attention with producer weights and FFN on GPU1; causal h96 defaults to the admitted whole-drafter home because its Context partial kernel is absent. Explicit `on` for h96 names the missing kernel and refuses before allocation. CLI false overrides config on. |
+| `TP2_DFLASH` | GLM Flash/MiMo/Muse dual-RTX DFlash2: `on`; Kimi: checkpoint geometry; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Muse defaults to `on` with dual-RTX DFlash2 (`off` remains available): rank-local query/KV heads and MLP neurons use the existing target peer exchange; selector and vocabulary head stay on GPU1. GLM Flash defaults to the head split with two RTX GPUs and DFlash2, regardless of admitted KV pool size; explicit `off` keeps the whole drafter on GPU0. `--drafter-gib` forces whole placement because TP2 requires checkpoint-derived physical owners. GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi derives Context support from checkpoint geometry: noncausal h64 defaults to split cache/attention with producer weights and FFN on GPU1; causal h96 defaults to the admitted whole-drafter home because its Context partial kernel is absent. Explicit `on` for h96 names the missing kernel and refuses before allocation. CLI false overrides config on. |
 
 ## Concurrency and serving
 
@@ -1173,6 +1173,13 @@ Speculator (`SPECULATOR`):
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✗ | ✓ (default) |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ | ✗ | ✗ |
 | `dfly2` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ |
+
+DFlash tensor parallelism (`TP2_DFLASH`) on active two-RTX DFlash2 layouts:
+
+| Layout | GLM Flash | MiMo | Kimi K3 | Muse |
+| --- | --- | --- | --- | --- |
+| Two RTX with DFlash2 | `on` | `on` | checkpoint geometry | `on` |
+| One RTX or no DFlash2 | `off` | `off` | `off` | `off` |
 
 Qwen4 unset/`auto` selects native MTP whenever the checkpoint declares its MTP
 layer, independent of expert quantization, core view, repository revision or
