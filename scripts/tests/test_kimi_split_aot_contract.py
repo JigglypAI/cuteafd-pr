@@ -29,28 +29,36 @@ def test_split_catalog_covers_whole_and_head_split(monkeypatch):
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef)],
                            type_ignores=[]), str(path), "exec"), namespace)
     entries = namespace["programs"]()
-    assert len(entries) == 56
-    assert len({name for name, _, _ in entries}) == 56
+    assert len(entries) == 84
+    assert len({name for name, _, _ in entries}) == 84
+    # Existing m64/m4096 table indices stay put; additive m128 stems follow.
     assert all(not name.startswith("kimik31_") for name, _, _ in entries[:32])
-    assert all(name.startswith("kimik31_") for name, _, _ in entries[32:])
+    assert all(name.startswith("kimik31_") for name, _, _ in entries[32:56])
+    assert all(not name.startswith("kimik31_") and name.endswith("_m128") for name, _, _ in entries[56:72])
+    assert all(name.startswith("kimik31_") and name.endswith("_m128") for name, _, _ in entries[72:])
     for heads in (48, 96):
-        for rows in (64, 4096):
+        for rows in (64, 128, 4096):
             selected = {name: thunk for name, thunk, capacity in entries
                         if f"h{heads}_" in name and capacity == rows and not name.startswith("kimik31_")}
-            assert len(selected) == (8 if heads == 96 else 7)
+            expected_count = 9 if (heads == 96 and rows == 128) else (8 if heads == 96 else 7)
+            assert len(selected) == expected_count
             if heads == 96:
                 args, kw = selected[f"kda_fused_h96_m{rows}"]()
                 assert args[0][1] == {"hidden": 7168, "kda_heads": 96}
-                assert kw == {"max_rows": rows, "output_kind": "norm", "decode": rows == 64}
+                assert kw == {"max_rows": rows, "output_kind": "norm", "decode": rows in (64, 128)}
+                if rows == 128:
+                    c_args, c_kw = selected["kda_commit_h96_m128"]()
+                    assert c_args[0][1] == {"hidden": 7168, "kda_heads": 96}
+                    assert c_kw == {"replay_rows": 128}
             assert selected[f"kda_core_h{heads}_m{rows}"]()[1] == {
-                "max_rows": rows, "decode": rows == 64}
+                "max_rows": rows, "decode": rows in (64, 128)}
             for stride in (576, 640):
                 for cache, suffix in (("bf16", ""), ("fp8", "_fp8")):
                     args, kw = selected[f"mla_rank_norm_h{heads}_kv{stride}{suffix}_m{rows}"]()
                     assert kw["kv_stride"] == stride and args[0] == {"heads": heads, "kv_cache": cache}
 
     catalogue = {name: thunk for name, thunk, _ in entries}
-    for name, thunk, capacity in entries[32:]:
+    for name, thunk, capacity in (*entries[32:56], *entries[72:]):
         args, kw = thunk()
         assert args[0]["norm_eps"] == 1e-5
         assert kw["max_rows"] == capacity

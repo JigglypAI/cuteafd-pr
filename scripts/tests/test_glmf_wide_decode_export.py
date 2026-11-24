@@ -625,7 +625,9 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     kda = [p for p in programs if p[1] in ("kda", "kda_commit")]
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in kda}
-    assert len(calls) == len(kda) == 1 + len({decode_rows, prefill_rows})
+    decode_caps = {decode_rows, 128} if decode_rows < 128 else {decode_rows}
+    all_rows = decode_caps | {prefill_rows}
+    assert len(calls) == len(kda) == len(decode_caps) + len(all_rows)
     for stem, (op, params, call) in calls.items():
         module, function, args, kwargs = call
         assert module == "glmf" and args == (GEOMETRY,)
@@ -633,9 +635,11 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
         assert params == kwargs
         if op == "kda":
             assert kwargs["output_kind"] == "norm"
-            assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+            assert kwargs["decode"] == (kwargs["max_rows"] in decode_caps)
             # The wide route is a prefill route; decode programs keep their shape.
-            assert kwargs["bf16_wide"] == (kwargs["max_rows"] != decode_rows)
+            assert kwargs["bf16_wide"] == (kwargs["max_rows"] not in decode_caps)
+        else:
+            assert kwargs == ({} if stem == "kda_commit" else {"replay_rows": 128})
     # KDA reuses the identical shared-FFN down projection, without a second export.
     output = [p for p in programs if p[0] == "ffn_down_i6144"]
     assert len(output) == 1
@@ -649,13 +653,15 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
              if op in ("mla_producer", "mla_output", "dense_mla")}
+    decode_caps = {decode_rows, 128} if decode_rows < 128 else {decode_rows}
+    all_rows = decode_caps | {prefill_rows}
     assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 14
-    assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
+    assert len(calls) == 2 * (3 * len(all_rows) + 4 * len(decode_caps) + 2)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
         for cache in ("bf16", "fp8"):
             cs = "" if cache == "bf16" else "_fp8"
-            for rows in {decode_rows, prefill_rows}:
+            for rows in all_rows:
                 op, params, (module, fn, args, kwargs) = calls[f"mla_producer{suffix}{cs}_m{rows}"]
                 assert op == "mla_producer" and module == "kimi_mla" and fn == "compile_kimi_mla_producer_aot"
                 assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
@@ -665,7 +671,9 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                     op, params, (module, fn, args, kwargs) = calls[f"mla_output{suffix}_m{rows}"]
                     assert fn == "compile_kimi_mla_output_aot"
                     assert params == {"max_rows": rows, "heads": heads}
-            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+            modes = [(mode, r) for r in sorted(decode_caps) for mode in ("decode", "verify")]
+            modes.append(("extend", prefill_rows))
+            for mode, rows in modes:
                 op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}{cs}_m{rows}"]
                 assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
                 assert vars(args[0]) == {"heads": heads, "kv_cache": cache}

@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn bootstrap_only_contains_replayable_rows() {
-        let layout = kimi_bootstrap_layout(KimiCoreFormat::Bf16);
+        let layout = kimi_bootstrap_layout(KimiCoreFormat::Bf16, 1);
         for entry in &layout.entries {
             assert!((1..=64).contains(&entry.rows));
         }
