@@ -618,25 +618,6 @@ fn mtp_layout(ids: &[i32], head: u8, cache: &cuteafd_loader::serving_capacity::s
     Ok(layout)
 }
 
-#[cfg(test)]
-#[test]
-fn step5_mtp_report_uses_the_predictor_head_and_cache() -> Result<()> {
-    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
-    use cuteafd_loader::{plan::testing::{step5_fixture, write_snapshot}, serving_capacity::step5::Step5CacheLayout};
-    let root = tempfile::tempdir()?;
-    let (json, tensors) = step5_fixture("fp8");
-    write_snapshot(root.path(), &json, &tensors, None);
-    let cfg = Config::parse(&Checkpoint::open(root.path())?)?;
-    let cache = Step5CacheLayout::new(&cfg, 2, 8192, 3, 256, 256, Default::default())?;
-    let state = &cache.ranks[0];
-    let first = state.sliding.iter().find(|ring| ring.mtp).unwrap();
-    let layout = mtp_layout(&[4, 2], 0, &cache, &plan(vec![owner(0, 1024)]), 2)?;
-    assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Mtp, Some(Placement::Whole), Some(Rank::CudaRank(4))));
-    assert_eq!(layout.ranks, [Rank::CudaRank(4)]);
-    assert_eq!(layout.arena_bytes, [1024 + 2 * (state.bytes - first.key.offset)]);
-    Ok(())
-}
-
 fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {
     ids.iter().map(|id| serde_json::json!({"device": id})).collect()
 }
@@ -1640,4 +1621,23 @@ mod session_ownership_tests {
         working.spark_layers.push(90);
         assert!(opens_expert_sessions(&working));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn step5_mtp_report_uses_the_predictor_head_and_cache() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    use cuteafd_loader::{plan::testing::{step5_fixture, write_snapshot}, serving_capacity::step5::Step5CacheLayout};
+    let root = tempfile::tempdir()?;
+    let (json, tensors) = step5_fixture("fp8");
+    write_snapshot(root.path(), &json, &tensors, None);
+    let cfg = Config::parse(&Checkpoint::open(root.path())?)?;
+    let cache = Step5CacheLayout::new(&cfg, 2, 8192, 3, 256, 256, Default::default())?;
+    let state = &cache.ranks[0];
+    let first = state.sliding.iter().find(|ring| ring.mtp).unwrap();
+    let layout = mtp_layout(&[4, 2], 0, &cache, &plan(vec![owner(0, 1024)]), 2)?;
+    assert_eq!((layout.kind, layout.placement, layout.lead), (Kind::Mtp, Some(Placement::Whole), Some(Rank::CudaRank(4))));
+    assert_eq!(layout.ranks, [Rank::CudaRank(4)]);
+    assert_eq!(layout.arena_bytes, [1024 + 2 * (state.bytes - first.key.offset)]);
+    Ok(())
 }
