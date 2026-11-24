@@ -1,4 +1,4 @@
-//! Rank-local decode/verify graph executor (`glm5_flash.decode_local`, `GRAPH_EXACT_ROWS`).
+//! Rank-local decode/verify graph executor (`glm5_flash.decode_local`).
 //!
 //! Every `PeerExchange` and `ContextExchange` push/wait runs on the host outside
 //! `replay_on`, pushing both ranks before waiting on either. Each captured CUDA
@@ -178,25 +178,8 @@ impl<'a> GlmfEngine<'a> {
                 };
                 if index == layers.len() && !head { segment()?; } else { self.replay(key, segment)?; }
                 if layers.get(index).is_some_and(|layer| !layer.dense) {
-                    if self.warming_graphs.get() {
-                        // SAFETY: masked warm-up owns live delta storage; no router ids are consumed.
-                        unsafe { self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?; }
-                    } else {
-                        crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
-                            self.moe(w, index, &layers[index], real, Scalar::I32(real as i32), cap, true,
-                                &[Span { first: 0, rows: real }], None)
-                        }, |tail| {
-                            let offset = tail.start * self.cfg.hidden * 2;
-                            let bytes = tail.len() * self.cfg.hidden * 2;
-                            ensure!(offset + bytes <= w.delta.buffer.bytes, "MoE tail exceeds delta");
-                            // SAFETY: subrange lies within live delta allocation on the active stream.
-                            unsafe {
-                                self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                                    ptr: w.delta.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w.delta.buffer
-                                }, bytes, self.stream)
-                            }
-                        })?;
-                    }
+                    self.moe(w, index, &layers[index], t, rows, cap, true,
+                        &[Span { first: 0, rows: t }], None)?;
                 }
                 if index < layers.len() { crate::shared::console::layer_mark(index); }
             }
@@ -369,50 +352,12 @@ impl<'a> GlmfEngine<'a> {
                     };
                     self.post_pre_on(rank, wr, attended, 0, lr, "ffn", "post_norm", rows, cap)?;
                 }
-                if self.warming_graphs.get() {
-                    // SAFETY: masked warm-up owns live delta/shared storage; no router ids are consumed.
-                    unsafe { self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?; }
-                    let buffer = if self.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer };
-                    self.on(1, || unsafe {
-                        self.library.cuda_zero_bytes_async(buffer, t * self.cfg.hidden * 2, self.stream_of(1))
-                    })?;
-                } else {
-                    if !self.tp2_layer(index) {
-                        let out1 = self.peer_ffn_out(index, w1, layer1)?;
-                        let real = tables.real_rows;
-                        ensure!(real > 0 && real <= t, "peer shared FFN real rows exceed step");
-                        self.ffn_on(1, w1, layer1, self.cfg.moe_intermediate, cap, out1, Scalar::I32(real as i32))?;
-                        if real < t {
-                            let offset = real * self.cfg.hidden * 2;
-                            let bytes = (t - real) * self.cfg.hidden * 2;
-                            self.on(1, || unsafe {
-                                self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                                    ptr: out1.wrapping_byte_add(offset), bytes, ..w1.shared.buffer
-                                }, bytes, self.stream_of(1))
-                            })?;
-                        }
-                    }
-                    crate::shared::decode_graph::real_row_moe(tables.real_rows, t, |real| {
-                        self.moe(w, index, layer0, real, Scalar::I32(real as i32), cap, true,
-                            &[Span { first: 0, rows: real }], Some(w1))
-                    }, |tail| {
-                        let offset = tail.start * self.cfg.hidden * 2;
-                        let bytes = tail.len() * self.cfg.hidden * 2;
-                        ensure!(offset + bytes <= w.delta.buffer.bytes, "MoE tail exceeds delta");
-                        // SAFETY: subrange belongs to live delta/shared storage on each rank's stream.
-                        unsafe {
-                            self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                                ptr: w.delta.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w.delta.buffer
-                            }, bytes, self.stream)?;
-                            if self.tp2_layer(index) {
-                                self.on(1, || self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                                    ptr: w1.shared.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w1.shared.buffer
-                                }, bytes, self.stream_of(1)))?;
-                            }
-                            Ok(())
-                        }
-                    })?;
+                if !self.tp2_layer(index) {
+                    let out1 = self.peer_ffn_out(index, w1, layer1)?;
+                    self.ffn_on(1, w1, layer1, self.cfg.moe_intermediate, cap, out1, rows)?;
                 }
+                self.moe(w, index, layer0, t, rows, cap, true,
+                    &[Span { first: 0, rows: t }], Some(w1))?;
                 if self.tp2_layer(index) {
                     self.tp2_publish(index, 0, t, Some(w1))?;
                 }

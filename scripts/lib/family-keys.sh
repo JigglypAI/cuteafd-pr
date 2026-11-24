@@ -34,7 +34,8 @@ _spark_slot_keys() {
 _family_allowed_keys() {
   local checkpoint_family="${2:-$1}" registry_dir
   registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PRECISION GRAPH_PREWARM GRAPH_DONOR_ALWAYS GRAPH_DONOR_COLD_LAG
+  printf '%s\n' CORE_VIEW FP8_PREFILL ATTENTION_PRECISION GRAPH_PREWARM
+  [[ "$1" == glm5_flash ]] || printf '%s\n' GRAPH_DONOR_ALWAYS GRAPH_DONOR_COLD_LAG
   cat <<'EOF'
 VISION
 AUDIO
@@ -281,7 +282,6 @@ GPU_GRAPH_RESERVE_EXTRA
 GPU_GRAPH_RESERVE_EXTRA_CAP
 SPARK_GRAPH_RESERVE
 GRAPH_TRACE
-GRAPH_EXACT_ROWS
 L2_PREFETCH
 FP8_SCALES
 SPECULATOR_FP8

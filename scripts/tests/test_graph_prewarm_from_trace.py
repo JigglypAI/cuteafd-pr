@@ -310,22 +310,6 @@ def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20, device=0):
                          capture_bytes=capture_bytes)]}
 
 
-def test_flash_checked_in_list_regenerates_byte_for_byte_from_source_traces(tmp_path):
-    import gzip
-    fixture = Path(__file__).parent / "fixtures/glmf-prewarm-traces.json.gz"
-    traces = json.loads(gzip.decompress(fixture.read_bytes()))
-    groups = {}
-    for layout, snapshots in traces.items():
-        groups[layout] = []
-        for index, snapshot in enumerate(snapshots):
-            path = tmp_path / f"{layout}-{index}.json"
-            path.write_text(json.dumps(snapshot))
-            groups[layout].append(path)
-    generated = MODULE.generate_layouts(groups, "glm5_flash")
-    checked_in = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_prewarm.json"
-    assert json.dumps(generated, indent=2) + "\n" == checked_in.read_text()
-
-
 def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     result = MODULE.generate([flash_trace()], "glm5_flash", coverage=0.99)
     assert result["family"] == "glm5_flash"

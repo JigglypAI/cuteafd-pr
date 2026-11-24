@@ -229,7 +229,6 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     solve = search.split("pub fn solve(", 1)[1]
     assert solve.index("recipe.prepare(&request)?") < solve.index("contract.add_driver_page_tables()")
     assert solve.index("contract.add_driver_page_tables()") < solve.index("apply_reserve_override(")
-    assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
     opening = module.split("pub fn with_engine", 1)[1]
     inventory = opening.index("self.admission_inventory(")
@@ -238,12 +237,10 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert inventory < opening.index("self.admit_candidate(")
     assert all(inventory < start < allocation for start in (
         match.start() for match in re.finditer(r"self\.admit_candidate\(", opening)))
-    # The charged per-device reserve configures the shared cache and the startup set warms it;
-    # each rank carries its own traced base and the fixed allocation tail behind its charge.
+    # Attach the admitted cache before first-use capture can run.
     flat = " ".join(opening.split())
     assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
-            "&admitted_graphs.bootstraps, admitted_graphs.extra)?") in flat
-    assert "engine.warm_decode_graphs(sequences.min(args.resolved_decode_rows()), speculation)?" in opening
+            "&admitted_graphs.bootstraps)?") in flat
     startup = opening.index("let result = with_startup_graphs(")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
     assert startup < opening.index("|| body(&engine)")

@@ -337,12 +337,10 @@ fn finish_loading<S, T>(library: &NativeLibrary, state: &mut S,
 }
 
 /// One startup owner, before TP2 diagnostics and the serving/golden body.
-fn with_startup_graphs<T>(tp2: bool, serving: Option<(usize, bool)>, golden: (usize, bool),
-    warm: impl FnOnce(usize, bool) -> Result<()>, check_tp2: impl FnOnce() -> Result<()>,
+fn with_startup_graphs<T>(tp2: bool, serving: bool,
+    attach: impl FnOnce() -> Result<()>, check_tp2: impl FnOnce() -> Result<()>,
     body: impl FnOnce() -> Result<T>) -> Result<T> {
-    if let Some((sequences, speculation)) = serving.or(tp2.then_some(golden)) {
-        warm(sequences, speculation)?;
-    }
+    if serving || tp2 { attach()?; }
     if tp2 { check_tp2()?; }
     body()
 }
@@ -393,7 +391,7 @@ mod draft_cli_tests {
             assert!(fixture.events()?.ends_with("HF"), "release must follow the last upload");
             let prime = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
             drop(prime);
-            with_startup_graphs(false, Some((1, draft)), (1, false), |_, _| {
+            with_startup_graphs(false, true, || {
                 assert_eq!(staging_bytes(), 0);
                 let warm = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
                 drop(warm);
@@ -429,37 +427,36 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn serving_startup_prewarm_runs_once_before_tp2_checks_and_the_body() {
+    fn serving_attaches_graphs_once_before_tp2_checks_and_the_body() {
         use std::cell::{Cell, RefCell};
 
         for (name, tp2) in [("tp2-zero-spark", true), ("tp2-spark-suffix", true), ("spark-only", false)] {
-            let warmups = Cell::new(0);
+            let attachments = Cell::new(0);
             let events = RefCell::new(Vec::new());
-            // The production with_engine sequence: one prewarm, then TP2 diagnostics, then the body.
-            with_startup_graphs(tp2, Some((8, true)), (16, false), |sequences, speculation| {
-                assert_eq!((sequences, speculation), (8, true), "{name}");
-                warmups.set(warmups.get() + 1);
-                events.borrow_mut().push("prewarm");
+            // The production with_engine sequence: one cache attachment, then TP2 diagnostics, then the body.
+            with_startup_graphs(tp2, true, || {
+                attachments.set(attachments.get() + 1);
+                events.borrow_mut().push("attach");
                 Ok(())
             }, || {
-                assert_eq!(warmups.get(), 1, "{name}");
+                assert_eq!(attachments.get(), 1, "{name}");
                 events.borrow_mut().push("tp2-check");
                 Ok(())
             }, || {
-                assert_eq!(warmups.get(), 1, "{name}: serving must not own a second warm-up");
+                assert_eq!(attachments.get(), 1, "{name}: serving must not own a second attachment");
                 events.borrow_mut().push("body");
                 Ok(())
             }).unwrap();
-            assert_eq!(warmups.get(), 1, "{name}");
-            assert_eq!(*events.borrow(), if tp2 { vec!["prewarm", "tp2-check", "body"] }
-                else { vec!["prewarm", "body"] });
+            assert_eq!(attachments.get(), 1, "{name}");
+            assert_eq!(*events.borrow(), if tp2 { vec!["attach", "tp2-check", "body"] }
+                else { vec!["attach", "body"] });
         }
-        // Golden-only runs (no serving policy, no TP2) prewarm nothing.
-        with_startup_graphs(false, None, (16, true),
-            |_, _| unreachable!("golden without TP2 prewarms nothing"),
+        // Eager golden-only runs have no serving policy or TP2 diagnostics.
+        with_startup_graphs(false, false,
+            || unreachable!("golden without TP2 does not attach graphs"),
             || unreachable!("no TP2 diagnostics"), || Ok(())).unwrap();
         let serve = include_str!("serve.rs");
-        assert!(!serve.contains("engine.warm_decode_graphs("), "serving must not own a second warm-up");
+        assert!(!serve.contains("engine.configure_graph_cache("), "serving must not own a second attachment");
     }
 
     #[test]
@@ -1052,14 +1049,7 @@ mod draft_cli_tests {
             engine::hand_out_remainder(&mut limits, room, verify_rows, |_| true);
             let real: usize = limits.iter().map(|limit| limit + 1).sum();
             assert_eq!(real, verify_rows);
-            // Padded into its bucket, the step's real rows run the router, the expert wire and the
-            // routed experts.
-            let bucket = engine::DecodeBuckets::new(verify_rows).bucket(real, true);
-            let mut experts = None;
-            crate::shared::decode_graph::real_row_moe(real, bucket, |rows| { experts = Some(rows); Ok(()) },
-                |_| Ok(())).unwrap();
-            let rows = experts.unwrap();
-            assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
+            assert!(real > args.prefill_rows && real <= args.expert_rows(), "{real} rows at {sms} SMs");
         }
         // A whole reserve is one allocation per rank, even when a wider
         // verify step leaves its physical backing in the same allocation quantum.
@@ -1446,9 +1436,6 @@ pub(crate) struct GoldenArgs {
     /// Diagnostic full-device drain before drafter launches and context updates.
     #[arg(long, requires = "replay_trace")]
     pub replay_draft_sync: bool,
-    /// Require byte-exact real-row logits for speculative masked decode padding 3->4, 9->16, 17->32 and 33->64.
-    #[arg(long)]
-    pub padding_check: bool,
     /// Compare queued multi-chunk prefill and decode replay with a drained reference, byte-for-byte.
     #[arg(long)]
     pub upload_check: bool,
@@ -1590,7 +1577,7 @@ fn reconciliation_provenance(manifest: &std::path::Path, native_lib: &std::path:
         "native_sha256": hash(native_lib)?, "programs_sha256": hash(manifest)?,
         "layout": layout, "devices": devices, "spark_world": spark_world,
         "onboard_layers": onboard_layers, "prefill": prefill,
-        "graph_basis": "trace-derived prewarm document keyed by resolved layout; uncalibrated byte fallback elsewhere"
+        "graph_basis": "lag-8 exact-row working set, with rank-local lazy capture"
     }))
 }
 
@@ -2138,7 +2125,7 @@ impl Opened {
                 && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
-            exact_graph_rows: crate::shared::decode_graph::exact_rows(),
+
  };
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
@@ -2196,7 +2183,7 @@ impl Opened {
         // Under TP2_DFLASH auto both drafter candidates are admitted; each logs its breakdown.
         tracing::info!(target: "cuteafd::memory_policy", tp2_dflash = args.tp2_dflash, "GLM Flash admission candidate");
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5_flash");
-        tracing::info!(graph_reserve = ?admitted.graphs.charged, prewarm_shapes = admitted.graphs.shapes,
+        tracing::info!(graph_reserve = ?admitted.graphs.charged, prewarm_shapes = 0,
             phases = ?admitted.solved.phases, "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
@@ -2492,7 +2479,7 @@ impl Opened {
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
             "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
-            "graph_shapes": admitted_graphs.shapes,
+            "graph_shapes": 0,
             "graphs": admitted_graphs.executables,
             "speculation": speculation, "sequences": sequences,
             "attention_first_owner": attention.first_owner,
@@ -3053,28 +3040,16 @@ impl Opened {
         if let Some(dump) = crate::shared::selection_dump::shared("glm5_flash")? {
             engine.attach_selection_dump(dump)?;
         }
-        let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
-            (16, engine.drafter.is_some()), |sequences, speculation| {
+        let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy.is_some(), || {
                 engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves,
-                    &admitted_graphs.bootstraps, admitted_graphs.extra)?;
-                let prewarm = admitted_graphs.prewarm_bytes();
+                    &admitted_graphs.bootstraps)?;
                 for (rank, &charge) in admitted_graphs.charged.iter().enumerate() {
-                    let resolved = if admitted_graphs.exact_rows.is_enabled() {
-                        cuteafd_loader::placement::graph_reserve::current_working_set(rank, admitted_graphs.reserves[rank])
-                    } else {
-                        cuteafd_loader::placement::graph_reserve::current(rank, false,
-                            admitted_graphs.reserves[rank], admitted_graphs.extra)
-                    }.map_err(anyhow::Error::msg)?;
-                    tracing::info!(rank, reserve = charge, default = resolved.bytes, source = %resolved.source,
-                        prewarm_bytes = prewarm[rank], capture_headroom = resolved.effective_extra_bytes,
-                        soft_margin_floor = resolved.soft_margin_floor,
-                        exact_rows = %admitted_graphs.exact_rows,
-                        extra_source = %resolved.extra_source, cap_source = %resolved.cap_source,
-                        executables = admitted_graphs.executables[rank], prewarm_shapes = admitted_graphs.shapes,
+                    let resolved = cuteafd_loader::placement::graph_reserve::current_working_set(rank,
+                        admitted_graphs.reserves[rank]).map_err(anyhow::Error::msg)?;
+                    tracing::info!(rank, reserve = charge, source = %resolved.source,
+                        soft_cap = resolved.base_bytes, soft_margin_floor = resolved.soft_margin_floor,
+                        executables = admitted_graphs.executables[rank], prewarm_shapes = 0,
                         bootstrap = admitted_graphs.bootstraps[rank], "GLM Flash graph reserve");
-                }
-                if engine.warm_decode_graphs(sequences.min(args.resolved_decode_rows()), speculation)? {
-                    probe("graphs-instantiated")?;
                 }
                 probe("graph-capture")
             }, || engine.check_tp2_routes(), || body(&engine));
@@ -3369,12 +3344,6 @@ fn print_op_profile(engine: &engine::GlmfEngine<'_>, title: &str, runs: usize) -
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
-    if args.padding_check {
-        let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
-        anyhow::ensure!(bytes.len() % 4 == 0, "padding check token bytes must be u32-aligned");
-        let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-        return engine.check_decode_padding(&tokens);
-    }
     if let Some(sequences) = args.draft_modes {
         return speculate::draft_modes(args, engine, sequences);
     }

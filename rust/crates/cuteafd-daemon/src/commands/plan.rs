@@ -103,7 +103,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == Some(crate::cli::PlanReplayRecords::Shared),
                 glmf_auto_replay: args.replay_records == Some(crate::cli::PlanReplayRecords::Auto),
-                glmf_exact_graph_rows: args.graph_exact_rows,
+
                 concurrency: args.concurrency,
                 tp2_dspark_experts: args.tp2_dspark_experts,
                 tp2_dflash: args.tp2_dflash.unwrap_or(false),
@@ -2049,7 +2049,7 @@ mod tests {
         PlanArgs {
             kimi_content_qualified: false,
             explicit_settings: Default::default(),
-            graph_exact_rows: Default::default(),
+
             test_host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost::raptor().host_ram),
             fp8_prefill: Default::default(),
             attention: Default::default(),

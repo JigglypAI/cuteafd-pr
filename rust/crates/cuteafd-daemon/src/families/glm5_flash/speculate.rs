@@ -688,7 +688,7 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
             }
             private_replay_write(&dir.join("geometry.json"), &serde_json::to_vec(&serde_json::json!({
                 "round": round.round, "start": start, "live": input.len(), "keep": keep,
-                "bucket": engine.serving_decode_rows(input.len(), round.spec), "sync": args.replay_draft_sync,
+                "bucket": input.len(), "sync": args.replay_draft_sync,
                 "state_first_byte": state_first, "mla_first_byte": paged_first }))?)?;
         }
         let first = actual[..keep * vocab].iter().zip(&expected).position(|(a,b)| a.to_bits() != b.to_bits());
@@ -699,7 +699,7 @@ fn replay_rounds(args: &GoldenArgs, engine: &GlmfEngine<'_>, sequence: &[u32], p
             MLA exact {paged_exact}, first byte {paged_first:?}; \
             selector exact {sampler_exact}; recorded emissions exact {emissions_exact}; \
             serial emissions exact {serial_emissions_exact}", round.round, input.len(),
-            engine.serving_decode_rows(input.len(), round.spec), first.map(|i| (i / vocab, i % vocab)));
+            input.len(), first.map(|i| (i / vocab, i % vocab)));
         ensure!(replay_round_valid(args.replay_dump_continue, logit_exact && state_exact && paged_exact,
             serial_emissions_exact, emissions_exact), "round {}: first serving replay divergence", round.round);
         if args.replay_dump_continue {
@@ -723,7 +723,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
     }
     ensure!(engine.slots >= 4, "--replay-check needs --slots >= 4");
     ensure!(!args.replay_production || engine.production_replay_ready(),
-        "--replay-production needs captured startup decode graphs");
+        "--replay-production needs attached exact-row decode graphs");
     let verify = |placement: &mut GlmfPlacement, count, input: &[u32], spec| -> Result<Vec<f32>> {
         let logits = if args.replay_production {
             engine.verify_device(&mut [(placement, count)], input, spec)?
@@ -736,9 +736,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         logits.context("replay check needs every layer")
     };
     if args.replay_production {
-        println!("production replay: live rows {rows}, captured bucket {}; \
-            expert policy uses live rows, copy-extension rows use the same keep boundary",
-            engine.serving_decode_rows(rows, true));
+        println!("production replay: exact live rows {rows}; copy-extension rows use the same keep boundary");
     }
     let embed = &sequence[prefill..prefill + rows];
     let family = super::prefix::GlmfPrefix::new(engine, super::prefix::PrefixMarks::Arena, |_| 0)?;
@@ -803,8 +801,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
             let production_paged = super::prefix::paged_rows(&family, &spec, spec.len)?;
             let paged_exact = eager_paged == production_paged;
             let first_paged = eager_paged.iter().zip(&production_paged).position(|(a, b)| a != b);
-            let bucket = engine.serving_decode_rows(rows, true);
-            println!("keep {keep}/{rows}: eager {rows} vs production bucket {bucket}: logits exact {}, \
+            println!("keep {keep}/{rows}: eager vs production: logits exact {}, \
                 first differing (row, vocab) {:?}, max |delta| {:.3e}; committed KDA/conv/index-tail \
                 state {state_bytes} bytes differ (first byte {first_state:?}, recurrent max |delta| \
                 {worst:.3e}); committed MLA exact {paged_exact}, first byte {first_paged:?}",
@@ -859,9 +856,9 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
                 finite_state(&eager_state, recurrent_bytes, element)?;
                 let eager_paged = super::prefix::paged_rows(&family, &eager_plain, eager_plain.len)?;
                 let state_bytes = state_delta(&eager_state, &plain_state, recurrent_bytes, element).0;
-                println!("plain {rows}: eager vs production bucket {}: logits exact {}, max |delta| {:.3e}; \
+                println!("plain {rows}: eager vs production: logits exact {}, max |delta| {:.3e}; \
                     committed state {state_bytes} bytes differ; MLA exact {}",
-                    engine.serving_decode_rows(rows, false), exact_logits(&eager_logits, &plain_logits),
+                    exact_logits(&eager_logits, &plain_logits),
                     max_logit(&eager_logits, &plain_logits), eager_paged == plain_paged);
                 production_exact &= exact_logits(&eager_logits, &plain_logits)
                     && eager_state == plain_state && eager_paged == plain_paged;
@@ -885,7 +882,7 @@ pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usi
         allocator.borrow_mut().release(spec);
         allocator.borrow_mut().release(alternate);
     }
-    ensure!(production_exact, "eager {rows}-row verification differs from production padding; see per-keep diagnostics");
+    ensure!(production_exact, "eager {rows}-row verification differs from the production graph; see per-keep diagnostics");
     // Cost: plain N-row verify vs speculative verify + commit, same position.
     let mut placement = fresh()?;
     let backup = fresh()?;

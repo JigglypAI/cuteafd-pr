@@ -1512,7 +1512,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).zip(&drafted).map(|((a, tokens), draft)|
             Proposal { id: a.ticket.id(), tokens, history: &a.history, greedy: a.job.sampling.is_greedy(),
                 head: draft.as_ref().map(|d| d.confidence.as_slice()).filter(|head| !head.is_empty()) }).collect();
-        policy.shape_with_padding(&mut shaped, verify_rows, |rows| engine.production_replay_ready().then(|| engine.serving_decode_rows(rows, true)));
+        policy.shape(&mut shaped, verify_rows);
     }
     let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, proposal)| {
         let mut rows: Vec<u32> = std::iter::once(a.next).chain(proposal.iter().copied()).collect();
@@ -1548,7 +1548,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             Ok((selector.select(&logits, &batch)?, logits))
         });
     let step_ms = timer.elapsed().as_secs_f64() * 1e3;
-    lane.stats.record(tokens.len(), engine.serving_decode_rows(tokens.len(), spec), spec, step_ms);
+    lane.stats.record(tokens.len(), tokens.len(), spec, step_ms);
     lane.verify_s += step_ms / 1e3;
     let (selected, logits) = match step {
         Ok(step) => step,
