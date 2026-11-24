@@ -68,22 +68,24 @@ The engine matches the checkpoint's `hf_quant_config.json` parameter groups and 
 
 ## Measured SM120 MoE Row Curves
 
-Isolated SM120 (RTX PRO 6000, `capacity=4096`, `--graph --check --check-prefix-rows 16`, TP1) kernel
-row curves — strictly monotonic in `us/row`, zero `>10%` jumps, and `prefix_comparison.bitwise_equal=true`
-(`rows=16`, `differing_rows=0`, `max_abs_diff=0.0`) on every wide shape (`17..4096`):
+Isolated SM120 (RTX PRO 6000, `capacity=4096`, `--route auto --graph --check --check-prefix-rows 16`, TP1)
+kernel row curves — NVFP4 measured on merged `#431` (`429ececda5`, literal vendor epilogue scale association),
+MXFP8 unchanged since `#430` (`306d4902be`) — strictly monotonic in `us/row`, zero `>10%` jumps, and
+`prefix_comparison.bitwise_equal=true` (`rows=16`, `differing_rows=0`, `max_abs_diff=0.0`) on every wide shape
+(`17..4096`):
 
-| rows | NVFP4 W4A4 (`bf16`) us | us/row | GB/s | TFLOPS | MXFP8 W8A8 (`wire`) us | us/row | GB/s | TFLOPS |
+| rows | NVFP4 W4A4 (`bf16`, `429ececd`) us | us/row | GB/s | TFLOPS | MXFP8 W8A8 (`wire`) us | us/row | GB/s | TFLOPS |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | 40.96 | 40.960 | 874.8 | 3.1 | 55.30 | 55.296 | 1188.0 | 2.3 |
 | 8 | 172.03 | 21.504 | 1352.2 | 5.9 | 276.48 | 34.560 | 1542.5 | 3.7 |
-| 16 | 266.24 | 16.640 | 1419.5 | 7.7 | 440.32 | 27.520 | 1573.5 | 4.6 |
-| 17 | 264.16 | 15.539 | 1438.0 | 8.2 | 432.16 | 25.421 | 1611.5 | 5.0 |
-| 64 | 390.14 | 6.096 | 1452.3 | 20.9 | 656.42 | 10.256 | 1582.5 | 12.4 |
-| 256 | 413.70 | 1.616 | 1385.8 | 78.8 | 675.84 | 2.640 | 1555.2 | 48.3 |
-| 1024 | 494.59 | 0.483 | 1159.2 | 263.8 | 717.82 | 0.701 | 1464.2 | 181.7 |
-| 2048 | 751.62 | 0.367 | 762.8 | 347.1 | 978.98 | 0.478 | 1073.6 | 266.5 |
-| 2752 | 831.49 | 0.302 | 689.5 | 421.7 | 1183.71 | 0.430 | 887.9 | 296.2 |
-| 4096 | 1163.26 | 0.284 | 492.8 | 448.6 | 1626.14 | 0.397 | 646.4 | 320.9 |
+| 16 | 265.22 | 16.576 | 1424.9 | 7.7 | 440.32 | 27.520 | 1573.5 | 4.6 |
+| 17 | 264.19 | 15.541 | 1437.9 | 8.2 | 432.16 | 25.421 | 1611.5 | 5.0 |
+| 64 | 389.12 | 6.080 | 1456.1 | 21.0 | 656.42 | 10.256 | 1582.5 | 12.4 |
+| 256 | 411.65 | 1.608 | 1392.7 | 79.2 | 675.84 | 2.640 | 1555.2 | 48.3 |
+| 1024 | 495.62 | 0.484 | 1156.8 | 263.2 | 717.82 | 0.701 | 1464.2 | 181.7 |
+| 2048 | 752.64 | 0.368 | 761.7 | 346.7 | 978.98 | 0.478 | 1073.6 | 266.5 |
+| 2752 | 830.46 | 0.302 | 690.3 | 422.2 | 1183.71 | 0.430 | 887.9 | 296.2 |
+| 4096 | 1162.24 | 0.284 | 493.3 | 449.0 | 1626.14 | 0.397 | 646.4 | 320.9 |
 
 ## Checkpoints
 
