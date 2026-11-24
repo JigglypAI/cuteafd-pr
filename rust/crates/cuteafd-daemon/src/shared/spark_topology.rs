@@ -601,7 +601,7 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
     fn launch_check() -> Result<()> {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let output = std::process::Command::new("bash")
-            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; for SPARK_COUNT in {1..8}; do release_validate_spark_count || exit; done", "launch-test"])
+            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; for SPARK_COUNT in {1..8}; do release_validate_spark_count || exit; done", "launch-test"])
             .arg(source).output()?;
         assert!(output.status.success(), "launcher count qualification: {}", String::from_utf8_lossy(&output.stderr));
         Ok(())

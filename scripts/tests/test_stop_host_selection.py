@@ -61,8 +61,6 @@ exit 0
 def write_config(path, hosts, *, spark_count=None, extra=""):
     lines = [
         "MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash",
-        "MODEL_VARIANT=flash",
-        "EXPERT_FORMAT=native",
     ]
     if spark_count is not None:
         lines.append(f"SPARK_COUNT={spark_count}")

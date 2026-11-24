@@ -3159,8 +3159,7 @@ def v41_tp_role(card, values):
     if card.get('family') != 'deepseek_v41':
         return dict(tp_role=None, nvfp4=False)
     count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-    exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
-    role = f'tp{count}' if not exl3 and 2 <= count <= 8 and count != 4 else None
+    role = f'tp{count}' if 2 <= count <= 8 and count != 4 else None
     return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
 
 
@@ -3441,9 +3440,6 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         if gpu not in ('0', '1'):
             raise ValueError(f'staging COORDINATOR_GPUS must start with GPU 0 or 1, got {gpu}')
         values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPUS=gpu, RTX_GPUS='1')
-        if len(hosts) in (2, 3):
-            # Two or three ranks without explicit keys are the compact EXL3 layout.
-            values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')
         tag = 'tc-' + toolchain_hash(revision)
         values.update(COORDINATOR_DOCKER_DEV='cuteafd-coordinator-dev:' + tag, SPARK_EXPERT_DOCKER_DEV='cuteafd-spark-expert-dev:' + tag)
         arm['dev_image_tag'] = tag

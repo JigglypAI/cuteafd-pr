@@ -2698,11 +2698,8 @@ families retain the qualified shared prefill queue and its existing defaults.
 - `run.sh` becomes the dispatcher only.
 - `serve-native` becomes a hidden alias of `serve --family deepseek_v41`
   for one release.
-- Old keys warn for one release through `key()`. `KV_POOL_TOKENS` aliases
-  `POOL_TOKENS`, `DSPARK` maps to `SPECULATOR=dspark`, and
-  `SPARK_REDUCTION_MIN_ROWS`, `COORDINATOR_GPU_HEADROOM_GIB`,
-  `SPARKINFER_EXL3` and `MODEL_VARIANT` are dropped (accepted but never
-  forwarded today).
+- The launcher uses `POOL_TOKENS` and `SPECULATOR=dspark` and derives the
+  model variant and expert format from checkpoint metadata.
 - **Gate.** `--dry-run` resolves the same fingerprint, roles and topology
   as `run.sh` for the release configs. Script tests. One launch per arm on
   min and max.

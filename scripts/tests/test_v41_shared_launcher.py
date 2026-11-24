@@ -527,6 +527,45 @@ def test_v41_decode_share_key_reaches_only_the_coordinator_command(tmp_root, mon
         assert not any("decode-share" in arg or "DECODE_SHARE" in arg for arg in worker["argv"])
 
 
+@pytest.mark.parametrize("audio", [None, "off"])
+def test_v41_public_model_id_and_audio_off_reach_the_correct_commands(tmp_root, monkeypatch, audio) -> None:
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+    served = "public/v41-alias"
+
+    def with_keys(name, directory):
+        keys = f"SERVED_MODEL_ID={served}\n"
+        if audio is not None:
+            keys += f"AUDIO={audio}\n"
+        return capture_module.append_config(original(name, directory), keys)
+
+    monkeypatch.setattr(capture_module, "example_config", with_keys)
+    result = capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = dict(flag_values(parse_run(result["containers"][0]["argv"])["command"]))
+    assert coordinator["--model-id"] == served
+    assert coordinator["--audio"] == "off"
+    assert result["plans"]
+    for plan in result["plans"]:
+        assert plan[plan.index("--audio") + 1] == "off"
+        assert "--model-id" not in plan
+
+
+@pytest.mark.parametrize("audio", ["auto", "rtx", "spark:0"])
+@pytest.mark.parametrize("dry_run", [True, False], ids=["plan", "serve"])
+def test_v41_refuses_enabled_audio_by_name(tmp_root, monkeypatch, audio, dry_run) -> None:
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_audio(name, directory):
+        return capture_module.append_config(original(name, directory), f"AUDIO={audio}\n")
+
+    monkeypatch.setattr(capture_module, "example_config", with_audio)
+    with pytest.raises(RuntimeError, match=rf"(?s)launcher exited 2.*AUDIO={audio} is unsupported for DeepSeek V4.1; use AUDIO=off"):
+        capture(ROOT, "deepseek-v41-mxfp4-max", dry_run=dry_run)
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module
