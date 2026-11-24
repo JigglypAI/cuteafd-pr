@@ -515,8 +515,11 @@ async fn run() -> Result<()> {
         }
         _ => vision,
     };
-    let requested_audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
-    let (vision, audio) = if let Commands::Plan(args) = &mut command {
+    let audio_selection = family_audio.or(initial_audio);
+    let requested_audio = audio_selection.unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
+    let (vision, audio) = if matches!(command, Commands::ServeNative(_)) {
+        (vision, cuteafd_loader::plan::v41_audio(audio_selection)?)
+    } else if let Commands::Plan(args) = &mut command {
         args.vision = vision;
         args.audio = requested_audio;
         (vision, requested_audio)
