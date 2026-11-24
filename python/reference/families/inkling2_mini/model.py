@@ -309,7 +309,7 @@ class Experts:
         return slots.gather(1, ids.argsort(-1)[..., None].expand_as(slots)).sum(1).to(x.dtype)
 
 
-def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None):
+def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None, trace=None):
     eps = cfg.rms_norm_eps
     inputs = (small.attn_res(blocks, partial, layer[f"attn_res.attn_queries.{index - 1}"], eps)
               if index else (partial,))
@@ -319,7 +319,9 @@ def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None):
         inputs = tuple(controller(x, m, layer, kind, eps)
                        for x, m, kind in zip(inputs, messages[:3], ("attn", "k", "v"), strict=True))
     dtype = partial.dtype
-    out = small.short_conv(attention(inputs, layer, cfg, index), layer["attn_sconv.weight"]).to(dtype).float()
+    attn = attention(inputs, layer, cfg, index)
+    conv = small.short_conv(attn, layer["attn_sconv.weight"]).to(dtype)
+    out = conv.float()
     if index % cfg.n_layers_per_attn_res_block == 0:
         blocks = (*blocks, partial)
     else:
@@ -328,11 +330,17 @@ def layer_forward(partial, blocks, layer, cfg, index, experts, messages=None):
     if messages is not None:
         mlp_in = controller(mlp_in, messages[3], layer, "mlp", eps)
     mlp_in = small.rms_norm(mlp_in, layer["mlp_norm.weight"], eps).to(dtype)
-    mlp = small.short_conv(experts(mlp_in), layer["mlp_sconv.weight"]).to(dtype)
+    moe = experts(mlp_in)
+    mlp = small.short_conv(moe, layer["mlp_sconv.weight"]).to(dtype)
+    if trace is not None:
+        for name, value in (("input", partial), ("attention", attn), ("post_attention_conv", conv),
+                            ("expert_input", mlp_in), ("expert_output", moe), ("post_mlp_conv", mlp),
+                            ("output", (out + mlp.float()).to(dtype))):
+            trace(name, value)
     return (out + mlp.float()).to(dtype), blocks
 
 
-def forward(weights, cfg, token_batches, *, native=True):
+def forward(weights, cfg, token_batches, *, native=True, trace=None):
     """Layer-major text forward. Each state is one unpadded token sequence."""
     embed, norm = (weights.tensor(TEXT + key) for key in ("embed.weight", "embed_norm.weight"))
     states = [(small.rms_norm(F.embedding(ids, embed), norm, cfg.rms_norm_eps).to(embed.dtype), ())
@@ -341,7 +349,7 @@ def forward(weights, cfg, token_batches, *, native=True):
     queries = message_queries(*(weights.tensor(TEXT + "middle_cycle_cross_pass_" + k)
                                 for k in ("queries", "kv_queries")))
 
-    def visit(states, layers, previous=None):
+    def visit(states, layers, previous=None, pass_index=0):
         for i in layers:
             layer = weights.load_layer(i)
             experts = Experts(layer, cfg, native=native)
@@ -350,18 +358,20 @@ def forward(weights, cfg, token_batches, *, native=True):
                 if previous is not None:
                     prev_partial, prev_blocks = previous[row]
                     messages = small.attn_res(prev_blocks, prev_partial, queries[i-cfg.core_start], cfg.rms_norm_eps)
-                states[row] = layer_forward(partial, blocks, layer, cfg, i, experts, messages)
+                observe = None if trace is None else lambda name, value: trace(
+                    row, cfg.cache_slot(i, pass_index), name, value)
+                states[row] = layer_forward(partial, blocks, layer, cfg, i, experts, messages, observe)
             del layer, experts
         return states
 
     initial = visit(states, range(cfg.core_start))
     end_of_pass = visit(initial.copy(), range(cfg.core_start, cfg.core_end))
-    for _ in range(1, cfg.num_passes):
+    for pass_index in range(1, cfg.num_passes):
         # Skip the pre-loop block appended at the first core layer: it is
         # already present verbatim as the next pass's starting partial.
         previous = [(partial, blocks[len(initial[row][1])+1:])
                     for row, (partial, blocks) in enumerate(end_of_pass)]
-        end_of_pass = visit(initial.copy(), range(cfg.core_start, cfg.core_end), previous)
+        end_of_pass = visit(initial.copy(), range(cfg.core_start, cfg.core_end), previous, pass_index)
     final = visit(end_of_pass, range(cfg.core_end, cfg.num_hidden_layers))
     query, norm = (weights.tensor(TEXT + key) for key in ("attn_res.output_query", "norm.weight"))
     return [small.output_norm(p, b, query, norm, cfg).to(p.dtype) for p, b in final]

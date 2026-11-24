@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from golden import HF, open_snapshot, start_f32
 from families.inkling2.model import head_forward, quantize_mxfp8
-from families.inkling2_mini.model import TEXT, forward, quantize_nvfp4
+from families.inkling2_mini.model import TEXT, Experts, forward, quantize_nvfp4
 
 PROMPTS = ["Explain why the sky looks blue at midday.",
            "Write a Python function that performs binary search on a sorted list.",
@@ -41,6 +41,59 @@ def compare(a, b):
             "top1_equal": agreed, "rows": a.shape[0]}
 
 
+def trace_comparison(path, model, weights, cfg, ids, oracle):
+    hf, handles = {}, []
+    for i, layer in enumerate(model.model.language_model.layers):
+        for name, sub in (("attention", layer.self_attn), ("post_attention_conv", layer.post_attention_convolution),
+                          ("expert_input", layer.mlp), ("expert_output", layer.mlp),
+                          ("post_mlp_conv", layer.post_mlp_convolution), ("output", layer)):
+            def save(_module, args, output, i=i, name=name):
+                value = args[0] if name == "expert_input" else (output[0] if isinstance(output, tuple) else output)
+                hf.setdefault((i, name), []).append(value[0].detach().cpu())
+            handles.append(sub.register_forward_hook(save))
+    try:
+        model(input_ids=ids[None], use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    visits = [(i, 0) for i in range(cfg.core_start)] + [
+        (i, p) for p in range(cfg.num_passes) for i in range(cfg.core_start, cfg.core_end)] + [
+        (i, 0) for i in range(cfg.core_end, cfg.num_hidden_layers)]
+    results = []
+    for i, p in visits:
+        observed = oracle[cfg.cache_slot(i, p)]
+        results.append({"layer": i, "pass": p, "tensors": {
+            name: compare(value.float(), hf[i, name][p].float())
+            for name, value in observed.items() if name != "input"}})
+
+    # Give the oracle the exact activation entering HF's first expert block to
+    # separate a real QDQ/weight discrepancy from upstream hidden drift.
+    first = weights.load_layer(0)
+    input_hf = hf[0, "expert_input"][0].to(weights.device)
+    matched = Experts(first, cfg)(input_hf).cpu()
+    expert = model.model.language_model.layers[0].mlp.experts
+    if hasattr(expert, "_hf_hook"):
+        expert._hf_hook.pre_forward(expert)
+    try:
+        e = Experts(first, cfg)
+        weight_witness = {}
+        for part, hf_w in enumerate((expert.gate_up_proj[0], expert.down_proj[0])):
+            source = e.weight(part, 0)
+            if part == 0:
+                source = torch.cat((source[::2], source[1::2]), dim=0)
+            weight_witness[str(part)] = {"hf_dtype": str(hf_w.dtype),
+                "max_abs_f32": (source - hf_w.float()).abs().max().item(),
+                "max_abs_if_rounded": (source.to(hf_w.dtype) - hf_w).abs().max().item()}
+    finally:
+        if hasattr(expert, "_hf_hook"):
+            expert._hf_hook.post_forward(expert, None)
+    out = {"visits": results, "first_expert_same_input": compare(matched.float(), hf[0, "expert_output"][0].float()),
+           "first_expert_weight": weight_witness}
+    path.write_text(json.dumps(out, indent=2) + "\n")
+    torch.save({"oracle": oracle, "hf": hf}, path.with_suffix(".pt"))
+
+
 @torch.inference_mode()
 def main():
     import transformers
@@ -50,6 +103,7 @@ def main():
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--trace", type=Path, help="save one prompt's 48 visit and sublayer comparison")
     a = p.parse_args()
     if transformers.__version__ != HF["version"]:
         raise ValueError(f"expected Transformers {HF['version']}")
@@ -58,9 +112,13 @@ def main():
     tokenizer = PreTrainedTokenizerFast.from_pretrained(a.snapshot, local_files_only=True)
     batches = [torch.tensor(tokenizer.apply_chat_template(
         [{"role": "user", "content": text}], add_generation_prompt=True, return_dict=False), device=a.device)
-        for text in PROMPTS]
+        for text in (PROMPTS[:1] if a.trace else PROMPTS)]
     head = weights.tensor(TEXT + "unembed.weight").float()
-    native = [head_forward(h, head, cfg).cpu() for h in forward(weights, cfg, batches)]
+    oracle_trace = {}
+    def trace_oracle(_row, slot, name, value):
+        oracle_trace.setdefault(slot, {})[name] = value.detach().cpu()
+    native = [head_forward(h, head, cfg).cpu() for h in forward(weights, cfg, batches,
+              trace=trace_oracle if a.trace else None)]
     unquantized = [cfg.final_logit_softcapping *
                    (F.linear(h, head[:cfg.unpadded_vocab_size].to(h.dtype)).float().cpu()
                     / cfg.final_logit_softcapping).tanh()
@@ -124,6 +182,8 @@ def main():
             expert._old_forward = implementation
         else:
             expert.forward = implementation
+    if a.trace:
+        trace_comparison(a.trace, model, weights, cfg, batches[0], oracle_trace)
     model.lm_head.float()
     head_cast = model.lm_head.register_forward_pre_hook(lambda _module, args: (args[0].float(),))
     try:
@@ -133,7 +193,7 @@ def main():
     checks = [{"prompt": text, "native_vs_hf_qdq_control": compare(ours, adapted),
                "native_vs_hf_stock": compare(ours, raw), "without_qdq_vs_hf_stock": compare(no_qdq, raw),
                "hf_stock_cached_last": cached}
-              for text, ours, adapted, raw, no_qdq, cached in zip(PROMPTS, native, matched, stock, unquantized,
+              for text, ours, adapted, raw, no_qdq, cached in zip(PROMPTS[:len(batches)], native, matched, stock, unquantized,
                                                                 cache_evidence, strict=True)]
     result = {"comparison": "Stock HF dequantizes the experts and does not QDQ their activations; matched control replaces the expert forward with native QDQ and upcasts the head. Dense compute is BF16 with HF F32 islands.",
               "upstream": HF, "revision": a.snapshot.name, "prompts": checks,
