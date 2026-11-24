@@ -304,7 +304,6 @@ ROOT_PRECISIONS = [
     (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
     (hy4_root, 'BF16 checkpoint (F32 computation; native Engram FP8 round-trip)'),
     (hy4_full_root, 'BF16 checkpoint (F32 computation)'),
-    (inkling2_mini_root, 'official mixed NVFP4/MXFP8 checkpoint, computed in F32'),
     (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
 ]
 
@@ -316,6 +315,9 @@ def reference_precision(meta, panel):
     for root, label in ROOT_PRECISIONS:
         if meta.get('root_arithmetic') == root():
             return label
+    # Mini's golden module imports Torch; unrelated references must package without it.
+    if panel.get('family') == 'inkling2_mini' and meta.get('root_arithmetic') == inkling2_mini_root():
+        return 'official mixed NVFP4/MXFP8 checkpoint, computed in F32'
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
 
 
