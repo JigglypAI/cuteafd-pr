@@ -508,8 +508,12 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
     // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
     let split = args.rtx == 2 || (matches!(family, "glm5" | "glm5_flash") && args.spark_range);
-    let applicable = crate::cli::tp2_dflash_default(family, args.layout && split,
-        args.speculator == "dflash2");
+    let draft_compatible = if family == "hy4_flash" {
+        args.speculator == "dfly2"
+    } else {
+        args.speculator == "dflash2"
+    };
+    let applicable = crate::cli::tp2_dflash_default(family, args.layout && split, draft_compatible);
     let default_on = applicable && (!matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
@@ -525,7 +529,7 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
         }
     } else { args.tp2_dflash.unwrap_or(configured) };
     anyhow::ensure!(!enabled || applicable,
-        "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
+        "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2 or Hy4-flash with DFly2, --layout, and --rtx 2");
     anyhow::ensure!(!enabled || !matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0,
         "TP2 DFlash requires checkpoint-derived physical owners; --drafter-gib forces whole placement");
     Ok(enabled)

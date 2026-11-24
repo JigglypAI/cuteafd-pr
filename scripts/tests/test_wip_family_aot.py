@@ -1375,7 +1375,7 @@ def test_hy4_flash_dense_trellis_policies_are_mul1_k6_k8_with_f32_heads():
     # Every K-split TP2 projection keeps side=2 and BF16 output_program (F32 core reduced before svh egress).
     ksplit = [p for p in policies if p['sharded_side'] == 2]
     assert {(p['input_features'], p['output_features']) for p in ksplit} == {
-        (4096, 3072), (8192, 3072), (6912, 3072), (768, 3072)
+        (4096, 3072), (8192, 3072), (6912, 3072), (768, 3072), (4608, 3072)
     }
 
 

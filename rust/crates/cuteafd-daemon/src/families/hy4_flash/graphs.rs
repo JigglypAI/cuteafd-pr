@@ -82,8 +82,9 @@ impl<'a> Hy4Graphs<'a> {
         device: i32,
         rank: usize,
         layout: Option<Hy4GraphLayout>,
+        tp2_dfly2: bool,
     ) -> Result<()> {
-        let policy = hy4_graphs::reserve_policy(layout, rank)?;
+        let policy = hy4_graphs::reserve_policy_for(layout, rank, tp2_dfly2)?;
         self.bank.get_mut().attach_device(
             library,
             device,
@@ -117,8 +118,13 @@ impl<'a> Hy4Graphs<'a> {
     }
 
     pub(super) fn retained_draft_rows(&self, rows: usize) -> usize {
-        self.bank.borrow().count(|key| key.rows == rows && matches!(key.section,
-            Section::DraftFusion | Section::DraftLayer | Section::DraftCorrection))
+        self.bank.borrow().count(|key| {
+            key.rows == rows
+                && matches!(
+                    key.section,
+                    Section::DraftFusion | Section::DraftLayer | Section::DraftCorrection
+                )
+        })
     }
 
     pub(crate) fn retained_rows(&self, rows: usize) -> usize {

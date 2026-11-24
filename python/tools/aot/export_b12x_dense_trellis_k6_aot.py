@@ -188,7 +188,9 @@ HY4F_SHAPES = (
     ("hy4f_shared_down", 1536, 3072, 1),
     ("hy4f_shared_down_tp2", 768, 3072, 2),
     ("hy4f_draft_gate_up", 3072, 9216, 1),
+    ("hy4f_draft_gate_up_tp2", 3072, 4608, 1),
     ("hy4f_draft_down", 9216, 3072, 1),
+    ("hy4f_draft_down_tp2", 4608, 3072, 2),
     ("hy4f_lm_head", 3072, 120832, 1),
     ("hy4f_lm_head_tp2", 3072, 60416, 1),
 )

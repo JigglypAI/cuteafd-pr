@@ -96,6 +96,9 @@ pub(crate) struct GoldenArgs {
     /// Qualify the bundled drafter with the exact resume check and a rejected tail.
     #[arg(long, requires = "resume_at")]
     pub(crate) resume_dfly2: bool,
+    /// Split DFly2 attention heads and MLP neurons across both RTX GPUs.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: bool,
     /// Compare serial greedy continuation to forced multi-row verify with those same tokens.
     #[arg(long, requires = "resume_at", conflicts_with = "resume_dfly2")]
     pub(crate) resume_verify: bool,
@@ -370,6 +373,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let (_, attention) = super::serve::resolve_attention_placement(devices.len(), args.attention_placement.as_str())?;
     let context_split = attention == cuteafd_loader::placement::AttentionPlacement::Context;
     let local_pages = if context_split { max_pages.div_ceil(2).max(16) } else { max_pages };
+    let draft_tp = if args.resume_dfly2 && args.tp2_dflash { 2 } else { 1 };
+    ensure!(
+        !args.tp2_dflash || (args.resume_dfly2 && devices.len() == 2),
+        "hy4f-golden --tp2-dflash requires --resume-dfly2 and --split-device"
+    );
     let mut engine = if !args.resume_at.is_empty() || args.verify_waves {
         let marks = if !args.resume_at.is_empty() {
             if args.resume_host { 2 } else { 4 }
@@ -394,6 +402,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             marks,
             args.skip_routed_experts,
             onboarded,
+            if draft_tp == 2 { 2 * 6 } else { 0 },
         )?
     } else {
         Hy4Engine::new(
@@ -416,10 +425,28 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
         let model = hy4_plan::Model::open(&checkpoint)?;
         let config = Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?.context("no bundled DFly2")?;
-        let layout = draft::Admission::new_with_context(&checkpoint, &cfg, &config, &model.core, args.kv_cache,
-            2, decode_rows, context_split)?;
-        let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint,
-            &cfg, config, layout, args.kv_cache, 2, decode_rows))?;
+        let layout = draft::Admission::new_tp_with_context(
+            &checkpoint,
+            &cfg,
+            &config,
+            &model.core,
+            args.kv_cache,
+            2,
+            decode_rows,
+            draft_tp,
+            context_split,
+        )?;
+        let drafter = super::draft::Drafter::new(
+            &devices[..draft_tp],
+            &programs,
+            &checkpoint,
+            &cfg,
+            config,
+            layout,
+            args.kv_cache,
+            2,
+            decode_rows,
+        )?;
         engine.attach_drafter(drafter)?;
     }
     if args.resume_verify { engine.allocate_verify_keys()?; }
@@ -1003,7 +1030,7 @@ fn run_resume_check(
             ensure!(!candidates.is_empty(), "DFly2 fresh request produced no proposals");
             ensure!(engine.draft_propose(&p_b, tokens[at], 5)?.is_empty(),
                 "DFly2 restored request proposed from stale taps");
-            println!("hy4f-golden DFly2 resume={at}: restored request skips one proposal; fresh draft_us={draft_us} proposed={}", candidates.len());
+            println!("hy4f-golden DFly2 resume={at}: restored request skips one proposal; fresh draft_us={draft_us} proposed={} ids={candidates:?}", candidates.len());
         }
 
         // 4) 1-token-at-a-time decode continuation comparison: A (straight) vs B (restored).
@@ -1057,7 +1084,7 @@ fn run_resume_check(
                     if at + 1 <= 2048 {
                         ensure!(matches, "DFly2 batched proposals differ from singleton: {together:?} vs {separate:?}");
                     }
-                    println!("hy4f-golden DFly2 batch at {at}: proposal ids match={matches}");
+                    println!("hy4f-golden DFly2 batch at {at}: proposal ids match={matches} together={together:?} separate={separate:?}");
                 }
             }
             if step == 0 || (dfly2 && step <= 2) {

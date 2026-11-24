@@ -425,19 +425,103 @@ impl Hy4Inputs {
         let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
         if let Some(draft) = &self.draft {
-            out.extend(buffer(format!("hy4_flash/dfly2/verify-keys/gpu{gpu}"), location,
-                draft.verify_bytes as u64, Lifetime::TARGET, Category::Workspace, "DFly2 provisional index keys", maximum));
-            if gpu == 0 {
-                out.extend(weight_arena_components(&draft.weights.arena, location, Lifetime::RESIDENT,
-                    maximum, MemoryKind::DrafterWeights)?);
-                out.extend(buffer(draft.workspace.id(), location, draft.workspace.bytes() as u64,
-                    Lifetime::TARGET, Category::Drafter, "DFly2 proposal workspace", maximum));
-                out.extend(buffer("hy4_flash/dfly2/trellis", location, draft.trellis_bytes as u64,
-                    Lifetime::TARGET, Category::Drafter, "DFly2 serialized K8 projection", maximum));
-                for (i, &bytes) in draft.conversion_requests.iter().enumerate() {
-                    out.extend(buffer(format!("hy4_flash/dfly2/kv-b-mount/{i}"), location, bytes,
-                        Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
-                        "DFly2 absorbed KV-B conversion", maximum));
+            let verify_id = format!("hy4_flash/dfly2/verify-keys/gpu{gpu}");
+            let verify_bytes = draft.verify_bytes as u64;
+            out.extend(buffer(
+                verify_id.clone(),
+                location,
+                verify_bytes,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "DFly2 provisional index keys",
+                maximum,
+            ));
+            if verify_bytes > 0 {
+                out.extend(exact_owner_tail(
+                    format!("{verify_id}.tail"),
+                    verify_id,
+                    location,
+                    Lifetime::TARGET,
+                    vec![verify_bytes],
+                    maximum,
+                )?);
+            }
+            if let Some(local) = draft.rank(gpu) {
+                out.extend(weight_arena_components(
+                    &local.weights.arena,
+                    location,
+                    Lifetime::RESIDENT,
+                    maximum,
+                    MemoryKind::DrafterWeights,
+                )?);
+                let ws_id = local.workspace.id().to_owned();
+                let ws_bytes = local.workspace.bytes() as u64;
+                out.extend(buffer(
+                    ws_id.clone(),
+                    location,
+                    ws_bytes,
+                    Lifetime::TARGET,
+                    Category::Drafter,
+                    "DFly2 proposal workspace",
+                    maximum,
+                ));
+                if ws_bytes > 0 {
+                    out.extend(exact_owner_tail(
+                        format!("{ws_id}.tail"),
+                        ws_id,
+                        location,
+                        Lifetime::TARGET,
+                        vec![ws_bytes],
+                        maximum,
+                    )?);
+                }
+                let trellis_id = crate::families::hy4_flash::draft::trellis_id(gpu, draft.tp);
+                let trellis_bytes = local.trellis_bytes as u64;
+                out.extend(buffer(
+                    trellis_id.clone(),
+                    location,
+                    trellis_bytes,
+                    Lifetime::TARGET,
+                    Category::Drafter,
+                    "DFly2 serialized K8 projection",
+                    maximum,
+                ));
+                if trellis_bytes > 0 {
+                    out.extend(exact_owner_tail(
+                        format!("{trellis_id}.tail"),
+                        trellis_id,
+                        location,
+                        Lifetime::TARGET,
+                        vec![trellis_bytes],
+                        maximum,
+                    )?);
+                }
+                let mount_life = Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad };
+                for (i, &bytes) in local.conversion_requests.iter().enumerate() {
+                    let mount_id = if draft.tp == 1 {
+                        format!("hy4_flash/dfly2/kv-b-mount/{i}")
+                    } else {
+                        format!("hy4_flash/dfly2/kv-b-mount/gpu{gpu}/{i}")
+                    };
+                    out.extend(buffer(
+                        mount_id.clone(),
+                        location,
+                        bytes,
+                        mount_life,
+                        Category::Staging,
+                        "DFly2 absorbed KV-B conversion",
+                        maximum,
+                    ));
+                    if bytes > 0 {
+                        out.extend(exact_owner_tail(
+                            format!("{mount_id}.tail"),
+                            mount_id,
+                            location,
+                            mount_life,
+                            vec![bytes],
+                            maximum,
+                        )?);
+                    }
                 }
             }
         }
@@ -634,7 +718,13 @@ impl Hy4Inputs {
             }
         }
         if self.gpus == 2 {
-            let sizes = hy4_peer_slot_sizes(cfg, capacity_rows);
+            let peer_rows = capacity_rows.max(
+                self.draft
+                    .as_ref()
+                    .filter(|d| d.tp == 2)
+                    .map_or(0, |d| d.draft_rows()),
+            );
+            let sizes = hy4_peer_slot_sizes(cfg, peer_rows);
             let peer = crate::serving_capacity::PeerStorageLayout::new(
                 sizes.len(),
                 sizes[1],

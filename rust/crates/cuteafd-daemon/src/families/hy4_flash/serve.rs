@@ -85,6 +85,11 @@ pub(crate) struct ServeArgs {
     /// Run bundled DFly2; auto enables it for Spark-free serving when present.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub dfly2: Option<bool>,
+    /// Split DFly2 attention heads and MLP neurons across both RTX GPUs (default on 2x RTX with DFly2).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
+    #[arg(skip)]
+    pub tp2_dflash_explicit: bool,
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
@@ -211,7 +216,13 @@ fn publish_provenance(
         args.peers.len(),
     );
     let graph_policies: Vec<_> = (0..runtime.gpus.len())
-        .map(|gpu| cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu))
+        .map(|gpu| {
+            cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy_for(
+                graph_layout,
+                gpu,
+                args.dfly2 == Some(true) && args.tp2_dflash,
+            )
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
         "memory_reconciliation_provenance": {
@@ -258,7 +269,7 @@ fn reconcile_runtime_inventory(
     let mut draft_backings = 0usize;
     for receipt in weight_receipts.iter().filter(|r| r.allocation.view.is_none()) {
         let actual = &receipt.allocation;
-        let drafter = actual.id == cuteafd_loader::families::hy4_flash::draft::ARENA_ID;
+        let drafter = actual.id.starts_with("hy4_flash/dfly2/gpu");
         if drafter || actual.id.starts_with("hy4_flash/target/gpu") {
             let planned = plan
                 .facts
@@ -282,7 +293,11 @@ fn reconcile_runtime_inventory(
         inputs.gpus
     );
 
-    ensure!(draft_backings == usize::from(inputs.draft.is_some()), "Hy4-flash drafter arena backing count differs");
+    let expected_draft_backings = inputs.draft.as_ref().map_or(0, |d| d.tp);
+    ensure!(
+        draft_backings == expected_draft_backings,
+        "Hy4-flash drafter arena backing count {draft_backings} != {expected_draft_backings}"
+    );
 
     // 2. Retained device backings: cache, packed rank scratch, packed wave scratches, head workspace, native scratch.
     let contract = inputs.prepare(&plan.request)?;
@@ -295,7 +310,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.peer.")
             || id.starts_with("hy4_flash.context_exchange.")
             || id.starts_with("expert-usage.gpu")
-            || (id.starts_with("hy4_flash/dfly2/") && id != cuteafd_loader::families::hy4_flash::draft::ARENA_ID)
+            || (id.starts_with("hy4_flash/dfly2/") && !id.starts_with("hy4_flash/dfly2/gpu"))
     };
     let planned: BTreeMap<&str, &cuteafd_loader::placement::planner::Allocation> = plan
         .facts
@@ -398,6 +413,13 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         args.dfly2 = Some(cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(&view.config()?));
         args.attention.selected_view = Some(view);
     }
+    if !args.tp2_dflash_explicit {
+        args.tp2_dflash = args.dfly2 == Some(true) && gpus == 2;
+    }
+    ensure!(
+        !args.tp2_dflash || (args.dfly2 == Some(true) && gpus == 2),
+        "Hy4-flash --tp2-dflash requires --dfly2 and --split-device"
+    );
     let decode_rows = args.resolved_decode_rows(gpus)?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
@@ -405,6 +427,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         .value("decode-rows", decode_rows)
         .value("dfly2", args.dfly2 == Some(true))
         .value("attention-placement", resolved_attention)
+        .value("tp2-dflash", if args.tp2_dflash { "on" } else { "off" })
         .publish();
 
     let encoding = ModelEncoding::Hy4Flash(Arc::new(Hy4Encoding::from_snapshot(&args.snapshot)?));
@@ -532,6 +555,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 cfg: &cfg,
                 model_core: &model.core,
                 dfly2: worker_args.dfly2 == Some(true),
+                tp2_dflash: worker_args.tp2_dflash,
                 kv_format: worker_args.kv_format,
                 manifest_path: Some(&worker_args.manifest),
                 coordinator: Coordinator::Measured { samples, loaded_code },
@@ -706,6 +730,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 }
             };
 
+            let draft_peer_rows = inputs
+                .draft
+                .as_ref()
+                .filter(|d| d.tp == 2)
+                .map_or(0, |d| d.draft_rows());
             let mut engine = Hy4Engine::new_serving(
                 &devices,
                 &programs,
@@ -724,16 +753,26 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 mark_slots,
                 false,
                 onboarded,
+                draft_peer_rows,
             )?;
             let drafts = if let Some(layout) = inputs.draft.clone() {
                 let config = cuteafd_loader::families::hy4_flash::Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?
                     .context("admitted DFly2 config is missing")?;
                 let depth = config.num_speculative_tokens;
-                let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint, &cfg, config,
-                    layout, worker_args.kv_format, worker_args.max_sequences,
-                    decode_rows))?;
-                let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
-                crate::shared::draft::report::publish(dfly2_report(&physical, &admitted.solved)?);
+                let draft_tp = layout.tp;
+                let drafter = super::draft::Drafter::new(
+                    &devices[..draft_tp],
+                    &programs,
+                    &checkpoint,
+                    &cfg,
+                    config,
+                    layout,
+                    worker_args.kv_format,
+                    worker_args.max_sequences,
+                    decode_rows,
+                )?;
+                let draft_devices = drafter.owner_devices();
+                crate::shared::draft::report::publish(dfly2_report(&draft_devices, &admitted.solved)?);
                 engine.attach_drafter(drafter)?;
                 scheduler::Drafts::Neural { depth }
             } else { scheduler::Drafts::None };
@@ -917,6 +956,7 @@ mod tests {
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("decode-rows", decode_rows)
                 .value("dfly2", args.dfly2 == Some(true))
+                .value("tp2-dflash", if args.tp2_dflash { "on" } else { "off" })
                 .value("max-context-tokens", 262144)
                 .value("pool-tokens", 262144)
                 .value("rtx-expert-layers", 41)
@@ -1313,13 +1353,32 @@ mod tests {
         super::reconcile_runtime_inventory(&admitted_ctx.solved, &inputs_ctx, &w_ctx, &r_ctx)?;
         Ok(())
     }
+
+    #[test]
+    fn hy4f_tp2_dflash_defaults_on_for_dual_rtx_dfly2_and_honors_explicit_false() -> anyhow::Result<()> {
+        use clap::{CommandFactory, FromArgMatches};
+        for (argv, expected) in [
+            (vec!["cuteafd", "serve-hy4f", "--snapshot", "/s", "--native-lib", "/l", "--dfly2", "--split-device", "1"], true),
+            (vec!["cuteafd", "serve-hy4f", "--snapshot", "/s", "--native-lib", "/l", "--dfly2", "--split-device", "1", "--tp2-dflash", "false"], false),
+            (vec!["cuteafd", "serve-hy4f", "--snapshot", "/s", "--native-lib", "/l", "--dfly2"], false),
+            (vec!["cuteafd", "serve-hy4f", "--snapshot", "/s", "--native-lib", "/l", "--split-device", "1"], false),
+        ] {
+            let matches = crate::cli::Cli::command().try_get_matches_from(&argv)?;
+            let mut cli = crate::cli::Cli::from_arg_matches(&matches)?;
+            crate::cli::resolve_tp2_dflash(&mut cli.command, &matches)?;
+            let crate::cli::Commands::ServeHy4f(args) = cli.command else { panic!("expected ServeHy4f") };
+            assert_eq!(args.tp2_dflash, expected, "{argv:?}");
+        }
+        Ok(())
+    }
 }
 
-fn dfly2_report(devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+fn dfly2_report(draft_devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
     -> Result<crate::shared::draft::report::DrafterLayout> {
     use crate::shared::draft::report::{self, Kind, Placement};
-    // Even with split target heads, the bundled DFly2 runs wholly on the lead.
-    report::admitted(Kind::Dfly2, Placement::Whole, 0, devices, plan)
+    // Bound to the actual DraftRank owner devices, never to the target's GPU count.
+    let placement = if draft_devices.len() > 1 { Placement::Split } else { Placement::Whole };
+    report::admitted(Kind::Dfly2, placement, 0, draft_devices, plan)
 }
 
 #[cfg(test)]
@@ -1329,9 +1388,22 @@ fn dfly2_report_does_not_confuse_target_head_split_with_draft_split() -> Result<
     use cuteafd_loader::placement::AttentionPlacement;
     assert_eq!(resolve_attention_placement(2, "heads")?, ("heads", AttentionPlacement::Heads));
     assert_eq!(resolve_attention_placement(2, "auto")?, ("context", AttentionPlacement::Context));
-    let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 1024)]))?;
+    let layout = dfly2_report(&[5], &plan(vec![owner(0, 1024)]))?;
     assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Whole)));
     assert_eq!(layout.ranks, [Rank::CudaRank(5)]);
+    assert_eq!(layout.lead, Some(Rank::CudaRank(5)));
     assert_eq!(layout.arena_bytes, [1024]);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn dfly2_report_reports_split_for_two_draft_ranks() -> Result<()> {
+    use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
+    let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 2048), owner(1, 1536)]))?;
+    assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Split)));
+    assert_eq!(layout.ranks, [Rank::CudaRank(5), Rank::CudaRank(2)]);
+    assert_eq!(layout.lead, Some(Rank::CudaRank(5)));
+    assert_eq!(layout.arena_bytes, [2048, 1536]);
     Ok(())
 }

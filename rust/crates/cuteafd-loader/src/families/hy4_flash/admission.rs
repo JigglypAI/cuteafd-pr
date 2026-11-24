@@ -69,6 +69,7 @@ pub struct FactsRequest<'a> {
     pub model_core: &'a BTreeMap<String, CoreProjection>,
     pub kv_format: Hy4KvCache,
     pub dfly2: bool,
+    pub tp2_dflash: bool,
     pub manifest_path: Option<&'a Path>,
     pub coordinator: Coordinator,
     pub attention: AttentionPlacement,
@@ -505,7 +506,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     )
                     .bytes,
                 );
-                let gr = crate::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu)
+                let gr = crate::serving_capacity::hy4_graphs::reserve_policy_for(
+                    graph_layout,
+                    gpu,
+                    request.dfly2 && request.tp2_dflash,
+                )
                     .map_err(|error| {
                         refused(
                             format!("Hy4-flash graph reserve refused: {error}"),
@@ -526,7 +531,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             for (gpu, &(total, logical, free)) in samples.iter().enumerate() {
                 budgets.push(hy4_flash::measured_budget(gpu as u8, total, logical, free));
                 code.push(loaded_code[gpu]);
-                let gr = crate::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu)
+                let gr = crate::serving_capacity::hy4_graphs::reserve_policy_for(
+                    graph_layout,
+                    gpu,
+                    request.dfly2 && request.tp2_dflash,
+                )
                     .map_err(|error| {
                         refused(
                             format!("Hy4-flash graph reserve refused: {error}"),
@@ -573,6 +582,12 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         ))?;
 
     let context_split = modes.iter().any(|m| *m == LayerMode::ContextSplit);
+    if request.tp2_dflash && (!request.dfly2 || gpus != 2) {
+        return Err(refused(
+            "Hy4-flash TP2_DFLASH requires two coordinator GPUs and DFly2",
+            "Use two RTX GPUs with SPECULATOR=dfly2, or set TP2_DFLASH=off.",
+        ));
+    }
     let draft = request.dfly2.then(|| {
         use super::{draft, Hy4DflyConfig};
         let checkpoint = request.checkpoint;
@@ -580,8 +595,17 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         let source = checkpoint.view.as_ref().map(|view| {
             crate::plan::Checkpoint::open_view_for_role(view, "Hy4 DFly2", |name| name.starts_with(draft::PREFIX))
         }).transpose()?;
-        draft::Admission::new_with_context(source.as_ref().unwrap_or(checkpoint), cfg, &config, request.model_core,
-            request.kv_format, request.sequences as usize, request.decode_rows as usize, context_split)
+        draft::Admission::new_tp_with_context(
+            source.as_ref().unwrap_or(checkpoint),
+            cfg,
+            &config,
+            request.model_core,
+            request.kv_format,
+            request.sequences as usize,
+            request.decode_rows as usize,
+            if request.tp2_dflash { 2 } else { 1 },
+            context_split,
+        )
     }).transpose().map_err(|error| refused(
         format!("Hy4 DFly2 admission refused: {error:#}"),
         "Use a supported bundled Hy4 drafter or SPECULATOR=off.",

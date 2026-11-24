@@ -169,30 +169,41 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             for name, (width, outputs, dtype) in shapes.items()
         }
 
-    if group == "draft" and tp == 1:
+    if group == "draft":
         from b12x.integration.cuteafd import hy4_mla as mla
         from b12x.integration.cuteafd.context_split import compile_paged_staging_gather_aot
 
+        draft_inter = 9216 // tp
+        reduce_dtype = torch.bfloat16 if tp == 1 else torch.float32
         draft = {
-            "draft_gated_residual": lambda: p.compile_gated_residual_bf16_aot(width=3072),
-            "draft_silu": lambda: p.compile_post_silu_split_aot(width=9216, limit=1e30),
-            "draft_correction_silu": lambda: p.compile_post_silu_split_aot(width=3072, limit=1e30),
+            "draft_silu": lambda width=draft_inter: p.compile_post_silu_split_aot(width=width, limit=1e30),
+            "draft_proj_gate_up": lambda outputs=draft_inter: p.compile_bf16_projection_aot(
+                width=3072, outputs=outputs, output_dtype=torch.bfloat16
+            ),
+            "draft_proj_down": lambda width=draft_inter, dtype=reduce_dtype: p.compile_bf16_projection_aot(
+                width=width, outputs=3072, output_dtype=dtype
+            ),
         }
         for kv in ("bf16", "fp8"):
-            g = mla.Hy4MlaGeometry(kv_cache=kv)
-            draft[f"draft_gather_{kv}"] = lambda g=g: compile_paged_staging_gather_aot(
-                row_bytes=g.record_bytes, page_rows=1)
+            g = mla.Hy4MlaGeometry(heads=dsa_heads, kv_cache=kv)
             draft[f"draft_attention_{kv}"] = lambda g=g: mla.compile_hy4_mla_attention_aot(
-                g, max_rows=6 * 64, max_context=2048 + 6, mode="decode", page_size=1)
-        for name, width, outputs in (
-            ("gate_up", 3072, 9216), ("down", 9216, 3072),
-            ("join", 6144, 3072), ("correction_down", 3072, 3072),
-        ):
-            draft[f"draft_proj_{name}"] = lambda width=width, outputs=outputs: p.compile_bf16_projection_aot(
-                width=width, outputs=outputs)
+                g, max_rows=6 * 64, max_context=2048 + 6, mode="decode", page_size=1
+            )
+            if tp == 1:
+                draft[f"draft_gather_{kv}"] = lambda g=g: compile_paged_staging_gather_aot(
+                    row_bytes=g.record_bytes, page_rows=1
+                )
+        if tp == 1:
+            draft["draft_gated_residual"] = lambda: p.compile_gated_residual_bf16_aot(width=3072)
+            draft["draft_correction_silu"] = lambda: p.compile_post_silu_split_aot(width=3072, limit=1e30)
+            for name, width, outputs in (
+                ("join", 6144, 3072),
+                ("correction_down", 3072, 3072),
+            ):
+                draft[f"draft_proj_{name}"] = lambda width=width, outputs=outputs: p.compile_bf16_projection_aot(
+                    width=width, outputs=outputs
+                )
         return draft
-    if group == "draft":
-        return {}  # TP2 shares the rank-0 TP1 drafter and sharded target head.
 
     raise ValueError(f"unknown Hy4-flash export group: {group}")
 
