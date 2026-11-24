@@ -438,6 +438,7 @@ async fn run() -> Result<()> {
                             Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)))
                             .map(|id| id.to_string()).collect();
                     }
+                    if cli.audio.is_some() { args.explicit_settings.insert("audio".into()); }
                 }
                 (cli.command, matches, cli.memory, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
