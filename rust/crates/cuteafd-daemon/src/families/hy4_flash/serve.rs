@@ -1326,7 +1326,9 @@ fn dfly2_report(devices: &[i32], plan: &cuteafd_loader::placement::planner::Reso
 #[test]
 fn dfly2_report_does_not_confuse_target_head_split_with_draft_split() -> Result<()> {
     use crate::shared::draft::report::{Kind, Placement, Rank, tests::{owner, plan}};
-    assert_eq!(resolve_attention_placement(2, "heads")?, "heads");
+    use cuteafd_loader::placement::AttentionPlacement;
+    assert_eq!(resolve_attention_placement(2, "heads")?, ("heads", AttentionPlacement::Heads));
+    assert_eq!(resolve_attention_placement(2, "auto")?, ("context", AttentionPlacement::Context));
     let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 1024)]))?;
     assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Whole)));
     assert_eq!(layout.ranks, [Rank::CudaRank(5)]);
