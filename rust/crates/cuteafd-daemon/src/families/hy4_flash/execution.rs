@@ -2557,7 +2557,7 @@ impl<'a> Hy4Engine<'a> {
                         r.stream.raw,
                     )
                 })
-            }
+            }?;
             if r.device.id == self.ranks[0].device.id {
                 if let Some(draft) = &self.draft {
                     r.device.run(|| {
