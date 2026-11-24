@@ -656,7 +656,6 @@ impl Recipe for MiniInputs {
 
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract {
-            floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,

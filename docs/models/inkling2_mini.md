@@ -39,7 +39,8 @@ encoding limits. See [memory policy](../options.md#memory-and-pools).
   `markov_rank=256`, target visit taps `[5, 23, 41, 48]`), own packed arena, history draft policy.
 - **Bundled vision tower:** 23-layer PE-Lang ViT (`1024` hidden, 16 heads, patch 20) + 2×2 merge
   projector (`proj_out=[2304, 4096]`), own packed arena, batched images and prefix-hash spans
-  through the shared media path (`VISION=auto|rtx|off`).
+  through the shared media path. `VISION=auto` admits the tower when the KV pool still meets
+  `KV_MIN_TOKENS`; explicit `VISION=off` leaves it unloaded.
 
 ## Authoritative Precision Contract (`f1940f40eb`)
 
