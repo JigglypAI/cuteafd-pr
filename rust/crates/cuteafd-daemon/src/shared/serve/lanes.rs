@@ -104,12 +104,15 @@ async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
 }
 
 /// Balance a drained request cohort across `lanes` (one or two) before
-/// admission. Preserve the first survivor migration and lane-zero tie break;
-/// one lane holds the whole cohort on lane zero. Call only after every lane
-/// releases its outstanding device and transport work.
-pub(crate) fn rebalance<T>(entries: &mut [T], lanes: u8, lane: impl Fn(&T) -> Option<usize>,
-    set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
-    let mut loads = [0usize; 2];
+/// admission. `reserved` counts members already pinned to each lane outside
+/// `entries` (queued prompts); they seed the loads, so balancing never moves a
+/// member into a lane they would push past its limit. Preserve the first
+/// survivor migration and lane-zero tie break; one lane holds the whole cohort
+/// on lane zero. Call only after every lane releases its outstanding device
+/// and transport work.
+pub(crate) fn rebalance<T>(entries: &mut [T], lanes: u8, reserved: [usize; 2],
+    lane: impl Fn(&T) -> Option<usize>, set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    let mut loads = reserved;
     for entry in entries.iter_mut() {
         let Some(mut index) = lane(entry) else { continue };
         if lanes < 2 && index != 0 { set_lane(entry, 0); index = 0; }
@@ -255,17 +258,17 @@ mod tests {
                 loads[1 - heavy] += 1;
             }
             let mut actual = original;
-            assert_eq!(rebalance(&mut actual, 2, |entry| *entry,
+            assert_eq!(rebalance(&mut actual, 2, [0; 2], |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, expected);
             let unchanged = actual.clone();
-            assert_eq!(rebalance(&mut actual, 2, |entry| *entry,
+            assert_eq!(rebalance(&mut actual, 2, [0; 2], |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, unchanged);
         }
         // One lane: every survivor moves to lane zero, nothing is balanced away.
         let mut cohort = vec![Some(1), None, Some(0), Some(1)];
-        assert_eq!(rebalance(&mut cohort, 1, |entry| *entry, |entry, index| *entry = Some(index)), [3, 0]);
+        assert_eq!(rebalance(&mut cohort, 1, [0; 2], |entry| *entry, |entry, index| *entry = Some(index)), [3, 0]);
         assert_eq!(cohort, [Some(0), None, Some(0), Some(0)]);
     }
 
