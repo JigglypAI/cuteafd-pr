@@ -266,6 +266,9 @@ pub(crate) enum Commands {
     /// Qualify a native coordinator-only Inkling target prefix.
     #[command(hide = true)]
     Inkling2Golden(crate::families::inkling2::golden::GoldenArgs),
+    /// Qualify Inkling 2 Mini TP1 forward, NLL/logits, width invariance and graph parity.
+    #[command(hide = true)]
+    Inkling2MiniGolden(crate::families::inkling2_mini::golden::GoldenArgs),
     /// Qualify Hy4-flash coordinator text forward, NLL/logits, Engram FP8/BF16, and unit exactness.
     #[command(hide = true)]
     Hy4fGolden(crate::families::hy4_flash::golden::GoldenArgs),
@@ -275,6 +278,9 @@ pub(crate) enum Commands {
     /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
     #[command(hide = true)]
     ServeInkling2(crate::families::inkling2::serve::ServeArgs),
+    /// Serve Inkling 2 Mini TP1 locally on one RTX through the shared scheduler.
+    #[command(hide = true)]
+    ServeInkling2Mini(crate::families::inkling2_mini::serve::ServeArgs),
     /// Qualify MiniMax whole-rank serving on the shared scheduler.
     #[command(hide = true)]
     ServeMinimax(crate::families::minimax_m3::serve::ServeArgs),

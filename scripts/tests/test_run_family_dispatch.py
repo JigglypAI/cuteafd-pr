@@ -6144,3 +6144,34 @@ def test_other_family_refuses_unimplemented_context_window(tmp_path):
         "first_k_dense_replace":3}, "test/glm", "DRAFT_CONTEXT_WINDOW=2048\n")
     assert result.returncode == 2
     assert "DRAFT_CONTEXT_WINDOW currently requires Kimi block DSpark" in result.stderr
+
+
+@pytest.mark.parametrize("extra,want_dspark,want_graphs", [
+    ("", True, "1"),
+    ("SPECULATOR=off\nDECODE_GRAPHS=off\n", False, "0"),
+])
+def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_graphs):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(
+        tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nVISION=off\nAUDIO=off\n" + extra,
+    )
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
+    assert "--kv-cache fp8" in serve
+    assert (f"CUTEAFD_INKLING2_MINI_GRAPHS={want_graphs}" in result.stderr)
+    if want_dspark:
+        assert "--dspark" in serve and "--dspark=false" not in serve
+        assert "--draft-kv-cache fp8" in serve
+    else:
+        assert "--dspark=false" in serve
+
+
+def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(
+        tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nATTENTION_PLACEMENT=layers\nVISION=off\nAUDIO=off\n",
+    )
+    assert result.returncode == 2
+    assert "inkling2_mini is TP1-only (heads)" in result.stderr

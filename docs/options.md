@@ -326,6 +326,18 @@ rings stay BF16, convolution/residual state stays F32, and prefix restores
 preserve captured state exactly. Report the admitted KV
 pool rather than assuming the default target fits these owners.
 
+### Inkling 2 Mini Serving
+
+Inkling 2 Mini (`inkling2_mini`, `inkling2_loop`) exposes `cuteafd serve --family inkling2_mini`
+(`serve-inkling2-mini`), `cuteafd golden --family inkling2_mini` (`inkling2-mini-golden`), and
+`./run.sh --config examples/configs/inkling2-mini-1x-rtx.config --wip SLOT` on **1× RTX (0 Sparks, TP1)**.
+All 24 physical routed-expert layers stay resident on GPU 0 (native NVFP4 W4A4 layers `0..20` +
+native MXFP8 W8A8 layers `20..24`), executed across 48 visits with 48 distinct KV + short-conv slots
+(8 global paged slots defaulting to FP8 + 40 SWA-1024 rings). `SPECULATOR=off|dspark` defaults to
+`dspark` (bundled 3-layer recurrent Markov drafter, `DRAFT_KV_CACHE=fp8|bf16`), `VISION=auto|rtx|off`
+admits the bundled 23-layer PE-Lang tower in its own arena, `AUDIO=off`, `DECODE_GRAPHS=on|off`
+controls `#2697` soft-cap per-visit exact-row CUDA graphs, and `PREFILL_PACKING=unrestricted`.
+
 ### Hy4-flash Serving
 
 Hy4-flash (`hy4_flash`, `hy_v4_flash`) exposes `cuteafd serve --family hy4_flash`
@@ -503,7 +515,7 @@ The `cuteafd` binary: `plan MODEL`, `serve` (family from `--snapshot` or
 before any kernel work; `cuteafd bench --url URL --profile NAME` runs a profile
 on a launched server. Family serve subcommands (`serve-native`, `serve-dsv4`,
 `serve-glm`, `serve-glmf`, `serve-mimo`, `serve-qwen4`, `serve-qwen35`,
-`serve-kimi`, `serve-step5`, `serve-muse`, `serve-inkling2`, `serve-hy4f`) take the flags the launcher maps the
+`serve-kimi`, `serve-step5`, `serve-muse`, `serve-inkling2`, `serve-inkling2-mini`, `serve-hy4f`) take the flags the launcher maps the
 keys below onto, and `cuteafd serve --family ID --help` lists a family's serve
 flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.

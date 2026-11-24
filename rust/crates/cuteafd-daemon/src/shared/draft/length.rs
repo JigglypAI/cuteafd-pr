@@ -102,6 +102,7 @@ mod tests {
             Commands::ServeMuse(a) => a.draft_length,
             Commands::ServeMinimax(a) => a.draft_length,
             Commands::ServeInkling2(a) => a.draft_length,
+            Commands::ServeInkling2Mini(a) => a.draft_length,
             Commands::ServeQwen4(a) => a.draft_length,
             Commands::ServeQwen35(a) => a.draft_length,
             Commands::ServeStep5(a) => a.draft_length,
@@ -171,6 +172,7 @@ mod tests {
     #[test] fn muse() { contract("serve-muse", 7); }
     #[test] fn minimax() { contract("serve-minimax", 7); }
     #[test] fn inkling() { contract("serve-inkling2", 8); }
+    #[test] fn inkling_mini() { contract("serve-inkling2-mini", 8); }
     #[test] fn mimo() { contract("serve-mimo", 7); contract("serve-mimo", 3); }
     #[test] fn qwen35() { contract("serve-qwen35", 7); contract("serve-qwen35", 3); }
     #[test] fn qwen4() { contract("serve-qwen4", 3); }

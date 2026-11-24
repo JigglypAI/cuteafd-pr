@@ -32,6 +32,7 @@ impl ChatTemplate {
         env.set_auto_escape_callback(|_| AutoEscape::None);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
+        env.add_filter("dictsort", dictsort);
         env.add_function("raise_exception", |message: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, message))
         });
@@ -169,6 +170,44 @@ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
         indent, item, key };
     let mut out = String::new();
     options.write(&mut out, &json, 0);
+    Ok(Value::from(out))
+}
+
+/// Jinja2 `dictsort(case_sensitive=False, by="key", reverse=False)` used by Inkling 2 Mini's
+/// official `chat_template.jinja` for deterministic tool-call argument rendering.
+fn dictsort(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
+    let case_sensitive: bool = kwargs.get::<Option<bool>>("case_sensitive")?.unwrap_or(false);
+    let by: String = kwargs.get::<Option<String>>("by")?.unwrap_or_else(|| "key".to_owned());
+    let reverse: bool = kwargs.get::<Option<bool>>("reverse")?.unwrap_or(false);
+    kwargs.assert_all_used()?;
+    let by_value = match by.as_str() {
+        "key" => false,
+        "value" => true,
+        other => {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("dictsort `by` must be 'key' or 'value', got {other:?}"),
+            ));
+        }
+    };
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    for key in value.try_iter()? {
+        let item = value.get_item(&key)?;
+        pairs.push((key, item));
+    }
+    let sort_key = |v: &Value| -> String {
+        let s = v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string());
+        if case_sensitive { s } else { s.to_lowercase() }
+    };
+    pairs.sort_by(|a, b| {
+        let ord = if by_value {
+            sort_key(&a.1).cmp(&sort_key(&b.1))
+        } else {
+            sort_key(&a.0).cmp(&sort_key(&b.0))
+        };
+        if reverse { ord.reverse() } else { ord }
+    });
+    let out: Vec<Value> = pairs.into_iter().map(|(k, v)| Value::from(vec![k, v])).collect();
     Ok(Value::from(out))
 }
 

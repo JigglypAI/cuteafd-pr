@@ -486,7 +486,7 @@ impl Family for Inkling2Mini {
     }
 
     fn runtime(&self) -> RuntimeStatus {
-        RuntimeStatus::Planned
+        RuntimeStatus::Serving
     }
 
     fn detect(&self, checkpoint: &Checkpoint) -> bool {

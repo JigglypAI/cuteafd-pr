@@ -109,16 +109,17 @@ fn mini_plan_detects_classifies_and_accepts_every_tensor() {
     let input = PlanInput::open(dir.path()).unwrap();
     let mut opts = PlanOptions::default();
     opts.placement = ExpertPlacement::Local;
+    opts.vision = crate::plan::MediaMode::Off;
     opts.layout = Some(crate::plan::layout::LayoutOptions::default());
     let report = input.plan(&opts).unwrap();
     assert_eq!(report.family.as_deref(), Some("inkling2_mini"));
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.config_error.is_none(), "{:?}", report.config_error);
     assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);
     for comp in &report.components {
         assert_eq!(comp.rejected, 0, "{:?}: {:?}", comp.component, comp.rejections);
     }
     let layout = report.memory_layout.as_ref().expect("TP1 memory layout");
-    assert_eq!(layout.devices.len(), 1);
+    assert_eq!(layout.devices.len(), 1, "hints={:?} notes={:?}", report.hints, layout.notes);
     assert!(layout.pool_tokens >= 262_144, "pool_tokens={}", layout.pool_tokens);
 }

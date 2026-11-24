@@ -13,4 +13,5 @@ pub(crate) mod step5;
 pub(crate) mod muse_spark;
 pub(crate) mod minimax_m3;
 pub(crate) mod inkling2;
+pub(crate) mod inkling2_mini;
 pub(crate) mod hy4_flash;

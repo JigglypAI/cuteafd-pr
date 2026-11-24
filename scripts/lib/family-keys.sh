@@ -137,7 +137,7 @@ EOF
   # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract
   # and Spark workers, no media or family modes yet; Step-5 takes an opt-in
   # MTP depth, Muse a DFlash2 drafter and its partial-reply format.
-  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark || "$1" == minimax_m3 || "$1" == inkling2 || "$1" == hy4_flash ]]; then
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark || "$1" == minimax_m3 || "$1" == inkling2 || "$1" == inkling2_mini || "$1" == hy4_flash ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -179,10 +179,11 @@ EOF
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATION_TRACE DECODE_GRAPHS GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
     [[ "$1" != muse_spark ]] || printf '%s\n' TP2_DFLASH KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATION_TRACE DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING EXPERT_PARTIAL_BF16_MAX_ROWS
     [[ "$1" != muse_spark ]] || printf '%s\n' VISION_REPLICAS MEDIA_CACHE_BYTES DECODE_GRAPHS GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
-    [[ "$1" != minimax_m3 && "$1" != inkling2 && "$1" != hy4_flash ]] || printf '%s\n' PREFIX_CACHE_MARK_MIB
+    [[ "$1" != minimax_m3 && "$1" != inkling2 && "$1" != inkling2_mini && "$1" != hy4_flash ]] || printf '%s\n' PREFIX_CACHE_MARK_MIB
     [[ "$1" != minimax_m3 ]] || printf '%s\n' RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE SPECULATION_TRACE
-    [[ "$1" != inkling2 && "$1" != step5 && "$1" != kimi_k3 && "$1" != minimax_m3 && "$1" != hy4_flash ]] || printf '%s\n' VISION_REPLICAS MEDIA_CACHE_BYTES
+    [[ "$1" != inkling2 && "$1" != inkling2_mini && "$1" != step5 && "$1" != kimi_k3 && "$1" != minimax_m3 && "$1" != hy4_flash ]] || printf '%s\n' VISION_REPLICAS MEDIA_CACHE_BYTES
     [[ "$1" != inkling2 ]] || printf '%s\n' DECODE_GRAPHS SPECULATION_TRACE DRAFT_POLICY DRAFT_KV_CACHE SPECULATOR_FP8 KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
+    [[ "$1" != inkling2_mini ]] || printf '%s\n' DECODE_GRAPHS SPECULATION_TRACE DRAFT_POLICY DRAFT_KV_CACHE KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
     [[ "$1" != hy4_flash ]] || printf '%s\n' TP2_DFLASH SPECULATION_TRACE KV_CACHE RTX_EXPERT_LAYERS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP GRAPH_TRACE
     _spark_slot_keys HOST LANE_A
     return
@@ -371,7 +372,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|muse_spark|minimax_m3|inkling2|hy4_flash|qwen4|deepseek_v4|deepseek_v41) echo units ;;
+    step5|kimi_k3|muse_spark|minimax_m3|inkling2|inkling2_mini|hy4_flash|qwen4|deepseek_v4|deepseek_v41) echo units ;;
     glm5|glm5_flash|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac

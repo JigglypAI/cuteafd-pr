@@ -29,6 +29,7 @@ NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "inkling2-nvfp4-min.config", "inkling2-exl3-min.config", "inkling2-exl3-max.config",
+                 "inkling2-mini-1x-rtx.config",
                  "hy4-flash-exl3-k4-mc-min.config", "hy4-flash-exl3-k4-mc-max.config",
                  "hy4-flash-exl3-k4-mc-k8-max.config", "hy4-flash-exl3-k4-mc-k6-max.config",
                  "hy4-flash-exl3-k4-mc-fp8-max.config", "hy4-flash-exl3-k4-mc-1rtx-1spark.config",
