@@ -1104,12 +1104,13 @@ fn installed_hy4_flash_vision_memory_on_0_spark_cards() {
             assert!(matches!(encoder.kind, EncoderKind::Rtx { .. }), "{view} {gpus}x: {encoder:?}");
             assert!(off >= rtx && off - rtx <= 400_000, "{view} {gpus}x: vision costs {} pool tokens", off - rtx);
             let auto_kind = auto_encoder.map(|e| e.kind);
-            // Shared auto rule: the tower starts only while the 2M KV target still holds.
-            assert_eq!(matches!(auto_kind, Some(EncoderKind::Rtx { .. })), rtx >= 2_097_152, "{view} {gpus}x auto {auto_kind:?}");
-            assert_eq!(auto, if rtx >= 2_097_152 { rtx } else { off });
+            // Shared auto rule (#2708): the tower starts unless KV would fall below KV_MIN,
+            // and every installed 0-Spark card keeps far more than that with it.
+            assert!(matches!(auto_kind, Some(EncoderKind::Rtx { .. })), "{view} {gpus}x auto {auto_kind:?}");
+            assert_eq!(auto, rtx, "{view} {gpus}x auto pool");
             rows.push(format!("| {view} | {gpus}x RTX + 0 | {:.3} | {:.3} | {off} | {rtx} | {} | {} |",
                 encoder.weights as f64 / (1u64 << 30) as f64, encoder.scratch as f64 / (1u64 << 30) as f64,
-                off - rtx, if matches!(auto_kind, Some(EncoderKind::Rtx { .. })) { "on (rtx)" } else { "off (KV < 2M target)" }));
+                off - rtx, if matches!(auto_kind, Some(EncoderKind::Rtx { .. })) { "on (rtx)" } else { "off" }));
         }
     }
     println!("| View | Card | Tower arena GiB | Scratch GiB | KV vision off | KV vision on | KV tokens lost | VISION=auto |");

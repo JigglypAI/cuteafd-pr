@@ -1352,6 +1352,10 @@ def test_hy4_flash_wip_scope_requires_mul1_routed_index(tmp_path, monkeypatch):
     assert scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
     assert scopes['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'hy4f:exl3-k45-mul1'
     assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'hy4f=2'
+    # The bundled ViT runs on the shared tower exports unless VISION=off.
+    assert scopes['CUTEAFD_WIP_VISION_ATTENTION_AOT'] == 'ON'
+    _, off = aot.config_scopes({'FAMILY': 'hy4_flash', 'MODEL_ID': mul1_model, 'SPARK_COUNT': '2', 'VISION': 'off'})
+    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in off
 
     mcg_model = 'test/Hy4-flash-EXL3-MCG-Invalid'
     seed_exl3_index(tmp_path, mcg_model, codebook='mcg')

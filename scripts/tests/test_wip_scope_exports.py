@@ -301,3 +301,18 @@ def test_inkling2_scope_exports_attention_and_shared_native_or_exl3_packages():
     assert exl3['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'inkling2:exl3-k45'
     assert exl3['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'inkling2:exl3-k45'
     assert exl3['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'inkling2=4'
+
+
+def test_vision_scope_matches_every_shared_tower_family():
+    """The WIP vision switch and the launch preflight cover every family the daemon builds a shared still tower for.
+
+    `TowerSpec::encoder_id` maps each `ImageFamily` to its launcher family; MiMo's ABI-1 tower needs no AOT export.
+    """
+    source = (ROOT / 'rust/crates/cuteafd-daemon/src/shared/vision.rs').read_text()
+    body = source[source.index('let family = match self.image_family() {'):]
+    body = body[:body.index('};')]
+    towers = set(re.findall(r'ImageFamily::\w+ => "(\w+)"', body)) - {'mimo_v2'}
+    assert towers and towers == aot.VISION_ATTENTION_FAMILIES
+    launcher = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    case = re.search(r'\n\s*([\w|]+)\) media_caps\+=\(vision\) ;;', launcher)
+    assert case and set(case.group(1).split('|')) == towers

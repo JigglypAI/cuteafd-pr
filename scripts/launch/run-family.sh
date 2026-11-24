@@ -2880,7 +2880,7 @@ media_capabilities() {
   media_caps=()
   if [[ "$wants_vision" == true ]]; then
     case "$checkpoint_family" in
-      qwen4|glm5_flash|muse_spark|mistral_large4|minimax_m3|kimi_k3|inkling2|step5) media_caps+=(vision) ;;
+      qwen4|glm5_flash|muse_spark|mistral_large4|minimax_m3|kimi_k3|inkling2|step5|hy4_flash) media_caps+=(vision) ;;
     esac
   fi
   if [[ "$wants_audio" == true ]]; then

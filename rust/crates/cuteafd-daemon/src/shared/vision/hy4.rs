@@ -158,6 +158,18 @@ pub(crate) mod tests {
         assert_ne!(spec.encoder_id("r", 120), spec.encoder_id("r", 121));
     }
 
+    /// Host-only (no CUDA): the native validator admits the real Hy4 spec.
+    #[test]
+    #[ignore = "requires VISION_SNAPSHOT and VISION_LIBRARY (no CUDA initialization)"]
+    fn hy4_native_validator_admits_the_real_tower() {
+        let snapshot = std::path::PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
+        let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let spec = TowerSpec::hy4_flash(&snapshot, MAX_MERGED_ROWS).unwrap();
+        let ledger = NativeVision::required(&library, &spec.native).unwrap();
+        assert_eq!(ledger.weights, spec.native.weight_bytes);
+        println!("hy4 tower ledger {ledger:?}");
+    }
+
     fn read_f32(path: &Path) -> Vec<f32> {
         std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
