@@ -3271,7 +3271,7 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     if args.replay_production {
-        // Capture speculative buckets even when this fixed-token diagnostic has no drafter.
+        // Attach exact-row decode graphs even when this fixed-token diagnostic has no drafter.
         args.engine.serving_graph_policy = Some((16, true));
     }
     // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.

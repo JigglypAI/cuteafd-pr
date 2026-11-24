@@ -3882,9 +3882,6 @@ impl<'a> GlmfEngine<'a> {
         self.post_pre_on(1, w1, w1.sum_ptr()?, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
     }
 
-    /// Rank 1's decode segment of layer `index` (see [`Self::decode_graphed`]): the previous
-    /// layer's FFN exchange and this layer's attention-site collapse (layer 0: rank 0's
-    /// streams), its attention half and FFN half.
     fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
@@ -5490,10 +5487,16 @@ mod wide_decode_tests {
 
 #[cfg(test)]
 mod graph_key_tests {
-    use super::{decode_strides, GraphKey, StepTables, MIN_PAGE_STRIDE};
+    use super::{decode_strides, glmf_table_pages, GraphKey, StepTables, MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
 
     fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
         StepTables { decode: true, long, pool_width, page_stride, pool_stride, spec: true, ..Default::default() }
+    }
+
+    /// A table row's (page, pool page) columns for `context` tokens.
+    fn table(context: usize) -> (usize, usize) {
+        let (pages, pools) = glmf_table_pages(context as u64);
+        (pages as usize, pools as usize)
     }
 
     #[test]
@@ -5532,7 +5535,6 @@ mod graph_key_tests {
         assert_eq!(decode_strides(units * UNIT_PAGES, units, pool, columns), (64, 16));
     }
 
-    /// A table row's (page, pool page) columns for `context` tokens.
     #[test]
     fn graph_keys_distinguish_live_rows_at_and_across_export_edges() {
         let tables = tables(true, 128, 512, 128);

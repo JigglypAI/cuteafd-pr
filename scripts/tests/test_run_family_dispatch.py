@@ -5875,14 +5875,12 @@ def test_spark_probe_is_bounded_by_selected_count_and_restart_stops_first(tmp_pa
         assert stop < probe_at
 @pytest.mark.parametrize("prewarm,donor,lag", [("on", "off", "0"), ("off", "on", "0"), ("off", "on", "16")])
 def test_graph_cache_experiment_flags_are_cli_only(tmp_path, prewarm, donor, lag):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
-              "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm",
+        f"GRAPH_PREWARM={prewarm}\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
     assert result.returncode == 0, result.stderr
     serve = shlex.split(next(line for line in result.stderr.splitlines()
-        if "serve-glmf" in line and "--snapshot" in line))
+        if "serve-glm" in line and "--snapshot" in line))
     assert ("--graph-no-prewarm" in serve) == (prewarm == "off")
     assert ("--graph-donor-always" in serve) == (donor == "on")
     assert "CUTEAFD_GRAPH_PREWARM" not in result.stderr
@@ -5918,14 +5916,12 @@ def test_inkling_graph_donors_default_to_qualified_lag(tmp_path, overrides, dona
     ("cold", "on", "must be a non-negative integer"),
 ])
 def test_graph_donor_cold_lag_refuses_invalid_launch(tmp_path, lag, donor, error):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
-              "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf",
-        f"RTX_GPUS=1\nGRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm",
+        f"GRAPH_DONOR_ALWAYS={donor}\nGRAPH_DONOR_COLD_LAG={lag}\n")
     assert result.returncode == 2, result.stderr
     assert error in result.stderr
-    assert "serve-glmf --snapshot" not in result.stderr
+    assert "serve-glm --snapshot" not in result.stderr
 
 
 @pytest.mark.parametrize("config,model,extra,command", [

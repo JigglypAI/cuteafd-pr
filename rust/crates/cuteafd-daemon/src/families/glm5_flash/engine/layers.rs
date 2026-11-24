@@ -251,20 +251,17 @@ impl Bindings<'_, '_, '_> {
         let w = self.work[rank];
         let layer = self.layer(rank, index);
         let rows = Scalar::I32(self.rows as i32);
-        let body = || {
-            if let Some(previous) = index.checked_sub(1).filter(|_| self.prepared.get() != Some(index)) {
-                if rank == 0 {
-                    let out = e.meet_ffn(w, previous, self.lane, e.weights.layers.len(), self.rows)?;
-                    e.post_pre_on(0, w, out, 1, layer, "attn", "input_norm", rows, self.cap())?;
-                    self.tap(previous)?;
-                } else { e.peer_post(previous, self.lane, w, self.rows, self.cap())?; }
-            } else if index == 0 && active { e.pre_on(rank, w, &w.streams[0], layer, rows)?; }
-            if !active { return Ok(()); }
-            e.attention(rank, w, index, layer, rows, self.cap(), self.tables[rank], None)?;
-            let attended = if layer.attention_share.split() { self.meet(rank, index)? } else { w.delta.buffer.ptr };
-            e.post_pre_on(rank, w, attended, 0, layer, "ffn", "post_norm", rows, self.cap())
-        };
-        body()
+        if let Some(previous) = index.checked_sub(1).filter(|_| self.prepared.get() != Some(index)) {
+            if rank == 0 {
+                let out = e.meet_ffn(w, previous, self.lane, e.weights.layers.len(), self.rows)?;
+                e.post_pre_on(0, w, out, 1, layer, "attn", "input_norm", rows, self.cap())?;
+                self.tap(previous)?;
+            } else { e.peer_post(previous, self.lane, w, self.rows, self.cap())?; }
+        } else if index == 0 && active { e.pre_on(rank, w, &w.streams[0], layer, rows)?; }
+        if !active { return Ok(()); }
+        e.attention(rank, w, index, layer, rows, self.cap(), self.tables[rank], None)?;
+        let attended = if layer.attention_share.split() { self.meet(rank, index)? } else { w.delta.buffer.ptr };
+        e.post_pre_on(rank, w, attended, 0, layer, "ffn", "post_norm", rows, self.cap())
     }
 
     fn meet(&self, rank: usize, layer: usize) -> Result<*mut c_void> {
@@ -312,13 +309,9 @@ impl Bindings<'_, '_, '_> {
         let e = self.engine;
         let w = self.work[0];
         let last = e.weights.layers.len() - 1;
-        let body = || {
-            let out = e.meet_ffn(w, last, self.lane, last + 1, self.rows)?;
-            e.mhc_post_at(w, out, 1, &Span { first: 0, rows: self.rows })?;
-            self.tap(last)?;
-            Ok(())
-        };
-        body()?;
+        let out = e.meet_ffn(w, last, self.lane, last + 1, self.rows)?;
+        e.mhc_post_at(w, out, 1, &Span { first: 0, rows: self.rows })?;
+        self.tap(last)?;
         e.replicate_terminal(w, self.work[1], 0, self.rows)?;
         self.completed_layer(last)?;
         if last + 1 == e.cfg.layers {
