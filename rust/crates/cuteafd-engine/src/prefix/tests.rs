@@ -2161,3 +2161,39 @@ fn a_dead_mark_falls_through_or_replays_by_rule() {
         cache.release(&fake, &admitted.placement.pages).unwrap();
     }
 }
+
+/// The frontier row a restore serves is the row the cold path computed, byte for byte.
+///
+/// `After` keeps the row that follows a snapshot so an exact-length hit is served without a
+/// forward. That row is a cache of the cold row, so the store must be lossless: a lossy store
+/// (bf16, or any narrowing) makes the restored row differ from the cold one at exactly the
+/// frontier position, which changes the sampled token silently. The KV is not the difference —
+/// the forward below re-checks every page row and ring row of the restored placement.
+#[test]
+fn a_restored_frontier_row_is_byte_identical_to_the_cold_row() {
+    let fake = Fake::new(8, 2, 4);
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 8);
+    // The head emits f32. These values are not representable in bf16, so a narrowing store loses
+    // bits exactly where a restore serves them: the row predicting the first generated token.
+    let cold: Vec<f32> = (0..8).map(|i| 0.1 + i as f32 * 0.037).collect();
+    let mut p = cache.admit_cold(&fake, prompt.len(), prompt.len(), |pages| Placement {
+        pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let _ = fake.forward(&mut p, &prompt).unwrap();
+    cache.capture(&fake, SnapshotKind::Prompt, &prompt, &p, After::from_logits(&cold, true)).unwrap();
+    cache.release(&fake, &p.pages).unwrap();
+    let admitted = cache.admit(&fake, &prompt, prompt.len(), false, |pages| Placement {
+        pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, prompt.len(), "the whole prompt is restored");
+    let after = admitted.after.expect("an exact hit brings its frontier row");
+    assert_eq!(after.greedy, Some(greedy(&cold)), "the same top-1");
+    let restored = after.logits.as_ref().expect("the row is kept");
+    let bits = |row: &[f32]| row.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(restored), bits(&cold),
+        "the restored frontier row must be the cold row byte for byte");
+    // The KV is exact: a forward re-checks every page row and every ring row of the restore.
+    let mut restored_placement = admitted.placement;
+    fake.forward(&mut restored_placement, &prompt).expect("the restored KV is byte-exact");
+    cache.release(&fake, &restored_placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+}
