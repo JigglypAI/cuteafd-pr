@@ -60,6 +60,9 @@ pub const MINIMAX_M3_MANIFEST_SHA256: &str = "6bb6ea8153f0484aa711ed932573092ea7
 pub const INKLING2_REVISION: &str = "a09a542737757710542b2460b5e1334ef6f79853";
 pub const INKLING2_CONFIG: &str = "inkling2-small-v1_20261113_own-text-mxfp8-f32";
 pub const INKLING2_MANIFEST_SHA256: &str = "68449d10abf27137a7ab805f74cf9f618303d6eaf33a5a1351a81f3a3d5af4ce";
+pub const INKLING2_MINI_REVISION: &str = "eabfaec64c7e96206ac1dffbbe51ad6deb73f635";
+pub const INKLING2_MINI_CONFIG: &str = "inkling2-mini-v1_20261124_own-text-native";
+pub const INKLING2_MINI_MANIFEST_SHA256: &str = "a7276a3e4f10653614bfe8b591acc3b32878d8f88ff1bdf5d9cf22f189ade449";
 pub const HY4_REVISION: &str = "0b1a914773c77072e768ee20ea2899806f554476";
 pub const HY4_CONFIG: &str = "hy4-flash-v1_20261118_own-text-bf16-f32";
 pub const HY4_MANIFEST_SHA256: &str = "9ffaf7dac6afa70d5360b1bc9c54c3ade21c3a26d1d234531fc53b9f44bbef87";
@@ -369,6 +372,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
             (INKLING2_REVISION, INKLING2_CONFIG) => Some(INKLING2_MANIFEST_SHA256),
+            (INKLING2_MINI_REVISION, INKLING2_MINI_CONFIG) => Some(INKLING2_MINI_MANIFEST_SHA256),
             (HY4_REVISION, HY4_CONFIG) => Some(HY4_MANIFEST_SHA256),
             (HY4_FULL_REVISION, HY4_FULL_CONFIG) => Some(HY4_FULL_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
@@ -542,7 +546,7 @@ fn inkling_reference_sources(provenance: &Value, manifest: &Value) -> bool {
         && hash(&helper["helper_harness_commit"], 40)
 }
 
-const INKLING2_MINI_ROOT: &str = "thinkingmachines/Inkling-2-Mini";
+pub(crate) const INKLING2_MINI_ROOT: &str = "thinkingmachines/Inkling-2-Mini";
 const INKLING2_MINI_ROOT_REVISION: &str = "7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6";
 
 fn inkling_mini_reference_sources(provenance: &Value, manifest: &Value) -> bool {
@@ -1417,6 +1421,7 @@ mod tests {
             (KIMI_K31_REVISION, KIMI_K31_CONFIG),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG),
+            (INKLING2_MINI_REVISION, INKLING2_MINI_CONFIG),
             (HY4_REVISION, HY4_CONFIG), (HY4_FULL_REVISION, HY4_FULL_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
@@ -1507,6 +1512,18 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 13557);
             assert_eq!(balance["prefill"]["generated_positions"], 12634);
+        }
+        if commit == INKLING2_MINI_REVISION && config == INKLING2_MINI_CONFIG {
+            assert_eq!(reference.checkpoint, INKLING2_MINI_ROOT);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], INKLING2_MINI_ROOT);
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.93, 0.05));
+            assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            assert_eq!(standard_windows(&reference, "decode", false).unwrap().len(), 64);
+            for (half, generated) in [("decode", 10618), ("prefill", 11061)] {
+                assert_eq!(standard_windows(&reference, half, true).unwrap().len(), 32);
+                assert_eq!(standard_balance(&reference)[half]["generated_positions"], generated);
+            }
         }
         if commit == INKLING2_REVISION && config == INKLING2_CONFIG {
             assert_eq!(reference.checkpoint, "thinkingmachines/Inkling-2-Small-MXFP8");
