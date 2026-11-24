@@ -8,7 +8,7 @@
 //! baseline (a planned forecast versus one measured sample) and in whether the
 //! image's code is already loaded.
 use super::{combine_tables_bytes, executor, intake, mark_bytes, ring_rows, rope_tables, spark_endpoint,
-    spark_reserve_bytes, step_tables, tp2_exchange_bytes, tp2_partial_bytes, LocalPackage, MediaAdmission,
+    spark_reserve_bytes_for_rows, step_tables, tp2_exchange_bytes, tp2_partial_bytes, LocalPackage, MediaAdmission,
     MediaOptions, MuseDrafter, LANES, MUSE_SPARK, PAGE_ROWS};
 use crate::families::muse_spark::{core::CoreInventory, weight_layout::{GlobalLayout, LayerLayout},
     MuseAttention, MuseSparkConfig};
@@ -164,6 +164,8 @@ pub struct ProductionInput<'a> {
     pub bf16_target_head: serving::BlasHead,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
+    /// Resolved per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: u32,
     /// Device mark slots from the shared prefix rule (the host tier holds retention).
     pub mark_slots: u64,
     /// The compiled context floor; `pool` carries the resolved extent.
@@ -323,7 +325,7 @@ fn scale_alias(id: String, backing: String, location: Location, lifetime: Lifeti
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, mark_slots,
+        let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, decode_rows, mark_slots,
             context, pool, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -373,8 +375,9 @@ impl<'a> ProductionInput<'a> {
             else { None };
         let combine = combine_tables_bytes(unit_rows) as u64 * prefill.waves;
         let rope = rope_tables(cfg, context).map_err(anyhow_refusal)?.allocation_bytes;
-        let (stored, trimmed) = crate::families::muse_spark::lane::head_planes(
-            global.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)
+        let decode_rows_usize = usize::try_from(decode_rows).map_err(|_| Refusal::Overflow("Muse decode rows"))?;
+        let (stored, trimmed) = crate::families::muse_spark::lane::head_planes_for_rows(
+            decode_rows_usize, global.stored_head_outputs(cfg.vocab_size), cfg.vocab_size)
             .map_err(anyhow_refusal)?;
 
         // Validate the same widest verify step the runtime seals.
@@ -389,7 +392,7 @@ impl<'a> ProductionInput<'a> {
         let mut components = crate::placement::planner::serving::ServingOwners {
             selector: crate::placement::planner::serving::SelectorOwners {
                 location: Location::coordinator(head_gpu),
-                capacity: crate::families::muse_spark::lane::HEAD_ROWS, vocab: cfg.vocab_size,
+                capacity: decode_rows_usize, vocab: cfg.vocab_size,
                 device_sampling: host.device_sampling },
             prefix: crate::placement::planner::serving::HostPrefixOwners {
                 quota_bytes: host_quotas.prefix_bytes, chunk_bytes: host_quotas.prefix_chunk },
@@ -548,7 +551,7 @@ impl<'a> ProductionInput<'a> {
             SparkBudgetInventory { rank_budgets: Vec::new(), layers: working.spark_layers.clone(), resident: vec![], overhead: vec![], budget: 0 }
         } else {
             SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings, spark_bytes,
-                spark_reserve_bytes(spark_ranks, prefill.waves, prefill.unit_rows).map_err(anyhow_refusal)?)
+                spark_reserve_bytes_for_rows(spark_ranks, prefill.waves, prefill.unit_rows, decode_rows).map_err(anyhow_refusal)?)
                 .map_err(anyhow_refusal)?
         };
         let mut peaks = vec![[0u64; 2]; cfg.layers + 1];
@@ -1057,7 +1060,7 @@ mod contract_tests {
                 host: HostInput { total: 256 << 30, available: 256 << 30, reserve: 0, prefix_bytes: Some(0),
                     prefix_entries: 0, media_bytes: None, device_sampling: true },
                 prefill: PrefillPlan { unit_rows: 64, waves: 1, span_rows: 64 }, bf16_target_head: serving::BlasHead::TensorLt,
-                slots: 1, mark_slots: 1, context: 64,
+                slots: 1, decode_rows: crate::plan::decode_rows::DEFAULT_DECODE_ROWS, mark_slots: 1, context: 64,
                 pool: crate::placement::prepare_pool(pool_facts(&cfg, &cards, 64, Some(64)))?,
                 partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_reply_formats: Default::default(), local: LocalPackage::Unknown,

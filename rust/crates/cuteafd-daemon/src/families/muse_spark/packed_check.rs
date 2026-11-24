@@ -80,8 +80,124 @@ fn qualify(mut args: GoldenArgs) -> Result<()> {
             &serde_json::json!([]), "meta-models/Muse-Spark-Open-816B-A42B", None)?;
         packed_check::reference::<_, DraftState>(backend.library(), &selected, placements, controls, limits, neural, &precision,
             |s| singleton(backend, s, cache.pool()),
-            |s, callback| packed_unit(backend, s, cache.pool(), callback))
+            |s, callback| packed_unit(backend, s, cache.pool(), callback))?;
+        let wide = backend.geometry().decode_rows;
+        if wide > cuteafd_loader::families::muse_spark::lane::HEAD_ROWS {
+            drop(cache);
+            drop(family);
+            let windows: Vec<&[u32]> = selected.iter().map(|w| w.tokens.as_slice()).collect();
+            check_wide_decode_rows(backend, &args.engine.prefix, slots, &windows, wide)?;
+        }
+        Ok(())
     })
+}
+
+/// Partition `total` verify rows across sequences of at most `SWA_RING_STEP` rows each.
+fn wide_verify_partition(total: usize) -> Vec<usize> {
+    let per_seq_cap = 32usize.min(cuteafd_loader::families::muse_spark::cache::SWA_RING_STEP as usize);
+    let seqs = total.div_ceil(per_seq_cap).max(2);
+    let base = total / seqs;
+    let extra = total % seqs;
+    (0..seqs).map(|i| base + usize::from(i < extra)).collect()
+}
+
+/// Qualify wide verify batches (`decode_rows > 64`): verify capture/replay/eager
+/// bit-identity at the full admitted `decode_rows` width and compare each
+/// sequence's rows against its single-sequence eager run.
+fn check_wide_decode_rows(
+    backend: &MuseBackend<'_, '_>,
+    prefix_args: &crate::shared::prefix::PrefixArgs,
+    slots: usize,
+    windows: &[&[u32]],
+    wide: usize,
+) -> Result<()> {
+    let counts = wide_verify_partition(wide);
+    ensure!(slots >= counts.len(), "Muse wide decode check needs {} slots (admitted {slots})", counts.len());
+    let prompt_base = 64usize;
+    let mut seq_inputs = Vec::with_capacity(counts.len());
+    for (i, &rows) in counts.iter().enumerate() {
+        let tokens = windows[i % windows.len()];
+        let prompt_len = prompt_base + i;
+        ensure!(tokens.len() >= prompt_len + rows,
+            "Muse reference window {} too short for wide decode check ({} < {})", i, tokens.len(), prompt_len + rows);
+        seq_inputs.push((&tokens[..prompt_len], &tokens[prompt_len..prompt_len + rows]));
+    }
+    let mut run_batch = |eager: bool| -> Result<Vec<f32>> {
+        clear_rings(backend)?;
+        let (family, mut cache) = backend.prefix_cache(prefix_args, slots)?;
+        let mut placements = Vec::with_capacity(seq_inputs.len());
+        for (slot, &(prompt, cont)) in seq_inputs.iter().enumerate() {
+            let total = prompt.len() + cont.len();
+            let mut placement = cache.admit_cold(&family, prompt.len(), total + 1,
+                |pages| Placement { pages, slot, ..Default::default() })?.placement;
+            backend.prefill_device(&mut placement, prompt, 1, cache.pool())?;
+            placements.push(placement);
+        }
+        backend.diagnostic_sync()?;
+        let mut batch: Vec<(&mut Placement, &[u32])> = placements.iter_mut()
+            .zip(seq_inputs.iter().map(|&(_, cont)| cont))
+            .collect();
+        let logits = if eager {
+            backend.verify_device_ungraphed(&mut batch, true,
+                crate::shared::qwen::scheduler::UngraphedKind::Decode, cache.pool())?
+        } else {
+            backend.verify_device(&mut batch, true, cache.pool())?
+        }.context("Muse wide decode check produced no logits")?;
+        if !eager && backend.diagnostic_graph_width().is_some() {
+            backend.diagnostic_require_graph_rows(wide)?;
+        }
+        logits.to_host(backend.library())
+    };
+    let mut outputs = Vec::new();
+    for eager in [false, false, true] {
+        outputs.push(run_batch(eager)?);
+    }
+    let bits: Vec<Vec<u32>> = outputs.iter().map(|v| v.iter().map(|x| x.to_bits()).collect()).collect();
+    ensure!(same_logit_bits(&bits[0], &bits[1]) && same_logit_bits(&bits[1], &bits[2]),
+        "Muse wide {wide}-row graph capture/replay/eager logits differ");
+    println!("Muse wide decode graph capture/replay/eager: {wide} rows ({counts:?}), every logit bit identical");
+    let vocab = backend.cfg.vocab_size;
+    let wide_logits = &outputs[2];
+    let mut offset = 0usize;
+    let mut top1_matches = 0usize;
+    let mut kl_sum = 0.0f64;
+    for &(prompt, cont) in &seq_inputs {
+        clear_rings(backend)?;
+        let (family, mut cache) = backend.prefix_cache(prefix_args, slots)?;
+        let mut placement = cache.admit_cold(&family, prompt.len(), prompt.len() + cont.len() + 1,
+            |pages| Placement { pages, slot: 0, ..Default::default() })?.placement;
+        backend.prefill_device(&mut placement, prompt, 1, cache.pool())?;
+        backend.diagnostic_sync()?;
+        let solo = backend.verify_device_ungraphed(&mut [(&mut placement, cont)], true,
+            crate::shared::qwen::scheduler::UngraphedKind::Decode, cache.pool())?
+            .context("Muse wide solo control produced no logits")?
+            .to_host(backend.library())?;
+        for r in 0..cont.len() {
+            let a = &solo[r * vocab..(r + 1) * vocab];
+            let b = &wide_logits[(offset + r) * vocab..(offset + r + 1) * vocab];
+            let argmax = |slice: &[f32]| slice.iter().enumerate()
+                .max_by(|(_, x), (_, y)| x.total_cmp(y)).map(|(idx, _)| idx).unwrap_or(0);
+            if argmax(a) == argmax(b) { top1_matches += 1; }
+            let max_a = a.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let max_b = b.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let log_za = a.iter().map(|&v| ((v as f64) - max_a).exp()).sum::<f64>().ln() + max_a;
+            let log_zb = b.iter().map(|&v| ((v as f64) - max_b).exp()).sum::<f64>().ln() + max_b;
+            let mut row_kl = 0.0f64;
+            for (&va, &vb) in a.iter().zip(b.iter()) {
+                let la = va as f64 - log_za;
+                let lb = vb as f64 - log_zb;
+                row_kl += la.exp() * (la - lb);
+            }
+            kl_sum += row_kl.max(0.0);
+        }
+        offset += cont.len();
+    }
+    let top1 = top1_matches as f64 / wide as f64;
+    let mean_kl = kl_sum / wide as f64;
+    println!("Muse wide {wide}-row vs solo-sequence eager: top1={top1:.6} ({top1_matches}/{wide}), mean_kl={mean_kl:.6}");
+    ensure!(top1 >= 0.99 && mean_kl <= 0.005,
+        "Muse wide {wide}-row verify batch drifted from solo eager: top1={top1:.6}, mean_kl={mean_kl:.6}");
+    Ok(())
 }
 
 fn singleton(backend: &MuseBackend<'_, '_>, s: &mut PrefillSeq<'_, Placement, DraftState>, pool: &RefPagePool)
@@ -253,7 +369,19 @@ fn same_logit_bits(live: &[u32], restored: &[u32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{graph_oracle_cases, same_logit_bits};
+    use super::{graph_oracle_cases, same_logit_bits, wide_verify_partition};
+
+    #[test]
+    fn wide_verify_partition_stays_within_swa_rollback_step() {
+        assert_eq!(wide_verify_partition(128), [32, 32, 32, 32]);
+        assert_eq!(wide_verify_partition(96), [32, 32, 32]);
+        assert_eq!(wide_verify_partition(65), [22, 22, 21]);
+        for total in [65, 80, 96, 128] {
+            let parts = wide_verify_partition(total);
+            assert_eq!(parts.iter().sum::<usize>(), total);
+            assert!(parts.iter().all(|&n| n >= 1 && n <= 64));
+        }
+    }
 
     #[test]
     fn graph_oracle_covers_decode_and_anchor_plus_draft_widths() {

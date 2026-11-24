@@ -199,9 +199,9 @@ impl Family for MuseSpark {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            crate::families::muse_spark::lane::MAX_DECODE_ROWS as u32,
             7,
-            "Muse Spark decode runtime currently caps verify rows at 64 (pending Muse port, #2184)",
+            "Muse Spark decode runtime caps verify rows at 128 (missing wider decode admission)",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

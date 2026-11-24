@@ -49,6 +49,7 @@ pub(crate) struct Options<'a> {
     pub spark_ranks: usize,
     pub prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
     pub slots: u64,
+    pub decode_rows: u32,
     /// Device mark slots from the shared prefix rule (`PrefixArgs::mark_rule`).
     pub mark_slots: u64,
     pub max_context: Option<u64>,
@@ -102,7 +103,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         catalog: options.catalog,
         budgets, host: options.host, prefill: options.prefill,
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
-        mark_slots: options.mark_slots, context, pool,
+        decode_rows: options.decode_rows, mark_slots: options.mark_slots, context, pool,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
     let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
@@ -112,7 +113,10 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context-tokens", admitted.solved.request.context.served(admitted.solved.pool_tokens)).publish();
+    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill)
+        .value("decode-rows", options.decode_rows)
+        .value("max-context-tokens", admitted.solved.request.context.served(admitted.solved.pool_tokens))
+        .publish();
     Ok(admitted)
 }
 
@@ -247,7 +251,7 @@ mod tests {
                 assert!(placement.items[0].iter().all(|item| item.group != "Muse head logits"), "head rank only");
                 let placement = report.solver_placement.clone().context("placed")?;
                 let folded_cutoff = Cutoff::with_formats(cutoff_rows, DEFAULT_BF16_MAX_ROWS, formats)?;
-                let plan = super::super::admission::spark_plan(&placement, prefill, folded_cutoff, 16, 6)?;
+                let plan = super::super::admission::spark_plan(&placement, prefill, folded_cutoff, 16, 6, 64)?;
                 assert_eq!(plan.working.spark_layers.len() + placement.onboard_layers, 62);
                 assert!(plan.working.spark_layers.iter().all(|layer| !plan.working.rtx_layers.contains(layer)));
                 let endpoint = plan.model.endpoints[0];
@@ -292,7 +296,7 @@ mod tests {
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
 
-                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
+                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16, decode_rows: 64,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes_with_format(&cfg, 1, target_kv), opts.mimo_prefix_mark_bytes, false),
                 max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
@@ -319,7 +323,7 @@ mod tests {
             }
             assert_eq!(live, planned, "{label}");
             // The Spark side: the planner's rings are the sealed endpoint's.
-            let spark = super::super::admission::spark_plan(&live, prefill, cutoff, 16, sparks)?;
+            let spark = super::super::admission::spark_plan(&live, prefill, cutoff, 16, sparks, 64)?;
             let layout = report.memory_layout.as_ref().context("layout")?;
             for device in layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
                 let rings = device.items.iter().find(|item| item.group == "rdma rings").context("rings")?.bytes;
@@ -382,7 +386,7 @@ mod tests {
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
 
-                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
+                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16, decode_rows: 64,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                 max_context: Some(opts.context_tokens),
@@ -430,7 +434,7 @@ mod tests {
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
 
-                    headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
+                    headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16, decode_rows: 64,
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                     max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
@@ -508,7 +512,7 @@ mod tests {
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
 
-            headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
+            headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16, decode_rows: 64,
             mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
             max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
@@ -577,5 +581,81 @@ mod tests {
     fn three_coordinators_refuse_before_any_device_query() {
         assert!(shared::executor(3).is_err());
         assert!(shared::executor(0).is_err());
+    }
+
+    #[test]
+    fn decode_rows_128_plan_equals_measured_startup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        let checkpoint = input.checkpoint();
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let (gpus, sparks, total) = (2usize, 6usize, cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+        let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
+        std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
+        let opts = LayoutOptions {
+            context_tokens: 786432,
+            host_memory: Some(cuteafd_loader::plan::testing::SimulatedHost {
+                host_ram: (256 << 30, 256 << 30), ..cuteafd_loader::plan::testing::SimulatedHost::raptor()
+            }.host_ram),
+            rtx_bytes: vec![total; gpus],
+            head_split: true,
+            host_cache_bytes: Some(0),
+            workspace_manifest: Some(path.clone()),
+            decode_rows: 128,
+            ..Default::default()
+        };
+        let report = input.plan(&PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(sparks),
+            decode_rows: Some(128),
+            layout: Some(opts.clone()),
+            ..Default::default()
+        })?;
+        assert!(report.fits, "{:?}", report.hints);
+        assert_eq!(report.decode_rows, 128);
+        let planned = report.solver_placement.clone().context("planned 128")?;
+        let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(
+            sparks,
+            cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
+            Default::default(),
+        )?;
+        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+        let live = admit(Options {
+            kv_cache: Default::default(),
+            host: shared::HostInput {
+                total: 256 << 30, available: 256 << 30, reserve: 8 << 30,
+                prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
+                media_bytes: opts.media_cache_bytes, device_sampling: true,
+            },
+            cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+            manifest: &preflight(&path, gpus)?,
+            projections: cuteafd_loader::families::muse_spark::weight_layout::projections(
+                &cfg, &core, gpus, prefill.unit_rows as usize)?,
+            measured: vec![Measured {
+                total_bytes: total, free_bytes: total - arch.context_bytes, untracked_bytes: arch.context_bytes,
+            }; gpus],
+            headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"),
+            spark_ranks: sparks, prefill, slots: 16, decode_rows: 128,
+            mark_slots: cuteafd_core::prefix::mark_slots_with_host(
+                16, opts.mimo_prefix_entries, shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
+            max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
+            spark_rank_bytes: cuteafd_loader::serving_capacity::spark_memory::serving_bytes(),
+            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows,
+            partial_reply_formats: opts.spark_reply_formats,
+            local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
+            drafter: None, media: None,
+        })?;
+        let live = without_sampled_baseline(live.placement, arch.context_bytes);
+        assert_eq!(live, planned);
+        let head_logits = live.items[1].iter().find(|item| item.group == "Muse head logits").unwrap().bytes;
+        let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes_for_rows(128, 202112, 202048)?;
+        assert_eq!(head_logits, (stored + trimmed) as u64);
+        let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::new(
+            opts.muse_partial_bf16_max_rows, cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)?;
+        let spark = super::super::admission::spark_plan(&live, prefill, cutoff, 16, sparks, 128)?;
+        assert_eq!(spark.model.executions.decode[0].capacity, 128);
+        assert_eq!(spark.model.executions.decode[0].compiled_capacity, 256);
+        Ok(())
     }
 }

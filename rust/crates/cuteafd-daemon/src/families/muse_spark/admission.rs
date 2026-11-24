@@ -20,7 +20,7 @@ pub(crate) struct SparkPlan {
 }
 
 pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cutoff, sequences: usize,
-    spark_ranks: usize) -> Result<SparkPlan> {
+    spark_ranks: usize, decode_rows: u32) -> Result<SparkPlan> {
     let geometry = ExpertGeometry::MUSE_SPARK;
     let layers_of = |home: fn(&ExpertHome) -> bool| placement.layers.iter().enumerate()
         .filter_map(|(layer, assignment)| home(&assignment.experts).then_some(layer)).collect::<Vec<_>>();
@@ -34,7 +34,7 @@ pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cu
     let (endpoint, rings) = shared::spark_endpoint(prefill, cutoff, sequences)?;
     let max_frame_bytes = endpoint.frame_bytes(geometry, rings).context("Muse Spark endpoint frame")?;
     let rings = cuteafd_core::SparkRings { max_frame_bytes, ..rings };
-    let executions = shared::spark_executions(prefill.waves, prefill.unit_rows)?;
+    let executions = shared::spark_executions_for_rows(prefill.waves, prefill.unit_rows, decode_rows)?;
     let model = ModelAdmission::new(vec![endpoint], rings, executions)?;
     model.validate(geometry)?;
     let working = SparkWorkingSet { rtx_layers, spark_layers, spark_ranks, prefill_lanes: shared::LANES };

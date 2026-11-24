@@ -24,7 +24,7 @@ use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
+use cuteafd_loader::families::muse_spark::MuseSparkConfig;
 use std::{cell::RefCell, ffi::c_void, path::Path};
 
 /// Pack image/audio features with row offsets across the same sequence order as tokens.
@@ -114,6 +114,7 @@ pub(crate) struct MuseBackend<'r, 'a> {
     pub(crate) packed_fallback_reason: String,
     waves: usize,
     slots: usize,
+    decode_rows: usize,
     context: usize,
     host_prefix_bytes: u64,
     pages: usize,
@@ -165,6 +166,9 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         ensure!(!ranks.is_empty() && streams.len() == ranks.len() && (ranks.len() == 1) == peer.is_none()
             && (local.is_empty() || local.len() == ranks.len()) && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
             "Muse backend geometry differs from its ranks, embedding or layers");
+        let decode_rows = ranks[0].decode_rows;
+        ensure!(decode_rows > 0 && ranks.iter().all(|rank| rank.decode_rows == decode_rows),
+            "Muse backend rank decode_rows differ");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
         let (packed_row_cap, packed_fallback_reason) = if packing == crate::shared::prefill_packing::PackingMode::Exact {
             let mut cap = unit_rows;
@@ -179,7 +183,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             (Some(0), reason)
         } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, decode_rows, context, host_prefix_bytes, pages, ring_rows,
             local: RefCell::new(local), draft })
     }
 
@@ -211,7 +215,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         self.graph_warming.set(true);
         let warmed = (|| -> Result<()> {
             for entry in cuteafd_loader::serving_capacity::muse_graphs::selected(layout, &bases) {
-                if entry.rows > self.unit_rows || entry.rows > HEAD_ROWS { continue; }
+                if entry.rows > self.unit_rows || entry.rows > self.decode_rows { continue; }
                 let tokens = vec![1; entry.rows];
                 let mut placement = Placement { slot: 0, pages: vec![0], len: 0, media: None };
                 // Initialize shape-specific lazy native state before observing graph growth.
@@ -292,7 +296,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         -> Result<DeviceLogits> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown(), || {
             let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum::<usize>();
-            ensure!((1..=HEAD_ROWS).contains(&rows), "Muse decode step of {rows} rows (at most {HEAD_ROWS})");
+            ensure!((1..=self.decode_rows).contains(&rows), "Muse decode step of {rows} rows (at most {})", self.decode_rows);
             let described = sequences.iter().map(|(placement, tokens)| StepSequence { slot: placement.slot,
                 start: placement.len, rows: tokens.len(), pages: &placement.pages }).collect::<Vec<_>>();
             let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?
@@ -332,7 +336,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "muse_spark", vocab_size: self.cfg.vocab_size, max_context: self.context,
-            slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: HEAD_ROWS }
+            slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: self.decode_rows }
     }
     /// Every Muse message opens with `<|start|>` (turn boundaries for prefix marks).
     fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }

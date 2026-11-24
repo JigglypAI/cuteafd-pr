@@ -1063,3 +1063,36 @@ fn kv_formats_price_exact_pool_ring_marks_and_lane_without_duplicate_scales() {
         }
     }
 }
+
+#[test]
+fn decode_rows_128_prices_wider_head_selector_and_spark_decode_owner() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    for (gpus, sparks) in [(1usize, 4), (2, 6)] {
+        let mut opt64 = with_package(gpus, sparks, package.path());
+        opt64.layout.as_mut().unwrap().concurrency = 16;
+        if gpus == 1 { opt64.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT; }
+        let mut opt128 = opt64.clone();
+        opt128.decode_rows = Some(128);
+        let r64 = input.plan(&opt64).unwrap();
+        let r128 = input.plan(&opt128).unwrap();
+        assert!(r64.fits && r128.fits, "{gpus}+{sparks}: {:?} / {:?}", r64.hints, r128.hints);
+        assert_eq!((r64.decode_rows, r128.decode_rows), (64, 128));
+        let p64 = r64.solver_placement.as_ref().unwrap();
+        let p128 = r128.solver_placement.as_ref().unwrap();
+        let head = gpus - 1;
+        let head_bytes = |p: &crate::placement::Placement| p.items[head].iter()
+            .find(|item| item.group == "Muse head logits").unwrap().bytes;
+        assert_eq!(head_bytes(p128), head_bytes(p64) * 2, "{gpus}+{sparks}: head logits double at 128");
+        let spark_owners = |r: &PlanReport| r.memory_layout.as_ref().unwrap().devices.iter()
+            .find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).unwrap()
+            .items.iter().filter(|i| i.group == "execution owners").map(|i| i.bytes).sum::<u64>();
+        assert!(spark_owners(&r128) > spark_owners(&r64), "{gpus}+{sparks}: Spark decode owner grows 80->256");
+        // Above 128 refuses.
+        let mut over = opt64.clone();
+        over.layout.as_mut().unwrap().concurrency = 32;
+        over.decode_rows = Some(256);
+        assert!(input.plan(&over).is_err());
+    }
+}
