@@ -29,6 +29,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
     Publication { root: "tencent/Hy4-flash", siblings: &["tencent/Hy4-flash"], revision: dataset::HY4_REVISION, config: dataset::HY4_CONFIG },
     Publication { root: "tencent/Hy4", siblings: &["tencent/Hy4", "tencent/Hy4-FP8"], revision: dataset::HY4_FULL_REVISION, config: dataset::HY4_FULL_CONFIG },
+    Publication { root: dataset::INKLING2_MINI_ROOT, siblings: &[dataset::INKLING2_MINI_ROOT], revision: dataset::INKLING2_MINI_REVISION, config: dataset::INKLING2_MINI_CONFIG },
     Publication { root: "thinkingmachines/Inkling-2-Small-MXFP8", siblings: &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"], revision: dataset::INKLING2_REVISION, config: dataset::INKLING2_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
     Publication { root: "mistralai/Mistral-Large-4-1T-A52B", siblings: &["mistralai/Mistral-Large-4-1T-A52B"], revision: dataset::MISTRAL_LARGE4_REVISION, config: dataset::MISTRAL_LARGE4_CONFIG },
@@ -54,6 +55,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
     ("tencent/Hy4-flash", &["tencent/Hy4-flash"]),
     ("tencent/Hy4", &["tencent/Hy4", "tencent/Hy4-FP8"]),
+    (dataset::INKLING2_MINI_ROOT, &[dataset::INKLING2_MINI_ROOT]),
     ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
 
@@ -446,6 +448,15 @@ mod tests {
         }
         assert!(official_root("tencent/Hy4-unverified").is_none());
         assert!(resolve_in("someone/Hy4-unverified", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn inkling2_mini_resolves_to_its_own_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dataset::INKLING2_MINI_ROOT;
+        let reference = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+            (root, dataset::INKLING2_MINI_REVISION, dataset::INKLING2_MINI_CONFIG));
     }
 
     #[test]

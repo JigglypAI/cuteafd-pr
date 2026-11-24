@@ -297,7 +297,7 @@ class APIClient(TextGenerator):
         request = copy.deepcopy(body)
         request["model"] = self.model
         request.update(self.extra_body)
-        explicit_inkling_effort = (self.family == "inkling2"
+        explicit_inkling_effort = (self.family in ("inkling2", "inkling2_mini")
             and (request.get("reasoning") or {}).get("effort") is not None)
         if explicit_inkling_effort:
             request.pop("reasoning_effort", None)

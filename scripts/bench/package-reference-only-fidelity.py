@@ -292,6 +292,11 @@ def hy4_full_root():
     return ROOT_ARITHMETIC
 
 
+def inkling2_mini_root():
+    from families.inkling2_mini.golden import ROOT_ARITHMETIC
+    return ROOT_ARITHMETIC
+
+
 ROOT_PRECISIONS = [
     (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
     (lambda: KIMI_K31_F32_ROOT, KIMI_F32_PRECISION),
@@ -310,6 +315,9 @@ def reference_precision(meta, panel):
     for root, label in ROOT_PRECISIONS:
         if meta.get('root_arithmetic') == root():
             return label
+    # Mini's golden module imports Torch; unrelated references must package without it.
+    if panel.get('family') == 'inkling2_mini' and meta.get('root_arithmetic') == inkling2_mini_root():
+        return 'official mixed NVFP4/MXFP8 checkpoint with BF16 dense compute and F32 islands'
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
 
 
@@ -503,6 +511,13 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
     generated_rows = standard_generated_rows(panel)
     require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
+    expect = copy.deepcopy(POLICY_EXPECT)
+    expect_provenance = 'declared policy floors; independent of engine measurements'
+    if panel['family'] == 'inkling2_mini':
+        # This pinned root mixes 20 NVFP4 and 4 MXFP8 equally sized expert banks.
+        # Both payload (4.667) and payload plus block scales (5.125) are mid-tier.
+        expect.update(top1_min=.93, kl_max=.05)
+        expect_provenance = '3 to <6 routed expert bpw tier; pooled generated rows, independent of engine measurements'
     provider_provenance = load_text_source_provenance(text_source_provenance) if text_source_provenance else None
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          **role_metrics, standard_generated_rows=generated_rows,
@@ -518,8 +533,7 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
     manifest = dict(schema='cuteafd.fidelity.dataset/1', kind='reference-top1024-plus-tail', config=config,
                     family=panel['family'], checkpoint=panel['checkpoint'], root_checkpoint=dict(id=snapshot['checkpoint'], revision=snapshot['snapshot_revision']),
                     set_sha256=set_id, vocab=rows['vocab'], top_k=1024,
-                    expect=copy.deepcopy(POLICY_EXPECT),
-                    expect_provenance='declared policy floors; independent of engine measurements',
+                    expect=expect, expect_provenance=expect_provenance,
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
                     files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
@@ -558,7 +572,8 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
             f'{launch_note}'
             f'{implementation_note(runtime_source)}'
             'No engine run is required to finish or publish this dataset.\n'
-            'Declared policy floors: top-1 >=90%, KL <=0.06 nat, confident top-1 >=96%, top-3 >=97%.\n\n'
+            f'Declared policy floors: top-1 >={expect["top1_min"]:.0%}, KL <={expect["kl_max"]:.2f} nat, '
+            'confident top-1 >=96%, top-3 >=97%.\n\n'
             '## Storage\n\n'
             'One safetensors file per window: U32 positions, next_token_ids and top_ids; U8 roles; F16 top_log_probs; '
             'F32 tail_log_mass and next_token_log_prob. Top-1024 selection uses the sealed full F16 rows with lower-ID boundary ties.\n'
