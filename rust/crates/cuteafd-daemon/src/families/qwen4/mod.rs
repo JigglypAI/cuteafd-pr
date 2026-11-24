@@ -329,9 +329,8 @@ fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
     -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
         cuteafd_core::coordinator_programs::AttentionPlanError>
 {
-    let decode_rows = args.resolved_decode_rows(args.slots.max(1) as u64).unwrap_or(engine::DECODE_ROWS);
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        decode_rows, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
+        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
     cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
     Ok(plan)
 }

@@ -1028,7 +1028,7 @@ impl<'a> Qwen4Engine<'a> {
             l2: None, embedding,
             decode_rows,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * decode_rows * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
-            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(decode_rows, None, None)? })
+            attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
     /// The resolved capture shape: one or two layer owners, and whether Sparks
