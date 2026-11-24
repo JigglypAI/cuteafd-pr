@@ -143,8 +143,9 @@ def quantize_nvfp4(x):
     blocks = x.reshape(*x.shape[:-1], -1, 16)
     amax = x.abs().amax(-1, keepdim=True).unsqueeze(-1)
     largest = torch.finfo(torch.float32).max
-    encoder = (1536. / amax).clamp_max(largest)
-    decoder = encoder.reciprocal()
+    # Scalar / tensor may lower to reciprocal times scalar, not div.rn.
+    encoder = torch.full_like(amax, 1536.).div(amax).clamp_max(largest)
+    decoder = torch.ones_like(encoder).div(encoder)
     outer = amax * (1. / 1536.)
     bmax = blocks.abs().amax(-1, keepdim=True)
     levels = e2m1_values(x.device)
@@ -152,7 +153,8 @@ def quantize_nvfp4(x):
 
     def candidate(inverse):
         scale = (bmax * (encoder * inverse)).clamp_max(448.).to(torch.float8_e4m3fn).float()
-        normalized = blocks * (scale * decoder).reciprocal().clamp_max(largest)
+        inverse_scale = torch.ones_like(scale).div(scale * decoder).clamp_max(largest)
+        normalized = blocks * inverse_scale
         magnitude = normalized.abs()
         # Alternate strict/non-strict cuts to give each exact midpoint to the even nibble.
         code = torch.bucketize(magnitude.contiguous(), cuts)
