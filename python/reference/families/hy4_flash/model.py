@@ -168,7 +168,32 @@ class Checkpoint(_BaseCheckpoint):
         return result
 
 
-def index_projections(x, q_residual, w, c, pos, base):
+def mrope_phase(positions, width, base, section=(12, 10, 10)):
+    """Interleaved M-RoPE phase. ``positions`` is ``[T]`` slots or ``[3, T]`` (T, H, W).
+
+    Pair ``p`` reads axis 1 when ``p % 3 == 1 and p < 3*section[1]``, axis 2 when
+    ``p % 3 == 2 and p < 3*section[2]``, otherwise axis 0 (HF recomposition_frequencies).
+    A ``[T]`` input is the original text phase bit for bit."""
+    if positions.ndim == 1:
+        return phase(positions, width, base)
+    pairs = width // 2
+    if positions.shape[0] != 3 or sum(section) != pairs:
+        raise ValueError("M-RoPE positions must be [3, T] and the section must cover the rotary pairs")
+    axis = torch.zeros(pairs, dtype=torch.long, device=positions.device)
+    p = torch.arange(pairs, device=positions.device)
+    axis[(p % 3 == 1) & (p < 3 * section[1])] = 1
+    axis[(p % 3 == 2) & (p < 3 * section[2])] = 2
+    inv = 1. / (base ** (torch.arange(0, width, 2, dtype=torch.float32, device=positions.device) / width))
+    chosen = positions.T.gather(1, axis[None].expand(positions.shape[1], -1))
+    freq = chosen.float() * inv
+    return tuple(f(freq).repeat_interleave(2, dim=-1).unsqueeze(1) for f in (torch.cos, torch.sin))
+
+
+def _section(c, kind):
+    return tuple(c.rope_parameters[kind].get("mrope_section", (12, 10, 10)))
+
+
+def index_projections(x, q_residual, w, c, pos, base, rope=None):
     p = "self_attn.compressed_indexer."
     ratio = c.compressed_indexer_compress_ratio
     heads, dim = c.compressed_indexer_num_attention_heads, c.compressed_indexer_head_dim
@@ -178,9 +203,13 @@ def index_projections(x, q_residual, w, c, pos, base):
     values = project(tokens, w, p + "key_value_projection")
     gates = project(tokens, w, p + "key_gate_projection") + w[p + "intra_group_ape"]
     pooled = norm((values * gates.softmax(dim=1)).sum(dim=1), w[p + "key_norm.weight"], c.rms_norm_eps)
-    keys = rotate_tail(pooled.unsqueeze(1), *phase(pos[:group_count * ratio:ratio], c.qk_rope_head_dim, base)).squeeze(1)
+    # Groups follow token slots; a group key rotates at its first slot's (3D) position.
+    rope = pos if rope is None else rope
+    section = _section(c, SPARSE)
+    first = rope[..., :group_count * ratio:ratio]
+    keys = rotate_tail(pooled.unsqueeze(1), *mrope_phase(first, c.qk_rope_head_dim, base, section)).squeeze(1)
     queries = project(q_residual, w, p + "query_projection").reshape(len(x), heads, dim)
-    queries = rotate_tail(queries, *phase(pos, c.qk_rope_head_dim, base))
+    queries = rotate_tail(queries, *mrope_phase(rope, c.qk_rope_head_dim, base, section))
     weights = project(x, w, p + "head_weight_projection") * (heads ** -.5 * dim ** -.5)
     return queries, keys, weights
 
@@ -193,18 +222,19 @@ def recall_groups(queries, keys, weights, groups, group_topk):
     return torch.cat((recalled, groups[:, None]), dim=-1)
 
 
-def attention(x, w, c, index):
+def attention(x, w, c, index, rope_positions=None):
+    """``rope_positions``: optional ``[3, T]`` M-RoPE positions; masks and slots stay token-slot based."""
     p = "self_attn."
     h, nope, rope, vdim = c.attention(index)
     kind = c.layer_types[index]
     base = c.rope_parameters[kind]["rope_theta"]
     pos = torch.arange(len(x), device=x.device)
-    cos, sin = phase(pos, rope, base)
+    cos, sin = mrope_phase(pos if rope_positions is None else rope_positions, rope, base, _section(c, kind))
     q0, q, k, v, gate, sink = mla_projections(x, w, c, h, nope, rope, vdim, cos, sin)
     indexed = kind == SPARSE and len(x) > c.compressed_indexer_candidate_topk
     tile_mask = None
     if indexed:
-        index_q, index_k, index_w = index_projections(x, q0, w, c, pos, base)
+        index_q, index_k, index_w = index_projections(x, q0, w, c, pos, base, rope_positions)
         ratio = c.compressed_indexer_compress_ratio
 
         def tile_mask(start, stop, first, width, query_id):
@@ -296,11 +326,12 @@ def engram(x, tokens, w, c, index, *, round_trip=fp8_roundtrip):
     return output.masked_fill(masked[:, None, None], 0.)
 
 
-def layer_forward(x, tokens, w, c, index):
+def layer_forward(x, tokens, w, c, index, rope_positions=None):
     if index + 1 in c.engram_layer_ids:
         x = x + engram(x, tokens, w, c, index)
     collapsed, post = hyper(x, w, "hc_attn_layer", c)
-    x = post * attention(norm(collapsed, w["input_layernorm.weight"], c.rms_norm_eps), w, c, index).unsqueeze(1) + x
+    x = post * attention(norm(collapsed, w["input_layernorm.weight"], c.rms_norm_eps), w, c, index,
+                         rope_positions).unsqueeze(1) + x
     collapsed, post = hyper(x, w, "hc_mlp_layer", c)
     ffn = feed_forward(norm(collapsed, w["post_attention_layernorm.weight"], c.rms_norm_eps), w, c, index)
     return post * ffn.unsqueeze(1) + x

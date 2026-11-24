@@ -128,7 +128,13 @@ class Family:
 
     def initial_carry(self, window):
         import torch
-        return {"tokens": torch.tensor(window["tokens"], dtype=torch.long)}
+        carry = {"tokens": torch.tensor(window["tokens"], dtype=torch.long)}
+        if window.get("media"):
+            import hy4_flash_media
+            hy4_flash_media.validate_window(window)
+            # [3, T] SGLang M-RoPE positions; text-only windows keep the 1D slot phase bit for bit.
+            carry["rope"] = torch.from_numpy(hy4_flash_media.rope_positions(window["tokens"], window["media"]))
+        return carry
 
     def work_bytes(self, tokens):
         # Q/G/K/V, residuals, tiled score/probability/value output and indexer scratch.
@@ -150,6 +156,22 @@ class Family:
         ids = torch.as_tensor(tokens, dtype=torch.long, device=self.device)
         embedding = F.embedding(ids, self.outer)
         return embedding[:, None].expand(-1, self.config.hc_mult, -1).unsqueeze(0).contiguous()
+
+    def embed_media(self, window, features):
+        """Text rows embed as usual; image rows take tower features before the iHC expansion."""
+        import torch.nn.functional as F
+        import torch
+        if not window.get("media"):
+            return self.embed(window["tokens"])
+        import hy4_flash_media
+        if self.outer is None:
+            self.outer = self.checkpoint.load(model.OUTER_NAMES[0])
+            self.checkpoint.close()
+        ids = torch.as_tensor(window["tokens"], dtype=torch.long, device=self.device)
+        flat = F.embedding(ids, self.outer).clone()
+        if features is None:
+            raise ValueError("missing Hy4 image features")
+        return hy4_flash_media.inject_embeddings(flat, window, features, self.config.hc_mult).unsqueeze(0)
 
     def release_outer(self):
         self.outer = None
@@ -222,7 +244,7 @@ class Family:
         module["official"] = layer.eval()
         return module["official"]
 
-    def official_forward(self, module, index, hidden, tokens):
+    def official_forward(self, module, index, hidden, tokens, rope=None):
         import torch
         from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
         layer = self.official_layer(module, index)
@@ -232,20 +254,23 @@ class Family:
                    else create_causal_mask)
         mask = creator(config=self.official_config, inputs_embeds=hidden[:, :, 0], attention_mask=None,
                        cache=None, position_ids=positions, allow_is_causal_skip=False)
-        phase = self.rotary(hidden, positions.unsqueeze(0), layer.attention_type)
+        rope_ids = positions.unsqueeze(0) if rope is None else rope.to(self.device).unsqueeze(1)
+        phase = self.rotary(hidden, rope_ids, layer.attention_type)
         ng = self.official.HYV4FlashTextModel.build_ngram_tokens(
             type("TextConfigProxy", (), {"config": self.official_config})(), tokens[None], positions)
         ngmask = torch.ones_like(tokens, dtype=torch.bool)
         for token_id in self.config.masked_tokens:
             ngmask &= tokens != token_id
-        return layer(hidden, attention_mask=mask, position_ids=positions.unsqueeze(0),
+        return layer(hidden, attention_mask=mask, position_ids=rope_ids,
                      position_embeddings=phase, ngram_tokens=ng, engram_mask=ngmask[None])
 
     def forward(self, module, index, hidden, carry):
-        tokens = carry["tokens"]
-        result = (self.official_forward(module, index, hidden, tokens) if self.official_mode else
-                  model.layer_forward(hidden[0], tokens, module["weights"], self.config, index).unsqueeze(0))
-        return result, carry, ("tokens",)
+        tokens, rope = carry["tokens"], carry.get("rope")
+        if rope is not None:
+            rope = rope.to(self.device)
+        result = (self.official_forward(module, index, hidden, tokens, rope) if self.official_mode else
+                  model.layer_forward(hidden[0], tokens, module["weights"], self.config, index, rope).unsqueeze(0))
+        return result, carry, tuple(carry)
 
     def load_final(self):
         self.outer = {name: self.checkpoint.load(name) for name in self.outer_tensors("final")}
@@ -360,6 +385,10 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-only", action="store_true")
     mode.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--media", action="store_true", help="inject the bundled vit.* tower for media windows")
+    parser.add_argument("--media-root", type=Path, help="fixture root (default: windows manifest directory)")
+    parser.add_argument("--media-features-out", type=Path, help="write immutable BF16 feature files")
+    parser.add_argument("--tower-dtype", choices=("bf16", "fp32"), default="bf16")
     mode.add_argument("--pilot-layers", type=int, choices=(2,),
                       help="profile the dense and first MoE/Engram layers; no logits")
     a = parser.parse_args()
@@ -400,7 +429,10 @@ def main():
           f"full logits max {max(evidence['full_logit_relative_l2']):.3e}", flush=True)
     family.upstream_preflight = evidence
     if not a.preflight_only:
-        layer_major.run(a, family)
+        adapter = None
+        if a.media:
+            import hy4_flash_media as adapter
+        layer_major.run(a, family, media_adapter=adapter)
 
 
 if __name__ == "__main__":

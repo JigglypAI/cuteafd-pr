@@ -136,7 +136,8 @@ def validate_media(media, tokens, roles, score_from, *, processor=None, audio_pr
             raise ValueError("fixture lacks a SHA256")
         if any(r != "ctx" for r in roles[start:start + length]):
             raise ValueError("image placeholders cannot be generated positions")
-        if span["kind"] == "image" and processor and processor.get("row_markers") == 1:
+        # A uniform span (Hy4-flash) closes each merged row with the same placeholder id.
+        if span["kind"] == "image" and processor and processor.get("row_markers") == 1 and not processor.get("uniform_span"):
             ids = [processor.get(key) for key in ("image_token_id", "row_break_token_id", "end_token_id")]
             if any(type(n) is not int or n < 0 for n in ids) or len(set(ids)) != 3:
                 raise ValueError("processor image marker ids are absent or invalid")
