@@ -63,7 +63,9 @@ def test_malformed_windows_are_not_silently_skipped(tmp_path, tokens, roles):
 def test_config_inventory_is_pinned_and_excludes_media_and_retired():
     registry = ROOT / "rust/crates/cuteafd-bench/src/fidelity_dataset.rs"
     configs = list(harness.registered_configs(registry))
-    assert len(configs) == 20
+    assert len(configs) == 21
+    assert ("inkling2-mini-v1_20261124_own-text-native",
+            "eabfaec64c7e96206ac1dffbbe51ad6deb73f635") in configs
     assert ("hy4-v1_20261122_own-text-bf16-f32",
             "ac045b800155a747ac4292a48ea9155728f5863a") in configs
     assert ("hy4-flash-v1_20261118_own-text-bf16-f32",
