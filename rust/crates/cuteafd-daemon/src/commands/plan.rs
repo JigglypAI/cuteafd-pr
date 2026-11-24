@@ -462,9 +462,11 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2
-            && (family != "glm5_flash" || args.drafter_gib == 0.0),
-        args.speculator == "dflash2");
+    // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
+    let split = args.rtx == 2 || (family == "glm5_flash" && args.spark_range);
+    let applicable = args.layout && split && args.speculator == "dflash2"
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark");
+    let default_on = applicable && (family != "glm5_flash" || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
         Some("off") => false,
@@ -478,8 +480,7 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
             None => args.tp2_dflash.unwrap_or(configured),
         }
     } else { args.tp2_dflash.unwrap_or(configured) };
-    anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+    anyhow::ensure!(!enabled || applicable,
         "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
     anyhow::ensure!(!enabled || family != "glm5_flash" || args.drafter_gib == 0.0,
         "TP2 DFlash requires checkpoint-derived physical owners; --drafter-gib forces whole placement");
@@ -687,9 +688,7 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
     let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
-    let tp2_dflash = tp2_dflash(&args, family, &cfg)? || (family == "glm5_flash" && args.spark_range
-        && args.drafter_gib == 0.0 && args.speculator == "dflash2" && args.tp2_dflash.is_none()
-        && cfg.get("TP2_DFLASH").is_none_or(String::is_empty));
+    let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;

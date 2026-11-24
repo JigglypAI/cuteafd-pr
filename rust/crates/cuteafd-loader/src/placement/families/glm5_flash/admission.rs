@@ -780,6 +780,13 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 .map(|owner| format!("{prefix}.{}", owner.id)).collect();
             for owner in layout.allocations(prefix, location).into_iter()
                 .filter(|owner| !immutable.contains(&owner.id)) {
+                // Each retained device workspace is a standalone CUDA allocation.
+                if owner.location == location {
+                    if let Some(tail) = p::exact_owner_tail(format!("{}.tail", owner.id), owner.id.clone(),
+                        location, owner.lifetime, vec![owner.bytes], maximum)? {
+                        contract.components.push(tail);
+                    }
+                }
                 let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
                 contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
             }
@@ -1353,7 +1360,19 @@ mod tests {
                     .collect::<std::collections::BTreeSet<_>>();
                 let expected = layouts[rank].allocations(prefix, location).into_iter()
                     .filter(|owner| !immutable.contains(&owner.id)).collect::<Vec<_>>();
-                for owner in expected { assert!(facts.allocations.contains(&owner), "changed nonweight owner {}", owner.id); }
+                for owner in expected {
+                    assert!(facts.allocations.contains(&owner), "changed nonweight owner {}", owner.id);
+                    let tails = facts.allocation_granularity.iter().filter(|tail|
+                        tail.backings.iter().any(|backing| backing.backing == owner.id)).collect::<Vec<_>>();
+                    let slack = if owner.location == location {
+                        p::sm120_request_backing(owner.bytes)? - owner.bytes
+                    } else { 0 };
+                    assert_eq!(tails.len(), usize::from(slack != 0), "{}", owner.id);
+                    for tail in tails {
+                        assert_eq!((tail.location, tail.lifetime, tail.bytes()?),
+                            (location, owner.lifetime, slack), "{}", owner.id);
+                    }
+                }
                 assert!(!facts.allocations.iter().any(|owner| immutable.contains(&owner.id)));
                 assert!(!facts.resident_weights.iter().any(|owner| immutable.contains(&owner.id)));
                 let root = facts.allocations.iter().find(|owner| owner.id == arenas[rank].id()).unwrap();
