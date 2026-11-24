@@ -293,7 +293,7 @@ impl<'a> Hy4Backend<'a> {
                 },
             )
         };
-        let result = if allow_graphs && !speculative {
+        let result = if allow_graphs {
             run(&mut engine)
         } else {
             engine.without_graphs(run)

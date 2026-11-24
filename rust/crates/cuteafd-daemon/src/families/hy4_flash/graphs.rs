@@ -20,6 +20,9 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Section {
+    DraftFusion,
+    DraftLayer,
+    DraftCorrection,
     /// TP1 local SWA layer: optional Engram compute + MLA SWA + post-attn + Dense/MoE+EXL3+post-FFN.
     SwaLocal,
     /// SWA attention section (TP2 before peer reduce, or Spark-routed before FFN frontend).
@@ -131,6 +134,11 @@ impl<'a> Hy4Graphs<'a> {
         self.bank.borrow_mut().cache_clear_drained();
     }
 
+    pub(super) fn retained_draft_rows(&self, rows: usize) -> usize {
+        self.bank.borrow().count(|key| key.rows == rows && matches!(key.section,
+            Section::DraftFusion | Section::DraftLayer | Section::DraftCorrection))
+    }
+
     pub(crate) fn retained_rows(&self, rows: usize) -> usize {
         self.bank.borrow().count(|key| key.rows == rows)
     }
@@ -151,10 +159,24 @@ impl<'a> Hy4Graphs<'a> {
         visit(self.device, "hy4_flash.section", false, &mut *self.bank.borrow_mut())
     }
 
+    pub(super) fn draft(
+        &self, rows: usize, stage: usize, section: Section, stream: &Stream<'a>,
+        work: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.run_with_pin(Key { layer: stage, rows, section }, stream, false, work)
+    }
+
     pub(crate) fn run(
+        &self, key: Key, stream: &Stream<'a>, work: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.run_with_pin(key, stream, self.pins.contains(&key.rows), work)
+    }
+
+    fn run_with_pin(
         &self,
         key: Key,
         stream: &Stream<'a>,
+        pinned: bool,
         mut work: impl FnMut() -> Result<()>,
     ) -> Result<()> {
         if !self.attached() || self.eager.borrow().contains(&key) {
@@ -176,7 +198,7 @@ impl<'a> Hy4Graphs<'a> {
         let Some(mut ticket) = self
             .bank
             .borrow_mut()
-            .cache_ticket(&key, self.pins.contains(&key.rows), None)
+            .cache_ticket(&key, pinned, None)
         else {
             return work();
         };

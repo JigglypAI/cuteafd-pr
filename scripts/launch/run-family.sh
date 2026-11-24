@@ -478,7 +478,7 @@ case "$(get GRAPH_PREWARM on)" in
   *) release_die 'GRAPH_PREWARM must be on or off' ;;
 esac
 local donor_default=off cold_lag_default=0
-[[ "$family" != inkling2 ]] || donor_default=on
+[[ "$family" != inkling2 && "$family" != hy4_flash ]] || donor_default=on
 graph_donor_always="$(get GRAPH_DONOR_ALWAYS "$donor_default")"
 case "$graph_donor_always" in
   on) graph_policy_args+=(--graph-donor-always) ;;
@@ -495,7 +495,7 @@ if [[ "$family" == glm5_flash ]]; then
     *) release_die 'GRAPH_EXACT_ROWS must be off, on, or prewarm' ;;
   esac
 fi
-if [[ "$family" == inkling2 && "$graph_donor_always" == on ]]; then cold_lag_default=8; fi
+if [[ ( "$family" == inkling2 || "$family" == hy4_flash ) && "$graph_donor_always" == on ]]; then cold_lag_default=8; fi
 graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG "$cold_lag_default")"
 [[ "$graph_donor_cold_lag" =~ ^[0-9]+$ ]] || release_die 'GRAPH_DONOR_COLD_LAG must be a non-negative integer'
 if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then

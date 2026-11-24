@@ -2375,6 +2375,14 @@ def test_hy4_flash_selects_replayed_rows_prices_siblings_and_rejects_bad_topolog
         MODULE.generate_hy4_flash([bad], "exl3-k4-mc-1rtx-0spark")
 
 
+def test_hy4_flash_keeps_unpaired_rank_zero_draft_graphs_lazy():
+    left, right = hy4_trace(0), hy4_trace(1)
+    expected = MODULE.generate_hy4_flash([left, right], "exl3-k4-mc-2rtx-0spark")
+    left["graphs"].append({**left["graphs"][0],
+        "shape": "Key { layer: 0, rows: 12, section: DraftLayer }"})
+    assert MODULE.generate_hy4_flash([left, right], "exl3-k4-mc-2rtx-0spark") == expected
+
+
 def inkling_graph_trace(device, decode_hits, verify_hits):
     return {"schema_version": 2, "cache": {"device": device, "charged": 40 << 20}, "graphs": [
         {"site": "inkling2.section", "shape": f"Key {{ layer: 0, rows: {rows}, section: RankAttention, mode: {mode} }}",

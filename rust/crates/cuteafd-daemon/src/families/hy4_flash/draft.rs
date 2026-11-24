@@ -1,6 +1,7 @@
 //! Hy4 DFly2 proposals over the committed target's latent KV and recall.
 use super::cache::slice_buf;
 use super::native::dequant_kv_b_trellis_absorbed;
+use super::graphs::{Hy4Graphs, Section};
 use super::weights::{pack_kv_b_absorbed, read_tensor_bytes};
 use crate::shared::dense_trellis::{
     codebook, CoreWeightLayout, CoreWeights, Projection, ProjectionLayout, ProjectionScratch,
@@ -483,6 +484,7 @@ impl<'a> Drafter<'a> {
         stream: &Stream<'a>,
         embedding: &TokenEmbedding<'a>,
         members: &[Member],
+        graphs: Option<&Hy4Graphs<'a>>,
         rope: Buffer,
         cache: impl Fn(usize) -> Result<Buffer>,
         mut head: impl FnMut(Buffer, usize) -> Result<DeviceLogits>,
@@ -509,6 +511,12 @@ impl<'a> Drafter<'a> {
         let meta = BatchMeta::new(members, width, self.cfg.mask_token_id)?;
         self.device.run(|| {
             let mut completed = stream.cancellation_guard("Hy4 DFly2 proposal batch");
+            let run = |section, stage, work: &mut dyn FnMut() -> Result<()>| {
+                match graphs {
+                    Some(graphs) => graphs.draft(rows, stage, section, stream, work),
+                    None => work(),
+                }
+            };
             let row = |b: Buffer, i: usize| slice_buf(b, i * H * 2, H * 2);
             let state = self.b("state");
             let residual = self.b("residual");
@@ -524,20 +532,23 @@ impl<'a> Drafter<'a> {
                 self.copy(row(anchor, i)?, row(state, i * width)?, stream)?;
                 self.copy(row(features, i)?, self.hidden(false, member.slot)?, stream)?;
             }
-            let f = format!("{PREFIX}mtp_fusion");
-            self.norm(&format!("{f}.enorm.weight"), anchor, left, count, stream)?;
-            self.norm(&format!("{f}.hnorm.weight"), features, right, count, stream)?;
-            self.join_rows(join, left, right, count, stream)?;
-            self.proj("join", &format!("{f}.eh_proj"), join, delta, count, stream)?;
-            self.rows(
-                "fusion",
-                &[anchor, delta, self.w(&format!("{f}.gate"))?, residual],
-                count,
-                stream,
-            )?;
-            for i in 0..count {
-                self.copy(row(state, i * width)?, row(residual, i)?, stream)?;
-            }
+            run(Section::DraftFusion, 0, &mut || {
+                let f = format!("{PREFIX}mtp_fusion");
+                self.norm(&format!("{f}.enorm.weight"), anchor, left, count, stream)?;
+                self.norm(&format!("{f}.hnorm.weight"), features, right, count, stream)?;
+                self.join_rows(join, left, right, count, stream)?;
+                self.proj("join", &format!("{f}.eh_proj"), join, delta, count, stream)?;
+                self.rows(
+                    "fusion",
+                    &[anchor, delta, self.w(&format!("{f}.gate"))?, residual],
+                    count,
+                    stream,
+                )?;
+                for i in 0..count {
+                    self.copy(row(state, i * width)?, row(residual, i)?, stream)?;
+                }
+                Ok(())
+            })?;
 
             for (name, data) in [
                 ("positions", words(&meta.positions)),
@@ -575,206 +586,214 @@ impl<'a> Drafter<'a> {
                         stream,
                     )?;
                 }
-                self.norm(
-                    &format!("{p}.input_layernorm.weight"),
-                    state,
-                    norm,
-                    rows,
-                    stream,
-                )?;
-                self.proj(
-                    "q_a",
-                    &format!("{a}.q_a_proj"),
-                    norm,
-                    self.b("q_a"),
-                    rows,
-                    stream,
-                )?;
-                self.proj(
-                    "kv_a",
-                    &format!("{a}.kv_a_proj_with_mqa"),
-                    norm,
-                    self.b("kv_a"),
-                    rows,
-                    stream,
-                )?;
-                self.proj(
-                    "gate",
-                    &format!("{a}.linear_gate"),
-                    norm,
-                    self.b("gate"),
-                    rows,
-                    stream,
-                )?;
-                self.rows(
-                    "pack",
-                    &[
+                run(Section::DraftLayer, stage, &mut || {
+                    self.norm(
+                        &format!("{p}.input_layernorm.weight"),
+                        state,
+                        norm,
+                        rows,
+                        stream,
+                    )?;
+                    self.proj(
+                        "q_a",
+                        &format!("{a}.q_a_proj"),
+                        norm,
                         self.b("q_a"),
+                        rows,
+                        stream,
+                    )?;
+                    self.proj(
+                        "kv_a",
+                        &format!("{a}.kv_a_proj_with_mqa"),
+                        norm,
                         self.b("kv_a"),
-                        self.w(&format!("{a}.q_a_layernorm.weight"))?,
-                        self.w(&format!("{a}.kv_a_layernorm.weight"))?,
-                        self.b("write_slots"),
-                        self.b("positions"),
-                        rope,
-                        self.b("q_norm"),
-                        kv,
-                    ],
-                    rows,
-                    stream,
-                )?;
-                self.proj(
-                    "q_b",
-                    &format!("{a}.q_b_proj"),
-                    self.b("q_norm"),
-                    self.b("q_b"),
-                    rows,
-                    stream,
-                )?;
-                let kv_b = self.w(&format!("{a}.kv_b_proj.weight"))?;
-                let uk_bytes = HEADS * 192 * 512 * 2;
-                let uk = slice_buf(kv_b, 0, uk_bytes)?;
-                let uv = slice_buf(kv_b, uk_bytes, kv_b.bytes - uk_bytes)?;
-                self.rows(
-                    "q_absorb",
-                    &[
-                        self.b("q_b"),
-                        uk,
-                        self.b("positions"),
-                        rope,
-                        self.b("query"),
-                    ],
-                    rows,
-                    stream,
-                )?;
-                self.launch(
-                    "attention",
-                    &[
-                        self.b("query"),
-                        kv,
-                        self.b("page_table"),
-                        self.b("lengths"),
-                        self.b("cu"),
-                        self.b("attn"),
-                        self.b("lse"),
-                        self.b("attn_scratch"),
-                    ],
-                    &[
-                        Scalar::I32(rows as i32),
-                        Scalar::I32(rows as i32),
-                        Scalar::I64(pt_width as i64),
-                        Scalar::I32(1),
-                    ],
-                    stream,
-                )?;
-                self.rows(
-                    "sink_uv",
-                    &[
-                        self.b("attn"),
-                        uv,
+                        rows,
+                        stream,
+                    )?;
+                    self.proj(
+                        "gate",
+                        &format!("{a}.linear_gate"),
+                        norm,
                         self.b("gate"),
-                        self.b("lse"),
-                        self.w(&format!("{a}.learnable_sink_param"))?,
+                        rows,
+                        stream,
+                    )?;
+                    self.rows(
+                        "pack",
+                        &[
+                            self.b("q_a"),
+                            self.b("kv_a"),
+                            self.w(&format!("{a}.q_a_layernorm.weight"))?,
+                            self.w(&format!("{a}.kv_a_layernorm.weight"))?,
+                            self.b("write_slots"),
+                            self.b("positions"),
+                            rope,
+                            self.b("q_norm"),
+                            kv,
+                        ],
+                        rows,
+                        stream,
+                    )?;
+                    self.proj(
+                        "q_b",
+                        &format!("{a}.q_b_proj"),
+                        self.b("q_norm"),
+                        self.b("q_b"),
+                        rows,
+                        stream,
+                    )?;
+                    let kv_b = self.w(&format!("{a}.kv_b_proj.weight"))?;
+                    let uk_bytes = HEADS * 192 * 512 * 2;
+                    let uk = slice_buf(kv_b, 0, uk_bytes)?;
+                    let uv = slice_buf(kv_b, uk_bytes, kv_b.bytes - uk_bytes)?;
+                    self.rows(
+                        "q_absorb",
+                        &[
+                            self.b("q_b"),
+                            uk,
+                            self.b("positions"),
+                            rope,
+                            self.b("query"),
+                        ],
+                        rows,
+                        stream,
+                    )?;
+                    self.launch(
+                        "attention",
+                        &[
+                            self.b("query"),
+                            kv,
+                            self.b("page_table"),
+                            self.b("lengths"),
+                            self.b("cu"),
+                            self.b("attn"),
+                            self.b("lse"),
+                            self.b("attn_scratch"),
+                        ],
+                        &[
+                            Scalar::I32(rows as i32),
+                            Scalar::I32(rows as i32),
+                            Scalar::I64(pt_width as i64),
+                            Scalar::I32(1),
+                        ],
+                        stream,
+                    )?;
+                    self.rows(
+                        "sink_uv",
+                        &[
+                            self.b("attn"),
+                            uv,
+                            self.b("gate"),
+                            self.b("lse"),
+                            self.w(&format!("{a}.learnable_sink_param"))?,
+                            self.b("uv"),
+                        ],
+                        rows,
+                        stream,
+                    )?;
+                    self.proj(
+                        "o",
+                        &format!("{a}.o_proj"),
                         self.b("uv"),
-                    ],
-                    rows,
-                    stream,
-                )?;
-                self.proj(
-                    "o",
-                    &format!("{a}.o_proj"),
-                    self.b("uv"),
-                    delta,
-                    rows,
-                    stream,
-                )?;
-                self.norm(
-                    &format!("{a}.post_proj_norm.weight"),
-                    delta,
-                    norm,
-                    rows,
-                    stream,
-                )?;
-                self.add(residual, state, norm, rows, stream)?;
-                self.norm(
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    residual,
-                    norm,
-                    rows,
-                    stream,
-                )?;
-                self.ffn(
-                    &format!("{p}.mlp"),
-                    "gate_up",
-                    "down",
-                    "silu",
-                    norm,
-                    delta,
-                    rows,
-                    MLP_WIDTH,
-                    stream,
-                )?;
-                self.add(state, residual, delta, rows, stream)?;
+                        delta,
+                        rows,
+                        stream,
+                    )?;
+                    self.norm(
+                        &format!("{a}.post_proj_norm.weight"),
+                        delta,
+                        norm,
+                        rows,
+                        stream,
+                    )?;
+                    self.add(residual, state, norm, rows, stream)?;
+                    self.norm(
+                        &format!("{p}.post_attention_layernorm.weight"),
+                        residual,
+                        norm,
+                        rows,
+                        stream,
+                    )?;
+                    self.ffn(
+                        &format!("{p}.mlp"),
+                        "gate_up",
+                        "down",
+                        "silu",
+                        norm,
+                        delta,
+                        rows,
+                        MLP_WIDTH,
+                        stream,
+                    )?;
+                    self.add(state, residual, delta, rows, stream)?;
+                    if stage + 1 == self.cfg.layers {
+                        self.norm(
+                            &format!("{PREFIX}final_norm.weight"),
+                            state,
+                            norm,
+                            rows,
+                            stream,
+                        )?;
+                    }
+                    Ok(())
+                })?;
             }
-            self.norm(
-                &format!("{PREFIX}final_norm.weight"),
-                state,
-                norm,
-                rows,
-                stream,
-            )?;
             let c = format!("{PREFIX}hidden_correction");
             for step in 0..depth {
-                for i in 0..count {
-                    self.copy(row(features, i)?, row(norm, i * width + step + 1)?, stream)?;
-                }
-                let previous = if step == 0 {
-                    self.b("anchor_ids")
-                } else {
-                    slice_buf(self.b("greedy_ids"), (step - 1) * count * 4, count * 4)?
-                };
-                // SAFETY: previous IDs and output are live and ordered on the proposal stream.
-                unsafe {
-                    embedding.gather(
-                        previous.ptr,
-                        std::ptr::null(),
+                run(Section::DraftCorrection, step, &mut || {
+                    for i in 0..count {
+                        self.copy(row(features, i)?, row(norm, i * width + step + 1)?, stream)?;
+                    }
+                    let previous = if step == 0 {
+                        self.b("anchor_ids")
+                    } else {
+                        slice_buf(self.b("greedy_ids"), (step - 1) * count * 4, count * 4)?
+                    };
+                    // SAFETY: previous IDs and output are live and ordered on the proposal stream.
+                    unsafe {
+                        embedding.gather(
+                            previous.ptr,
+                            std::ptr::null(),
+                            count,
+                            1,
+                            std::ptr::null(),
+                            anchor.ptr,
+                            None,
+                            crate::shared::peer_split::RankDevice {
+                                device: self.device.id,
+                                stream: stream.raw,
+                            },
+                        )?;
+                    }
+                    self.norm(
+                        &format!("{c}.hidden_norm.weight"),
+                        features,
+                        left,
                         count,
-                        1,
-                        std::ptr::null(),
-                        anchor.ptr,
-                        None,
-                        crate::shared::peer_split::RankDevice {
-                            device: self.device.id,
-                            stream: stream.raw,
-                        },
+                        stream,
                     )?;
-                }
-                self.norm(
-                    &format!("{c}.hidden_norm.weight"),
-                    features,
-                    left,
-                    count,
-                    stream,
-                )?;
-                self.norm(
-                    &format!("{c}.embed_norm.weight"),
-                    anchor,
-                    right,
-                    count,
-                    stream,
-                )?;
-                self.join_rows(join, left, right, count, stream)?;
-                self.ffn(
-                    &c,
-                    "join",
-                    "correction_down",
-                    "correction_silu",
-                    join,
-                    delta,
-                    count,
-                    H,
-                    stream,
-                )?;
-                self.add(residual, features, delta, count, stream)?;
+                    self.norm(
+                        &format!("{c}.embed_norm.weight"),
+                        anchor,
+                        right,
+                        count,
+                        stream,
+                    )?;
+                    self.join_rows(join, left, right, count, stream)?;
+                    self.ffn(
+                        &c,
+                        "join",
+                        "correction_down",
+                        "correction_silu",
+                        join,
+                        delta,
+                        count,
+                        H,
+                        stream,
+                    )?;
+                    self.add(residual, features, delta, count, stream)?;
+                    Ok(())
+                })?;
                 let logits = head(slice_buf(residual, 0, count * H * 2)?, count)?;
                 ensure!(
                     logits.rows == count

@@ -1848,7 +1848,7 @@ HY4_LAYOUTS = {
 }
 HY4_GEOMETRY = re.compile(
     r"Key \{ layer: (\d+), rows: (\d+), section: "
-    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish) \}"
+    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish|DraftFusion|DraftLayer|DraftCorrection) \}"
 )
 
 
@@ -1877,6 +1877,9 @@ def generate_hy4_flash(traces, layout):
             if match is None:
                 raise ValueError(f"cannot parse Hy4-flash identity: {graph['shape']!r}")
             layer, rows, section = match.groups()
+            # Draft sections are lazy on rank 0 and do not define target prewarm rows.
+            if section in {"DraftFusion", "DraftLayer", "DraftCorrection"}:
+                continue
             key = (int(layer), int(rows), section)
             if key[0] > 42 or key[1] <= 0:
                 raise ValueError(f"unsupported Hy4-flash geometry {key}")
