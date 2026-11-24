@@ -947,6 +947,40 @@ mod tests {
     }
 
     #[test]
+    fn inkling_mini_reference_requires_its_own_checkpoint_and_vendor_pins() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["family"] = json!("inkling2_mini");
+        manifest["vocab"] = json!(200058);
+        manifest["root_checkpoint"] = json!({"id": INKLING2_MINI_ROOT, "revision": INKLING2_MINI_ROOT_REVISION});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(INKLING2_MINI_ROOT);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(INKLING2_MINI_ROOT_REVISION);
+        }
+        qualification["prefix_qualification"]["vocab"] = json!(200058);
+        let provenance = &mut qualification["reference_provenance"];
+        provenance["source_identity_provider"] = json!("families.inkling2_mini.golden");
+        let mut source = json!({"revision": INKLING2_MINI_ROOT_REVISION,
+            "transformers": {"revision": "89c632fd826f68ecadd176320e9b2c070918f4f2"},
+            "vllm": {"revision": "a0c1f162f4ded00f0f40928698b4b5816f4d3bd7"},
+            "sglang": {"revision": "daba437630ff7c1e02a9b1d88a7d8414376acff7"},
+            "snapshot": {"config.json": provenance["snapshot_identity"]["config_sha256"],
+                "hf_quant_config.json": "7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143",
+                "model.safetensors.index.json": "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838"}});
+        for key in ["reference_adapter_sha256", "reference_runner_sha256", "inkling_primitives_sha256",
+            "shape_invariant_sha256"] { source[key] = json!("d".repeat(64)); }
+        provenance["source_pin"] = source;
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        let mut wrong_family = manifest.clone();
+        wrong_family["family"] = json!("inkling2");
+        assert!(qualification_label(&qualification, &wrong_family).is_err());
+        for key in ["transformers", "sglang", "snapshot", "inkling_primitives_sha256"] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["source_pin"][key] = Value::Null;
+            assert!(qualification_label(&changed, &manifest).is_err(), "{key}");
+        }
+    }
+
+    #[test]
     fn inkling_reference_requires_native_root_and_real_pinned_helper_evidence() {
         let (mut qualification, mut manifest) = kimi_reference_qualification();
         let root = "thinkingmachines/Inkling-2-Small-MXFP8";
