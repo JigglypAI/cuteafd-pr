@@ -156,6 +156,10 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/qwen4/golden.py, or a published shared fidelity set.
     #[arg(long)]
     pub golden: PathBuf,
+    /// Compare exact-row graphed decode/verify logits and persistent state byte
+    /// for byte against ungraphed eager execution across short and long contexts.
+    #[arg(long)]
+    pub replay_check: bool,
     /// Compare real packed and singleton target state/logits on 2..=8 members.
     #[arg(long)]
     pub packed_check: Option<usize>,
@@ -834,6 +838,17 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     };
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if args.replay_check {
+            let bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+            ensure!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid replay-check token payload");
+            let tokens: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+            engine.prepare_serving_workspaces()?;
+            let reserves = engine.configure_graph_cache()?;
+            ensure!(reserves.iter().any(|&bytes| bytes > 0), "replay-check needs a nonzero graph reserve");
+            engine.warm_decode_graphs(args.engine.slots, args.engine.mtp > 0)?;
+            engine.check_decode_graphs(&tokens)?;
+            return Ok(());
+        }
         if let Some(members) = args.packed_check {
             let tokens = if let Some(windows) = &windows {
                 windows.first().context("packed check needs a fidelity window")?.tokens.clone()
@@ -946,9 +961,12 @@ fn packed_decode_interleave(engine: &engine::Qwen4Engine<'_>, tokens: &[u32]) ->
         let before = graph_hits();
         // Table row zero still names member 0. Decode member 1 first so a
         // missing rewrite cannot accidentally read the right table on replay.
+        // With lazy exact-row capture, member 1 captures on iteration 0 and
+        // member 0 replays it; on iteration 1 both replay cached graphs.
         let second = decode(&mut packed[1], &mut packed_draft[1], &input[1])?;
-        ensure!(graph_hits() > before, "packed/decode golden did not replay member 1 at row {end}");
-        let decoded = [decode(&mut packed[0], &mut packed_draft[0], &input[0])?, second];
+        let first_decoded = decode(&mut packed[0], &mut packed_draft[0], &input[0])?;
+        ensure!(graph_hits() > before, "packed/decode golden did not replay decode graph at row {end}");
+        let decoded = [first_decoded, second];
         for i in [1, 0] {
             let ids = &input[i];
             let head = engine.prefill_device(&mut single[i], &ids[start..end], None, None, 1)?

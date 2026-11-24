@@ -10,7 +10,7 @@ use crate::shared::decode_graph::sites::{Scope, Table};
 
 // (visitor site, scope, capture/dependency evidence).
 pub(super) const SITES: &Table = &[
-    ("qwen4.segment", Scope::Local, "engine.rs:3263-3286 local embedding/enter/attention/post_pre; :3322 local head; :3484 TP1 local segment; hops and experts outside replay at :3250,:3299,:3314"),
+    ("qwen4.segment", Scope::Local, "engine.rs:2917 local embedding/enter/attention/post_pre; :2961 local head; :3118 TP1 local segment; hops and experts outside replay at :2905,:2942,:2953"),
 ];
 
 /// An unclassified site is spanning: it stays prewarmed and sealed (#2303).
