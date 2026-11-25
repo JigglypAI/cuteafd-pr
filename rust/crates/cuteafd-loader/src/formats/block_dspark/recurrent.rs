@@ -27,11 +27,19 @@ pub struct RecurrentBlockConfig {
 
 impl RecurrentBlockConfig {
     pub fn from_hf(root: &Value) -> Result<Self> {
-        let target = Inkling2Config::from_hf(root)?;
-        let transformer = Inkling2MtpConfig::from_hf(root, &target)?
+        let (target, total_visits) = if root["model_type"] == "inkling2_loop" {
+            let mini = crate::families::inkling2_mini::Inkling2MiniConfig::from_hf(root)?;
+            let visits = mini.total_visits();
+            (mini.text, visits)
+        } else {
+            let target = Inkling2Config::from_hf(root)?;
+            let visits = target.layers;
+            (target, visits)
+        };
+        let transformer = Inkling2MtpConfig::from_hf_with_target(root, target.hidden, total_visits)?
             .context("checkpoint has no bundled recurrent block drafter")?;
         let taps = transformer.target_layers.iter().map(|&id| {
-            if id == target.layers { TapSite::FinalNorm } else { TapSite::LayerEntry(id) }
+            if id == total_visits { TapSite::FinalNorm } else { TapSite::LayerEntry(id) }
         }).collect();
         let context = transformer.local.iter().map(|&local| {
             if local { ContextPolicy::BlockAnchoredWindow(transformer.window) } else { ContextPolicy::Full }

@@ -30,12 +30,13 @@ def muse_transformer_names():
 
 
 def perception_names(kind):
-    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
+    inkling = kind in ("inkling2", "inkling2_mini")
+    h,i,p,o = (1024,4096,1200,2304 if kind == "inkling2_mini" else 4608) if inkling else (1536,8960,588,4096)
     names = [f"pe_norm_h{h}",f"pe_scale_h{h}",f"pe_position_h{h}",f"pe_rotary_d{h//16}"]
     names += [f"biased_projection_h{w}_o{n}" for w,n in ((h,3*h),(h,h),(h,i),(i,h))]
     names += [f"projection_h{p}_o{h}"]
-    if kind == "inkling2":
-        names += ["pe_rgb_p20","pe_merge_h1024","pe_patch_projection_h4096_o4096","projection_h4096_o4608","gelu_h4096"]
+    if inkling:
+        names += ["pe_rgb_p20","pe_merge_h1024","pe_patch_projection_h4096_o4096",f"projection_h4096_o{o}","gelu_h4096"]
     else:
         names += ["rgb_normalize","resize_coefficients_bilinear","resize_horizontal","resize_vertical",
             "pe_patches_p14","pe_conv_lower_h1536","pe_conv_lower_h3072","pe_quick_gelu_h8960",
@@ -55,7 +56,7 @@ def main():
     parser.add_argument("--capability", type=int, choices=(120, 121))
     parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer", "perception", "tower"), default="legacy")
     parser.add_argument("--list-transformer-programs", action="store_true")
-    parser.add_argument("--perception", choices=("inkling2","step5"))
+    parser.add_argument("--perception", choices=("inkling2","inkling2_mini","step5"))
     parser.add_argument("--list-perception-programs", action="store_true")
     parser.add_argument("--tower", choices=("kimi","minimax","hy4f"))
     parser.add_argument("--list-tower-programs", action="store_true")
@@ -192,8 +193,8 @@ def main():
 def perception_builders(kind):
     from b12x.integration.cuteafd import media,perception,perception_forward,image_resize
     from b12x.integration.cuteafd import perception_pixels
-    h,i,p,o = (1024,4096,1200,4608) if kind == "inkling2" else (1536,8960,588,4096)
-    inkling = kind == "inkling2"
+    inkling = kind in ("inkling2", "inkling2_mini")
+    h,i,p,o = (1024,4096,1200,2304 if kind == "inkling2_mini" else 4608) if inkling else (1536,8960,588,4096)
     result = {
         f"pe_norm_h{h}":lambda:perception_forward.compile_layer_norm_aot(hidden=h,vendor_rsqrt=inkling),
         f"pe_scale_h{h}":lambda:perception.compile_scaled_residual_aot(width=h),
@@ -206,7 +207,7 @@ def perception_builders(kind):
     if inkling:
         result["pe_rgb_p20"] = lambda:perception_pixels.compile_pixel_patches_aot(patch=20)
         result["pe_merge_h1024"] = lambda:perception.compile_merge2_aot(width=1024,class_token=True)
-        for w,n in ((4096,4096),(4096,4608)):
+        for w,n in ((4096,4096),(4096,o)):
             name = f"pe_patch_projection_h{w}_o{n}" if n == 4096 else f"projection_h{w}_o{n}"
             result[name] = lambda w=w,n=n:media.compile_patch_projection_aot(width=w,outputs=n)
         result["gelu_h4096"] = lambda:media.compile_gelu_aot(width=4096)

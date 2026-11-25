@@ -428,7 +428,7 @@ impl<'a> DenseLinear<'a> {
 pub struct Mxfp8A8<'a> {
     linear: DenseLinear<'a>,
     quantizer: super::native_dense_glue::Companion<'a>,
-    narrow: super::v41_device_ops::F32Bf16Narrow<'a>,
+    narrow: super::device_ops::F32Bf16Narrow<'a>,
     library: &'a crate::NativeLibrary,
     device: i32,
 }

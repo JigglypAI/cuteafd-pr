@@ -39,6 +39,7 @@ FAMILIES = {
     "mistral_large4": "mistral_large4",
     "minimax_m3_vl": "minimax_m3",
     "inkling2": "inkling2",
+    "inkling2_loop": "inkling2_mini",
     "hy_v4_flash": "hy4_flash",
     "hy_v4_vl": "hy4",
 }
@@ -99,7 +100,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
     if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4",
-                  "minimax_m3", "inkling2", "hy4_flash", "hy4"):
+                  "minimax_m3", "inkling2", "inkling2_mini", "hy4_flash", "hy4"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -145,8 +146,8 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         # mtp_dspark drafter is dense, so the Sparks serve backbone layers only.
         first = _dense_prefix(text, layers)
         last = layers - 1
-    elif family == "inkling2":
-        # Every Inkling 2 layer is routed; the bundled dSpark drafter is dense.
+    elif family in ("inkling2", "inkling2_mini"):
+        # Every physical Inkling 2 layer is routed; the bundled dSpark drafter is dense.
         last = layers - 1
     elif family in ("hy4_flash", "hy4"):
         # Dense prefix (layer 0), then MoE layers 1..=last; DFly2 drafter is dense.
@@ -203,7 +204,7 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
-    if family in ("kimi_k3", "mistral_large4", "minimax_m3", "inkling2", "hy4_flash", "hy4"):
+    if family in ("kimi_k3", "mistral_large4", "minimax_m3", "inkling2", "inkling2_mini", "hy4_flash", "hy4"):
         _, _, first, last = describe(config)
         return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},

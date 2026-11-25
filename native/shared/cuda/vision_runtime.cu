@@ -321,7 +321,7 @@ static int32_t vision_create_impl(const cuteafd_vision_spec* s, int32_t device, 
     const char* group=s->tower->absolute_kind==2 ? "tower_hy4f" : s->tower->temporal_patch==1 ? "tower_kimi" : "tower_minimax";
     e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
   } else if(s->abi_version==2 || s->perception) {
-    const char* group=s->perception ? (s->reserved==6?"pe_inkling2":"pe_step5") :
+    const char* group=s->perception ? (s->reserved==6 ? (s->output_width==2304 ? "pe_inkling2_mini" : "pe_inkling2") : "pe_step5") :
       (s->reserved==5 ? "muse" : (s->reserved==4 ? "pixtral" : ""));
     e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
     if(s->reserved==5) {

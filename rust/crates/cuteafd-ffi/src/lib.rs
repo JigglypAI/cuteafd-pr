@@ -1,5 +1,5 @@
 mod families;
-pub use families::{inkling2, minimax_m3};
+pub use families::{inkling2, inkling2_mini, minimax_m3};
 pub use families::glm5::glm_mla::MlaPrefillKernel;
 mod shared;
 pub use shared::{fir_strided, fir_replay, fir_history, recurrent_draft, audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_attention, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, index_cache, vision};
@@ -14,7 +14,7 @@ pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch
     KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
 pub use shared::packed_head::PackedHeadPlanes;
-pub use shared::v41_device_ops::{Bf16Add, Bf16F32Add, F32Bf16Narrow, F32Add, V41PeerCopy};
+pub use shared::device_ops::{Bf16Add, Bf16F32Add, DeviceRowCopy, F32Bf16Narrow, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
 pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseBatchRecipe, V41SparseSource, V41SparseWindow};
@@ -1783,8 +1783,8 @@ native_symbols! {
     cuteafd_copy_d2h_async: CopyD2HAsyncFn,
     cuteafd_copy_d2d_2d_async: unsafe extern "C" fn(CuteafdDeviceBuffer, usize, CuteafdDeviceBuffer, usize, usize, usize, *mut c_void) -> CuteafdStatus,
     cuteafd_copy_d2d_async: CopyD2DAsyncFn,
-    cuteafd_load_narrow_f32_bf16: shared::v41_device_ops::NarrowFn,
-    cuteafd_bf16_f32_add_async: shared::v41_device_ops::Bf16F32AddFn,
+    cuteafd_load_narrow_f32_bf16: shared::device_ops::NarrowFn,
+    cuteafd_bf16_f32_add_async: shared::device_ops::Bf16F32AddFn,
     cuteafd_cuda_kv_cache_write_blocks_async: unsafe extern "C" fn(*const u8, *mut u8, *const u64, *const u64, *const u64, usize, *mut c_void) -> CuteafdStatus,
     cuteafd_cuda_engram_dequant_bf16_async: unsafe extern "C" fn(*const u8, *const u8, *mut u16, i32, *mut c_void) -> CuteafdStatus,
     cuteafd_cuda_engram_nvfp4_dequant_bf16_async: unsafe extern "C" fn(*const u8, *const u8, f32, *mut u16, i32, *mut c_void) -> CuteafdStatus,

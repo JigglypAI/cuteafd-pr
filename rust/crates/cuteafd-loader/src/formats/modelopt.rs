@@ -171,6 +171,11 @@ impl ModelOpt {
     /// for checkpoints ModelOpt did not produce.
     pub fn read(snapshot: &Path, config: &Value) -> Result<Option<Self>, ModelOptError> {
         let hf = read_json(&snapshot.join("hf_quant_config.json"))?;
+        if config.get("model_type").and_then(Value::as_str) == Some("inkling2_loop")
+            && hf.as_ref().is_none_or(|h| h.get("quant_method").and_then(Value::as_str) == Some("inkling2"))
+        {
+            return Ok(None);
+        }
         let quant = config.get("quantization_config")
             .or_else(|| config.get("text_config").and_then(|t| t.get("quantization_config")));
         Self::from_json(hf.as_ref(), quant)
@@ -179,6 +184,9 @@ impl ModelOpt {
     /// The metadata from `hf_quant_config.json` (when present) checked
     /// against `config.json`'s `quantization_config`.
     pub fn from_json(hf: Option<&Value>, config: Option<&Value>) -> Result<Option<Self>, ModelOptError> {
+        if hf.and_then(|h| h.get("quant_method")).and_then(Value::as_str) == Some("inkling2") {
+            return Ok(None);
+        }
         let config = config.filter(|c| {
             c.get("quant_method").and_then(Value::as_str) == Some("modelopt") || producer_name(c) == Some("modelopt")
         });

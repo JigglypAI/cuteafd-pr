@@ -29,6 +29,7 @@ NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "inkling2-nvfp4-min.config", "inkling2-exl3-min.config", "inkling2-exl3-max.config",
+                 "inkling2-mini-1x-rtx.config",
                  "hy4-flash-exl3-k4-mc-min.config", "hy4-flash-exl3-k4-mc-max.config",
                  "hy4-flash-exl3-k4-mc-k8-max.config", "hy4-flash-exl3-k4-mc-k6-max.config",
                  "hy4-flash-exl3-k4-mc-fp8-max.config", "hy4-flash-exl3-k4-mc-1rtx-1spark.config",
@@ -649,7 +650,8 @@ GATE_KIT = "scripts/bench/kits/gate/matrix-gate.json"
 GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "glm5": "dflash2", "glm5_flash": "dflash2",
                             "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
-                            "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2"}
+                            "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2",
+                            "inkling2_mini": "dspark"}
 def _default_speculator(family: str, model: str) -> str:
     if family == "kimi_k3":
         return "dspark" if "K3.1" in model else "dflash2"
@@ -815,7 +817,9 @@ def test_v7_release_cards_match_live_and_retired_inventory():
         cards.add(identity)
     kept = {(e["family"], _effective(e, v6)["MODEL_ID"], len(e["gpus"]), len(e["sparks"]))
             for e in v6["entries"] if e["name"] not in V7_RETIREMENTS}
-    assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)}
+    assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)} | {
+        ("inkling2_mini", "thinkingmachines/Inkling-2-Mini", 1, 0),
+    }
     primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
                        for g in (1, 2) if row[f"{g}rtx"]["status"] != "na"}

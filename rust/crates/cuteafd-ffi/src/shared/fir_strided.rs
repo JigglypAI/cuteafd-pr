@@ -5,7 +5,7 @@ use std::ffi::c_void;
 pub struct Convolution<'a>{program:Program<'a>,width:usize,heads:usize,dynamic:bool}
 impl<'a> Convolution<'a>{
  pub fn load(programs:&'a Programs<'a>,width:usize,dynamic:bool)->Result<Self>{
-  ensure!(matches!((width,dynamic),(4608,false)|(1024,false)|(1024,true)|(512,false)|(512,true)),"Inkling strided convolution geometry");
+  ensure!(matches!((width,dynamic),(4608,false)|(2304,false)|(1024,false)|(1024,true)|(512,false)|(512,true)),"Inkling strided convolution geometry");
   let heads=if dynamic{width/128}else{1};let name=format!("inkling2_conv_{}_h{width}_f32_strided",if dynamic{"dynamic"}else{"static"});
   let program=programs.program(&name,&["x","weight","dynamic","history","first","slots","out"])?;
   let spec=program.spec();let g=&spec.geometry;

@@ -357,6 +357,9 @@ impl ExpertGeometry {
     /// Inkling 2 Small: every layer routed (48), sigmoid top-8, SiTU (4/25);
     /// experts MXFP8, native NVFP4 or EXL3 K4 by checkpoint and layer.
     pub const INKLING2: Self = Self { hidden: 4608, experts: 384, topk: 8, intermediate: 2304, layers: 48, activation: ExpertActivation::Situ4_25 };
+    /// Inkling 2 Mini (`inkling2_loop`): 24 physical layers (core 6..18 looped 3x -> 48 visits),
+    /// sigmoid top-8 of 128, SiTU (4/25); layers 0..20 native NVFP4, 20..24 MXFP8.
+    pub const INKLING2_MINI: Self = Self { hidden: 2304, experts: 128, topk: 8, intermediate: 1152, layers: 24, activation: ExpertActivation::Situ4_25 };
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91, activation: ExpertActivation::SiluPostClamp7 };
@@ -389,7 +392,7 @@ impl ExpertGeometry {
             | (4096, 256, 8, 4096) => ExpertActivation::SiluUnclamped,
             (4096, 352, 8, 1536) => ExpertActivation::SiluPostClamp7,
             (6144, 128, 4, 3072) => ExpertActivation::SwigluOai7,
-            (3584, 896, 16, 3072) | (4608, 384, 8, 2304) => ExpertActivation::Situ4_25,
+            (3584, 896, 16, 3072) | (4608, 384, 8, 2304) | (2304, 128, 8, 1152) => ExpertActivation::Situ4_25,
             _ => ExpertActivation::SiluClamp10,
         };
         Self { hidden, experts, topk, intermediate, layers, activation }
@@ -484,6 +487,7 @@ impl ExpertGeometry {
             (Self::MISTRAL_LARGE4, "ml4"),
             (Self::MINIMAX_M3, "minimax"),
             (Self::INKLING2, "inkling2"),
+            (Self::INKLING2_MINI, "inkling2_mini"),
             (Self::HY4_FLASH, "hy4f"),
             (Self::HY4, "hy4"),
         ]
@@ -885,6 +889,7 @@ mod tests {
             (ExpertGeometry::MISTRAL_LARGE4, "ml4", None, FfnActivation::SiluBf16Product { limit: None }, false),
             (ExpertGeometry::MINIMAX_M3, "minimax", Some(7.0), FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 }, false),
             (ExpertGeometry::INKLING2, "inkling2", None, FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }, false),
+            (ExpertGeometry::INKLING2_MINI, "inkling2_mini", None, FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }, false),
             (ExpertGeometry::STEP5, "step5", Some(7.0), FfnActivation::SiluPostClampFp32Product { limit: 7.0 }, false),
             (ExpertGeometry::MUSE_SPARK, "muse", None, FfnActivation::SiluBf16Product { limit: None }, true),
             (ExpertGeometry::HY4_FLASH, "hy4f", Some(10.0), FfnActivation::SiluBf16Product { limit: Some(10.0) }, false),

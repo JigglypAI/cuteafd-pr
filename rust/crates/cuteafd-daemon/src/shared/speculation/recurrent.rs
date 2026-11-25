@@ -45,9 +45,14 @@ impl<'a> Drafter<'a> {
     pub fn append_context(&self,slot:usize,start:usize,features:Buffer,rows:usize)->Result<()> {
         self.context.append_ranked(&self.lead,self.split.as_ref(),slot,start,features,rows)
     }
-    pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
+    pub fn bind_slot(&self,slot:usize,origin:usize,admit_end:Option<usize>)->Result<()> {
         self.drain()?;
-        self.context.state.borrow_mut().reset(slot,origin)
+        let admit=admit_end.map(|end|(end,self.lead.config.transformer.block));
+        self.context.state.borrow_mut().bind_slot(slot,origin,admit)?;
+        Ok(())
+    }
+    pub fn reset_context(&self,slot:usize,origin:usize)->Result<()> {
+        self.bind_slot(slot,origin,None)
     }
     pub fn frontier(&self,slot:usize)->Result<(usize,usize)>{
         let state=self.context.state.borrow();Ok(state.pool.frontier(state.binding(slot)?)?)

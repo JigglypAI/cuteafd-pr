@@ -21,6 +21,7 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("muse_spark", "serve-muse", Some("muse-golden")),
     ("minimax_m3", "serve-minimax", Some("minimax-golden")),
     ("inkling2", "serve-inkling2", Some("inkling2-golden")),
+    ("inkling2_mini", "serve-inkling2-mini", Some("inkling2-mini-golden")),
     ("hy4_flash", "serve-hy4f", Some("hy4f-golden")),
 ];
 
@@ -152,6 +153,10 @@ mod tests {
             ["cuteafd", "inkling2-golden", "--nll"]);
         assert_eq!(argv(Kind::Serve, args(Some("inkling2"), &["--device", "1"])).unwrap().unwrap(),
             ["cuteafd", "serve-inkling2", "--device", "1"]);
+        assert_eq!(argv(Kind::Golden, args(Some("inkling2_mini"), &["--nll"])).unwrap().unwrap(),
+            ["cuteafd", "inkling2-mini-golden", "--nll"]);
+        assert_eq!(argv(Kind::Serve, args(Some("inkling2_mini"), &["--device", "1"])).unwrap().unwrap(),
+            ["cuteafd", "serve-inkling2-mini", "--device", "1"]);
     }
 
     #[test]

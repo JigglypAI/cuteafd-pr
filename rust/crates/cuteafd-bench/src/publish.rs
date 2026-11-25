@@ -41,6 +41,7 @@ pub fn family_title(family: &str) -> &str {
         "step5" => "Step-5",
         "hy4_flash" => "Hy4-flash",
         "inkling2" => "Inkling 2 Small",
+        "inkling2_mini" => "Inkling 2 Mini",
         "minimax_m3" => "MiniMax M3.1 Flash",
         other => other,
     }
@@ -612,8 +613,8 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 14] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
-    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5", "inkling2", "minimax_m3", "hy4_flash"];
+const FAMILIES: [&str; 15] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
+    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5", "inkling2", "inkling2_mini", "minimax_m3", "hy4_flash"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))

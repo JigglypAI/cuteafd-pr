@@ -1890,8 +1890,8 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
                 compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
                 compare_sm.V41_DRAFT_CAPACITIES if name in ('v41-experts', 'v41-dspark_tp2') else
                 compare_sm.V41_CAPACITIES)
-    # ModelOpt NVFP4 is deprecated; Inkling 2's native dynamic-amax NVFP4 is a different package.
-    assert [name for name in names if 'nvfp4' in name] == ['fp8/fp8-inkling2-nvfp4a4']
+    # ModelOpt NVFP4 is deprecated; Inkling 2 / Mini native dynamic-amax NVFP4 are separate packages.
+    assert sorted(name for name in names if 'nvfp4' in name) == ['fp8/fp8-inkling2-nvfp4a4', 'fp8/fp8-inkling2_mini-nvfp4a4']
     # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
     assert not any(name.startswith('fp8/fp8-step5') for name in names)
     args = jobs[0][2]

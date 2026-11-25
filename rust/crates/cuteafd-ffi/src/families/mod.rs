@@ -9,3 +9,4 @@ pub(crate) mod kimi_k3;
 pub(crate) mod kimi_k3_split;
 pub mod minimax_m3;
 pub mod inkling2;
+pub mod inkling2_mini;

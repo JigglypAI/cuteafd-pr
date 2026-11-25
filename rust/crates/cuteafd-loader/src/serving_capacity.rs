@@ -17,6 +17,7 @@ pub mod step5;
 pub mod step5_graphs;
 pub mod hy4_graphs;
 pub mod inkling2_graphs;
+pub mod inkling2_mini_graphs;
 mod spark_intake;
 pub mod spark_waves;
 pub mod prefill_waves;

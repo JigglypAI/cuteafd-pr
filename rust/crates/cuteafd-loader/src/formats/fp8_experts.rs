@@ -526,6 +526,11 @@ impl Fp8ExpertTensors {
                 vec![cuteafd_core::FfnActivation::Situ { beta: cfg.gate_softcap as f32,
                     linear_beta: Some(cfg.up_softcap as f32) }; cfg.layers]
             }
+            Some(family) if family.id() == "inkling2_mini" => {
+                let cfg = crate::families::inkling2_mini::Inkling2MiniConfig::from_hf(&checkpoint.config)?;
+                vec![cuteafd_core::FfnActivation::Situ { beta: cfg.text.gate_softcap as f32,
+                    linear_beta: Some(cfg.text.up_softcap as f32) }; cfg.text.layers]
+            }
             _ => Vec::new(),
         };
         let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, compressed_nvfp4, dynamic_nvfp4: false,

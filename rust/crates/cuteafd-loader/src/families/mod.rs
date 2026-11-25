@@ -8,6 +8,7 @@ pub mod hy4;
 pub mod hy4_common;
 pub mod hy4_flash;
 pub mod inkling2;
+pub mod inkling2_mini;
 pub mod kimi_k3;
 pub mod mimo_v2;
 pub mod minimax_m3;

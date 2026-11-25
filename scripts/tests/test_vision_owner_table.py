@@ -78,7 +78,8 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert result.returncode == 0, result.stderr
     entries = json.loads((tmp_path / "build/vision_attention/entries.json").read_text())
     assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
-        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"), (64, False, "pe_inkling2"), (96, False, "pe_step5"),
+        (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"),
+        (64, False, "pe_inkling2"), (64, False, "pe_inkling2_mini"), (96, False, "pe_step5"),
         (128, False, "tower_kimi"), (80, False, "tower_minimax"), (72, False, "tower_hy4f")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
@@ -92,7 +93,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 15, exports  # Step reuses Muse; each generic tower adds two groups
+    assert len(exports) == 16, exports  # Step reuses Muse; inkling2_mini reuses inkling2; each generic tower adds two groups
     legacy = [line for line in exports if "--group" not in line]
     assert len(legacy) == 1
     assert legacy[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
@@ -104,17 +105,18 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert pixtral["programs"][0] == "vision_attention_d128_full"
     assert [p["name"] for p in pixtral["programs"][1:]] == [
         "vision_axial_rotary_d128_bf16", "vision_rms_bf16_gamma_h2048"]
-    for item, kind, dim in zip(entries[5:7], ("inkling2", "step5"), (64, 96), strict=True):
+    for item, kind, dim in zip(entries[5:8], ("inkling2", "inkling2_mini", "step5"), (64, 64, 96), strict=True):
         inventory = subprocess.check_output(["python3", str(exporter), "--list-perception-programs", "--perception", kind], text=True).strip().split(";")
         assert item["programs"][0] == f"vision_attention_d{dim}_full"
         assert [p["name"] for p in item["programs"][1:]] == inventory
-        assert len(inventory) == (14 if kind == "inkling2" else 20)
-    inkling_export = next(line for line in exports if "--group perception --perception inkling2" in line)
+        assert len(inventory) == (14 if kind in ("inkling2", "inkling2_mini") else 20)
+    inkling_export = next(line for line in exports if "--group perception --perception inkling2 " in line or line.endswith("--group perception --perception inkling2"))
     assert "--omit-program vision_gelu_h4096" in inkling_export
     assert entries[5]["programs"][-1]["directory"].endswith("pointwise_muse")
     assert "vision_pe_patch_projection_h4096_o4096" in [p["name"] for p in entries[5]["programs"][1:]]
-    assert "vision_pe_patch_projection_h6144_o4096" in [p["name"] for p in entries[6]["programs"][1:]]
-    step = entries[6]
+    assert "vision_projection_h4096_o2304" in [p["name"] for p in entries[6]["programs"][1:]]
+    assert "vision_pe_patch_projection_h6144_o4096" in [p["name"] for p in entries[7]["programs"][1:]]
+    step = entries[7]
     assert step["directory"] == entries[2]["directory"]
     borrowed = [p for p in step["programs"][1:] if p["directory"].endswith("pointwise_muse")]
     assert [p["name"] for p in borrowed] == [p["name"] for p in entries[2]["programs"][1:] if p in borrowed]
@@ -125,7 +127,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
         assert f'--omit-program {program["name"]}' in step_export
         assert not any(Path(p).name == program["name"] + ".o" and "pointwise_pe_step5" in p
                        for p in rules.split())
-    for item, kind, heads, dim in zip(entries[7:], ("kimi", "minimax", "hy4f"), (12, 16, 16), (128, 80, 72), strict=True):
+    for item, kind, heads, dim in zip(entries[8:], ("kimi", "minimax", "hy4f"), (12, 16, 16), (128, 80, 72), strict=True):
         inventory = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
         assert item["programs"][0] == f"vision_dynamic_attention_h{heads}_d{dim}"
         assert [p["name"] for p in item["programs"][1:]] == inventory[1:]

@@ -69,14 +69,15 @@ impl<'a> ProgramsForRank<'a> {
             Some((fp8, Allocation::new(device, bytes, Tag::drafter_workspace("shared/recurrent-fp8"))?))
         };
         let head=if local.rank==local.lead {Some(HeadPrograms{
-            fold:Primitive::load(programs,Op::Fold)?,gate:Primitive::load(programs,Op::Gate)?,
+            fold:Primitive::load(programs,Op::Fold { hidden: c.hidden })?,gate:Primitive::load(programs,Op::Gate)?,
             finish:Primitive::load(programs,Op::Finish)?,
             bias_raw:Primitive::load(programs,Op::Bias{width:768,bf16:false})?,
             bias_correction:Primitive::load(programs,Op::Bias{width:201024,bf16:true})?,
         })}else{None};
         Ok(Self {plain,f32,compressed,compressed_scratch,trellis_add,fp8,head,
-            mix:Primitive::load(programs,Op::Mix)?,init:Primitive::load(programs,Op::Mask)?,
-            residual_norm:Primitive::load(programs,Op::ResidualNorm)?,
+            mix:Primitive::load(programs,Op::Mix { hidden: c.hidden, taps: config.taps.len() })?,
+            init:Primitive::load(programs,Op::Mask { hidden: c.hidden })?,
+            residual_norm:Primitive::load(programs,Op::ResidualNorm { hidden: c.hidden })?,
             rotary:Primitive::load(programs,Op::QkRope{query_heads:local.heads,kv_heads:local.kv_heads})?,
             context_rotary:Primitive::load(programs,Op::QkRope{query_heads:0,kv_heads:local.kv_heads})?,
             silu:Primitive::load(programs,Op::Silu{intermediate:local.intermediate})?,

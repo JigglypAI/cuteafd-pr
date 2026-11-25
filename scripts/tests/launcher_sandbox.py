@@ -318,6 +318,8 @@ def seed_checkpoint_metadata(hf):
             "num_hidden_layers": 48}, "quantization_config": {"quant_method": "mxfp8"}},
         "thinkingmachines/Inkling-2-Small": {"model_type": "inkling2", "text_config": {
             "num_hidden_layers": 48}, "quantization_config": {"quant_method": "nvfp4"}},
+        "thinkingmachines/Inkling-2-Mini": {"model_type": "inkling2_loop", "text_config": {
+            "num_hidden_layers": 24}, "quantization_config": {"quant_method": "nvfp4"}},
         "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC": {"model_type": "inkling2", "text_config": {
             "num_hidden_layers": 48}, "quantization_config": {"quant_method": "exl3"}},
         "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC": {"model_type": "hy_v4_flash", "text_config": {

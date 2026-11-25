@@ -342,12 +342,36 @@ mod tests {
     #[test]
     fn qualified_pe_towers_have_explicit_shared_dispatch() {
         let source=include_str!("../vision.rs");
-        assert!(source.contains("Some(\"inkling2\"|\"step5_vl\") => Self::perception"));
+        assert!(source.contains("Some(\"inkling2\"|\"inkling2_loop\"|\"step5_vl\") => Self::perception"));
         for (inkling,family) in [(true,cuteafd_loader::media::ImageFamily::Inkling2),(false,cuteafd_loader::media::ImageFamily::Step5)] {
             let directory=sparse_snapshot(inkling);
             let tower=TowerSpec::from_snapshot(directory.path(),169).unwrap();
             assert_eq!(tower.image_family(),family);
         }
+        // Also verify Inkling 2 Mini (inkling2_loop, output_width=2304) dispatches through Self::perception.
+        let mini_dir = tempfile::tempdir().unwrap();
+        let mini_cfg = serde_json::json!({"model_type":"inkling2_loop","text_config":{"hidden_size":2304},"vision_config":{
+            "hidden_size":1024,"num_hidden_layers":23,"num_attention_heads":16,"native_patch_size":20,
+            "temporal_patch_size":2,"adapter_merge_size":2,"projection_hidden_dim":4096,"posemb_grid_size":32,
+            "mlp_ratio":4.0,"projector_bias":false,"layer_norm_eps":1e-5}});
+        let mini_g = PerceptionGeometry::from_config(&mini_cfg).unwrap();
+        std::fs::write(mini_dir.path().join("config.json"), serde_json::to_vec(&mini_cfg).unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut end = 0u64;
+        for (name, shape) in mini_g.tensor_shapes() {
+            let bytes = shape.iter().product::<usize>() as u64 * 2;
+            header.insert(name, serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[end,end+bytes]}));
+            end += bytes;
+        }
+        let hbytes = serde_json::to_vec(&header).unwrap();
+        let mut file = File::create(mini_dir.path().join("model.safetensors")).unwrap();
+        use std::io::Write;
+        file.write_all(&(hbytes.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&hbytes).unwrap();
+        file.set_len(8 + hbytes.len() as u64 + end).unwrap();
+        let mini_tower = TowerSpec::from_snapshot(mini_dir.path(), 169).unwrap();
+        assert_eq!(mini_tower.image_family(), cuteafd_loader::media::ImageFamily::Inkling2);
+        assert_eq!(mini_tower.native.output_width, 2304);
     }
 }
 

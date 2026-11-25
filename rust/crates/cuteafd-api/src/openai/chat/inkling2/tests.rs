@@ -296,3 +296,43 @@ fn ordinary_openai_image_parts_keep_the_native_inkling_placeholder() {
         assert!(prompt.contains("<|content_image|>"));
     }
 }
+
+#[test]
+fn inkling2_mini_generation_and_dictsort_tool_calls_render() {
+    let tpl = include_str!("fixtures/inkling2.jinja").replace(
+        r#"{{- (args | tojson(sort_keys=true, separators=(",", ":"))) -}}
+            {{- "}<|end_message|>" -}}"#,
+        r#"{{- "{" -}}
+            {%- for key, value in args | dictsort(case_sensitive=true) -%}
+                {{- (key | tojson) ~ ":" ~ (value | tojson(separators=(",", ":"))) -}}
+                {%- if not loop.last -%},{%- endif -%}
+            {%- endfor -%}
+            {{- "}}<|end_message|>" -}}"#,
+    );
+    let encoding = super::InklingEncoding::new(
+        tpl,
+        super::InklingTokenIds {
+            eos: vec![200006],
+            message_model: 200001,
+            thinking: 200008,
+            text: 200004,
+            invoke_tool_json: 200049,
+            end_message: 200010,
+        },
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{\"z\":1,\"A\":2,\"a\":3}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+        ]
+    });
+    let prompt = encoding.render(&body, &super::InklingPromptOptions::default()).unwrap();
+    assert!(
+        prompt.contains(r#"{"name":"search","args":{"A":2,"a":3,"z":1}}"#),
+        "case-sensitive dictsort must place 'A' before 'a' before 'z': {prompt}"
+    );
+}
