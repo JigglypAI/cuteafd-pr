@@ -3235,6 +3235,20 @@ mod sampling_tests {
         assert!(!host_pending(false, false, &empty, &[]));
     }
 
+    /// Queued entries keep `prepared.images` empty and carry the image flag
+    /// beside it, so a queued image donor is not a text donor: admission lets
+    /// the waiter in, and so must `host_pending`.
+    #[test]
+    fn a_queued_image_donor_does_not_block_a_waiter() {
+        let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
+        let donor = prepared(&[1, 2]);
+        assert!(prefix_waiters_blocked(&waiters, &[(true, &donor)]));
+        assert!(!prefix_waiters_blocked(&waiters, &[(false, &donor)]), "an image donor publishes no text snapshot");
+        assert!(host_pending(false, false, &waiters, &[(false, &donor)]));
+        assert!(prefix_deferred(&waiters[0], [(true, &donor)].into_iter()));
+        assert!(!prefix_deferred(&waiters[0], [(false, &donor)].into_iter()));
+    }
+
     #[test]
     fn packed_prefill_caps_taps_and_unknown_exact_routes_without_rechunking() -> Result<()> {
         use crate::shared::prefill_packing::{groups, plan, PackingMode};
