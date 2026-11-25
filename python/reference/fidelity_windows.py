@@ -291,6 +291,22 @@ def admit_reference_memory(cuda, required_peak_bytes, *, margin_bytes=4 * 2**30)
         raise RuntimeError("reference unified CUDA/host admission failed before allocation")
 
 
+def read_tokens_file(path, vocab=None):
+    """A ``tokens.bin`` (little-endian u32 ids) exactly as written, never re-tokenized."""
+    data = Path(path).read_bytes()
+    if not data or len(data) % 4:
+        raise ValueError(f"{path}: {len(data)} bytes is not a nonempty little-endian u32 token file")
+    tokens = np.frombuffer(data, dtype="<u4").tolist()
+    if vocab is not None and max(tokens) >= vocab:
+        raise ValueError(f"{path}: token id {max(tokens)} is outside the vocabulary ({vocab})")
+    return tokens
+
+
+def write_tokens_file(path, tokens):
+    """The u32 ``tokens.bin`` layout ``read_tokens_file`` reads and the goldens emit."""
+    Path(path).write_bytes(np.asarray(tokens, dtype="<u4").tobytes())
+
+
 def log_checkpoint_reads(label, readers, before, started):
     """Logical cloned/sliced tensor bytes, not physical FUSE or archive traffic."""
     elapsed = time.monotonic() - started
