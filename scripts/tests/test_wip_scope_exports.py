@@ -312,7 +312,9 @@ def test_vision_scope_matches_every_shared_tower_family():
     body = source[source.index('let family = match self.image_family() {'):]
     body = body[:body.index('};')]
     towers = set(re.findall(r'ImageFamily::\w+ => "(\w+)"', body)) - {'mimo_v2'}
-    assert towers and towers == aot.VISION_ATTENTION_FAMILIES
+    # inkling2_mini shares ImageFamily::Inkling2 ("inkling2") in vision.rs.
+    expected = towers | {'inkling2_mini'}
+    assert towers and expected == aot.VISION_ATTENTION_FAMILIES
     launcher = (ROOT / 'scripts/launch/run-family.sh').read_text()
     case = re.search(r'\n\s*([\w|]+)\) media_caps\+=\(vision\) ;;', launcher)
-    assert case and set(case.group(1).split('|')) == towers
+    assert case and set(case.group(1).split('|')) == expected
