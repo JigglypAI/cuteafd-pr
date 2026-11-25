@@ -1778,6 +1778,8 @@ if [[ "$family" == hy4_flash && "$speculator" == dfly2 ]]; then
   tp2_dflash_supported=1
 elif [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$speculator" == dflash2 ]]; then
   tp2_dflash_supported=1
+elif [[ "$family" == glm5 && "$speculator" == dspark ]]; then
+  tp2_dflash_supported=1
 fi
 if [[ "$tp2_dflash_supported" == 1 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off ]]; then
   tp2_dflash_default=on
@@ -1786,7 +1788,7 @@ fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == kimi_k3 && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( "$tp2_dflash_supported" == 1 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 ) ]] ||
-  release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2 or Hy4-flash with DFly2 and two selected RTX GPUs"
+  release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2, Mistral Large 4 with dSpark, or Hy4-flash with DFly2 and two selected RTX GPUs"
 if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"

@@ -168,7 +168,7 @@ def test_deployment_preserves_release_container_commands(
                 position = after["command"].index("--tp2-dflash")
                 assert after["command"].count("--tp2-dflash") == 1
                 tp2_dflash = ("true" if "--split-device" in before["command"]
-                              and "--draft" in before["command"] else "false")
+                              and ("--draft" in before["command"] or "--dspark" in before["command"]) else "false")
                 assert after["command"][position + 1] == tp2_dflash
                 del after["command"][position:position + 2]
             if entry["family"] == "glm5_flash":

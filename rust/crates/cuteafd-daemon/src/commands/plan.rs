@@ -507,14 +507,19 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
     // Spark-range plans price both GPU counts; its one-GPU column clears TP2.
-    let split = args.rtx == 2 || (matches!(family, "glm5" | "glm5_flash") && args.spark_range);
-    let draft_compatible = if family == "hy4_flash" {
-        args.speculator == "dfly2"
+    let split = args.rtx == 2 || (matches!(family, "glm5" | "glm5_flash" | "mistral_large4") && args.spark_range);
+    let applicable = if family == "mistral_large4" {
+        args.layout && split && args.speculator == "dspark"
     } else {
-        args.speculator == "dflash2"
+        let draft_compatible = if family == "hy4_flash" {
+            args.speculator == "dfly2"
+        } else {
+            args.speculator == "dflash2"
+        };
+        crate::cli::tp2_dflash_default(family, args.layout && split, draft_compatible)
     };
-    let applicable = crate::cli::tp2_dflash_default(family, args.layout && split, draft_compatible);
-    let default_on = applicable && (!matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0);
+    let default_on = applicable
+        && (!matches!(family, "glm5" | "glm5_flash" | "mistral_large4") || args.drafter_gib == 0.0);
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
         Some("off") => false,
@@ -529,8 +534,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
         }
     } else { args.tp2_dflash.unwrap_or(configured) };
     anyhow::ensure!(!enabled || applicable,
-        "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2 or Hy4-flash with DFly2, --layout, and --rtx 2");
-    anyhow::ensure!(!enabled || !matches!(family, "glm5" | "glm5_flash") || args.drafter_gib == 0.0,
+        "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2, Mistral Large 4 with dSpark, or Hy4-flash with DFly2, --layout, and --rtx 2");
+    anyhow::ensure!(!enabled || !matches!(family, "glm5" | "glm5_flash" | "mistral_large4") || args.drafter_gib == 0.0,
         "TP2 DFlash requires checkpoint-derived physical owners; --drafter-gib forces whole placement");
     Ok(enabled)
 }
@@ -2067,6 +2072,25 @@ mod tests {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).is_err());
         }
+        // Mistral Large 4 bundled dspark defaults TP2 on with 2 RTX GPUs, honors off/--drafter-gib, refuses 1 RTX.
+        let ml4_argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
+        for (explicit, expected) in [("false", false), ("true", true)] {
+            let crate::cli::Commands::Plan(ml4) = crate::cli::Cli::try_parse_from(
+                ml4_argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
+                else { panic!("expected plan") };
+            assert_eq!(tp2_dflash(&ml4, "mistral_large4", &cfg).unwrap(), expected);
+        }
+        let crate::cli::Commands::Plan(mut ml4) = crate::cli::Cli::try_parse_from(ml4_argv).unwrap().command
+            else { panic!("expected plan") };
+        assert!(tp2_dflash(&ml4, "mistral_large4", &Default::default()).unwrap());
+        assert!(!tp2_dflash(&ml4, "mistral_large4", &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
+        ml4.drafter_gib = 8.0;
+        assert!(!tp2_dflash(&ml4, "mistral_large4", &Default::default()).unwrap());
+        assert!(tp2_dflash(&ml4, "mistral_large4", &cfg).is_err());
+        ml4.drafter_gib = 0.0;
+        ml4.rtx = 1;
+        assert!(!tp2_dflash(&ml4, "mistral_large4", &Default::default()).unwrap());
+        assert!(tp2_dflash(&ml4, "mistral_large4", &cfg).is_err());
     }
 
     #[test]

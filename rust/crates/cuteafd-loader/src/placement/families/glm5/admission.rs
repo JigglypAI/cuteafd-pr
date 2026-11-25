@@ -664,6 +664,106 @@ impl DraftFacts {
         Ok(facts)
     }
 
+    /// Fixed two-GPU tensor-parallel ML4 mtp_dspark owners: 32 attention heads
+    /// and half FFN intermediate per rank, replicated context/KV/norms, RNN
+    /// Markov head and masks on GPU0, reusing the target's peer exchange.
+    pub fn ml4_tp2(layouts: &[crate::formats::dflash::MlaDraftRuntimeLayout; 2]) -> anyhow::Result<Self> {
+        use crate::formats::dflash::{MlaDraftDomain, MlaDraftDtype, MlaDraftPacking, MlaDraftShardAxis};
+        use anyhow::{ensure, Context};
+        use cuteafd_core::memory_layout::Category;
+        let mut facts = Self::default();
+        let mut pinned = 0usize;
+        let mut row_cache = 0usize;
+        for (rank, layout) in layouts.iter().enumerate() {
+            ensure!(layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2
+                && layout.tp2_rank() == Some(rank),
+                "GLM ML4 TP2 facts require Ml4DsparkTp2 rank {rank} layout");
+            let prefix = if rank == 0 { "glm.draft" } else { "glm.draft.peer" };
+            let location = Location::coordinator(rank as u8);
+            let arena = crate::serving_capacity::WeightArenaLayout::new(
+                format!("glm/draft/{rank}"), layout.immutable_arena_requests())?;
+            let mut rank_weights = 0u64;
+            let mut removed = 0u64;
+            for owner in layout.owners().iter().filter(|owner| !owner.on_use) {
+                if owner.shared_key.as_deref() == Some("library/sync-h2d") {
+                    facts.sync_upload_bytes = facts.sync_upload_bytes.max(owner.bytes as u64);
+                    continue;
+                }
+                if layout.is_immutable_buffer(&owner.id) {
+                    rank_weights = rank_weights.checked_add(owner.resident_weights.0)
+                        .context("ML4 TP2 draft logical weight overflow")?;
+                    removed = removed.checked_add(owner.bytes as u64)
+                        .context("ML4 TP2 draft immutable owner overflow")?;
+                    continue;
+                }
+                let mut allocation = Allocation::buffer(format!("{prefix}.{}", owner.id),
+                    match owner.domain { MlaDraftDomain::Device => location,
+                        MlaDraftDomain::HostPinned => Location::PINNED }, owner.bytes as u64,
+                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter,
+                    "ML4 TP2 draft owners");
+                allocation.alignment = owner.alignment as u64;
+                allocation.dtype = match owner.dtype { MlaDraftDtype::Bytes => "bytes", MlaDraftDtype::Bf16 => "bf16",
+                    MlaDraftDtype::F32 => "f32", MlaDraftDtype::I32 => "i32", MlaDraftDtype::U32 => "u32",
+                    MlaDraftDtype::I64 => "i64" }.into();
+                allocation.shape = owner.shape.iter().map(|&n| n as u64).collect();
+                facts.owners.push(allocation);
+            }
+            ensure!(removed == arena.payload_bytes() as u64,
+                "ML4 TP2 draft rank {rank} immutable owners differ from shared arena requests: {removed}/{}",
+                arena.payload_bytes());
+            for weight in layout.weight_destinations() {
+                if matches!(weight.packing, MlaDraftPacking::UnitScale | MlaDraftPacking::Uv) { continue; }
+                if weight.packing == MlaDraftPacking::Uk {
+                    let heads = weight.shape[0];
+                    let ranks = weight.shard.map_or(1, |s| s.ranks);
+                    let shape = &weight.sources.first().context("ML4 TP2 Uk source")?.1;
+                    let total_heads = heads * ranks;
+                    ensure!(heads > 0 && shape.len() == 2 && shape[0] % total_heads == 0,
+                        "ML4 TP2 absorption source geometry");
+                    let head = (shape[0] / total_heads).checked_mul(shape[1]).and_then(|n| n.checked_mul(2))
+                        .context("ML4 TP2 absorption head overflow")?;
+                    let per = crate::shared::dense_read::STEP_BYTES / head;
+                    ensure!(per > 0, "ML4 TP2 absorption head exceeds Mount bank");
+                    pinned = pinned.max((per.min(heads) * head).max(crate::shared::dense_read::PINNED_FLOOR_BYTES));
+                } else {
+                    for (_, shape) in &weight.sources {
+                        let (mut rows, mut slice_row, full_row) = if shape.len() >= 2 {
+                            let row = shape[1..].iter().try_fold(2usize, |b, &n| b.checked_mul(n))
+                                .context("ML4 TP2 draft read row overflow")?;
+                            (shape[0], row, row)
+                        } else {
+                            let row = shape.iter().try_fold(2usize, |b, &n| b.checked_mul(n))
+                                .context("ML4 TP2 draft read row overflow")?;
+                            (1, row, row)
+                        };
+                        if let Some(shard) = weight.shard {
+                            match shard.axis {
+                                MlaDraftShardAxis::Rows => rows /= shard.ranks,
+                                MlaDraftShardAxis::Columns => slice_row /= shard.ranks,
+                            }
+                        }
+                        let batch = crate::shared::dense_read::ReadBatch::new(rows, full_row, slice_row,
+                            crate::shared::dense_read::STEP_BYTES)?;
+                        pinned = pinned.max(batch.pinned_bytes());
+                        row_cache = row_cache.max(batch.cached_bytes);
+                    }
+                }
+            }
+            facts.tp2_arenas.push((arena, rank_weights));
+        }
+        if pinned > 0 {
+            facts.owners.push(Allocation::buffer("glm.draft.load.mount", Location::PINNED, pinned as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                "ML4 TP2 bundled draft Mount bank"));
+        }
+        if row_cache > 0 {
+            facts.owners.push(Allocation::buffer("glm.draft.load.mount.row_cache", Location::HOST, row_cache as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
+                "ML4 TP2 bundled draft Mount full-row cache"));
+        }
+        Ok(facts)
+    }
+
     fn pack_arena(&mut self, requests: Vec<(String, usize)>) -> anyhow::Result<()> {
         use anyhow::{ensure, Context};
         ensure!(self.arena.is_none(), "GLM draft arena supplied twice");
