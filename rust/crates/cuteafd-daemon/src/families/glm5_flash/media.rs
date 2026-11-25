@@ -295,7 +295,7 @@ pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
     };
     let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
-    probe.spec.validate_media()?;
+    probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::GlmFlash.token_geometry())?;
     apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(view)?)
 }
 

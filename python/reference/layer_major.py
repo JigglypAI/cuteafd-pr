@@ -244,6 +244,9 @@ def official_state_equality(path, state, manifest, snapshot):
 
 def embed_window(family, window, features=None):
     """Replace only native image span rows before any decoder layer runs."""
+    if hasattr(family, "embed_media"):
+        # Families whose embedding expands to residual streams inject before expansion.
+        return family.embed_media(window, features)
     hidden = family.embed(window["tokens"])
     for span in window.get("media", []):
         if features is None or span["key"] not in features:

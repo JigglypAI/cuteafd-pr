@@ -13,6 +13,13 @@ struct Running {
     pending: Pending,
     ticket: EncoderTicket,
 }
+/// A batched owner turn: every member's ticket completes from one reply.
+struct RunningBatch {
+    members: Vec<(Pending, usize)>,
+    ticket: EncoderTicket,
+    done: Option<Result<Vec<u16>, MediaError>>,
+    elapsed_ms: f64,
+}
 pub struct LocalEncoder {
     service: EncoderService,
     lut: Arc<[f32; 768]>,
@@ -21,6 +28,7 @@ pub struct LocalEncoder {
     patch_size: usize,
     queue: VecDeque<Pending>,
     running: Option<Running>,
+    batch: Option<RunningBatch>,
     next: u64,
 }
 impl LocalEncoder {
@@ -33,16 +41,14 @@ impl LocalEncoder {
         let limits = cuteafd_core::media::ImageEncodeLimits {
             max_patches: u32::try_from(max_tokens.saturating_mul(config.merge.pow(2) as usize))
                 .unwrap_or(u32::MAX),
-            max_output_rows: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+            // Row-marker towers (Mistral, Hy4 newline rows) emit their whole LM span.
+            max_output_rows: u32::try_from(if config.token_geometry().row_markers > 0 {
+                config.max_image_tokens.max(max_tokens)
+            } else { max_tokens }).unwrap_or(u32::MAX),
             max_canvas_pixels: (max_tokens as u64)
                 .saturating_mul(u64::from(config.merge.pow(2)))
                 .saturating_mul(u64::from(config.patch.pow(2))),
-            geometry: cuteafd_core::media::ImageTokenGeometry {
-                merge: config.merge,
-                row_markers: u32::from(
-                    config.family == cuteafd_loader::media::ImageFamily::Mistral,
-                ),
-            },
+            geometry: config.token_geometry(),
         };
         Self::with_limits(service, config, width, limits)
     }
@@ -61,6 +67,7 @@ impl LocalEncoder {
             patch_size: config.patch as usize,
             queue: VecDeque::new(),
             running: None,
+            batch: None,
             next: 0,
         }
     }
@@ -101,6 +108,63 @@ impl LocalEncoder {
         Ok(())
     }
 }
+impl LocalEncoder {
+    /// Batch-capable towers take every queued still (up to eight) in one owner
+    /// turn: one upload, one varlen attention per block, one download.
+    fn poll_batch(&mut self, id: media::EncoderTicket) -> Option<Result<EncodeOutput, MediaError>> {
+        if self.batch.is_none() && self.running.is_none() {
+            let mut members = Vec::new();
+            let mut jobs = Vec::new();
+            while members.len() < cuteafd_ffi::vision::NativeVision::MAX_BATCH {
+                let Some(pending) = self.queue.pop_front() else { break };
+                let EncodeInput::Image { grid, rgb8, .. } = &pending.job.input else {
+                    self.queue.push_front(pending);
+                    break;
+                };
+                let rows = pending.job.tokens * self.width;
+                jobs.push(EncodeJob { rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize], pixels: None,
+                    lut: self.lut.clone(), output: vec![0; rows] });
+                members.push((pending, rows));
+            }
+            if members.is_empty() { return None; }
+            match self.service.submit_batch(jobs) {
+                Ok(ticket) => self.batch = Some(RunningBatch { members, ticket, done: None, elapsed_ms: 0.0 }),
+                Err(error) => {
+                    let backpressure = matches!(error, super::VisionError::QueueFull);
+                    for (pending, _) in members.into_iter().rev() { self.queue.push_front(pending); }
+                    if backpressure { return None; }
+                    if self.queue.front()?.id == id {
+                        self.queue.pop_front();
+                        return Some(Err(MediaError::Encoder(error.to_string())));
+                    }
+                    return None;
+                }
+            }
+        }
+        let batch = self.batch.as_mut()?;
+        if batch.done.is_none() {
+            batch.done = match batch.ticket.poll() {
+                Ok(None) => return None,
+                Ok(Some(output)) => Some(Ok(output)),
+                Err(error) => Some(Err(MediaError::Encoder(error.to_string()))),
+            };
+            batch.elapsed_ms = batch.ticket.encode_ms();
+        }
+        let index = batch.members.iter().position(|(pending, _)| pending.id == id)?;
+        let offset: usize = batch.members[..index].iter().map(|(_, rows)| rows).sum();
+        let (pending, rows) = batch.members.remove(index);
+        let result = match batch.done.as_ref().expect("completed batch") {
+            Ok(output) => Ok(EncodeOutput { key: pending.job.key,
+                features: output[offset..offset + rows].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>().into(),
+                elapsed_ms: batch.elapsed_ms }),
+            Err(error) => Err(error.clone()),
+        };
+        // Keep the packed reply aligned for the members still to collect.
+        if let Some(Ok(output)) = batch.done.as_mut() { output.drain(offset..offset + rows); }
+        if batch.members.is_empty() { self.batch = None; }
+        Some(result)
+    }
+}
 impl EncoderClient for LocalEncoder {
     fn submit(&mut self, job: media::EncodeJob) -> Result<media::EncoderTicket, MediaError> {
         self.validate(&job)?;
@@ -111,6 +175,10 @@ impl EncoderClient for LocalEncoder {
         Ok(id)
     }
     fn poll(&mut self, id: media::EncoderTicket) -> Option<Result<EncodeOutput, MediaError>> {
+        if self.service.supports_batch() && self.queue.iter().chain(self.batch.iter().flat_map(|b| b.members.iter().map(|(p, _)| p)))
+            .all(|pending| matches!(pending.job.input, EncodeInput::Image { .. })) {
+            return self.poll_batch(id);
+        }
         if self.running.is_none() {
             let pending = self.queue.pop_front()?;
             let output = vec![0; pending.job.tokens * self.width];
@@ -182,6 +250,18 @@ impl EncoderClient for LocalEncoder {
     }
     fn cancel(&mut self, id: media::EncoderTicket) {
         self.queue.retain(|pending| pending.id != id);
+        if let Some(batch) = self.batch.as_mut() {
+            // A batched owner turn cannot cancel one member; the others still
+            // collect their rows, and the dropped member's slice is discarded.
+            if let Some(index) = batch.members.iter().position(|(pending, _)| pending.id == id) {
+                if let Some(Ok(output)) = batch.done.as_mut() {
+                    let offset: usize = batch.members[..index].iter().map(|(_, rows)| rows).sum();
+                    output.drain(offset..offset + batch.members[index].1);
+                }
+                batch.members.remove(index);
+                if batch.members.is_empty() { self.batch = None; }
+            }
+        }
         if self
             .running
             .as_ref()
@@ -217,7 +297,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            turn: None,
+            turn: None, batch: false,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::with_limits(service, &config, 1, limits);
@@ -298,7 +378,7 @@ mod tests {
             audio_ledger: Some(Default::default()),
             audio_geometry: Some(geometry),
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            turn: None,
+            turn: None, batch: false,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 8192, 256);
@@ -331,6 +411,50 @@ mod tests {
     }
 
     #[test]
+    fn batch_capable_tower_encodes_queued_images_in_one_owner_turn() {
+        use cuteafd_loader::media::ImageFamily;
+        let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
+        let turns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = turns.clone();
+        let owner = std::thread::spawn(move || {
+            while let Ok(work) = jobs.recv() {
+                let super::super::EncoderJob::VisionBatch(batch) = work.job else { panic!("expected a batch") };
+                seen.lock().unwrap().push(batch.len());
+                let mut output = Vec::new();
+                for (i, job) in batch.into_iter().enumerate() { output.extend(vec![i as u16 + 1; job.output.len()]); }
+                work.encode_ns.store(2_000_000, Ordering::Release);
+                let _ = work.reply.send(Ok(output));
+            }
+        });
+        let service = EncoderService { queue: Some(queue), owner: Some(super::super::push::OwnerThread::mock(owner)),
+            ledger: Default::default(), audio_ledger: None, audio_geometry: None,
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)), turn: None, batch: true };
+        let config = ProcessorConfig::for_family(ImageFamily::Hy4Flash);
+        let mut encoder = LocalEncoder::new(service, &config, 2, 4096);
+        // 2x2 patches -> 1 x (1 + 1) rows; 4x2 -> 2 x 2 rows (newline rows included).
+        let job = |key: u8, h: u32, w: u32| media::EncodeJob::image(ImageKey([key; 32]), [1, h, w],
+            vec![0; (h * w * 256 * 3) as usize].into(), (h as usize / 2) * (w as usize / 2 + 1), 2);
+        let ids = [encoder.submit(job(1, 2, 2)).unwrap(), encoder.submit(job(2, 4, 2)).unwrap(),
+            encoder.submit(job(3, 2, 2)).unwrap()];
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut outputs = vec![None; 3];
+        // Collect out of order: the packed reply must still split per member.
+        for &i in [2usize, 0, 1].iter().cycle() {
+            if outputs.iter().all(Option::is_some) { break; }
+            if outputs[i].is_none() { outputs[i] = encoder.poll(ids[i]).map(|r| r.unwrap()); }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        for (i, rows) in [2usize, 4, 2].into_iter().enumerate() {
+            let output = outputs[i].take().unwrap();
+            assert_eq!(output.features.len(), rows * 2 * 2);
+            assert!(output.features.chunks_exact(2).all(|v| u16::from_le_bytes([v[0], v[1]]) == i as u16 + 1));
+            assert_eq!(output.elapsed_ms, 2.0);
+        }
+        assert_eq!(*turns.lock().unwrap(), [3]);
+    }
+
+    #[test]
     fn rgb_extent_uses_the_processor_patch_size() {
         use cuteafd_loader::media::ImageFamily;
         for family in [ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
@@ -342,7 +466,7 @@ mod tests {
                 audio_ledger: None,
                 audio_geometry: None,
                 healthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            turn: None,
+            turn: None, batch: false,
             };
             let config = ProcessorConfig::for_family(family);
             let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -376,7 +500,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: health,
-            turn: None,
+            turn: None, batch: false,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -407,7 +531,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            turn: None,
+            turn: None, batch: false,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -469,7 +593,7 @@ mod tests {
             audio_ledger: None,
             audio_geometry: None,
             healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            turn: None,
+            turn: None, batch: false,
         };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);

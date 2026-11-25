@@ -42,7 +42,7 @@ pub(crate) fn spans(job: &NativeRequest, tokens: &[u32], vocabulary: u32, contex
         "still probe token/context/audio extent");
     ensure!(probe.spec.prompt_ids.as_deref() == Some(tokens) && probe.spec.media.len() == job.media.len(),
         "still probe expanded ids/image count differs");
-    probe.spec.validate_media()?;
+    probe.spec.validate_media_geometry(family.token_geometry())?;
     let placeholder = marker(snapshot, if family == ImageFamily::Kimi { "<|media_pad|>" } else { "]<]image[>[" }, vocabulary)?;
     let tokenizer = cuteafd_loader::cached_tokenizer(snapshot)?;
     let mut covered = std::collections::BTreeSet::new();
@@ -84,10 +84,15 @@ pub(crate) fn prepare(job: NativeRequest, tokens: Vec<u32>, vocabulary: u32, hid
     Ok((crate::shared::qwen::scheduler::Prompt { job, tokens, keys }, media, jobs))
 }
 
+/// The pinned serving reference whose tower produced fidelity features.
+fn source_revision(family: ImageFamily) -> &'static str {
+    if family == ImageFamily::Hy4Flash { "sglang@ccb8d9cc" } else { "sglang@a9bf8c76" }
+}
+
 pub(crate) fn snapshot_identity(snapshot: &Path, family: ImageFamily) -> Result<serde_json::Value> {
     use sha2::{Digest, Sha256};
     let mut identity = serde_json::json!({"snapshot_revision": snapshot.file_name().and_then(|s| s.to_str())
-        .context("probe snapshot revision")?, "family": format!("{family:?}"), "source": "sglang@a9bf8c76"});
+        .context("probe snapshot revision")?, "family": format!("{family:?}"), "source": source_revision(family)});
     for name in ["config.json", "tokenizer_config.json", "tokenizer.json", "tiktoken.model", "model.safetensors.index.json"] {
         let path = snapshot.join(name);
         if path.is_file() { identity[format!("{name}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(path)?)).into(); }
@@ -101,7 +106,7 @@ pub(crate) fn features(prompt: &crate::shared::qwen::scheduler::Prompt, media: &
     ensure!(prompt.job.probe.as_ref().is_some_and(|p| p.spec.feature_scoring()), "still media is fidelity-only");
     let root = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR").context("fidelity image feature payload directory absent")?;
     super::features::apply_probe_features(&prompt.job, media, cache, &std::path::PathBuf::from(root),
-        &snapshot_identity(snapshot, family)?, "a9bf8c76")
+        &snapshot_identity(snapshot, family)?, &source_revision(family)["sglang@".len()..])
 }
 
 /// Diagnostic path only: reuse admitted embedding storage, never allocate GPU

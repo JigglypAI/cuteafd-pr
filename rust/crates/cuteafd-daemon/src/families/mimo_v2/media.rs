@@ -256,7 +256,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
             (tokens, spans)
         } else if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
-            probe.spec.validate_media()?;
+            probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::Mimo.token_geometry())?;
             anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
                 "expanded probe media count/context differs");
             anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
@@ -376,7 +376,7 @@ pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
     let variable = if audio { "CUTEAFD_AUDIO_FEATURES_DIR" } else { "CUTEAFD_MEDIA_FEATURES_DIR" };
     let Some(root) = std::env::var_os(variable) else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
-    probe.spec.validate_media()?;
+    probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::Mimo.token_geometry())?;
     let root = std::path::PathBuf::from(root);
     let identity = snapshot_identity(snapshot)?;
     if audio { apply_audio_probe_features(prompt, media, cache, &root, &identity) }

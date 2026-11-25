@@ -24,6 +24,20 @@ The [MC comparison](../../scripts/bench/release-smoke-v7-mc-compact.json)
 runs `original`, `k6-compact` and `fp8-compact` on the same two-RTX
 layout as the K8 base. Cards and quality comparisons are pending measurement.
 
+## Vision
+
+`VISION=auto` serves the checkpoint's bundled 27-layer ViT (`vit.*`, 441 BF16
+tensors, 0.87 GiB). It is a SigLIP2-So400m body: patch-16 biased conv
+embedding, a learned 128x128 position grid resized per image, 16 heads x 72,
+exact GELU, then RMSNorm and a 2x2 conv merger to the 3072-wide LM. The
+checkpoint's `image_newline` closes every merged row, so an `h x w` patch grid
+fills `h/2 * (w/2 + 1)` image rows between `<|hy_image start|>` and
+`<|hy_image end|>`. Those rows carry interleaved 3D M-RoPE positions. Numerics
+follow Tencent's serving stack (SGLang `hunyuan_v4_vl.py`), cross-checked
+against Transformers PR 50903. The tower lives in its own packed arena, charged
+once by joint admission, and encodes up to eight images per batched pass. Image
+spans hash into exact prefix-cache marks. `VISION=off` keeps text-only serving.
+
 ## Changelog
 
 | Release | Date | Changes | Basic eval |

@@ -1602,6 +1602,7 @@ impl<'a> Hy4Engine<'a> {
             skip_routed_experts,
             onboarded_experts,
             0,
+            Default::default(),
         )
     }
 
@@ -1627,6 +1628,7 @@ impl<'a> Hy4Engine<'a> {
         skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
         draft_peer_rows: usize,
+        media: crate::shared::vision::push::Contribution,
     ) -> Result<Self> {
         ensure!((1..=DECODE_ROWS as usize).contains(&decode_rows),
             "Hy4-flash split-K decode exports cover at most {DECODE_ROWS} rows; got {decode_rows}");
@@ -1665,7 +1667,7 @@ impl<'a> Hy4Engine<'a> {
         // Prefill scoring can project a full head tile, independently of the
         // configured decode-row budget.
         let head_rows = max_rows.min(DECODE_ROWS as usize);
-        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows)?;
+        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows, media)?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
         let max_seq_pages = admitted_context.div_ceil(PAGE_ROWS).max(16);
@@ -2007,7 +2009,8 @@ impl<'a> Hy4Engine<'a> {
 
     pub(super) fn draft_propose(&self, placement: &Hy4Placement, bonus: u32, depth: usize) -> Result<Vec<u32>> {
         if depth == 0 || !self.draft_valid(placement) { return Ok(Vec::new()); }
-        let batch = [super::draft::Member { slot: placement.slot, pos: placement.len, bonus, depth }];
+        let batch = [super::draft::Member { slot: placement.slot, pos: placement.len, bonus, depth,
+            rope_delta: placement.rope.delta() }];
         Ok(self.draft_batch(&batch)?.pop().unwrap_or_default())
     }
 
@@ -2470,7 +2473,10 @@ impl<'a> Hy4Engine<'a> {
         let swa_ring_rows = self.ranks[0].cache.swa_ring_rows;
 
         let mut flat_tokens = Vec::with_capacity(rows);
-        let mut pos_i64 = Vec::with_capacity(rows * 8);
+        // Rope coordinates are [rows, 3] (T, H, W) interleaved M-RoPE; KV and SWA
+        // slots, indexer limits and group ids stay slot-based (`pos`).
+        let mut pos_i64 = Vec::with_capacity(rows * 24);
+        let mut media_rows: Vec<(usize, usize, usize)> = Vec::new();
         let mut pos_i32 = Vec::with_capacity(rows * 4);
         let mut dsa_slots_i64 = Vec::with_capacity(rows * 8);
         let mut dsa_slots_ctx: [Vec<u8>; 2] = if self.context_split {
@@ -2538,13 +2544,18 @@ impl<'a> Hy4Engine<'a> {
             swa_seqlens_bytes.extend_from_slice(&(pos_end as i32).to_le_bytes());
             flat_tokens.extend_from_slice(tok_slice);
 
+            if p.media.as_ref().is_some_and(|media| media.needed(pos_start, pos_start + n).next().is_some()) {
+                media_rows.push((seg.sequence, pos_start, row_cursor));
+            }
             for (offset, _) in tok_slice.iter().enumerate() {
                 let pos = pos_start + offset;
                 let logical_page = pos / PAGE_ROWS;
                 let local_row = pos % PAGE_ROWS;
                 let raw_page = p.units[logical_page] as usize;
                 let swa_slot = p.slot * swa_ring_rows + (pos % swa_ring_rows);
-                pos_i64.extend_from_slice(&(pos as i64).to_le_bytes());
+                for axis in p.rope_at(pos)? {
+                    pos_i64.extend_from_slice(&axis.to_le_bytes());
+                }
                 pos_i32.extend_from_slice(&(pos as i32).to_le_bytes());
                 swa_slots_i64.extend_from_slice(&(swa_slot as i64).to_le_bytes());
                 if self.context_split {
@@ -2572,7 +2583,10 @@ impl<'a> Hy4Engine<'a> {
                     let logical_page = gid / (PAGE_ROWS / 4);
                     let local_group = gid % (PAGE_ROWS / 4);
                     let raw_page = p.units[logical_page] as usize;
-                    g_pos_bytes.extend_from_slice(&((gid * 4) as i64).to_le_bytes());
+                    // A pooled group carries the rope phase of its first token slot.
+                    for axis in p.rope_at(gid * 4)? {
+                        g_pos_bytes.extend_from_slice(&axis.to_le_bytes());
+                    }
                     if self.context_split {
                         let owner = context::page_owner(logical_page);
                         ensure!(raw_page & 1 == owner, "Hy4 ContextSplit group {gid} page {logical_page} has wrong parity id {raw_page}");
@@ -2721,8 +2735,28 @@ impl<'a> Hy4Engine<'a> {
         {
             let r0 = &self.ranks[0];
             let emb = r0.weights.embedding.as_ref().context("rank 0 missing TokenEmbedding")?;
+            // Image rows: the gathered placeholder embedding is replaced on all four
+            // iHC streams by the tower's cached BF16 features, as in SGLang's
+            // prepare_mm_inputs before the stream expansion. r_b and y are dead
+            // until layer 0 writes them, so they stage the feature rows and indices.
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            for &(sequence, start, row) in &media_rows {
+                let p = &placements[sequence];
+                let media = p.media.as_ref().context("Hy4 media rows without request media")?;
+                let n = members.iter().find(|m| m.row_start == row).context("Hy4 media member")?.row_len;
+                let mut part = cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(start, start + n, &mut part)?;
+                chunk.indices.extend(part.indices.iter().map(|&index| index + row as u32));
+                chunk.features.extend(part.features);
+            }
+            let wave = &r0.waves[wave_slot];
             r0.device.run(|| {
-                emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, r0.waves[wave_slot].r_a.buffer, r0.stream.raw)
+                emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, wave.r_a.buffer, r0.stream.raw)?;
+                if !chunk.indices.is_empty() {
+                    r0.device.library.embedding_injection()?.inject_host(&chunk.features, &chunk.indices,
+                        wave.r_b.buffer, wave.y.buffer, wave.r_a.buffer, rows, H, HC, r0.stream.raw)?;
+                }
+                Ok(())
             })?;
         }
         if self.ranks.len() == 2 {

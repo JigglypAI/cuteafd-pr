@@ -453,13 +453,13 @@ impl Family for Hy4Flash {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if component == Component::Vision { return None; }
         let how = match component {
             Component::Attention => "Export Hy4-flash absorbed MLA (H=32 DSA / H=64 SWA-512, scale=1/16, F32 learnable sinks folded into W_UV + sigmoid linear_gate + o_proj + post_proj_norm); see #2478.",
             Component::Indexer => "Export Hy4-flash 16-head compressed indexer (4-token gated pooling + intra_group_ape + top-511 group recall + current group -> 2048 candidate slots); see #2478.",
             Component::HyperConnection => "Export 4-stream iHC pre/post kernels and MhcHeadKernel(H=3072) in sparkinfer-glmrt; see #2478.",
             Component::RoutedExpert => "Wire hy4f EXL3 K4 MUL1 routed expert package (H1536, I1536, E512, K16, swiglu_limit=10.0) on the MUL1 branches (#415 / #2538); see #2478.",
             Component::MappedTable | Component::TableProjection => "Wire FP8-only Hy4EngramTable + shared look-ahead and 4-stream GPU Engram gate kernel; see #2478.",
-            Component::Vision => "Optional 27-layer ViT vision tower is a follow-up item on #2478; text serving runs with --vision off.",
             Component::Speculator => "Bundled DFly2 requires the validated Hy4-flash draft headers and matching coordinator programs; use SPECULATOR=off for target-only serving.",
             _ => "Implement Hy4-flash text forward, golden parity, and serve-hy4f over the shared scheduler; see #2478.",
         };

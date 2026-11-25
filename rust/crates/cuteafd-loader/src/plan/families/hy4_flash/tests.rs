@@ -686,6 +686,9 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
     let measured_inputs = admission::gather(&FactsRequest {
         checkpoint: &checkpoint,
@@ -717,6 +720,9 @@ fn hy4_flash_planned_and_measured_admission_agree() -> anyhow::Result<()> {
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
 
     let req = hy4_place::request(
@@ -779,6 +785,9 @@ fn hy4_flash_admission_refuses_invalid_or_unfitting_rtx_expert_layers() -> anyho
         replies,
         expert_usage: false,
         resident_weight_limit: None,
+        vision: crate::plan::MediaMode::Off,
+        vision_replicas: 1,
+        media_cache_bytes: None,
     })?;
 
     // 41 onboarded layers on a 1x 96 GiB RTX with original view cannot fit and must refuse, never clamp.
@@ -909,6 +918,9 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
                 replies,
                 expert_usage: true,
                 resident_weight_limit: None,
+                vision: crate::plan::MediaMode::Off,
+                vision_replicas: 1,
+                media_cache_bytes: None,
             })?;
             let req = hy4_place::request(
                 inputs.context,
@@ -1052,4 +1064,56 @@ fn installed_hy4_flash_tp2_dfly2_per_rank_arenas_tails_peer_slots_and_burden_tab
         }
     }
     Ok(())
+}
+
+/// Installed bundled-ViT memory table: tower arena + scratch and KV pool with
+/// and without vision on the 0-Spark 1x/2x RTX cards (quiet raptor host, the
+/// `cuteafd plan` device-capacity weight budget).
+#[test]
+#[ignore = "reads installed wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC and PROGRAMS via CUTEAFD_DEPLOYMENT_TEST_HF_HOME/_PROGRAMS"]
+fn installed_hy4_flash_vision_memory_on_0_spark_cards() {
+    use crate::plan::{encoder::EncoderKind, MediaMode};
+    let snap = hy4_snapshot().expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME missing Hy4-flash snapshot");
+    let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS is required"));
+    let mut rows = Vec::new();
+    for view in [CoreView::Original, CoreView::K8Compact] {
+        let selected = CheckpointView::select(&snap, view).unwrap();
+        let input = PlanInput::open_view(&selected).unwrap();
+        for gpus in [1usize, 2] {
+            let plan = |vision: MediaMode| {
+                let mut host = crate::plan::testing::SimulatedHost::raptor();
+                host.gpu_count = gpus;
+                let mut layout = host.layout();
+                layout.workspace_manifest = Some(programs.clone());
+                let mut opts = PlanOptions::default();
+                // `cuteafd plan` defaults the weight budget to the device capacity.
+                opts.coordinator_budget_bytes = host.gpu_bytes;
+                opts.placement = ExpertPlacement::Local;
+                opts.vision = vision;
+                opts.layout = Some(layout);
+                let report = input.plan(&opts).unwrap();
+                assert!(report.config_error.is_none() && report.fits, "{view} {gpus}x {vision:?}: {:?}",
+                    report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+                (report.memory_layout.as_ref().unwrap().pool_tokens, report.encoder.clone())
+            };
+            let (off, _) = plan(MediaMode::Off);
+            let (auto, auto_encoder) = plan(MediaMode::Auto);
+            let (rtx, encoder) = plan(MediaMode::Rtx(Some(gpus - 1)));
+            let encoder = encoder.expect("explicit RTX vision reports its owner");
+            assert!(matches!(encoder.kind, EncoderKind::Rtx { .. }), "{view} {gpus}x: {encoder:?}");
+            assert!(off >= rtx && off - rtx <= 400_000, "{view} {gpus}x: vision costs {} pool tokens", off - rtx);
+            let auto_kind = auto_encoder.map(|e| e.kind);
+            // Shared auto rule (#2708): the tower starts unless KV would fall below KV_MIN,
+            // and every installed 0-Spark card keeps far more than that with it.
+            assert!(matches!(auto_kind, Some(EncoderKind::Rtx { .. })), "{view} {gpus}x auto {auto_kind:?}");
+            assert_eq!(auto, rtx, "{view} {gpus}x auto pool");
+            rows.push(format!("| {view} | {gpus}x RTX + 0 | {:.3} | {:.3} | {off} | {rtx} | {} | {} |",
+                encoder.weights as f64 / (1u64 << 30) as f64, encoder.scratch as f64 / (1u64 << 30) as f64,
+                off - rtx, if matches!(auto_kind, Some(EncoderKind::Rtx { .. })) { "on (rtx)" } else { "off" }));
+        }
+    }
+    println!("| View | Card | Tower arena GiB | Scratch GiB | KV vision off | KV vision on | KV tokens lost | VISION=auto |");
+    println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |");
+    for row in rows { println!("{row}"); }
 }

@@ -18,11 +18,22 @@ use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl
 pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path,
     devices: &[crate::shared::memory::device::Device<'a>],
     load: impl FnOnce() -> Result<T>) -> Result<T> {
+    load_alone_with_media(snapshot, devices, Default::default(), load)
+}
+
+/// [`load_alone`] that also lands a media owner's deferred tower arena in the
+/// same dense group, then releases that owner once the group has committed.
+pub(crate) fn load_alone_with_media<'a, T>(snapshot: &std::path::Path,
+    devices: &[crate::shared::memory::device::Device<'a>],
+    media: crate::shared::vision::push::Contribution,
+    load: impl FnOnce() -> Result<T>) -> Result<T> {
     use super::dense;
     let policy = PushPolicy::for_snapshot(snapshot)?;
-    if policy == PushPolicy::Mount { return load(); }
+    if policy == PushPolicy::Mount { let owners = load()?; media.commit()?; return Ok(owners); }
+    let media_records = media.records();
     let (owners, push, dense, operands, steps) = policy.plan(|| {
-        let (owners, records) = dense::recording(load)?;
+        let (owners, mut records) = dense::recording(load)?;
+        records.extend(media_records);
         let (operands, steps) = (records.operands.len(), records.steps.len());
         let dense = dense::plan_records(snapshot, records, devices, 0)?;
         let push = CoordinatorPush::prepare_alone(snapshot, None, devices.len(), None)?;
@@ -32,6 +43,7 @@ pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path,
     let (delivered, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || ());
     let delivered = policy.committed(delivered).context("standalone coordinator dense push delivery")?;
     tracing::info!(pushed = delivered.is_some(), operands, steps, "standalone coordinator dense operands landed");
+    media.commit()?;
     Ok(owners)
 }
 

@@ -1558,6 +1558,9 @@ pub(super) struct Member {
     pub pos: usize,
     pub bonus: u32,
     pub depth: usize,
+    /// Text rope offset past the prompt's image spans (0 for text-only prompts):
+    /// drafted rows are text rows at rope `pos + query + rope_delta` on every axis.
+    pub rope_delta: i64,
 }
 
 struct BatchMeta {
@@ -1625,7 +1628,8 @@ impl BatchMeta {
             out.recall.push(recall);
             for query in 0..block {
                 let row = i * block + query;
-                out.positions.push((member.pos + query) as i64);
+                // [T, H, W] rope coordinates; text rows carry equal axes.
+                out.positions.extend([(member.pos + query) as i64 + member.rope_delta; 3]);
                 out.write_slots.push((base + TOPK + query) as i64);
                 out.lengths.push((recall + query + 1) as i32);
                 let dst = &mut out.table[row * stride..(row + 1) * stride];
@@ -1654,6 +1658,7 @@ mod tests {
                     pos: [7, 2048, 2049, 2064][i % 4],
                     bonus: i as u32 + 10,
                     depth: i % 5 + 1,
+                    rope_delta: 0,
                 })
                 .collect::<Vec<_>>();
             let meta = BatchMeta::new(&members, 6, 120009)?;
@@ -1666,7 +1671,7 @@ mod tests {
                     let table = &meta.table[row * stride..(row + 1) * stride];
                     let live = recall + offset + 1;
                     assert_eq!(meta.ids[row], if offset == 0 { m.bonus } else { 120009 });
-                    assert_eq!(meta.positions[row], (m.pos + offset) as i64);
+                    assert_eq!(meta.positions[3 * row..3 * row + 3], [(m.pos + offset) as i64; 3]);
                     assert_eq!(meta.lengths[row], live as i32);
                     assert_eq!(table[0], (i * stride) as i32);
                     assert_eq!(table[live - 1] as i64, meta.write_slots[row]);

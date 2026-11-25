@@ -57,7 +57,7 @@ def main():
     parser.add_argument("--list-transformer-programs", action="store_true")
     parser.add_argument("--perception", choices=("inkling2","step5"))
     parser.add_argument("--list-perception-programs", action="store_true")
-    parser.add_argument("--tower", choices=("kimi","minimax"))
+    parser.add_argument("--tower", choices=("kimi","minimax","hy4f"))
     parser.add_argument("--list-tower-programs", action="store_true")
     parser.add_argument("--head-dim", type=int, default=96)
     parser.add_argument("--hidden", type=int, default=1536)

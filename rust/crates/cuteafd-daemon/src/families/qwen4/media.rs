@@ -135,7 +135,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
         if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
-            probe.spec.validate_media()?;
+            probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::Qwen.token_geometry())?;
             anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
                 "expanded probe media count/context differs");
             anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
@@ -262,7 +262,7 @@ pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
     };
     let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
-    probe.spec.validate_media()?;
+    probe.spec.validate_media_geometry(cuteafd_loader::media::ImageFamily::Qwen.token_geometry())?;
     apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?)
 }
 

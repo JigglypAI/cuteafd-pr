@@ -1450,10 +1450,8 @@ if [[ "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == inkling2 |
   case "$audio" in auto|off) audio=off ;; *) release_die "$family has no bundled audio execution owner" ;; esac
 fi
 if [[ "$family" == hy4_flash ]]; then
-  case "$vision:$audio" in
-    auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
-    *) release_die "Hy4-flash bundled media execution is not enabled yet; use VISION=off AUDIO=off" ;;
-  esac
+  # The bundled ViT is the only Hy4 media tower; there is no audio owner.
+  case "$audio" in auto|off) audio=off ;; *) release_die "Hy4-flash has no bundled audio execution owner" ;; esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
   case "$vision:$audio" in
@@ -1820,7 +1818,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
 fi
 # Still towers use the shared media options and the admitted encoder owner.
 family_args+=(--vision "$vision" --audio "$audio")
-if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 || "$family" == minimax_m3 ]]; then
+if [[ "$family" == inkling2 || "$family" == step5 || "$family" == kimi_k3 || "$family" == minimax_m3 || "$family" == hy4_flash ]]; then
   family_args+=(--vision-replicas "$vision_replicas")
 fi
 
@@ -1932,7 +1930,7 @@ if [[ $family == glm5 ]]; then
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 || $checkpoint_family == mistral_large4 ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 || $family == hy4_flash || $checkpoint_family == mistral_large4 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2790,7 +2788,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
-          || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == kimi_k3 || "$family" == inkling2 || "$family" == step5 || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
+          || "$family" == muse_spark || "$family" == minimax_m3 || "$family" == kimi_k3 || "$family" == inkling2 || "$family" == step5 || "$family" == hy4_flash || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/$selected_config"; } ||
    [[ "$audio" != off ]]; then
   selected="$(python3 -c '
@@ -2798,7 +2796,7 @@ import json,sys
 p=json.load(sys.stdin); e=p.get("encoder")
 assert p["placement_supported"] and p["fits"], "encoder deployment cannot fit: "+str(p.get("hints"))
 k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
-cap=p.get("max_image_tokens") or ({"qwen4":1024,"minimax_m3":576,"kimi_k3":16698,"inkling2":4096,"step5":4096}.get(sys.argv[1],4096))
+cap=p.get("max_image_tokens") or ({"qwen4":1024,"minimax_m3":576,"kimi_k3":16698,"inkling2":4096,"step5":4096,"hy4_flash":4160}.get(sys.argv[1],4096))
 assert type(cap) is int and 1<=cap<=16698, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
@@ -2882,7 +2880,7 @@ media_capabilities() {
   media_caps=()
   if [[ "$wants_vision" == true ]]; then
     case "$checkpoint_family" in
-      qwen4|glm5_flash|muse_spark|mistral_large4|minimax_m3|kimi_k3|inkling2|step5) media_caps+=(vision) ;;
+      qwen4|glm5_flash|muse_spark|mistral_large4|minimax_m3|kimi_k3|inkling2|step5|hy4_flash) media_caps+=(vision) ;;
     esac
   fi
   if [[ "$wants_audio" == true ]]; then

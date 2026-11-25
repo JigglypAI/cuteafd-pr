@@ -8,10 +8,25 @@ def geometry(kind):
     if kind == "minimax":
         return dict(hidden=1280, attention=1280, heads=16, dim=80, intermediate=5120,
                     patch=1176, output=6144, temporal=2, group_major=True)
+    if kind == "hy4f":
+        return dict(hidden=1152, attention=1152, heads=16, dim=72, intermediate=4304,
+                    patch=768, output=3072, temporal=1, group_major=False, merger=4608, segments=8)
     raise ValueError("unknown generic still tower")
 
 
+def hy4_names():
+    """Hy4-flash: separate biased Q/K/V, scale-factor positions, channel-major conv merger."""
+    g=geometry("hy4f");h,i,o,m,p=g["hidden"],g["intermediate"],g["output"],g["merger"],g["patch"]
+    result=[f"dynamic_attention_h{g['heads']}_d{g['dim']}","patches_raster_p16_t1",f"scaled_position_h{h}",
+            f"tower_layer_norm_h{h}",f"tower_rms_norm_h{h}",f"residual_h{h}",f"group_channel_h{h}",
+            f"row_markers_h{o}",f"gelu_h{i}",f"gelu_h{m}"]
+    result += [f"biased_projection_h{w}_o{n}" for w,n in [(p,h),(h,h),(h,i),(i,h),(4*h,m),(m,o)]]
+    return ["vision_"+name for name in result]
+
+
 def names(kind):
+    if kind == "hy4f":
+        return hy4_names()
     g=geometry(kind);h,a,i,o=g["hidden"],g["attention"],g["intermediate"],g["output"]
     suffix="raster_t1" if kind=="kimi" else "group_t2"
     rotary="vendor_rotary_raster_t1" if kind=="kimi" else "rotary_group_t2"
@@ -76,6 +91,25 @@ def builders(kind):
             Operand("bias",torch.bfloat16,"ignored"),Operand("out",torch.bfloat16,f"[rows,{width}]","out")),
             scalars=(Scalar("rows"),Scalar("epsilon","float32")),key=(width,),geometry=dict(width=width))
 
+    if kind=="hy4f":
+        from b12x.integration.cuteafd.vision_tower import (compile_scaled_bilinear_position_aot,
+            compile_row_markers_aot)
+        g=geometry(kind);h,i,o,m,p=g["hidden"],g["intermediate"],g["output"],g["merger"],g["patch"]
+        result={f"dynamic_attention_h16_d72":lambda:compile_dynamic_vision_attention_aot(heads=16,dim=72,segments=g["segments"]),
+            "patches_raster_p16_t1":lambda:compile_still_patches_aot(patch=16),
+            f"scaled_position_h{h}":lambda:compile_scaled_bilinear_position_aot(channels=h,table_height=128,table_width=128),
+            f"tower_layer_norm_h{h}":lambda:compile_vectorized_vision_layer_norm_aot(width=h),
+            f"tower_rms_norm_h{h}":lambda:rms(h),
+            f"residual_h{h}":lambda:media.compile_bf16_residual_add_aot(width=h),
+            f"group_channel_h{h}":lambda:compile_spatial_group_aot(channels=h,channel_major=True),
+            f"row_markers_h{o}":lambda:compile_row_markers_aot(width=o),
+            f"gelu_h{i}":lambda:media.compile_gelu_aot(width=i),
+            f"gelu_h{m}":lambda:media.compile_gelu_aot(width=m)}
+        for w,n in [(p,h),(h,h),(h,i),(i,h),(4*h,m),(m,o)]:
+            result[f"biased_projection_h{w}_o{n}"]=lambda w=w,n=n:media.compile_biased_projection_aot(width=w,outputs=n)
+        if ["vision_"+name for name in result]!=names(kind):
+            raise ValueError("generic tower export inventory mismatch")
+        return result
     g=geometry(kind);h,a,i,o=g["hidden"],g["attention"],g["intermediate"],g["output"]
     suffix="raster_t1" if kind=="kimi" else "group_t2"
     axes=(0,64,64) if kind=="kimi" else (26,26,26)

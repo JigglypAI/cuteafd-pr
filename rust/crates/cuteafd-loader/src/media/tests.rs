@@ -481,3 +481,15 @@ fn pe_normalization_identity_keys_both_inkling_round_boundaries() {
             assert_eq!(table[i].to_bits(),((value-config.mean[c] as f32)/config.std[c] as f32).to_bits());}
     }
 }
+
+#[test]
+fn every_family_has_one_span_geometry_for_serving_and_probes() {
+    use ImageFamily::*;
+    for family in [Mimo, Qwen, GlmFlash, Muse, Mistral, Inkling2, Step5, Kimi, MiniMax, Hy4Flash] {
+        let geometry = family.token_geometry();
+        assert_eq!(ProcessorConfig::for_family(family).token_geometry(), geometry, "{family:?}");
+        assert_eq!(geometry.row_markers == 1, matches!(family, Mistral | Hy4Flash), "{family:?}");
+    }
+    // Hy4's 32x32 patch grid is 16 merged rows of 16 tokens plus a newline each.
+    assert_eq!(Hy4Flash.token_geometry().extent([1, 32, 32]).map(|(_, _, rows)| rows), Some(272));
+}

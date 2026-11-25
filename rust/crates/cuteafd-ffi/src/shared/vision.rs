@@ -386,6 +386,18 @@ type EncodePixels = unsafe extern "C" fn(
     *mut c_void,
 ) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut VisionLedger) -> i32;
+type EncodeBatch = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    u64,
+    *const f32,
+    *const i32,
+    i32,
+    *mut u16,
+    u64,
+    Option<Observer>,
+    *mut c_void,
+) -> i32;
 
 pub struct NativeVision {
     _library: Arc<Library>,
@@ -399,6 +411,8 @@ pub struct NativeVision {
     /// [IMG_BREAK]/[IMG_END] row after each merged row of [IMG] rows.
     span_markers: bool,
     source_pixels: bool,
+    /// Towers accepting several stills per owner turn (`cuteafd_vision_encode_batch`).
+    batch: bool,
     merge: usize,
     backings: super::media_backings::MediaBackings,
     // CUDA and the BLAS handle never migrate away from their owner thread.
@@ -515,7 +529,9 @@ impl NativeVision {
                 } else {
                     spec.patch_size as usize
                 },
-                span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
+                span_markers: (spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED)
+                    || spec.tower.is_some_and(|tower| tower.projection_order == 3),
+                batch: spec.tower.is_some_and(|tower| tower.projection_order == 3),
                 source_pixels: spec.supports_source_pixels(),
                 merge: if spec
                     .perception
@@ -663,6 +679,87 @@ impl NativeVision {
                 std::ptr::null_mut(),
             ))
         }
+    }
+    /// Most images one batched encode accepts (one varlen segment each).
+    pub const MAX_BATCH: usize = 8;
+    pub fn supports_batch(&self) -> bool { self.batch }
+    /// Encode several stills in one owner turn: one upload, one varlen attention
+    /// per block, one download and one stream sync. `rgb` and `output` pack the
+    /// images in order; `grids` gives each image's patch grid.
+    pub fn encode_batch_into(
+        &mut self,
+        rgb: &[u8],
+        grids: &[[usize; 2]],
+        lut: &[f32; 768],
+        output: &mut [u16],
+    ) -> Result<(), VisionError> {
+        let invalid = || VisionError::InvalidInput("vision batch RGB/grid/output extent mismatch");
+        if !self.batch || grids.is_empty() || grids.len() > Self::MAX_BATCH {
+            return Err(invalid());
+        }
+        let (mut pixels, mut rows, mut units) = (0usize, 0usize, 0usize);
+        let mut packed = Vec::with_capacity(grids.len() * 2);
+        for &[h, w] in grids {
+            if h < 2 || w < 2 || h % 2 != 0 || w % 2 != 0 || h > i32::MAX as usize || w > i32::MAX as usize {
+                return Err(invalid());
+            }
+            pixels += h * w * self.patch_size * self.patch_size * 3;
+            rows += output_rows([h, w], self.span_markers);
+            units += (h / 2) * (w / 2);
+            packed.extend([h as i32, w as i32]);
+        }
+        if units > self.max_tokens || rgb.len() != pixels || output.len() != rows * self.output_width {
+            return Err(invalid());
+        }
+        // SAFETY: validated host extents stay live through the synchronous batch
+        // encode; the native owner drains its stream on success and on errors.
+        unsafe {
+            let encode = self._library.get::<EncodeBatch>(b"cuteafd_vision_encode_batch")?;
+            check(encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(), packed.as_ptr(),
+                grids.len() as i32, output.as_mut_ptr(), std::mem::size_of_val(output) as u64,
+                None, std::ptr::null_mut()))
+        }
+    }
+    /// Qualification only: the batched encode with a per-stage observer that
+    /// receives each drained device stage (BF16 rows x width). Stage 0 is the
+    /// patch embedding, -1 after positions, 1..=depth block outputs, depth+1
+    /// the merger RMSNorm and depth+2 the final LM rows.
+    pub fn encode_batch_observed(
+        &mut self,
+        rgb: &[u8],
+        grids: &[[usize; 2]],
+        lut: &[f32; 768],
+        output: &mut [u16],
+        observe: &mut dyn FnMut(i32, *const c_void, usize, usize) -> Result<(), VisionError>,
+    ) -> Result<(), VisionError> {
+        struct Context<'a> {
+            observe: &'a mut dyn FnMut(i32, *const c_void, usize, usize) -> Result<(), VisionError>,
+            failed: Option<VisionError>,
+        }
+        unsafe extern "C" fn trampoline(context: *mut c_void, stage: i32, data: *const c_void,
+            rows: i32, width: i32, _column: i32) -> i32 {
+            // SAFETY: `context` is the live `Context` below for the synchronous encode.
+            let context = unsafe { &mut *context.cast::<Context>() };
+            match (context.observe)(stage, data, rows.max(0) as usize, width.max(0) as usize) {
+                Ok(()) => 0,
+                Err(error) => { context.failed = Some(error); 1 }
+            }
+        }
+        if !self.batch || grids.is_empty() || grids.len() > Self::MAX_BATCH {
+            return Err(VisionError::InvalidInput("observed batch requires a batch-capable tower"));
+        }
+        let packed: Vec<i32> = grids.iter().flat_map(|&[h, w]| [h as i32, w as i32]).collect();
+        let mut context = Context { observe, failed: None };
+        // SAFETY: host buffers and the observer context outlive the synchronous call;
+        // native validates every extent and drains before each observer callback.
+        let status = unsafe {
+            let encode = self._library.get::<EncodeBatch>(b"cuteafd_vision_encode_batch")?;
+            encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(), packed.as_ptr(), grids.len() as i32,
+                output.as_mut_ptr(), std::mem::size_of_val(output) as u64, Some(trampoline),
+                (&mut context as *mut Context).cast())
+        };
+        if let Some(error) = context.failed { return Err(error); }
+        check(status)
     }
     pub fn ledger(&self) -> Result<VisionLedger, VisionError> {
         let mut ledger = VisionLedger::default();

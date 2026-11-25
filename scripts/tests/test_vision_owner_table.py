@@ -1,5 +1,6 @@
 """CPU-only coverage of the shared vision module registry and owner lifetime."""
 import importlib.util
+import re
 import json
 from pathlib import Path
 import shutil
@@ -78,7 +79,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     entries = json.loads((tmp_path / "build/vision_attention/entries.json").read_text())
     assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
         (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"), (64, False, "pe_inkling2"), (96, False, "pe_step5"),
-        (128, False, "tower_kimi"), (80, False, "tower_minimax")]
+        (128, False, "tower_kimi"), (80, False, "tower_minimax"), (72, False, "tower_hy4f")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
     exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
@@ -91,7 +92,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 13, exports  # Step reuses Muse; each generic tower adds two groups
+    assert len(exports) == 15, exports  # Step reuses Muse; each generic tower adds two groups
     legacy = [line for line in exports if "--group" not in line]
     assert len(legacy) == 1
     assert legacy[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
@@ -124,7 +125,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
         assert f'--omit-program {program["name"]}' in step_export
         assert not any(Path(p).name == program["name"] + ".o" and "pointwise_pe_step5" in p
                        for p in rules.split())
-    for item, kind, heads, dim in zip(entries[7:], ("kimi", "minimax"), (12, 16), (128, 80), strict=True):
+    for item, kind, heads, dim in zip(entries[7:], ("kimi", "minimax", "hy4f"), (12, 16, 16), (128, 80, 72), strict=True):
         inventory = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
         assert item["programs"][0] == f"vision_dynamic_attention_h{heads}_d{dim}"
         assert [p["name"] for p in item["programs"][1:]] == inventory[1:]
@@ -300,6 +301,17 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
         assert ("vision_vendor_rotary_raster_t1" in names) == (kind=="kimi")
         assert "vision_rotary_raster_t1" not in names
         assert not any("cu130" in name for name in names)
+    # Every tower group links into one native library: export names must be
+    # disjoint across groups (Hy4's patch-16 raster once collided with Kimi's patch-14).
+    groups={kind:set(module.names(kind)) for kind in ("kimi","minimax","hy4f")}
+    for a in groups:
+        for b in groups:
+            assert a>=b or not groups[a]&groups[b], f"{a}/{b} share exports {sorted(groups[a]&groups[b])}"
+    hy4=(ROOT / "native/shared/cuda/vision_hy4.cuh").read_text()
+    # Literal names (or the literal prefix of a composed one) must resolve to a Hy4 export.
+    launched=set(re.findall(r'generic_program\(o,"(vision_\w+)"',hy4))
+    assert "vision_patches_raster_p16_t1" in launched
+    assert all(any(name==prefix or name.startswith(prefix) for name in groups["hy4f"]) for prefix in launched), launched
     native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
     assert "if(s.tower)return false" in native
     assert "return vision_required_impl(s,out,valid_tower);" in native
