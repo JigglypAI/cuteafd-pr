@@ -2022,6 +2022,27 @@ std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
   if (cuteafd::diagnostic_cuda(cudaGraphGetNodes(graph, nodes.data(), &count)) != cudaSuccess) return {};
   int current_device = -1;
   bool have_device = false;
+  // Shared 1D same-device checks for transferable memory-op nodes
+  // (cudaGraphNodeTypeMemcpy today; cudaGraphNodeTypeMemset extension point below).
+  const auto is_current_device_ptr = [&](const void* ptr) {
+    if (!ptr) return false;
+    if (!have_device) {
+      if (cuteafd::diagnostic_cuda(cudaGetDevice(&current_device)) != cudaSuccess || current_device < 0) return false;
+      have_device = true;
+    }
+    cudaPointerAttributes attr{};
+    if (cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&attr, ptr)) != cudaSuccess) return false;
+    return attr.type == cudaMemoryTypeDevice && attr.device == current_device;
+  };
+  const auto is_1d_extent = [](size_t width, size_t height, size_t depth) {
+    return width != 0 && height <= 1 && depth <= 1;
+  };
+  const auto is_linear_1d_pitch = [](size_t pitch, size_t width, size_t height, size_t depth,
+                                     size_t xsize, size_t ysize) {
+    if (pitch == 0) return true;
+    return height == 1 && depth == 1 && pitch == width &&
+           (xsize == 0 || xsize == width) && ysize == 1;
+  };
   std::vector<uint64_t> signature{count};
   std::unordered_map<cudaGraphNode_t, size_t> indices;
   for (size_t n = 0; n < count; ++n) {
@@ -2036,35 +2057,31 @@ std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
     } else if (kind == cudaGraphNodeTypeMemcpy) {
       cudaMemcpy3DParms params{};
       if (cuteafd::diagnostic_cuda(cudaGraphMemcpyNodeGetParams(nodes[n], &params)) != cudaSuccess) return {};
-      const auto is_linear_1d_ptr = [&](const cudaPitchedPtr& p) {
-        if (!p.ptr) return false;
-        if (p.pitch == 0) return true;
-        return params.extent.height == 1 && params.extent.depth == 1 &&
-               p.pitch == params.extent.width &&
-               (p.xsize == 0 || p.xsize == params.extent.width) &&
-               p.ysize == 1;
-      };
       if (params.srcArray || params.dstArray ||
-          !is_linear_1d_ptr(params.srcPtr) || !is_linear_1d_ptr(params.dstPtr) ||
           params.srcPos.x != 0 || params.srcPos.y != 0 || params.srcPos.z != 0 ||
           params.dstPos.x != 0 || params.dstPos.y != 0 || params.dstPos.z != 0 ||
-          params.extent.width == 0 || params.extent.height > 1 || params.extent.depth > 1 ||
-          (params.kind != cudaMemcpyDeviceToDevice && params.kind != cudaMemcpyDefault)) return {};
-      if (!have_device) {
-        if (cuteafd::diagnostic_cuda(cudaGetDevice(&current_device)) != cudaSuccess || current_device < 0) return {};
-        have_device = true;
-      }
-      cudaPointerAttributes src_attr{}, dst_attr{};
-      if (cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&src_attr, params.srcPtr.ptr)) != cudaSuccess ||
-          cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&dst_attr, params.dstPtr.ptr)) != cudaSuccess) return {};
-      if (src_attr.type != cudaMemoryTypeDevice || dst_attr.type != cudaMemoryTypeDevice ||
-          src_attr.device != current_device || dst_attr.device != current_device) return {};
+          !is_1d_extent(params.extent.width, params.extent.height, params.extent.depth) ||
+          !is_linear_1d_pitch(params.srcPtr.pitch, params.extent.width, params.extent.height, params.extent.depth,
+                              params.srcPtr.xsize, params.srcPtr.ysize) ||
+          !is_linear_1d_pitch(params.dstPtr.pitch, params.extent.width, params.extent.height, params.extent.depth,
+                              params.dstPtr.xsize, params.dstPtr.ysize) ||
+          (params.kind != cudaMemcpyDeviceToDevice && params.kind != cudaMemcpyDefault) ||
+          !is_current_device_ptr(params.srcPtr.ptr) || !is_current_device_ptr(params.dstPtr.ptr)) return {};
       // Omit 1D extent.width from the signature (matching kernel nodes omitting
       // gridDim/rows): cudaGraphExecUpdate updates 1D same-device D2D pointers
       // and byte counts in place across different batch row counts.
       signature.push_back(static_cast<uint64_t>(kind));
       signature.push_back(static_cast<uint64_t>(cudaMemcpyDeviceToDevice));
-      signature.push_back(static_cast<uint64_t>(src_attr.device));
+      signature.push_back(static_cast<uint64_t>(current_device));
+    } else if (kind == cudaGraphNodeTypeMemset) {
+      // Extension point for 1D same-device memset nodes (e.g. cudaMemsetAsync /
+      // cuda_zero_bytes_async): query cudaGraphMemsetNodeGetParams, check
+      // is_1d_extent(params.width, params.height, 1),
+      // is_linear_1d_pitch(params.pitch, params.width * params.elementSize, params.height, 1, 0, 1),
+      // and is_current_device_ptr(params.dst). Hash (kind, params.elementSize,
+      // params.value, current_device) and omit 1D params.width so
+      // cudaGraphExecUpdate updates the dst pointer and 1D width in place.
+      return {};
     } else {
       return {};
     }
