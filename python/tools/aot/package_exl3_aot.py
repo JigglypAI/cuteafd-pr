@@ -1081,9 +1081,9 @@ def _compile_variants(payloads, jobs, context):
         # and reservations; cancelling futures does not stop running compilers.
         processes = list((pool._processes or {}).values())
         groups = sorted(owned | {process.pid for process in processes})
-        for group in groups:
+        for session in groups:
             try:
-                os.killpg(group, signal.SIGTERM)
+                os.killpg(session, signal.SIGTERM)
             except ProcessLookupError:
                 pass
         for process in processes:
