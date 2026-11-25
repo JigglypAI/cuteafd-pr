@@ -154,6 +154,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     prefix: &worker_args.prefix,
                     resident_weights: crate::shared::memory::budget::resident_weight_limit(),
                     expert_usage: false,
+                    prewarm_graphs: true,
                     vision: &worker_args.vision,
                 },
             )?;

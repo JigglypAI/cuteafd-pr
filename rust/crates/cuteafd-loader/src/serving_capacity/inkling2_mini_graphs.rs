@@ -6,12 +6,15 @@ use crate::placement::graph_reserve::{self, Error, Resolved, WorkingSet};
 
 const MIB: u64 = 1 << 20;
 
-/// Working-set seed for 1x RTX PRO 6000 (48 exact-row visits, rank-local TP1).
-/// Updated to measured W1/step/capture once live graph census is collected.
+/// Measured shipping working set for 1x RTX PRO 6000 (`inkling2_mini.step`, monolithic
+/// 48-visit kernel-only graph): full producible key space is 80 keys for `dspark`
+/// (`Decode 1..=16` + `Verify 1..=64`, key collapsed to `(rows, mode, taps)` without
+/// `slots` or `verify_rows`) at measured `7.85 MiB/graph` = `628 MiB` exact union.
+/// Under the #2697 rule: soft = 628 + max(125.6, 95.4, 16) = 754 MiB, hard = 770 MiB.
 pub const WORKING_SET: WorkingSet = WorkingSet {
-    w1: 220 * MIB,
-    step_growth: 16 * MIB,
-    capture_growth: 16 * MIB,
+    w1: 628 * MIB,
+    step_growth: 8 * MIB,
+    capture_growth: 8 * MIB,
 };
 
 fn resolve(
@@ -53,10 +56,10 @@ mod tests {
     #[test]
     fn mini_working_set_uses_shared_2697_soft_cap_and_headroom() {
         let p = resolve(0, true, None, None, None).unwrap();
-        // W1 = 220 MiB; max(20% W1 = 44 MiB, 100 MB, 2*16 MiB = 32 MiB) = 100 MB -> soft = 316 MiB, headroom = 32 MiB
-        assert_eq!(p.base_bytes, 316 * MIB);
-        assert_eq!(p.growth_headroom, Some(32 * MIB));
-        assert_eq!(p.bytes, 348 * MIB);
+        // W1 = 628 MiB; max(20% W1 = 125.6 MiB, 100 MB, 2*8 MiB = 16 MiB) = 125.6 MiB -> soft = 754 MiB, headroom = 16 MiB
+        assert_eq!(p.base_bytes, 754 * MIB);
+        assert_eq!(p.growth_headroom, Some(16 * MIB));
+        assert_eq!(p.bytes, 770 * MIB);
         assert_eq!(resolve(0, false, Some("2GiB"), None, None).unwrap().bytes, 0);
         assert_eq!(resolve(0, true, Some("0"), None, None).unwrap().bytes, 0);
         assert_eq!(resolve(0, true, Some("gpu0=256MiB"), None, None).unwrap().bytes, 256 * MIB);

@@ -33,6 +33,8 @@ pub(super) struct DecodeGraphs<'a> {
     first_touched: HashSet<Key>,
     first_touch_pending: bool,
     unsupported: HashSet<Key>,
+    captures: usize,
+    last_launched_exec: Option<usize>,
     device: i32,
 }
 
@@ -62,6 +64,8 @@ impl<'a> DecodeGraphs<'a> {
             first_touched: HashSet::new(),
             first_touch_pending: false,
             unsupported: HashSet::new(),
+            captures: 0,
+            last_launched_exec: None,
             device,
         }))
     }
@@ -86,8 +90,17 @@ impl<'a> DecodeGraphs<'a> {
             first_touched: HashSet::new(),
             first_touch_pending: false,
             unsupported: HashSet::new(),
+            captures: 0,
+            last_launched_exec: None,
             device: stream.device.id,
         })
+    }
+
+    pub(super) fn capture_count(&self) -> usize {
+        self.captures
+    }
+    pub(super) fn last_launched_exec(&self) -> Option<usize> {
+        self.last_launched_exec
     }
 
     pub(super) fn cycle(&mut self, cycle: Cycle) {
@@ -107,6 +120,64 @@ impl<'a> DecodeGraphs<'a> {
     }
     pub(super) fn clear_drained(&mut self) {
         self.bank.cache_clear_drained();
+    }
+
+    pub(super) fn prewarm_capture(
+        &mut self,
+        key: Key,
+        stream: &Stream<'a>,
+        mut work: impl FnMut() -> Result<()>,
+    ) -> Result<bool> {
+        if self.unsupported.contains(&key) {
+            return Ok(false);
+        }
+        self.first_touched.insert(key);
+        if self.bank.cached_launch(&key).is_some() {
+            return Ok(false);
+        }
+        let library = stream.device.library;
+        let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else {
+            return Ok(false);
+        };
+        stream.device.run(|| {
+            // SAFETY: rank-local stream operations on persistent admitted owners.
+            if let Err(error) = unsafe { decode_graph::begin_capture(library, stream.raw, &ticket) } {
+                if self.bank.cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, ?key, "Inkling 2 Mini prewarm capture unavailable");
+                }
+                return Ok(false);
+            }
+            let result = work();
+            // SAFETY: always close capture we opened.
+            let source = unsafe { library.cuda_graph_capture_source(stream.raw) };
+            if let Err(error) = result {
+                self.bank.cache_ticket_failed(ticket, source.as_ref().err().unwrap_or(&error));
+                return Err(error);
+            }
+            let captured = source.and_then(|source| {
+                if source.spans_devices || source.inspection_error.is_some() {
+                    self.unsupported.insert(key);
+                    anyhow::bail!("Inkling 2 Mini graph must have inspected rank-local topology");
+                }
+                ticket.complete_source(library, source, stream.raw)
+            });
+            let (raw, nodes, width, spans, _) = match captured {
+                Ok(topology) => topology,
+                Err(error) => {
+                    let warn = self.bank.cache_ticket_failed(ticket, &error);
+                    if warn && !cuteafd_ffi::is_small_graph(&error) {
+                        tracing::warn!(%error, ?key, "Inkling 2 Mini prewarm graph unavailable");
+                    }
+                    return Ok(false);
+                }
+            };
+            // SAFETY: execution owns all captured persistent storage and drains before drop.
+            let graph = unsafe { GraphOwner::new(library, self.device, raw, ())? };
+            self.bank.census_capture_key("step", 0, None, &key, raw);
+            self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans);
+            self.captures += 1;
+            Ok(true)
+        })
     }
 
     fn run(
@@ -136,8 +207,10 @@ impl<'a> DecodeGraphs<'a> {
             self.first_touch_pending = true;
             return work();
         }
+        self.last_launched_exec = None;
         let library = stream.device.library;
         if let Some(raw) = self.bank.cached_launch(&key).map(|owner| owner.raw) {
+            self.last_launched_exec = Some(raw as usize);
             // SAFETY: retained TP1 stream, geometry, and persistent owners outlive replay.
             return stream
                 .device
@@ -206,6 +279,8 @@ impl<'a> DecodeGraphs<'a> {
             let graph = unsafe { GraphOwner::new(library, self.device, raw, ())? };
             self.bank.census_capture_key("step", 0, None, &key, raw);
             self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans);
+            self.captures += 1;
+            self.last_launched_exec = Some(raw as usize);
             // SAFETY: bank owns executable through this ordered launch.
             unsafe { decode_graph::launch(library, raw, stream.raw) }
         })
@@ -225,6 +300,35 @@ pub(super) fn step<'a>(
         return work();
     };
     graphs.run(Key { rows, mode, taps }, slots, stream, work)
+}
+
+/// Shipping startup pre-capture key list (`(rows, mode)`), covering the full
+/// producible key space (`Decode 1..=max_sequences` + `Verify 1..=64` = 80 keys
+/// for `dspark` at `max_sequences=16`; `Decode 1..=max_sequences` = 16 keys for
+/// `off`), sized to fit inside `#2697` `W1 = 628 MiB`, `soft = 754 MiB`, `hard = 770 MiB`.
+pub(super) fn shipping_prewarm_keys(max_sequences: usize, has_draft: bool) -> Vec<(usize, Mode)> {
+    let max_decode = max_sequences.clamp(1, 64);
+    let mut keys = Vec::new();
+    for rows in 1..=max_decode {
+        keys.push((rows, Mode::Decode));
+    }
+    if has_draft {
+        for rows in 1..=64 {
+            keys.push((rows, Mode::Verify));
+        }
+    }
+    keys
+}
+
+pub(super) fn prewarm_step<'a>(
+    graphs: &mut DecodeGraphs<'a>,
+    stream: &Stream<'a>,
+    rows: usize,
+    mode: Mode,
+    taps: bool,
+    work: impl FnMut() -> Result<()>,
+) -> Result<bool> {
+    graphs.prewarm_capture(Key { rows, mode, taps }, stream, work)
 }
 
 #[cfg(test)]
@@ -253,5 +357,22 @@ mod tests {
             .len(),
             5
         );
+    }
+
+    #[test]
+    fn shipping_prewarm_covers_all_dspark_verify_rows_and_decode_bands() {
+        let dspark = shipping_prewarm_keys(16, true);
+        assert_eq!(dspark.len(), 80);
+        for rows in 1..=16 {
+            assert!(dspark.contains(&(rows, Mode::Decode)));
+        }
+        for rows in 1..=64 {
+            assert!(dspark.contains(&(rows, Mode::Verify)));
+        }
+        let off = shipping_prewarm_keys(16, false);
+        assert_eq!(off.len(), 16);
+        for rows in 1..=16 {
+            assert!(off.contains(&(rows, Mode::Decode)));
+        }
     }
 }

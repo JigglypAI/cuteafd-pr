@@ -260,6 +260,130 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
+    /// Pre-captures the shipping exact-row decode/verify graph set at startup so
+    /// C1..C16 serving runs capture-free and with zero eager fallbacks.
+    pub(super) fn prewarm_graphs(&mut self, max_sequences: usize) -> Result<(usize, usize)> {
+        if self.graphs.is_none() {
+            return Ok((0, 0));
+        }
+        let Some(_startup) = crate::shared::decode_graph::sites::startup(false) else {
+            return Ok((0, 0));
+        };
+        let has_draft = self.draft.is_some();
+        let keys = super::graphs::shipping_prewarm_keys(max_sequences, has_draft);
+        if keys.is_empty() {
+            return Ok((0, 0));
+        }
+        let max_decode = max_sequences.clamp(1, 64);
+        let warm_tokens = vec![0u32; 64];
+
+        let run_one = |exec: &mut Self, rows: usize, mode: Mode, capture: bool| -> Result<bool> {
+            let replay = if mode == Mode::Verify {
+                let draft = exec
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Inkling 2 Mini verify prewarm requires drafter"))?;
+                Some((draft.verify.replay.buffer, exec.requests.cache.layout.conv.width))
+            } else {
+                None
+            };
+            exec.requests.decode.set_replay(replay)?;
+            let res = (|| -> Result<bool> {
+                if capture {
+                    if let Some(graphs) = &mut exec.graphs {
+                        graphs.cycle(if mode == Mode::Verify {
+                            Cycle::Verify
+                        } else {
+                            Cycle::Decode
+                        });
+                    }
+                }
+                let mut placements = [Placement {
+                    units: vec![0],
+                    slot: 0,
+                    len: 0,
+                    state_len: 0,
+                    media: None,
+                }];
+                let unit = Unit {
+                    index: 0,
+                    sequence: 0,
+                    rows: 0..rows,
+                    layers: 0..exec.cfg.total_visits(),
+                    slot: 0,
+                    barrier: false,
+                    segments: vec![crate::shared::prefill_pipeline::UnitSegment {
+                        sequence: 0,
+                        rows: 0..rows,
+                        tokens: 0..rows,
+                        prompt_end: false,
+                        snapshot: false,
+                        head: false,
+                    }],
+                };
+                let token_slices: [&[u32]; 1] = [&warm_tokens[..rows]];
+                let starts = [0usize];
+                let slots = [0usize];
+                let media = [None];
+                let mut io = TokenIo {
+                    kernels: &exec.kernels,
+                    head: &exec.head,
+                    cache: &exec.requests.cache,
+                    target: &exec.target,
+                    cfg: &exec.cfg,
+                    tokens: &token_slices,
+                    starts: &starts,
+                    slots: &slots,
+                    retained_rows: true,
+                    head_projection: HeadProjection::AllHeadRows,
+                    draft: exec.draft.as_deref(),
+                    publish_draft: false,
+                    media: &media,
+                    on_logits: &mut |_, _, _| Ok(()),
+                };
+                Stateful {
+                    graphs: if capture { exec.graphs.as_mut() } else { None },
+                    kernels: &exec.kernels,
+                    owners: std::slice::from_ref(&exec.requests.decode),
+                    cache: &exec.requests.cache,
+                    target: &exec.target,
+                    cfg: &exec.cfg,
+                    visits: &exec.visits,
+                    placements: &mut placements,
+                    uploads: std::slice::from_mut(&mut exec.requests.decode_uploads),
+                    local: &exec.local,
+                    io: &mut io,
+                }
+                .prewarm_unit(&unit, capture)
+            })();
+            let _ = exec.requests.decode.set_replay(None);
+            res
+        };
+
+        // 1. Eager warm pass so one-time kernel/workspace initialization lands before
+        //    measuring graph arena growth.
+        run_one(self, max_decode, Mode::Decode, false)?;
+        if has_draft {
+            run_one(self, 64, Mode::Verify, false)?;
+        }
+        self.completed()?;
+        let device = self.requests.decode.stream.device;
+        crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
+
+        // 2. Capture-only pass for every shipping key.
+        let mut captured = 0usize;
+        for &(rows, mode) in &keys {
+            if run_one(self, rows, mode, true)? {
+                captured += 1;
+            }
+        }
+        self.completed()?;
+        self.observe_completed()?;
+        self.requests.decode.zero()?;
+        self.completed()?;
+        Ok((captured, keys.len()))
+    }
+
     pub fn terminate(&mut self) {
         if self.terminal {
             return;

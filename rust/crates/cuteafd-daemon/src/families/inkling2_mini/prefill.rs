@@ -363,6 +363,57 @@ impl Stateful<'_, '_> {
         };
         run_prefill_units(&mut prepared, units, waves)
     }
+
+    /// Runs one eager warm pass (`capture = false`) or one capture-only monolithic
+    /// prewarm (`capture = true`, no head projection, no replay launch).
+    pub(super) fn prewarm_unit(&mut self, unit: &Unit, capture: bool) -> Result<bool> {
+        ensure!(
+            self.owners.len() == 1 && self.uploads.len() == 1 && unit.slot == 0,
+            "Inkling 2 Mini prewarm requires single decode unit owner"
+        );
+        let owner = &self.owners[0];
+        let uploads = &mut self.uploads[0];
+        let mut ops = StatefulOps {
+            kernels: self.kernels,
+            target: self.target,
+            local: self.local,
+            io: self.io,
+        };
+        if !capture {
+            ops.begin_io(unit, owner, uploads)?;
+        }
+        let packed = build_packed_members(self.cfg, self.cache, self.placements, unit)?;
+        owner.packed_metadata(self.cache, &packed, uploads)?;
+        let rows = unit.rows.len();
+        let mode = if owner.replaying() {
+            Mode::Verify
+        } else {
+            Mode::Decode
+        };
+        let has_taps = ops.io.has_taps();
+        let mut body = || {
+            for (visit_idx, &visit) in self.visits.iter().enumerate() {
+                let state = PackedVisitUnit {
+                    unit: owner,
+                    cache: self.cache,
+                    cache_slot: visit.cache_slot,
+                    members: &packed,
+                };
+                ops.attention(visit_idx, visit, unit, self.cfg, &state)?;
+                ops.local_ffn(visit_idx, visit, unit, self.cfg, &state)?;
+            }
+            Ok(())
+        };
+        if capture {
+            let Some(graphs) = self.graphs.as_deref_mut() else {
+                return Ok(false);
+            };
+            graphs::prewarm_step(graphs, &owner.stream, rows, mode, has_taps, body)
+        } else {
+            body()?;
+            Ok(false)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,7 +997,7 @@ mod tests {
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
         fixture.configure_device_flags(&library, 0)?;
-        fixture.configure_memory_usage(&library, 0, 512 << 20, 0)?;
+        fixture.configure_memory_usage(&library, 0, 1024 << 20, 0)?;
         let device = Device {
             library: &library,
             id: 0,

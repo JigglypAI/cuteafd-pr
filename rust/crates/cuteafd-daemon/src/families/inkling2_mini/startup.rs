@@ -42,6 +42,7 @@ pub(crate) struct Options<'a> {
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
     pub expert_usage: bool,
+    pub prewarm_graphs: bool,
     pub vision: &'a crate::shared::vision::still::Options,
 }
 
@@ -354,6 +355,22 @@ pub(crate) fn whole<'a>(
     execution.graphs = super::graphs::DecodeGraphs::new(&execution.requests.decode.stream, graph_policy)?;
     drop(module_pins);
     let bind_secs = t_bind.elapsed().as_secs_f64();
+    phase.log("inkling2_mini request owners and graph attachment");
+    cuteafd_bench::context::phase("Inkling 2 Mini request owners and graph attachment");
+
+    let phase = crate::shared::memory::load_timing::Split::start();
+    let t_prewarm = std::time::Instant::now();
+    let (prewarm_captured, prewarm_wanted) = if options.prewarm_graphs {
+        execution.prewarm_graphs(usize::try_from(options.sequences)?)?
+    } else {
+        (0, 0)
+    };
+    let prewarm_secs = t_prewarm.elapsed().as_secs_f64();
+    if options.prewarm_graphs {
+        phase.log("inkling2_mini graph prewarm");
+        cuteafd_bench::context::phase("Inkling 2 Mini graph prewarm");
+    }
+
     let total_secs = total_start.elapsed().as_secs_f64();
     let resident_bytes: u64 = inputs.target.execution_arena()?.bytes() as u64
         + backings.iter().map(|b| b.arena.bytes() as u64).sum::<u64>()
@@ -363,13 +380,14 @@ pub(crate) fn whole<'a>(
         admit_secs = format_args!("{admit_secs:.3}"),
         weight_delivery_secs = format_args!("{load_secs:.3}"),
         bind_secs = format_args!("{bind_secs:.3}"),
+        prewarm_secs = format_args!("{prewarm_secs:.3}"),
+        prewarm_captured,
+        prewarm_wanted,
         total_ready_secs = format_args!("{total_secs:.3}"),
         resident_gb = format_args!("{resident_gb:.2}"),
         secs_per_resident_gb = format_args!("{:.4}", total_secs / resident_gb.max(1e-9)),
         load_gb_per_sec = format_args!("{:.2}", resident_gb / load_secs.max(1e-9)),
         "Inkling 2 Mini readiness breakdown"
     );
-    phase.log("inkling2_mini request owners and graph attachment");
-    cuteafd_bench::context::phase("Inkling 2 Mini request owners and graph attachment");
     Ok((execution, inputs, admitted, encoding, media))
 }

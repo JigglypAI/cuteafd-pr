@@ -47,6 +47,13 @@ pub(crate) struct GoldenArgs {
     /// Verify byte-exact equality between eager and graphed decode replays.
     #[arg(long)]
     pub graph_parity: bool,
+    /// Optional total packed row count for multi-slot shared-graph invariance check (e.g. 40).
+    #[arg(long, default_value_t = 0)]
+    pub slot_parity_rows: usize,
+    /// Comma-separated slot counts to check at `slot_parity_rows` (e.g. `15,16`), proving one
+    /// captured graph replays identically across different slot counts with byte-exact eager parity.
+    #[arg(long, value_delimiter = ',')]
+    pub slot_parity_slots: Vec<usize>,
     #[arg(long, default_value_t = 64)]
     pub prefill: usize,
     #[arg(long)]
@@ -152,6 +159,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             prefix: &args.prefix,
             resident_weights: crate::shared::memory::budget::resident_weight_limit(),
             expert_usage: false,
+            prewarm_graphs: false,
             vision: &vision,
         },
     )?;
@@ -388,6 +396,187 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         });
     }
 
+    // Optional direct slot-independence disproof: verify that the same total `rows`
+    // across different active slot counts (e.g., rows=40 at slots=15 and slots=16)
+    // replays the EXACT same single captured graph executable with byte-exact parity vs eager.
+    let mut slot_report = serde_json::Value::Null;
+    if args.slot_parity_rows > 0 && !args.slot_parity_slots.is_empty() {
+        let total_rows = args.slot_parity_rows;
+        let max_slots = *args.slot_parity_slots.iter().max().unwrap();
+        ensure!(
+            total_rows <= 64 && max_slots >= 1 && max_slots <= args.max_sequences,
+            "Mini slot parity requires rows<=64 and slots<=max_sequences"
+        );
+        ensure!(
+            pages_needed * (max_slots as u32 + 1) <= pool_pages,
+            "Mini slot parity pool too small for {max_slots} sequences"
+        );
+        let use_verify = execution.draft.is_some();
+        let mode_name = if use_verify { "Verify" } else { "Decode" };
+        let captures_before = execution.graphs.as_ref().map_or(0, |g| g.capture_count());
+        let mut shared_exec: Option<usize> = None;
+        let mut captures_after_first = 0usize;
+        let mut per_slot = Vec::with_capacity(args.slot_parity_slots.len());
+
+        for (idx, &slot_count) in args.slot_parity_slots.iter().enumerate() {
+            ensure!(
+                slot_count >= 1 && total_rows >= slot_count && total_rows <= slot_count * 8,
+                "Mini slot parity cannot partition {total_rows} rows across {slot_count} slots (1..=8/slot)"
+            );
+            let base = total_rows / slot_count;
+            let rem = total_rows % slot_count;
+            let row_counts: Vec<usize> = (0..slot_count).map(|i| base + usize::from(i < rem)).collect();
+            let prefix_lens: Vec<usize> = (0..slot_count)
+                .map(|i| (16 + (i % 7) * 5).min(rows.saturating_sub(8)).max(1))
+                .collect();
+
+            let build_prefilled = |exec: &mut super::engine::Execution<'_>| -> Result<Vec<super::cache::Placement>> {
+                let mut ps = Vec::with_capacity(slot_count);
+                for i in 0..slot_count {
+                    let plen = prefix_lens[i];
+                    let page_base = (i as u32 + 1) * pages_needed;
+                    let mut p = super::cache::Placement {
+                        units: (page_base..page_base + pages_needed).collect(),
+                        slot: i,
+                        len: 0,
+                        state_len: 0,
+                        media: None,
+                    };
+                    prefix.bind_slot(&mut p, Some(plen + row_counts[i]))?;
+                    let pre_u = Unit {
+                        index: 0,
+                        sequence: 0,
+                        rows: 0..plen,
+                        layers: 0..cfg.total_visits(),
+                        slot: 0,
+                        barrier: false,
+                        segments: vec![UnitSegment {
+                            sequence: 0,
+                            rows: 0..plen,
+                            tokens: 0..plen,
+                            prompt_end: true,
+                            snapshot: false,
+                            head: false,
+                        }],
+                    };
+                    let mut one = [p];
+                    exec.prefill(
+                        &mut one,
+                        &[&tokens[..plen]],
+                        &[pre_u],
+                        super::prefill::HeadProjection::AllHeadRows,
+                        &mut |_, _, _| Ok(()),
+                    )?;
+                    ps.push(one[0].clone());
+                }
+                Ok(ps)
+            };
+
+            let run_step = |exec: &mut super::engine::Execution<'_>, graphed: bool| -> Result<Vec<u32>> {
+                let mut ps = build_prefilled(exec)?;
+                let mut segments = Vec::with_capacity(slot_count);
+                let mut tok_slices: Vec<&[u32]> = Vec::with_capacity(slot_count);
+                let mut cursor = 0usize;
+                for i in 0..slot_count {
+                    let plen = prefix_lens[i];
+                    let r = row_counts[i];
+                    ps[i].len = plen;
+                    segments.push(UnitSegment {
+                        sequence: i,
+                        rows: cursor..cursor + r,
+                        tokens: plen..plen + r,
+                        prompt_end: false,
+                        snapshot: false,
+                        head: true,
+                    });
+                    tok_slices.push(&tokens[plen..plen + r]);
+                    cursor += r;
+                }
+                ensure!(cursor == total_rows);
+                let dec_u = Unit {
+                    index: 0,
+                    sequence: 0,
+                    rows: 0..total_rows,
+                    layers: 0..cfg.total_visits(),
+                    slot: 0,
+                    barrier: false,
+                    segments,
+                };
+                if use_verify {
+                    let draft = exec.draft.as_ref().expect("drafter").clone();
+                    exec.requests
+                        .decode
+                        .set_replay(Some((draft.verify.replay.buffer, exec.requests.cache.layout.conv.width)))?;
+                }
+                let res = if graphed {
+                    exec.decode(&mut ps, &tok_slices, &dec_u)
+                } else {
+                    exec.decode_eager(&mut ps, &tok_slices, &dec_u)
+                };
+                if use_verify {
+                    let _ = exec.requests.decode.set_replay(None);
+                }
+                let logits = res?;
+                Ok(read_logits(&library, device_id, &logits)?.into_iter().map(f32::to_bits).collect())
+            };
+
+            let eager_bits = run_step(&mut execution, false)?;
+            let reps = if idx == 0 { 3 } else { 1 };
+            let mut graphed_bits = Vec::new();
+            for rep in 0..reps {
+                let bits = run_step(&mut execution, true)?;
+                if rep + 1 == reps {
+                    graphed_bits = bits;
+                }
+            }
+            ensure!(
+                eager_bits == graphed_bits,
+                "Inkling 2 Mini slot parity failed at rows={total_rows} slots={slot_count} ({mode_name})"
+            );
+            let exec_addr = execution
+                .graphs
+                .as_ref()
+                .and_then(|g| g.last_launched_exec())
+                .ok_or_else(|| anyhow::anyhow!("Mini slot parity did not launch a captured graph at slots={slot_count}"))?;
+            let captures_now = execution.graphs.as_ref().map_or(0, |g| g.capture_count());
+            if idx == 0 {
+                ensure!(
+                    captures_now == captures_before + 1,
+                    "Mini slot parity expected 1 capture at slots={slot_count}, got {}",
+                    captures_now - captures_before
+                );
+                shared_exec = Some(exec_addr);
+                captures_after_first = captures_now;
+            } else {
+                ensure!(
+                    captures_now == captures_after_first,
+                    "Mini slot parity at slots={slot_count} triggered a new capture ({captures_after_first} -> {captures_now})"
+                );
+                ensure!(
+                    shared_exec == Some(exec_addr),
+                    "Mini slot parity at slots={slot_count} launched a different cudaGraphExec_t ({exec_addr:#x} vs {:#x})",
+                    shared_exec.unwrap_or(0)
+                );
+            }
+            per_slot.push(serde_json::json!({
+                "slots": slot_count,
+                "row_partition": row_counts,
+                "exec_addr": format!("{exec_addr:#x}"),
+                "captures_total": captures_now,
+                "graph_vs_eager_byte_exact": true,
+            }));
+        }
+        let captures_after = execution.graphs.as_ref().map_or(0, |g| g.capture_count());
+        slot_report = serde_json::json!({
+            "rows": total_rows,
+            "mode": mode_name,
+            "slots_checked": args.slot_parity_slots,
+            "captures_added": captures_after - captures_before,
+            "shared_single_capture": captures_after - captures_before == 1,
+            "per_slot": per_slot,
+        });
+    }
+
     let mut nll = 0f64;
     for (row, &next) in values.chunks_exact(vocab).zip(&tokens[1..]) {
         let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -469,6 +658,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         "mean_nll": nll,
         "reference_comparison": comparison,
         "invariance": width_report,
+        "slot_invariance": slot_report,
     });
     std::fs::write(args.save_logits.join("result.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("Inkling 2 Mini golden mean NLL={nll:.8} rows={rows} oracle=f1940f40eb");
