@@ -80,6 +80,7 @@ macro_rules! cache_attached_methods {
 mod bank;
 pub(crate) mod device;
 pub(crate) mod census;
+pub(crate) mod stats;
 mod owner;
 pub(crate) mod sites;
 mod native;
