@@ -453,15 +453,17 @@ fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
     !earlier.is_empty() && prompt.starts_with(earlier)
 }
 
-/// Whether `waiter` is still blocked on a donor in `prefills` whose prompt
-/// snapshot is not published yet: an earlier text member shares a pending
-/// prefix hit. The admission loop defers exactly these (`pending_prefix_hit`
-/// over `admitted` + `prefills`); once the donor publishes its snapshot (it
-/// joins `active`) or drops out, the waiter is admissible.
-fn prefix_waiter_blocked(waiter: &admission::Prepared, donors: &[&admission::Prepared]) -> bool {
-    donors.iter().any(|earlier| earlier.images.is_empty()
-        && !crate::shared::probe::cold(&earlier.job.probe)
-        && pending_prefix_hit(&waiter.prompt, &earlier.prompt))
+/// The one admission predicate: `prepared` is deferred while an earlier text
+/// member (this wave or still prefilling) shares a pending prefix hit, because
+/// that member will publish its prompt snapshot once prefilled. `earlier` yields
+/// `(is_text, member)`; the flag is the queued entry's `images` flag, not
+/// `member.images`, which queued entries store empty. The admission loop and
+/// `host_pending` both call this, so they cannot disagree.
+fn prefix_deferred<'a>(prepared: &admission::Prepared,
+    mut earlier: impl Iterator<Item = (bool, &'a admission::Prepared)>) -> bool {
+    prepared.images.is_empty() && !crate::shared::probe::cold(&prepared.job.probe)
+        && earlier.any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
+            && pending_prefix_hit(&prepared.prompt, &earlier.prompt))
 }
 
 /// Every `prefix_waiters` entry is blocked on an in-flight donor. Waking the
@@ -471,15 +473,15 @@ fn prefix_waiter_blocked(waiter: &admission::Prepared, donors: &[&admission::Pre
 /// pushes it back and re-enters the round — tens of thousands of times until
 /// the donor's decode debt drains.
 fn prefix_waiters_blocked(waiters: &std::collections::VecDeque<admission::Prepared>,
-    donors: &[&admission::Prepared]) -> bool {
-    !waiters.is_empty() && waiters.iter().all(|waiter| prefix_waiter_blocked(waiter, donors))
+    donors: &[(bool, &admission::Prepared)]) -> bool {
+    !waiters.is_empty() && waiters.iter().all(|waiter| prefix_deferred(waiter, donors.iter().copied()))
 }
 
 /// The `Wake`'s host-side pending flag: an image backlog with a free encoder
 /// slot, or a `prefix_waiter` that is admissible now. A waiter blocked on a
 /// donor still in `prefills` is NOT pending: it must not stop lane 0 at round 0.
 fn host_pending(media_full: bool, media_backlog: bool,
-    waiters: &std::collections::VecDeque<admission::Prepared>, donors: &[&admission::Prepared]) -> bool {
+    waiters: &std::collections::VecDeque<admission::Prepared>, donors: &[(bool, &admission::Prepared)]) -> bool {
     (!media_full && media_backlog) || (!waiters.is_empty() && !prefix_waiters_blocked(waiters, donors))
 }
 
@@ -1062,13 +1064,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             // An earlier member (this wave or still prefilling) will publish its
             // prompt snapshot once prefilled. Defer before leasing, while unrelated
             // queued prompts still pack.
-            if prefixes.engine().enabled() && prepared.images.is_empty()
-                && !crate::shared::probe::cold(&prepared.job.probe)
-                && admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
+            if prefixes.engine().enabled()
+                && prefix_deferred(&prepared, admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
                     .chain(prefills.iter().filter_map(|queued| queued.request())
-                        .map(|waiting| (!waiting.images, &waiting.prepared)))
-                    .any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
-                        && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
+                        .map(|waiting| (!waiting.images, &waiting.prepared)))) {
                 next_wave.push_back(prepared);
                 continue;
             }
@@ -1329,8 +1328,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + prefills.len(),
                 host_pending: {
-                    let donors: Vec<&admission::Prepared> = prefills.iter().filter_map(|queued| queued.request())
-                        .map(|waiting| &waiting.prepared).collect();
+                    let donors: Vec<(bool, &admission::Prepared)> = prefills.iter().filter_map(|queued| queued.request())
+                        .map(|waiting| (!waiting.images, &waiting.prepared)).collect();
                     host_pending(media.full(), !media.backlog.is_empty(), &prefix_waiters, &donors)
                 },
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
@@ -3200,7 +3199,7 @@ mod sampling_tests {
     fn prefix_waiters_blocked_on_in_flight_donor_do_not_trigger_round_zero_admission_spin() {
         let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
         let donor = prepared(&[1, 2]);
-        let donors = [&donor];
+        let donors = [(true, &donor)];
         assert!(prefix_waiters_blocked(&waiters, &donors), "the donor is still prefilling");
         assert!(!host_pending(false, false, &waiters, &donors),
             "a blocked waiter is not host_pending: no round-0 Admission spin");
@@ -3215,7 +3214,7 @@ mod sampling_tests {
     fn a_blocked_prefix_waiter_wakes_once_its_donor_publishes() {
         let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
         let donor = prepared(&[1, 2]);
-        assert!(prefix_waiters_blocked(&waiters, &[&donor]));
+        assert!(prefix_waiters_blocked(&waiters, &[(true, &donor)]));
         // The donor left `prefills`: the waiter is admissible and wakes the lanes.
         assert!(!prefix_waiters_blocked(&waiters, &[]));
         assert!(host_pending(false, false, &waiters, &[]));
@@ -3228,8 +3227,8 @@ mod sampling_tests {
     fn an_unrelated_donor_does_not_block_a_waiter_and_media_backlog_still_wakes() {
         let waiters = std::collections::VecDeque::from([prepared(&[9, 9, 9])]);
         let donor = prepared(&[1, 2]);
-        assert!(!prefix_waiters_blocked(&waiters, &[&donor]), "no shared prefix: admissible");
-        assert!(host_pending(false, false, &waiters, &[&donor]));
+        assert!(!prefix_waiters_blocked(&waiters, &[(true, &donor)]), "no shared prefix: admissible");
+        assert!(host_pending(false, false, &waiters, &[(true, &donor)]));
         let empty = std::collections::VecDeque::new();
         assert!(host_pending(false, true, &empty, &[]), "an image backlog still wakes the lanes");
         assert!(!host_pending(true, true, &empty, &[]), "a full encoder does not");
