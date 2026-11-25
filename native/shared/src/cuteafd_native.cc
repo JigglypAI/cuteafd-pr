@@ -2040,7 +2040,8 @@ std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
         if (!p.ptr) return false;
         if (p.pitch == 0) return true;
         return params.extent.height == 1 && params.extent.depth == 1 &&
-               p.pitch == params.extent.width && p.xsize == params.extent.width &&
+               p.pitch == params.extent.width &&
+               (p.xsize == 0 || p.xsize == params.extent.width) &&
                p.ysize == 1;
       };
       if (params.srcArray || params.dstArray ||

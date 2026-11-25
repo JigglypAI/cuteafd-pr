@@ -427,6 +427,10 @@ int main() {
   pitched_1d[1].memcpy.srcPtr.pitch = 4096; pitched_1d[1].memcpy.srcPtr.xsize = 4096; pitched_1d[1].memcpy.srcPtr.ysize = 1;
   pitched_1d[1].memcpy.dstPtr.pitch = 4096; pitched_1d[1].memcpy.dstPtr.xsize = 4096; pitched_1d[1].memcpy.dstPtr.ysize = 1;
   assert(run_sig(pitched_1d) == sig_donor);
+  // CUDA 13.2 cudaMemcpy3DAsync omits xsize in CUDA_MEMCPY3D (returns xsize == 0 with pitch == width, ysize == 1).
+  auto pitched_1d_zero_xsize = pitched_1d;
+  pitched_1d_zero_xsize[1].memcpy.srcPtr.xsize = 0; pitched_1d_zero_xsize[1].memcpy.dstPtr.xsize = 0;
+  assert(run_sig(pitched_1d_zero_xsize) == sig_donor);
   auto pitched_1d_smaller = make_d2d(new_src.data(), new_dst.data(), 2048);
   pitched_1d_smaller[1].memcpy.srcPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.srcPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.srcPtr.ysize = 1;
   pitched_1d_smaller[1].memcpy.dstPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.dstPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.dstPtr.ysize = 1;
