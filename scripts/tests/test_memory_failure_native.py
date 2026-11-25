@@ -301,6 +301,200 @@ int main() {
     assert ran.returncode == 0, ran.stderr
 
 
+def test_transferable_signature_handles_d2d_memcpy_nodes(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
+    signature_fn = native.split("std::vector<uint64_t> transferable_signature(", 1)[1]
+    signature_fn = "std::vector<uint64_t> transferable_signature(" + signature_fn.split("\n}\n}\n#endif", 1)[0] + "\n}\n"
+    diagnostics = (ROOT / "native/shared/include/cuteafd_graph_diagnostics.h").read_text()
+    clear_error = diagnostics.split("inline cudaError_t diagnostic_cuda", 1)[1].split("using GraphEdgesQuery", 1)[0]
+    source = tmp_path / "transferable_signature_d2d.cc"
+    source.write_text(r'''
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <unordered_map>
+#include <vector>
+using cudaError_t = int;
+using CUresult = int;
+using cudaGraph_t = struct FakeGraph*;
+using cudaGraphNode_t = struct FakeNode*;
+using CUgraphNode = cudaGraphNode_t;
+constexpr int cudaSuccess = 0, CUDA_SUCCESS = 0, cudaErrorInvalidValue = 1;
+enum cudaGraphNodeType { cudaGraphNodeTypeKernel = 0, cudaGraphNodeTypeMemcpy = 1, cudaGraphNodeTypeMemset = 2 };
+enum cudaMemcpyKind { cudaMemcpyHostToHost = 0, cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2, cudaMemcpyDeviceToDevice = 3, cudaMemcpyDefault = 4 };
+enum cudaMemoryType { cudaMemoryTypeUnregistered = 0, cudaMemoryTypeHost = 1, cudaMemoryTypeDevice = 2 };
+struct cudaPos { size_t x = 0, y = 0, z = 0; };
+struct cudaPitchedPtr { void* ptr = nullptr; size_t pitch = 0, xsize = 0, ysize = 0; };
+struct cudaExtent { size_t width = 0, height = 0, depth = 0; };
+struct cudaMemcpy3DParms {
+  void* srcArray = nullptr;
+  cudaPos srcPos{};
+  cudaPitchedPtr srcPtr{};
+  void* dstArray = nullptr;
+  cudaPos dstPos{};
+  cudaPitchedPtr dstPtr{};
+  cudaExtent extent{};
+  cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
+};
+struct CUDA_KERNEL_NODE_PARAMS { void* func = nullptr; };
+struct cudaPointerAttributes { cudaMemoryType type = cudaMemoryTypeUnregistered; int device = -1; };
+struct cudaGraphEdgeData { uint8_t from_port = 0, to_port = 0, type = 0; };
+struct FakeNode {
+  cudaGraphNodeType kind = cudaGraphNodeTypeKernel;
+  void* func = nullptr;
+  cudaMemcpy3DParms memcpy{};
+};
+struct FakeGraph {
+  std::vector<FakeNode*> nodes;
+  std::vector<std::pair<FakeNode*, FakeNode*>> edges;
+};
+static int current_device = 0;
+static std::unordered_map<const void*, cudaPointerAttributes> ptr_attrs;
+int cudaGetLastError() { return cudaSuccess; }
+int cudaGetDevice(int* dev) { *dev = current_device; return cudaSuccess; }
+int cudaGraphGetNodes(cudaGraph_t g, cudaGraphNode_t* out, size_t* count) {
+  if (!out) { *count = g->nodes.size(); return cudaSuccess; }
+  const size_t n = std::min(*count, g->nodes.size());
+  for (size_t i = 0; i < n; ++i) out[i] = g->nodes[i];
+  *count = n;
+  return cudaSuccess;
+}
+int cudaGraphNodeGetType(cudaGraphNode_t n, cudaGraphNodeType* kind) { *kind = n->kind; return cudaSuccess; }
+CUresult cuGraphKernelNodeGetParams(CUgraphNode n, CUDA_KERNEL_NODE_PARAMS* p) { p->func = n->func; return CUDA_SUCCESS; }
+int cudaGraphMemcpyNodeGetParams(cudaGraphNode_t n, cudaMemcpy3DParms* p) { *p = n->memcpy; return cudaSuccess; }
+int cudaPointerGetAttributes(cudaPointerAttributes* attr, const void* ptr) {
+  auto it = ptr_attrs.find(ptr);
+  if (it == ptr_attrs.end()) return cudaErrorInvalidValue;
+  *attr = it->second;
+  return cudaSuccess;
+}
+int cudaGraphGetEdges(cudaGraph_t g, cudaGraphNode_t* from, cudaGraphNode_t* to, cudaGraphEdgeData* data, size_t* count) {
+  const size_t n = std::min(*count, g->edges.size());
+  for (size_t i = 0; i < n; ++i) { from[i] = g->edges[i].first; to[i] = g->edges[i].second; data[i] = {}; }
+  *count = g->edges.size();
+  return cudaSuccess;
+}
+namespace cuteafd {
+''' + "inline cudaError_t diagnostic_cuda" + clear_error + r'''
+}
+''' + signature_fn + r'''
+int main() {
+  std::vector<uint8_t> old_src(4096, 0x11), old_dst(4096, 0), new_src(4096, 0x5a), new_dst(4096, 0);
+  std::vector<uint8_t> host_buf(4096, 0x22), peer_buf(4096, 0x33);
+  ptr_attrs[old_src.data()] = {cudaMemoryTypeDevice, 0};
+  ptr_attrs[old_dst.data()] = {cudaMemoryTypeDevice, 0};
+  ptr_attrs[new_src.data()] = {cudaMemoryTypeDevice, 0};
+  ptr_attrs[new_dst.data()] = {cudaMemoryTypeDevice, 0};
+  ptr_attrs[host_buf.data()] = {cudaMemoryTypeHost, -1};
+  ptr_attrs[peer_buf.data()] = {cudaMemoryTypeDevice, 1};
+  auto make_d2d = [&](void* src, void* dst, size_t bytes, cudaMemcpyKind kind = cudaMemcpyDeviceToDevice) {
+    FakeNode k1{cudaGraphNodeTypeKernel, reinterpret_cast<void*>(0x101), {}};
+    FakeNode m{cudaGraphNodeTypeMemcpy, nullptr, {}};
+    m.memcpy.srcPtr.ptr = src; m.memcpy.dstPtr.ptr = dst;
+    m.memcpy.extent = {bytes, 1, 1}; m.memcpy.kind = kind;
+    FakeNode k2{cudaGraphNodeTypeKernel, reinterpret_cast<void*>(0x202), {}};
+    return std::array<FakeNode, 3>{k1, m, k2};
+  };
+  auto run_sig = [&](std::array<FakeNode, 3>& nodes) {
+    FakeGraph g{{&nodes[0], &nodes[1], &nodes[2]}, {{&nodes[0], &nodes[1]}, {&nodes[1], &nodes[2]}}};
+    return transferable_signature(&g, 3);
+  };
+  auto donor_nodes = make_d2d(old_src.data(), old_dst.data(), 4096);
+  auto target_nodes = make_d2d(new_src.data(), new_dst.data(), 4096);
+  auto default_nodes = make_d2d(new_src.data(), new_dst.data(), 4096, cudaMemcpyDefault);
+  const auto sig_donor = run_sig(donor_nodes);
+  const auto sig_target = run_sig(target_nodes);
+  const auto sig_default = run_sig(default_nodes);
+  assert(!sig_donor.empty());
+  assert(sig_donor == sig_target);
+  assert(sig_donor == sig_default);
+  // Signature includes node type, direction (D2D) and device, omitting 1D byte length so
+  // different batch row counts share donors across cudaGraphExecUpdate.
+  assert(sig_donor[3] == cudaGraphNodeTypeMemcpy && sig_donor[4] == cudaMemcpyDeviceToDevice &&
+         sig_donor[5] == 0);
+  // Different 1D copy size matches signature; canonical 1D pitched layout
+  // (pitch == xsize == extent.width, ysize == 1, height == depth == 1) also matches.
+  auto smaller_nodes = make_d2d(new_src.data(), new_dst.data(), 2048);
+  const auto sig_smaller = run_sig(smaller_nodes);
+  assert(sig_smaller == sig_donor);
+  auto pitched_1d = make_d2d(new_src.data(), new_dst.data(), 4096);
+  pitched_1d[1].memcpy.srcPtr.pitch = 4096; pitched_1d[1].memcpy.srcPtr.xsize = 4096; pitched_1d[1].memcpy.srcPtr.ysize = 1;
+  pitched_1d[1].memcpy.dstPtr.pitch = 4096; pitched_1d[1].memcpy.dstPtr.xsize = 4096; pitched_1d[1].memcpy.dstPtr.ysize = 1;
+  assert(run_sig(pitched_1d) == sig_donor);
+  // CUDA 13.2 cudaMemcpy3DAsync omits xsize in CUDA_MEMCPY3D (returns xsize == 0 with pitch == width, ysize == 1).
+  auto pitched_1d_zero_xsize = pitched_1d;
+  pitched_1d_zero_xsize[1].memcpy.srcPtr.xsize = 0; pitched_1d_zero_xsize[1].memcpy.dstPtr.xsize = 0;
+  assert(run_sig(pitched_1d_zero_xsize) == sig_donor);
+  auto pitched_1d_smaller = make_d2d(new_src.data(), new_dst.data(), 2048);
+  pitched_1d_smaller[1].memcpy.srcPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.srcPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.srcPtr.ysize = 1;
+  pitched_1d_smaller[1].memcpy.dstPtr.pitch = 2048; pitched_1d_smaller[1].memcpy.dstPtr.xsize = 2048; pitched_1d_smaller[1].memcpy.dstPtr.ysize = 1;
+  assert(run_sig(pitched_1d_smaller) == sig_donor);
+  current_device = 1;
+  ptr_attrs[new_src.data()] = {cudaMemoryTypeDevice, 1};
+  ptr_attrs[new_dst.data()] = {cudaMemoryTypeDevice, 1};
+  const auto sig_dev1 = run_sig(target_nodes);
+  assert(!sig_dev1.empty() && sig_dev1 != sig_donor && sig_dev1[5] == 1);
+  current_device = 0;
+  ptr_attrs[new_src.data()] = {cudaMemoryTypeDevice, 0};
+  ptr_attrs[new_dst.data()] = {cudaMemoryTypeDevice, 0};
+  // Strided/pitched, mismatched xsize/ysize/height/depth, non-D2D, cross-device peer, 2D/3D, non-zero offset, zero-width, array and memset nodes stay non-transferable.
+  auto pitched = make_d2d(new_src.data(), new_dst.data(), 4096);
+  pitched[1].memcpy.srcPtr.pitch = 8192; pitched[1].memcpy.srcPtr.xsize = 4096; pitched[1].memcpy.srcPtr.ysize = 1;
+  assert(run_sig(pitched).empty());
+  auto bad_xsize = pitched_1d;
+  bad_xsize[1].memcpy.srcPtr.xsize = 2048;
+  assert(run_sig(bad_xsize).empty());
+  auto bad_ysize = pitched_1d;
+  bad_ysize[1].memcpy.dstPtr.ysize = 2;
+  assert(run_sig(bad_ysize).empty());
+  auto zero_ysize = pitched_1d;
+  zero_ysize[1].memcpy.srcPtr.ysize = 0;
+  assert(run_sig(zero_ysize).empty());
+  auto zero_height = pitched_1d;
+  zero_height[1].memcpy.extent.height = 0;
+  assert(run_sig(zero_height).empty());
+  auto zero_depth = pitched_1d;
+  zero_depth[1].memcpy.extent.depth = 0;
+  assert(run_sig(zero_depth).empty());
+  auto h2d = make_d2d(host_buf.data(), new_dst.data(), 4096, cudaMemcpyHostToDevice);
+  assert(run_sig(h2d).empty());
+  auto d2h = make_d2d(new_src.data(), host_buf.data(), 4096, cudaMemcpyDeviceToHost);
+  assert(run_sig(d2h).empty());
+  auto default_host = make_d2d(host_buf.data(), new_dst.data(), 4096, cudaMemcpyDefault);
+  assert(run_sig(default_host).empty());
+  auto peer = make_d2d(peer_buf.data(), new_dst.data(), 4096, cudaMemcpyDeviceToDevice);
+  assert(run_sig(peer).empty());
+  auto copy2d = make_d2d(new_src.data(), new_dst.data(), 4096);
+  copy2d[1].memcpy.extent.height = 2;
+  assert(run_sig(copy2d).empty());
+  auto offset = make_d2d(new_src.data(), new_dst.data(), 4096);
+  offset[1].memcpy.srcPos.x = 16;
+  assert(run_sig(offset).empty());
+  auto zero = make_d2d(new_src.data(), new_dst.data(), 0);
+  assert(run_sig(zero).empty());
+  auto arr = make_d2d(new_src.data(), new_dst.data(), 4096);
+  arr[1].memcpy.srcArray = reinterpret_cast<void*>(0x999);
+  assert(run_sig(arr).empty());
+  auto memset_nodes = make_d2d(new_src.data(), new_dst.data(), 4096);
+  memset_nodes[1].kind = cudaGraphNodeTypeMemset;
+  assert(run_sig(memset_nodes).empty());
+}
+''')
+    executable = tmp_path / "transferable_signature_d2d"
+    built = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                            str(source), "-o", str(executable)],
+                           capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr
+
+
 def test_cmake_rejects_wrapped_source_without_real_callbacks(tmp_path):
     cmake = shutil.which("cmake")
     if not cmake:

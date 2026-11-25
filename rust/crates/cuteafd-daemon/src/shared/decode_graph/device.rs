@@ -2896,6 +2896,41 @@ mod tests {
     }
 
     #[test]
+    fn d2d_memcpy_signature_is_indexed_and_donor_updated_not_eagered() {
+        let mut cache = test_cache(-1087, 1000);
+        let d2d_sig = |device: u64| vec![3, 0, 0x101, 1, 3, device, 0, 0x202, 2, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0];
+        let donor = capture(&mut cache, 1, false);
+        cache.records.get_mut(&donor).unwrap().last_used = Some(cache.lanes[0].index);
+        cache.register_native(donor, 501, d2d_sig(0));
+        cache.soft.limit = 10;
+        cache.charged = 10;
+        for _ in 0..2 { cache.begin_lane(0); cache.complete_lane(0); }
+        // Matching D2D memcpy signature (including across different 1D row byte counts): indexed and donor-updated, not eagered.
+        let id = cache.update_ticket(key(2), site(Preference::Adaptive), None, false)
+            .expect("graph with D2D memcpy signature must get a donor update ticket");
+        cache.register_native(id, 0, d2d_sig(0));
+        let mut updated_exec = None;
+        let transferred = cache.finish_update(id, |exec| { updated_exec = Some(exec); Ok(true) },
+            |exec| Ok(exec + 1000), |_| panic!());
+        assert_eq!(updated_exec, Some(501));
+        assert_eq!(transferred, Some(1501));
+        assert!(cache.owns(id, 1) && !cache.owns(donor, 1));
+        assert_eq!(cache.counters[&Cycle::Decode].updates_soft, 1);
+        assert_eq!(cache.counters[&Cycle::Decode].eager_soft_room, 0);
+        assert_eq!(cache.counters[&Cycle::Decode].no_cold_donor_soft, 0);
+        // Different device signature must not steal a mismatched-device donor.
+        cache.records.get_mut(&id).unwrap().last_used = Some(cache.lanes[0].index);
+        for _ in 0..2 { cache.begin_lane(0); cache.complete_lane(0); }
+        cache.charged = cache.reserve;
+        let id_diff = cache.update_ticket(key(3), site(Preference::Adaptive), None, false)
+            .expect("unseen shape probes signature via host-only capture");
+        cache.register_native(id_diff, 0, d2d_sig(1));
+        assert!(cache.finish_update(id_diff, |_| panic!(), |_| panic!(), |_| panic!()).is_none());
+        assert!(matches!(cache.fallback_update(id_diff), Miss::Eager));
+        assert!(cache.owns(id, 1), "mismatched device must leave existing donor intact");
+    }
+
+    #[test]
     fn working_set_reserve_seeds_adaptive_headroom() {
         use cuteafd_loader::placement::graph_reserve::{WorkingSet, resolve_working_set};
         let policy = resolve_working_set(None, None, None, 0, WorkingSet {
