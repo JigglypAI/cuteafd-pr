@@ -1232,6 +1232,7 @@ mod tests {
             "packed reference logit extent");
         let reference_logits = reference_bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        crate::shared::golden_scores::check_reference_logits(&folder.join("logits.bin"), &reference_logits, vocab)?;
         with_backend(&args, |backend, _, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 4)?;
             let mut placements = (0..4).map(|sequence| pool.admit_cold(&family, 192, 256,

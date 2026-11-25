@@ -1018,6 +1018,60 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
 
 
+def write_reference(directory, rows):
+    import struct
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'tokens.bin').write_bytes(struct.pack(f'<{len(rows)}I', *range(len(rows))))
+    (directory / 'logits.bin').write_bytes(b''.join(struct.pack(f'<{len(r)}f', *r) for r in rows))
+    return directory
+
+
+@pytest.mark.parametrize('rows,match', [
+    ([[0.0] * 8] * 3, 'all 3 x 8 logits are zero (a shape-only placeholder)'),
+    ([[1.0, 2.0, 0.0, 0.0], [3.5] * 4], 'row 1 is constant (every logit is 3.5)'),
+    ([[0.0] * 4, [1.0, 2.0, 3.0, 4.0]], 'row 0 is constant (every logit is 0.0)'),
+    ([[1.0, 2.0, 3.0, 4.0], [1.0, float('nan'), 0.0, 0.0]], 'row 1 column 1 is non-finite'),
+    ([[1.0, float('inf'), 0.0, 0.0]], 'row 0 column 1 is non-finite'),
+])
+def test_golden_refuses_uninformative_reference_before_the_queue(env, capsys, rows, match):
+    """#2719: an all-zero / constant / non-finite logits.bin fails at preflight, naming the file."""
+    write_slot(env['home'], 'i1')
+    ref = write_reference(env['tmp'] / 'ref', rows)
+    for argv in (BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--', '--snapshot', '{snapshot}', '--golden', str(ref),
+                         '--skip-routed-experts', '--nll'],
+                 BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--fixtures', str(ref), '--', '--snapshot', '{snapshot}',
+                         '--golden={fixtures}', '--skip-routed-experts', '--nll']):
+        assert golden.main(argv) == 2
+        err = capsys.readouterr().err
+        assert match in err and str(ref / 'logits.bin') in err, err
+    assert not runs(env) and not list(env['locks'].iterdir())
+
+
+def test_golden_accepts_informative_reference_and_skips_other_layouts(env, tmp_path):
+    ref = write_reference(tmp_path / 'ok', [[0.0, 0.0, 0.0, -1e-30], [5.0, 4.0, 3.0, 2.0]])
+    golden.check_reference_logits(ref)
+    golden.check_reference_logits(tmp_path / 'missing')  # a fresh dump target or fidelity set
+    (tmp_path / 'fidelity').mkdir()
+    (tmp_path / 'fidelity/a00.safetensors').write_bytes(b'x')
+    golden.check_reference_logits(tmp_path / 'fidelity')
+    (ref / 'logits.bin').write_bytes(b'\0' * 12)
+    with pytest.raises(ValueError, match='not \\[2 tokens, vocab\\] F32 rows'):
+        golden.check_reference_logits(ref)
+    assert golden.golden_reference_dirs(['--golden', '/a', '--golden=/b', '--golden', '{fixtures}', '--x']) \
+        == [Path('/a'), Path('/b')]
+    # A writable fixture directory is being generated; its placeholder state is not scored.
+    many = write_reference(tmp_path / 'chunked', [[float(i), 1.0, 2.0] for i in range(9)])
+    old = golden.REFERENCE_CHUNK
+    try:
+        golden.REFERENCE_CHUNK = 24  # two rows per read: rows span several chunks
+        golden.check_reference_logits(many)
+        (many / 'logits.bin').write_bytes((many / 'logits.bin').read_bytes()[:-12] + b'\0' * 12)
+        with pytest.raises(ValueError, match='row 8 is constant'):
+            golden.check_reference_logits(many)
+    finally:
+        golden.REFERENCE_CHUNK = old
+
+
 @pytest.mark.parametrize('extra,match', [
     (['--fixtures-writable'], 'needs --fixtures'),
     (['--fixtures', '/tmp/elsewhere', '--fixtures-writable'], 'must be under'),
