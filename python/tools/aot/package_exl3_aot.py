@@ -1062,8 +1062,16 @@ def compile_variants(payloads, jobs):
 def _compile_variants(payloads, jobs, context):
     pool = ProcessPoolExecutor(max_workers=jobs, mp_context=context,
                                initializer=init_variant_worker)
+    # Each worker leads its own session (init_variant_worker), so its pid names
+    # the group its compilers run in. Record the pids as the pool starts them:
+    # a worker that crashes is dropped from pool._processes before the failure
+    # reaches us, but compilers it started can still be running in its session.
+    owned = set()
     try:
-        futures = {pool.submit(compile_variant, payload): index for index, payload in enumerate(payloads)}
+        futures = {}
+        for index, payload in enumerate(payloads):
+            futures[pool.submit(compile_variant, payload)] = index
+            owned.update(process.pid for process in (pool._processes or {}).values())
         results = [None] * len(payloads)
         for future in as_completed(futures):
             results[futures[future]] = future.result()
@@ -1072,22 +1080,21 @@ def _compile_variants(payloads, jobs, context):
         # Python 3.12 has no terminate_workers(). Join before releasing outputs
         # and reservations; cancelling futures does not stop running compilers.
         processes = list((pool._processes or {}).values())
-        groups = []
-        for process in processes:
+        groups = sorted(owned | {process.pid for process in processes})
+        for group in groups:
             try:
-                if os.getpgid(process.pid) == process.pid:
-                    groups.append(process.pid)
-                    os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(group, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        for process in processes:
             process.terminate()
         for process in processes:
             process.join(timeout=5)
             if process.is_alive():
                 process.kill()
                 process.join()
-        # A compiler can outlive a terminated worker. Kill its owned session
-        # even when the group's original leader has already exited.
+        # A compiler can outlive a terminated or crashed worker. Kill its owned
+        # session even when the group's original leader has already exited.
         for group in groups:
             try:
                 os.killpg(group, signal.SIGKILL)
