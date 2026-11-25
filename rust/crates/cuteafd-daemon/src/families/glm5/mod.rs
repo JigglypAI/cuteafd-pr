@@ -2617,6 +2617,14 @@ fn golden(mut args: GoldenArgs) -> Result<()> {
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,
         usize::from(args.engine.prefill_waves), 256,
         1, engine::DECODE_ROWS)?;
+    // A placeholder reference (#2719) fails here, not after the model load.
+    let reference = args.golden.join("logits.bin");
+    if reference.is_file() {
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(args.engine.snapshot.join("config.json"))?)?;
+        let vocab = GlmDsaConfig::from_hf(&config)?.vocab_size;
+        let rows = std::fs::metadata(args.golden.join("tokens.bin"))?.len() as usize / 4;
+        crate::shared::golden_scores::ReferenceRows::open(&reference, rows, vocab, false)?;
+    }
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine, transport, runtime| golden_run(&args, &opened, engine, transport, runtime))
 }
@@ -2740,9 +2748,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
     }
     if !decode_logits.is_empty() {
-        let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let vocab = cfg.vocab_size;
+        let golden = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"), vocab)?;
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
         let (mut agree, mut next_ok, mut golden_next) = (0usize, 0usize, 0usize);
         let rows = decode_logits.len() / vocab;
@@ -2772,8 +2779,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
-        let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let golden = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"),
+            cfg.vocab_size)?;
         let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).context("empty");
         let (cosine, _) = similarity(&logits, last);
@@ -2932,8 +2939,7 @@ fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     let vocab = opened.cfg.vocab_size;
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
-        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let golden = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"), vocab)?;
     let prefill = args.prefill.unwrap_or(512);
     let mut pages = engine::PageAllocator::new(engine);
     let mut placements = Vec::new();

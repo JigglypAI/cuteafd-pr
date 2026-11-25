@@ -1618,8 +1618,8 @@ mod golden_tests {
         assert_eq!(reference.row(1).unwrap(), values[2..]);
         assert!(reference.row(2).is_err());
         assert!(golden_logits(dir.path(), true, 3, 1).is_err());
-        std::fs::write(&path, f32::NAN.to_le_bytes()).unwrap();
-        assert!(golden_logits(dir.path(), true, 1, 1).unwrap().unwrap().row(0).is_err());
+        std::fs::write(&path, [f32::NAN, 1.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        assert!(golden_logits(dir.path(), true, 1, 2).is_err()); // refused at open (#2719)
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(golden_logits(dir.path(), true, 1, 1).is_err());

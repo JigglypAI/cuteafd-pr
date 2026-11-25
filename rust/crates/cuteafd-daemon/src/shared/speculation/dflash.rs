@@ -3347,14 +3347,16 @@ pub(crate) fn golden_sequence(dir: &Path, vocab: usize) -> Result<(Vec<u32>, Vec
     use std::io::Read;
     let tokens: Vec<u32> = std::fs::read(dir.join("tokens.bin"))?.chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let mut file = std::io::BufReader::with_capacity(1 << 24, std::fs::File::open(dir.join("logits.bin"))?);
+    let path = dir.join("logits.bin");
+    let mut file = std::io::BufReader::with_capacity(1 << 24, std::fs::File::open(&path)?);
     let mut row = vec![0u8; vocab * 4];
     let mut greedy = Vec::with_capacity(tokens.len());
-    for _ in 0..tokens.len() {
+    for index in 0..tokens.len() {
         file.read_exact(&mut row)?;
+        let values = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        crate::shared::golden_scores::check_reference_row(&path, index, &values)?;
         let (mut best, mut value) = (0u32, f32::NEG_INFINITY);
-        for (i, b) in row.chunks_exact(4).enumerate() {
-            let v = f32::from_le_bytes(b.try_into().unwrap());
+        for (i, &v) in values.iter().enumerate() {
             if v > value {
                 (best, value) = (i as u32, v);
             }

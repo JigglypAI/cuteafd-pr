@@ -1779,7 +1779,72 @@ def resolve_fixtures(args, task_root):
         raise ValueError(f'--fixtures {path} is not a directory')
     if not re.fullmatch(r'/[A-Za-z0-9._/+-]+', str(path)):
         raise ValueError(f'--fixtures {path}: path characters must be [A-Za-z0-9._/+-]')
+    if not args.fixtures_writable:
+        check_reference_logits(path)
     return str(path)
+
+
+def golden_reference_dirs(args):
+    """The --golden DIR values after `--` (the reference a family golden scores against)."""
+    dirs = []
+    for i, arg in enumerate(args):
+        flag, sep, value = arg.partition('=')
+        if flag == '--golden':
+            value = value if sep else (args[i + 1] if i + 1 < len(args) else '')
+            if value.startswith('/') and '{' not in value:
+                dirs.append(Path(value))
+    return dirs
+
+
+REFERENCE_CHUNK = 1 << 24
+
+
+def check_reference_logits(directory):
+    """Refuse a legacy golden reference (tokens.bin + [T, vocab] F32 logits.bin) whose
+    logits carry no information: all zero, a constant row, or non-finite (#2719).
+
+    A KL against an all-zero reference is a number about the engine alone (8.95 for
+    GLM 5.3), so the run must not reach the hardware queue. Reads the file once in
+    bounded chunks; a directory without that pair (a fidelity set, a fresh dump) passes.
+    """
+    directory = Path(directory)
+    logits, tokens = directory / 'logits.bin', directory / 'tokens.bin'
+    if not (logits.is_file() and tokens.is_file()):
+        return
+    rows, size = tokens.stat().st_size // 4, logits.stat().st_size
+    if rows == 0 or size == 0 or size % (rows * 4):
+        raise ValueError(f'golden reference {logits}: {size} bytes are not [{rows} tokens, vocab] F32 rows')
+    vocab = size // (rows * 4)
+    # Stdlib only (the host python3 has no numpy). Per row: a constant row is its
+    # first value repeated (one bytes compare); a non-finite value makes the row's
+    # float64 sum non-finite (F32 magnitudes cannot overflow a double sum).
+    import array
+    import math
+    row_bytes = vocab * 4
+    per_chunk = max(1, REFERENCE_CHUNK // row_bytes)
+    zero = bytes(row_bytes)
+    with logits.open('rb') as handle:
+        for first in range(0, rows, per_chunk):
+            block = handle.read(min(per_chunk, rows - first) * row_bytes)
+            for offset in range(0, len(block), row_bytes):
+                row, data = first + offset // row_bytes, block[offset:offset + row_bytes]
+                values = array.array('f')
+                values.frombytes(data)
+                if sys.byteorder != 'little':
+                    values.byteswap()
+                if not math.isfinite(sum(values)):
+                    column = next(i for i, v in enumerate(values) if not math.isfinite(v))
+                    raise ValueError(f'golden reference {logits}: row {row} column {column} is non-finite '
+                                     f'({values[column]}); regenerate it from the family reference golden.py')
+                if data == data[:4] * vocab:
+                    if row == 0 and data == zero and handle.read().strip(b'\0') == b'' \
+                            and block.strip(b'\0') == b'':
+                        raise ValueError(f'golden reference {logits}: all {rows} x {vocab} logits are zero (a '
+                                         'shape-only placeholder); no reference logits for this fixture. '
+                                         'Regenerate it from the family reference golden.py (#2719)')
+                    raise ValueError(f'golden reference {logits}: row {row} is constant (every logit is '
+                                     f'{values[0]}), so KL and top-1 against it carry no information; '
+                                     'regenerate it from the family reference golden.py (#2719)')
 
 
 def build_state(args, arms):
@@ -1823,6 +1888,8 @@ def build_state(args, arms):
         raise ValueError('SparkNest snapshots require push loading: add --rdma (host network and verbs)')
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
+        for directory in golden_reference_dirs(args.golden):
+            check_reference_logits(directory)
     else:
         golden = list(args.golden)
     native_test = native_digest = None

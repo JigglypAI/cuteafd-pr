@@ -206,9 +206,9 @@ fn report(args: &Report, tokens: &[u32], rows: &Rows, seconds: f64) -> Result<()
     let n = rows.positions.len();
     println!("v41 golden: {} rows scored ({} path) in {seconds:.1} s | mean NLL engine {:.4} | next-token accuracy {:.1}% \
         | logits digest {digest:016x}", n, args.score_path, nll / n as f64, 100.0 * next_ok as f64 / n as f64);
-    if let Ok(golden) = std::fs::read(args.golden.join("logits.bin")) {
-        ensure!(golden.len() % (VOCAB * 4) == 0, "golden logits are not [T, vocab] F32");
-        let golden: Vec<f32> = golden.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let reference = args.golden.join("logits.bin");
+    if reference.is_file() {
+        let golden = crate::shared::golden_scores::read_reference_logits(&reference, VOCAB)?;
         // golden.py writes the row predicting token t at index t - 1.
         let (mut agree, mut kl, mut golden_nll) = (0usize, 0f64, 0f64);
         for (ours, &position) in rows.logits.chunks_exact(VOCAB).zip(&rows.positions) {
